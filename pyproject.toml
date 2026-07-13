@@ -1,0 +1,128 @@
+[project]
+name = "omni-forecast"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = []
+
+license = { text = "Apache-2.0" }
+authors = [
+    { name = "Harold Martin", email = "harold.martin@gmail.com" }
+]
+requires-python = ">=3.13"
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Environment :: Web Environment",
+    "Framework :: AsyncIO",
+    "Framework :: Pydantic :: 2",
+    "Intended Audience :: Developers",
+    "Natural Language :: English",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
+    "Topic :: Scientific/Engineering :: Atmospheric Science",
+    "Topic :: Software Development :: Libraries :: Python Modules",
+    "Typing :: Typed",
+]
+keywords = [
+    "weather",
+    "forecast",
+    "api",
+    "aggregation",
+    "async",
+    "openweather",
+    "open-meteo",
+    "noaa",
+    "meteorology",
+    "pydantic",
+]
+
+[project.urls]
+Homepage = "https://github.com/hbmartin/omni-forecast"
+Repository = "https://github.com/hbmartin/omni-forecast"
+Issues = "https://github.com/hbmartin/omni-forecast/issues"
+
+[build-system]
+requires = ["uv_build>=0.10.9,<0.11.0"]
+build-backend = "uv_build"
+
+[dependency-groups]
+dev = [
+    "codecov>=2.1.13",
+    "deptry>=0.23.0",
+    "hypothesis>=6.130",
+    "lizard>=1.23.0",
+    "pyrefly>=0.55.0",
+    "pyroma>=5.0.1",
+    "pytest>=8.4.2",
+    "pytest-asyncio>=1.3.0",
+    "pytest-cov>=7.0.0",
+    "ruff>=0.15.5",
+    "ty>=0.0.21",
+]
+docs = [
+    "zensical>=0.0.50",
+    "mkdocstrings[python]>=0.27.0",
+]
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]
+
+[tool.coverage.run]
+relative_files = true
+
+[tool.coverage.report]
+fail_under = 88
+
+[tool.ruff]
+# Exclude a variety of commonly ignored directories.
+exclude = [".bzr", ".direnv", ".eggs", ".git", ".git-rewrite", ".hg", ".ipynb_checkpoints", ".mypy_cache", ".nox", ".pants.d", ".pyenv", ".pytest_cache", ".pytype", ".ruff_cache", ".svn", ".tox", ".venv", ".vscode", "__pypackages__", "_build", "buck-out", "build", "dist", "node_modules", "setup.py", "site-packages", "venv"]
+
+line-length = 88
+indent-width = 4
+target-version = "py313"
+
+lint.select = ["ALL"]
+lint.ignore = [
+    "ANN401",
+    "BLE001",
+    "C901",
+    "COM812", # Conflicts with Ruff's formatter.
+    "D",
+    "E501",
+    "EM",
+    "PERF401",
+    "PLR",
+    "PYI034",
+    "RUF001",
+    "S113",
+    "S608",
+    "T201",
+    "TC",
+    "TRY",
+    "UP",
+]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/**/*.py" = [
+    "ANN",    # Type annotations not required in tests
+    "D",      # Docstrings not required in tests
+    "S101",   # assert is expected in tests
+    "SLF001", # Private member access is fine in tests
+]
+"scripts/**/*.py" = [
+    "INP001",  # Standalone maintenance scripts, not a package
+    "T201",    # print is the output mechanism for these scripts
+    "SLF001",  # Scripts intentionally reuse package-internal helpers
+]
+
+[tool.ruff.format]
+quote-style = "double"
+indent-style = "space"
+skip-magic-trailing-comma = false
+line-ending = "auto"
+
+[tool.deptry]
+known_first_party = ["omni_weather_forecast_apis"]

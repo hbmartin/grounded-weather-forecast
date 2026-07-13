@@ -1,0 +1,15 @@
+- Always run `uv run ruff check src --fix; uv run ruff format src tests; uv run pyrefly check src; uv run ty check src` after making changes.
+- Run `uv run deptry src; uv run pyroma --min 8 .; uv run lizard -Eduplicate -C 27 src; uv run pytest tests/ --cov=src --cov-report=term-missing` after finishing implementation.
+- Any user facing changes (e.g. new CLI flags) should be documented in the `README.md`.
+- Use `uv` not `python` for running scripts.
+- Use Ruff, not Black, for formatting and keep the Ruff format check aligned between local development and CI.
+- When dependencies change, update `uv.lock` with `uv lock` and verify Deptry still passes.
+- Treat `src/omni_weather_forecast_apis` as first-party code in dependency analysis; keep optional dynamic imports documented in the Deptry configuration.
+- Use `httpx2.MockTransport` for provider integration tests; tests must not call live weather APIs.
+- Preserve unrelated working-tree changes and inspect existing diffs before editing dirty files.
+- Add focused regression tests for changed behavior and keep total coverage at or above the configured 87% threshold.
+- Keep Lizard's cyclomatic-complexity ceiling at 27 or lower; refactor code instead of raising it.
+- Treat Type Hints as First-Class
+- Prefer Explicitness and Small Functions
+- Use modern Python features e.g. assignment expressions and Structural Pattern Matching where applicable
+- Use a parenthesized tuple of exception classes in the except clause
