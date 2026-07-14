@@ -1,14 +1,16 @@
 """Command-line interface: thin wrappers over library functions."""
 
 import argparse
+import sys
 from collections.abc import Sequence
 from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 
 import polars as pl
 
+from omni_forecast import __version__
 from omni_forecast.config import Config, ConfigError, load_config
-from omni_forecast.contracts import TruthSemantics
+from omni_forecast.contracts import HOURLY_VARIABLES, TruthSemantics
 
 HOURLY_DEFAULT_VARIABLES = (
     "temp_c,humidity_pct,dew_point_c,wind_speed_ms,wind_gust_ms,"
@@ -27,6 +29,11 @@ def build_parser() -> argparse.ArgumentParser:
         type=Path,
         default=Path("config.toml"),
         help="path to the TOML configuration (default: config.toml)",
+    )
+    parser.add_argument(
+        "--version",
+        action="version",
+        version=f"%(prog)s {__version__}",
     )
     subparsers = parser.add_subparsers(dest="command", required=True)
     subparsers.add_parser("qc", help="summarize station truth quality control")
@@ -205,9 +212,9 @@ def _alignment_artifact_path(config: Config) -> Path:
     return config.artifacts_dir / "alignment.json"
 
 
-def _resolve_semantics(config: Config, flag: str) -> TruthSemantics:
-    from collections import Counter  # noqa: PLC0415
-
+def _resolve_semantics(
+    config: Config, flag: str, variable: str | None = None
+) -> TruthSemantics:
     from omni_forecast.dataset.alignment import load_recommended  # noqa: PLC0415
 
     match flag:
@@ -217,10 +224,17 @@ def _resolve_semantics(config: Config, flag: str) -> TruthSemantics:
             return TruthSemantics.INTERVAL_MEAN
         case _:
             recommended = load_recommended(_alignment_artifact_path(config))
-            if not recommended:
+            if variable is None or variable not in recommended:
                 return TruthSemantics.INSTANTANEOUS
-            majority = Counter(recommended.values()).most_common(1)[0][0]
-            return TruthSemantics(majority)
+            return TruthSemantics(recommended[variable])
+
+
+def _semantics_by_variable(
+    config: Config, flag: str, variables: Sequence[str]
+) -> dict[str, TruthSemantics]:
+    return {
+        variable: _resolve_semantics(config, flag, variable) for variable in variables
+    }
 
 
 def _live_hourly_matrix_path(config: Config) -> Path:
@@ -293,18 +307,24 @@ def _cmd_predict(config: Config, args: argparse.Namespace) -> int:
     from omni_forecast.serve.selection import select_methods  # noqa: PLC0415
 
     forced = None if args.method == "auto" else args.method
-    selections = (
-        select_methods(config, config.dataset.dir / "scores") if not forced else {}
-    )
     now = args.now
     if now is not None and now.tzinfo is None:
         now = now.replace(tzinfo=UTC)
+    selections = (
+        select_methods(config, config.dataset.dir / "scores", as_of=now)
+        if not forced
+        else {}
+    )
     try:
         document = predict(
             config,
             selections,
             now=now,
-            semantics=_resolve_semantics(config, args.semantics),
+            semantics=_semantics_by_variable(
+                config,
+                args.semantics,
+                tuple(variable.name for variable in HOURLY_VARIABLES),
+            ),
             force_method=forced,
         )
     except NoForecastDataError as exc:
@@ -321,7 +341,10 @@ def _cmd_predict(config: Config, args: argparse.Namespace) -> int:
         print(f"wrote {out}")
     if not args.no_history:
         added = append_history(document, config.predict.history_path)
-        print(f"appended {added} rows to {config.predict.history_path}")
+        print(
+            f"appended {added} rows to {config.predict.history_path}",
+            file=sys.stderr if args.out == "-" else sys.stdout,
+        )
     return 0
 
 
@@ -340,7 +363,6 @@ def _cmd_backtest(config: Config, args: argparse.Namespace) -> int:
     from omni_forecast.dataset.matrix import matrix_path  # noqa: PLC0415
 
     methods = available_methods() if args.methods == "all" else _split_csv(args.methods)
-    semantics = _resolve_semantics(config, args.semantics)
     products = _split_csv(args.products)
     total = 0
     for product in products:
@@ -359,6 +381,7 @@ def _cmd_backtest(config: Config, args: argparse.Namespace) -> int:
             print(f"{product}: matrix carries {kinds}, expected [{args.source}]")
             return 1
         names = _split_csv(args.daily_variables if daily else args.hourly_variables)
+        semantics = _semantics_by_variable(config, args.semantics, names)
         request = BacktestRequest(
             variables=variables_from_names(
                 names, DAILY_VARIABLES if daily else HOURLY_VARIABLES
@@ -369,12 +392,34 @@ def _cmd_backtest(config: Config, args: argparse.Namespace) -> int:
             semantics=semantics,
         )
         scores = run_backtest(matrix, request, config)
-        path = scores_path(config.dataset.dir / "scores", product, args.source)
+        evaluation_id = (
+            str(scores["evaluation_id"][0]) if not scores.is_empty() else None
+        )
+        path = scores_path(
+            config.dataset.dir / "scores",
+            product,
+            args.source,
+            args.window,
+            evaluation_id,
+        )
         write_scores(scores, path)
         print(f"{product}: {scores.height} score rows -> {path}")
         if scores.is_empty():
             _explain_no_folds(config, matrix, product)
         total += scores.height
+    if total and args.source == "live":
+        from omni_forecast.serve.selection import select_methods  # noqa: PLC0415
+
+        promoted = select_methods(config, config.dataset.dir / "scores")
+        release_ids = sorted(
+            {
+                choice.release_id
+                for choice in promoted.values()
+                if choice.release_id is not None
+            }
+        )
+        if release_ids:
+            print(f"promoted model release: {', '.join(release_ids)}")
     return 0 if total else 1
 
 
@@ -431,10 +476,20 @@ def _cmd_report(config: Config) -> int:
         # synthetic board describes different sources entirely. The provenance
         # comes from the filename, since an empty scores frame (a young archive
         # with no folds yet) carries no rows to read it from.
-        is_live = path.stem.endswith("_live")
+        filename_kind = path.stem.split("_")[2]
+        is_live = (
+            filename_kind == "live"
+            if scores.is_empty()
+            else set(scores["source_kind"].unique()) == {"live"}
+        )
         if is_live and config.predict.history_path.exists():
-            _, hourly_truth, _ = build_truth(config)
-            live = verify_history(config.predict.history_path, hourly_truth)
+            minute_truth, hourly_truth, daily_truth = build_truth(config)
+            live = verify_history(
+                config.predict.history_path,
+                hourly_truth,
+                minute_truth,
+                daily_truth,
+            )
             sections.append(
                 (
                     "Self-verification (served vs realized)",

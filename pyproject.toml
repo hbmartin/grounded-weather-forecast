@@ -12,7 +12,8 @@ dependencies = [
     "scoringrules>=0.11.0",
 ]
 
-license = { text = "Apache-2.0" }
+license = "Apache-2.0"
+license-files = ["LICENSE"]
 authors = [
     { name = "Harold Martin", email = "harold.martin@gmail.com" }
 ]
@@ -46,12 +47,16 @@ omni-forecast = "omni_forecast.cli:main"
 
 [project.urls]
 Homepage = "https://github.com/hbmartin/omni-forecast"
+Documentation = "https://hbmartin.github.io/omni-forecast/"
 Repository = "https://github.com/hbmartin/omni-forecast"
 Issues = "https://github.com/hbmartin/omni-forecast/issues"
 
 [build-system]
 requires = ["uv_build>=0.10.9,<0.11.0"]
 build-backend = "uv_build"
+
+[tool.uv.build-backend]
+source-include = ["config.example.toml"]
 
 [dependency-groups]
 dev = [

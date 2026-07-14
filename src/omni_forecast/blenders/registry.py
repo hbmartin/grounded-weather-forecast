@@ -3,7 +3,7 @@ the backtest engine constructs a fresh blender per fold (a leakage defense)."""
 
 from collections.abc import Callable
 
-from omni_forecast.contracts import Blender
+from omni_forecast.contracts import Blender, Product, VariableSpec
 
 type BlenderFactory = Callable[[], Blender]
 
@@ -32,3 +32,15 @@ def get_factory(method_id: str) -> BlenderFactory:
 
 def available_methods() -> tuple[str, ...]:
     return tuple(sorted(_REGISTRY))
+
+
+def supports_product(
+    method_id: str, product: Product, variable: VariableSpec | None = None
+) -> bool:
+    """Whether a method's feature assumptions match the product contract."""
+    hourly_only = method_id == "persistence" or method_id.startswith("anchored_")
+    if product is Product.DAILY and hourly_only:
+        return False
+    return not (
+        variable is not None and variable.name in {"precip_mm", "pop"} and hourly_only
+    )

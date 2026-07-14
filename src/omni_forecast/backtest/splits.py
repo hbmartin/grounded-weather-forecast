@@ -60,6 +60,12 @@ def fold_plans(
     """Build inspectable fold plans; may be empty if data is too short."""
     if issue_time.is_empty():
         return []
+    if backtest.step_days <= 0:
+        msg = f"step_days must be positive, got {backtest.step_days}"
+        raise ValueError(msg)
+    if backtest.initial_train_days <= 0 or backtest.rolling_window_days <= 0:
+        msg = "initial_train_days and rolling_window_days must be positive"
+        raise ValueError(msg)
     issues = issue_time.cast(pl.Int64).to_numpy()  # epoch microseconds, UTC
     known = truth_known_at.cast(pl.Int64).to_numpy()
     step_us = backtest.step_days * _US_PER_DAY

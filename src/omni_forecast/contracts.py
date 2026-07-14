@@ -28,6 +28,18 @@ class SourceKind(StrEnum):
     SYNTHETIC = "synthetic"
 
 
+class Product(StrEnum):
+    MINUTELY = "minutely"
+    HOURLY = "hourly"
+    DAILY = "daily"
+
+
+class LeadUnit(StrEnum):
+    MINUTES = "minutes"
+    HOURS = "hours"
+    LOCAL_DAYS = "local_days"
+
+
 class TruthSemantics(StrEnum):
     INSTANTANEOUS = "inst"
     INTERVAL_MEAN = "mean"
@@ -41,28 +53,57 @@ class VariableSpec:
     kind: TargetKind
     unit: str
     has_dual_semantics: bool = False
+    minimum: float | None = None
+    maximum: float | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class ProductSpec:
+    """Temporal contract for one emitted product."""
+
+    product: Product
+    lead_unit: LeadUnit
+    horizon: int
+
+
+PRODUCT_SPECS: tuple[ProductSpec, ...] = (
+    ProductSpec(Product.MINUTELY, LeadUnit.MINUTES, 60),
+    ProductSpec(Product.HOURLY, LeadUnit.HOURS, 48),
+    ProductSpec(Product.DAILY, LeadUnit.LOCAL_DAYS, 10),
+)
 
 
 HOURLY_VARIABLES: tuple[VariableSpec, ...] = (
     VariableSpec("temp_c", TargetKind.CONTINUOUS, "°C", has_dual_semantics=True),
-    VariableSpec("humidity_pct", TargetKind.CONTINUOUS, "%", has_dual_semantics=True),
+    VariableSpec(
+        "humidity_pct",
+        TargetKind.CONTINUOUS,
+        "%",
+        has_dual_semantics=True,
+        minimum=0.0,
+        maximum=100.0,
+    ),
     VariableSpec("dew_point_c", TargetKind.CONTINUOUS, "°C", has_dual_semantics=True),
     VariableSpec(
-        "wind_speed_ms", TargetKind.CONTINUOUS, "m/s", has_dual_semantics=True
+        "wind_speed_ms",
+        TargetKind.CONTINUOUS,
+        "m/s",
+        has_dual_semantics=True,
+        minimum=0.0,
     ),
-    VariableSpec("wind_gust_ms", TargetKind.CONTINUOUS, "m/s"),
+    VariableSpec("wind_gust_ms", TargetKind.CONTINUOUS, "m/s", minimum=0.0),
     VariableSpec(
         "pressure_sea_hpa", TargetKind.CONTINUOUS, "hPa", has_dual_semantics=True
     ),
-    VariableSpec("precip_mm", TargetKind.CONTINUOUS, "mm"),
-    VariableSpec("pop", TargetKind.PROBABILITY, ""),
+    VariableSpec("precip_mm", TargetKind.CONTINUOUS, "mm", minimum=0.0),
+    VariableSpec("pop", TargetKind.PROBABILITY, "", minimum=0.0, maximum=1.0),
 )
 
 DAILY_VARIABLES: tuple[VariableSpec, ...] = (
     VariableSpec("temp_max_c", TargetKind.CONTINUOUS, "°C"),
     VariableSpec("temp_min_c", TargetKind.CONTINUOUS, "°C"),
-    VariableSpec("pop", TargetKind.PROBABILITY, ""),
-    VariableSpec("precip_sum_mm", TargetKind.CONTINUOUS, "mm"),
+    VariableSpec("pop", TargetKind.PROBABILITY, "", minimum=0.0, maximum=1.0),
+    VariableSpec("precip_sum_mm", TargetKind.CONTINUOUS, "mm", minimum=0.0),
 )
 
 
@@ -82,14 +123,24 @@ def daily_variable(name: str) -> VariableSpec:
     raise KeyError(msg)
 
 
+def _encode_column_segment(segment: str) -> str:
+    if not segment:
+        raise ValueError("column-name segments must not be empty")
+    return segment.replace("%", "%25").replace(COLUMN_SEPARATOR, "%5F%5F")
+
+
+def _decode_column_segment(segment: str) -> str:
+    return segment.replace("%5F%5F", COLUMN_SEPARATOR).replace("%25", "%")
+
+
 def fx_col(source: str, variable: str) -> str:
     """Forecast column for one source and canonical variable."""
-    return f"fx{COLUMN_SEPARATOR}{source}{COLUMN_SEPARATOR}{variable}"
+    return f"fx{COLUMN_SEPARATOR}{_encode_column_segment(source)}{COLUMN_SEPARATOR}{_encode_column_segment(variable)}"
 
 
 def fxd_col(source: str, variable: str) -> str:
     """Daily-forecast column for one source and canonical daily variable."""
-    return f"fxd{COLUMN_SEPARATOR}{source}{COLUMN_SEPARATOR}{variable}"
+    return f"fxd{COLUMN_SEPARATOR}{_encode_column_segment(source)}{COLUMN_SEPARATOR}{_encode_column_segment(variable)}"
 
 
 def age_col(source: str) -> str:
@@ -114,7 +165,7 @@ def parse_fx_col(column: str) -> tuple[str, str]:
     """Invert :func:`fx_col`/:func:`fxd_col` into (source, variable)."""
     match column.split(COLUMN_SEPARATOR):
         case ["fx" | "fxd", source, variable] if source and variable:
-            return source, variable
+            return _decode_column_segment(source), _decode_column_segment(variable)
         case _:
             msg = f"not a forecast column: {column!r}"
             raise ValueError(msg)
@@ -147,6 +198,7 @@ class ForecastMatrix:
     availability: BoolArray
     lead_hours: FloatArray
     features: pl.DataFrame
+    product: Product = Product.HOURLY
 
     def __post_init__(self) -> None:
         n, k = self.values.shape
@@ -179,6 +231,7 @@ class ForecastMatrix:
         values: FloatArray,
         lead_hours: FloatArray,
         features: pl.DataFrame,
+        product: Product = Product.HOURLY,
     ) -> Self:
         """Construct with availability derived from the NaN pattern."""
         return cls(
@@ -187,6 +240,7 @@ class ForecastMatrix:
             availability=~np.isnan(values),
             lead_hours=lead_hours,
             features=features,
+            product=product,
         )
 
 
@@ -224,6 +278,12 @@ class BlendResult:
                 expected = (self.point.shape[0], len(levels))
                 if q.shape != expected:
                     msg = f"quantiles shape {q.shape} != {expected}"
+                    raise ContractViolationError(msg)
+                if (
+                    any(not 0.0 < level < 1.0 for level in levels)
+                    or tuple(sorted(levels)) != levels
+                ):
+                    msg = "quantile_levels must be strictly increasing inside (0, 1)"
                     raise ContractViolationError(msg)
             case _:
                 msg = "quantiles and quantile_levels must be provided together"

@@ -14,6 +14,7 @@ QC_OK = 0
 QC_OUT_OF_BOUNDS = 1
 QC_SPIKE = 2
 QC_FLATLINE = 4
+_MAX_CONTIGUOUS_GAP_MINUTES = 5.0
 
 
 def qc_col(channel: str) -> str:
@@ -54,13 +55,30 @@ def _spike_flag(channel: str, max_step_per_minute: float) -> pl.Expr:
     )
 
 
-def _flatline_flag(channel: str, min_minutes: int) -> pl.Expr:
+def _flatline_run_id(channel: str) -> pl.Expr:
+    value = pl.col(channel)
+    gap_minutes = (pl.col("ts") - pl.col("ts").shift(1)).dt.total_seconds() / 60.0
+    changed = (
+        (value != value.shift(1))
+        | value.is_null()
+        | value.shift(1).is_null()
+        | (gap_minutes > _MAX_CONTIGUOUS_GAP_MINUTES)
+    )
+    return changed.fill_null(value=True).cum_sum()
+
+
+def _flatline_flag(channel: str, min_minutes: int, *, causal: bool = False) -> pl.Expr:
     """Flag runs of identical consecutive values lasting at least ``min_minutes``."""
     value = pl.col(channel)
-    run_id = (value != value.shift(1)).fill_null(value=True).cum_sum()
-    run_minutes = (pl.col("ts").max() - pl.col("ts").min()).dt.total_seconds().over(
-        run_id
-    ) / 60.0
+    run_id = _flatline_run_id(channel)
+    if causal:
+        run_minutes = (
+            pl.col("ts") - pl.col("ts").first().over(run_id)
+        ).dt.total_seconds() / 60.0
+    else:
+        run_minutes = (pl.col("ts").max() - pl.col("ts").min()).dt.total_seconds().over(
+            run_id
+        ) / 60.0
     return (
         pl.when(value.is_not_null() & (run_minutes >= float(min_minutes)))
         .then(QC_FLATLINE)
@@ -83,6 +101,28 @@ def apply_qc(
             flag = flag | _spike_flag(channel, max_step).cast(pl.UInt8)
         if (flatline := qc.flatline_minutes.get(channel)) is not None:
             flag = flag | _flatline_flag(channel, flatline).cast(pl.UInt8)
+        flags.append(flag.alias(qc_col(channel)))
+    return minute.with_columns(flags)
+
+
+def apply_causal_qc(
+    minute: pl.DataFrame, qc: QcConfig, channels: Sequence[str]
+) -> pl.DataFrame:
+    """QC suitable for issue-time features without consulting future samples.
+
+    Bounds are immediate. Flatlines are flagged only from the instant their
+    duration crosses the threshold. The two-sided isolated-spike rule is
+    intentionally excluded because it requires a following observation.
+    """
+    flags: list[pl.Expr] = []
+    for channel in channels:
+        if channel not in minute.columns:
+            continue
+        flag: pl.Expr = pl.lit(QC_OK, dtype=pl.UInt8)
+        if (bounds := qc.bounds.get(channel)) is not None:
+            flag = flag | _bounds_flag(channel, *bounds).cast(pl.UInt8)
+        if (flatline := qc.flatline_minutes.get(channel)) is not None:
+            flag = flag | _flatline_flag(channel, flatline, causal=True).cast(pl.UInt8)
         flags.append(flag.alias(qc_col(channel)))
     return minute.with_columns(flags)
 

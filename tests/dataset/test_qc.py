@@ -6,6 +6,7 @@ from omni_forecast.dataset.qc import (
     QC_FLATLINE,
     QC_OUT_OF_BOUNDS,
     QC_SPIKE,
+    apply_causal_qc,
     apply_qc,
     masked,
     qc_summary,
@@ -28,8 +29,8 @@ db_path = "y.sqlite"
     return load_config(path).qc
 
 
-def frame(values, step_seconds=60):
-    ts = minute_series(utc(2026, 7, 13, 12, 0), len(values), step_seconds)
+def frame(values, step_seconds=60, start=None):
+    ts = minute_series(start or utc(2026, 7, 13, 12, 0), len(values), step_seconds)
     return pl.DataFrame(
         {"ts": ts, "temp": values},
         schema={"ts": pl.Datetime("us", "UTC"), "temp": pl.Float64},
@@ -89,6 +90,26 @@ class TestFlatline:
         values = [15.0] * 100 + [None] + [15.0] * 100
         flagged = apply_qc(frame(values), qc, ["temp"])
         assert flagged["temp_qc"].sum() == 0
+
+    def test_gap_breaks_flatline_run(self, tmp_path):
+        qc = qc_config(tmp_path)
+        first = frame([15.0] * 100)
+        second = frame(
+            [15.0] * 100,
+            start=utc(2026, 7, 13, 16, 0),
+        )
+        flagged = apply_qc(pl.concat([first, second]), qc, ["temp"])
+        assert flagged["temp_qc"].sum() == 0
+
+    def test_causal_flags_do_not_change_when_future_rows_arrive(self, tmp_path):
+        qc = qc_config(tmp_path)
+        prefix = frame([10.0, 10.0, 10.0])
+        future = frame([50.0], start=utc(2026, 7, 13, 12, 3))
+        before = apply_causal_qc(prefix, qc, ["temp"])["temp_qc"]
+        after = apply_causal_qc(pl.concat([prefix, future]), qc, ["temp"])[
+            "temp_qc"
+        ].head(3)
+        assert before.to_list() == after.to_list()
 
 
 class TestMaskedAndSummary:

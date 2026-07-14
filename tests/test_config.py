@@ -80,6 +80,7 @@ class TestMinimalConfig:
         assert cfg.station.units["temp"] == "degF"
         assert cfg.forecasts.sources == ()
         assert cfg.forecasts.max_forecast_age_hours == 12.0
+        assert cfg.forecasts.immutable is False
         assert cfg.dataset.dir == Path("data")
         assert cfg.dataset.pop_threshold_mm == 0.254
         assert cfg.qc.bounds["temp"] == (-40.0, 55.0)
@@ -90,6 +91,7 @@ class TestMinimalConfig:
         assert cfg.backtest.initial_train_days == 90
         assert cfg.predict.selection == "skill_per_slice"
         assert cfg.predict.history_path == Path("data/predict_history.parquet")
+        assert cfg.predict.minutely_tau_hours == 3.0
         assert cfg.reports_dir == Path("reports")
         assert cfg.artifacts_dir == Path("artifacts")
 
@@ -158,3 +160,22 @@ class TestErrors:
         )
         cfg = load_config(write(tmp_path, text))
         assert cfg.backfill.start_date == date(2024, 1, 2)
+
+    @pytest.mark.parametrize(
+        "raw",
+        ('"not-a-date"', "2024-01-02T03:04:05Z"),
+    )
+    def test_malformed_or_datetime_start_rejected(self, tmp_path, raw):
+        text = MINIMAL + f"\n[backfill.open_meteo]\nstart_date = {raw}\n"
+        with pytest.raises(ConfigError, match="start_date"):
+            load_config(write(tmp_path, text))
+
+    def test_duplicate_canonical_station_alias_rejected(self, tmp_path):
+        text = MINIMAL + '\n[station.columns]\nsecond_temp = "temp"\n'
+        with pytest.raises(ConfigError, match="multiple database columns"):
+            load_config(write(tmp_path, text))
+
+    def test_nonpositive_backtest_step_rejected(self, tmp_path):
+        text = MINIMAL + "\n[backtest]\nstep_days = 0\n"
+        with pytest.raises(ConfigError, match="positive integer"):
+            load_config(write(tmp_path, text))

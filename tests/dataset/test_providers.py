@@ -4,6 +4,7 @@ import pytest
 from conftest import make_forecast_db, utc, write_config
 
 from omni_forecast.dataset.providers import (
+    read_forecast_archive,
     read_daily_long,
     read_hourly_long,
     read_minutely_long,
@@ -140,6 +141,63 @@ class TestReadHourlyLong:
         )
         frame = read_hourly_long(la_config.forecasts)
         assert frame["source"][0] == "open_meteo_ecmwf_ifs025"
+
+    def test_filters_runs_for_other_locations(self, tmp_path, la_config):
+        make_forecast_db(
+            tmp_path / "fx.sqlite",
+            [
+                {
+                    "completed_at": FETCH,
+                    "results": [
+                        {
+                            "provider": "local",
+                            "fetched_at": FETCH,
+                            "hourly": [(VALID, {"temperature": 10.0})],
+                        }
+                    ],
+                },
+                {
+                    "latitude": 40.0,
+                    "longitude": -75.0,
+                    "completed_at": "2026-03-22T12:01:00+00:00",
+                    "results": [
+                        {
+                            "provider": "other_location",
+                            "fetched_at": FETCH,
+                            "hourly": [(VALID, {"temperature": 99.0})],
+                        }
+                    ],
+                },
+            ],
+        )
+        archive = read_forecast_archive(la_config.forecasts)
+        assert archive.hourly["source"].unique().to_list() == ["local"]
+        assert archive.completions.height == 1
+
+    def test_live_wal_rows_are_visible(self, tmp_path, la_config):
+        one_run_db(
+            tmp_path,
+            [
+                {
+                    "provider": "nws",
+                    "fetched_at": FETCH,
+                    "hourly": [(VALID, {"temperature": 10.0})],
+                }
+            ],
+        )
+        writer = sqlite3.connect(tmp_path / "fx.sqlite")
+        try:
+            writer.execute("PRAGMA journal_mode=WAL")
+            source_id = writer.execute("SELECT id FROM source_forecasts").fetchone()[0]
+            writer.execute(
+                "INSERT INTO hourly_points (source_forecast_id, timestamp_unix, temperature)"
+                " VALUES (?, ?, ?)",
+                (source_id, int(utc(2026, 3, 22, 19).timestamp()), 11.0),
+            )
+            writer.commit()
+            assert read_hourly_long(la_config.forecasts).height == 2
+        finally:
+            writer.close()
 
 
 class TestReadDailyAndMinutely:

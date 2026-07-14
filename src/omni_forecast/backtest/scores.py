@@ -17,6 +17,13 @@ SCORES_SCHEMA: pl.Schema = pl.Schema(
         "variable": pl.String(),
         "product": pl.String(),
         "source_kind": pl.String(),
+        "evaluation_id": pl.String(),
+        "evaluation_created_at": pl.Datetime("us", "UTC"),
+        "dataset_fingerprint": pl.String(),
+        "source_set_json": pl.String(),
+        "semantics": pl.String(),
+        "code_version": pl.String(),
+        "config_fingerprint": pl.String(),
         "window": pl.String(),
         "fold_origin": pl.Datetime("us", "UTC"),
         "issue_time": pl.Datetime("us", "UTC"),
@@ -25,6 +32,8 @@ SCORES_SCHEMA: pl.Schema = pl.Schema(
         "lead_bucket": pl.String(),
         "y_pred": pl.Float64(),
         "y_true": pl.Float64(),
+        "quantile_levels_json": pl.String(),
+        "quantiles_json": pl.String(),
     }
 )
 
@@ -33,8 +42,17 @@ def empty_scores() -> pl.DataFrame:
     return pl.DataFrame(schema=SCORES_SCHEMA)
 
 
-def scores_path(directory: Path, product: str, source_kind: str) -> Path:
-    return directory / f"scores_{product}_{source_kind}.parquet"
+def scores_path(
+    directory: Path,
+    product: str,
+    source_kind: str,
+    window: str | None = None,
+    evaluation_id: str | None = None,
+) -> Path:
+    """Path that preserves distinct windows/evaluations instead of overwriting."""
+    suffix = "_".join(part for part in (window, evaluation_id) if part)
+    tail = f"_{suffix}" if suffix else ""
+    return directory / f"scores_{product}_{source_kind}{tail}.parquet"
 
 
 def write_scores(scores: pl.DataFrame, path: Path) -> None:

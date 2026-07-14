@@ -18,6 +18,11 @@ class ArtifactError(ValueError):
     """A requested artifact is missing or inconsistent."""
 
 
+_RESERVED_MANIFEST_KEYS = frozenset(
+    {"method_id", "product", "variable", "dataset_fingerprint", "created_at"}
+)
+
+
 @dataclass(frozen=True, slots=True)
 class ArtifactStore:
     root: Path
@@ -38,6 +43,9 @@ class ArtifactStore:
         meta: dict[str, Any] | None = None,
     ) -> Path:
         slot = self._slot(fingerprint, method_id, product, variable)
+        if overlap := _RESERVED_MANIFEST_KEYS.intersection(meta or {}):
+            msg = f"artifact metadata may not override reserved keys: {sorted(overlap)}"
+            raise ArtifactError(msg)
         slot.mkdir(parents=True, exist_ok=True)
         (slot / "state.json").write_text(json.dumps(state), encoding="utf-8")
         manifest = {

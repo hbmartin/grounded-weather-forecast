@@ -12,14 +12,15 @@ with lead. Providers' native minutely precipitation is blended separately,
 because it is the only genuinely minute-resolution signal they publish.
 """
 
-import json
 import math
+from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 
 import numpy as np
 import polars as pl
 
+from omni_forecast.backtest.splits import daily_truth_known_at, hourly_truth_known_at
 from omni_forecast.blenders.registry import get_factory
 from omni_forecast.config import Config
 from omni_forecast.contracts import (
@@ -29,22 +30,22 @@ from omni_forecast.contracts import (
     ForecastMatrix,
     TruthSemantics,
     VariableSpec,
+    hourly_variable,
 )
 from omni_forecast.dataset.matrix import (
     build_daily_matrix,
     build_hourly_matrix,
+    build_observation_features,
     build_truth,
     matrix_path,
     matrix_sources,
     to_forecast_matrix,
     to_supervised_slice,
 )
-from omni_forecast.dataset.providers import (
-    read_daily_long,
-    read_hourly_long,
-    read_minutely_long,
-)
+from omni_forecast.dataset.providers import read_forecast_archive
+from omni_forecast.evaluation import dataset_fingerprint
 from omni_forecast.leads import daily_bucket, hourly_bucket
+from omni_forecast.serve.history import load_archived_forecast
 from omni_forecast.serve.schema import (
     SCHEMA_VERSION,
     DailyPoint,
@@ -58,7 +59,6 @@ MINUTELY_HORIZON_MINUTES = 60
 HOURLY_HORIZON_HOURS = 48
 DAILY_HORIZON_DAYS = 10
 _OBS_STALENESS = timedelta(minutes=30)
-_DEFAULT_TAU_HOURS = 3.0
 _MINUTELY_VARIABLES = (
     "temp_c",
     "humidity_pct",
@@ -83,6 +83,15 @@ class Snapshot:
     observation_at: datetime | None
 
 
+@dataclass(frozen=True, slots=True)
+class VariableBlend:
+    point: np.ndarray
+    methods: list[str]
+    reasons: list[str]
+    release_ids: list[str | None]
+    quantiles: list[dict[str, float]]
+
+
 def _latest_observation(
     minute: pl.DataFrame, issue_time: datetime
 ) -> tuple[dict[str, float], datetime | None]:
@@ -104,28 +113,32 @@ def _latest_observation(
 
 def build_snapshot(config: Config, issue_time: datetime) -> Snapshot:
     """The as-of view of every source at ``issue_time``, plus current truth."""
-    minute, hourly_truth, daily_truth = build_truth(config)
+    _, hourly_truth, daily_truth = build_truth(config)
+    causal_minute = build_observation_features(config)
+    archive = read_forecast_archive(config.forecasts)
     snapshots = pl.DataFrame(
         {"issue_time": [issue_time]},
         schema={"issue_time": pl.Datetime("us", "UTC")},
     )
-    hourly_long = read_hourly_long(config.forecasts)
     hourly = build_hourly_matrix(
-        hourly_long, snapshots, hourly_truth, minute, config
+        archive.hourly, snapshots, hourly_truth, causal_minute, config
     ).filter(pl.col("lead_hours") <= HOURLY_HORIZON_HOURS)
     daily = build_daily_matrix(
-        read_daily_long(config.forecasts), snapshots, hourly, daily_truth, config
+        archive.daily, snapshots, hourly, daily_truth, config
     ).filter(pl.col("lead_days") < DAILY_HORIZON_DAYS)
-    minutely_long = read_minutely_long(config.forecasts)
-    minutely = minutely_long.filter(
+    minutely = archive.minutely.filter(
         (pl.col("fetched_at") <= issue_time)
+        & (
+            pl.col("fetched_at")
+            > issue_time - timedelta(hours=config.forecasts.max_forecast_age_hours)
+        )
         & (pl.col("valid_time") > issue_time)
         & (
             pl.col("valid_time")
             <= issue_time + timedelta(minutes=MINUTELY_HORIZON_MINUTES)
         )
     )
-    observation, observation_at = _latest_observation(minute, issue_time)
+    observation, observation_at = _latest_observation(causal_minute, issue_time)
     if hourly.is_empty() and daily.is_empty():
         msg = (
             f"no provider forecast within {config.forecasts.max_forecast_age_hours}h "
@@ -166,6 +179,22 @@ def _fit_methods(
     return results, x
 
 
+def _cold_start_equal_weight(
+    predict_frame: pl.DataFrame,
+    variable: VariableSpec,
+    *,
+    daily: bool,
+) -> np.ndarray:
+    sources = matrix_sources(predict_frame)
+    if not sources:
+        return np.full(predict_frame.height, np.nan)
+    matrix = to_forecast_matrix(predict_frame, variable, daily=daily, sources=sources)
+    with np.errstate(invalid="ignore"):
+        counts = matrix.availability.sum(axis=1)
+        totals = np.where(matrix.availability, matrix.values, 0.0).sum(axis=1)
+        return np.where(counts > 0, totals / counts, np.nan)
+
+
 def _blend_variable(
     train: pl.DataFrame,
     predict_frame: pl.DataFrame,
@@ -176,7 +205,7 @@ def _blend_variable(
     daily: bool,
     semantics: TruthSemantics,
     force_method: str | None = None,
-) -> tuple[np.ndarray, list[str]] | None:
+) -> VariableBlend | None:
     """Per row: the prediction of the method selected for that row's bucket."""
     product = "daily" if daily else "hourly"
     buckets: list[str | None] = [
@@ -200,16 +229,72 @@ def _blend_variable(
         semantics=semantics,
     )
     if fitted is None:
-        return None
+        if {selection.method_id for selection in chosen} != {"equal_weight"}:
+            return None
+        point = _cold_start_equal_weight(predict_frame, variable, daily=daily)
+        return VariableBlend(
+            point=point,
+            methods=["equal_weight"] * predict_frame.height,
+            reasons=["degraded cold start: no scoreable training truth"]
+            * predict_frame.height,
+            release_ids=[None] * predict_frame.height,
+            quantiles=[{} for _ in range(predict_frame.height)],
+        )
     results, _ = fitted
     point = np.full(predict_frame.height, np.nan)
+    quantiles: list[dict[str, float]] = []
     for row, selection in enumerate(chosen):
-        point[row] = results[selection.method_id].point[row]
-    return point, [c.method_id for c in chosen]
+        result = results[selection.method_id]
+        point[row] = result.point[row]
+        quantiles.append(
+            {
+                str(level): float(result.quantiles[row, index])
+                for index, level in enumerate(result.quantile_levels)
+            }
+            if result.quantiles is not None
+            else {}
+        )
+    return VariableBlend(
+        point=point,
+        methods=[selection.method_id for selection in chosen],
+        reasons=[selection.reason for selection in chosen],
+        release_ids=[selection.release_id for selection in chosen],
+        quantiles=quantiles,
+    )
 
 
-def _finite(value: float) -> float | None:
-    return None if math.isnan(value) else round(float(value), 3)
+def _finite(value: float, variable: VariableSpec | None = None) -> float | None:
+    if not math.isfinite(value):
+        return None
+    bounded = float(value)
+    if variable is not None:
+        if variable.minimum is not None:
+            bounded = max(bounded, variable.minimum)
+        if variable.maximum is not None:
+            bounded = min(bounded, variable.maximum)
+    return round(bounded, 3)
+
+
+def _cohere_hourly(points: list[HourlyPoint]) -> None:
+    """Enforce cross-variable physical relationships after marginal clipping."""
+    for point in points:
+        values = point.values
+        temperature = values.get("temp_c")
+        dew_point = values.get("dew_point_c")
+        if temperature is not None and dew_point is not None:
+            values["dew_point_c"] = min(dew_point, temperature)
+        speed = values.get("wind_speed_ms")
+        gust = values.get("wind_gust_ms")
+        if speed is not None and gust is not None:
+            values["wind_gust_ms"] = max(gust, speed)
+
+
+def _cohere_daily(points: list[DailyPoint]) -> None:
+    for point in points:
+        high = point.values.get("temp_max_c")
+        low = point.values.get("temp_min_c")
+        if high is not None and low is not None and high < low:
+            point.values["temp_max_c"], point.values["temp_min_c"] = low, high
 
 
 def hourly_product(
@@ -217,14 +302,18 @@ def hourly_product(
     train: pl.DataFrame,
     selections: SelectionMap,
     config: Config,
-    semantics: TruthSemantics,
+    semantics: TruthSemantics | Mapping[str, TruthSemantics],
     force_method: str | None = None,
 ) -> tuple[list[HourlyPoint], dict[str, np.ndarray]]:
     """Blended hourly path, plus the raw per-variable arrays for anchoring."""
     frame = snapshot.hourly.sort("valid_time")
-    blended: dict[str, np.ndarray] = {}
-    methods: dict[str, list[str]] = {}
+    blended: dict[str, VariableBlend] = {}
     for variable in HOURLY_VARIABLES:
+        variable_semantics = (
+            semantics.get(variable.name, TruthSemantics.INSTANTANEOUS)
+            if isinstance(semantics, Mapping)
+            else semantics
+        )
         result = _blend_variable(
             train,
             frame,
@@ -232,23 +321,40 @@ def hourly_product(
             selections,
             config,
             daily=False,
-            semantics=semantics,
+            semantics=variable_semantics,
             force_method=force_method,
         )
         if result is None:
             continue
-        blended[variable.name], methods[variable.name] = result
+        blended[variable.name] = result
+    variables = {variable.name: variable for variable in HOURLY_VARIABLES}
     points = [
         HourlyPoint(
             valid_time=row["valid_time"].isoformat(),
             lead_hours=round(float(row["lead_hours"]), 2),
             lead_bucket=row["lead_bucket"],
-            values={name: _finite(values[index]) for name, values in blended.items()},
-            methods={name: chosen[index] for name, chosen in methods.items()},
+            values={
+                name: _finite(result.point[index], variables[name])
+                for name, result in blended.items()
+            },
+            methods={name: result.methods[index] for name, result in blended.items()},
+            quantiles={
+                name: {
+                    level: value
+                    for level, raw in result.quantiles[index].items()
+                    if (value := _finite(raw, variables[name])) is not None
+                }
+                for name, result in blended.items()
+                if result.quantiles[index]
+            },
+            selection_reasons={
+                name: result.reasons[index] for name, result in blended.items()
+            },
         )
         for index, row in enumerate(frame.iter_rows(named=True))
     ]
-    return points, blended
+    _cohere_hourly(points)
+    return points, {name: result.point for name, result in blended.items()}
 
 
 def daily_product(
@@ -267,8 +373,7 @@ def daily_product(
     frame = snapshot.daily.sort("forecast_date")
     if frame.is_empty():
         return []
-    blended: dict[str, np.ndarray] = {}
-    methods: dict[str, list[str]] = {}
+    blended: dict[str, VariableBlend] = {}
     for variable in DAILY_VARIABLES:
         result = _blend_variable(
             train,
@@ -282,16 +387,34 @@ def daily_product(
         )
         if result is None:
             continue
-        blended[variable.name], methods[variable.name] = result
-    return [
+        blended[variable.name] = result
+    variables = {variable.name: variable for variable in DAILY_VARIABLES}
+    points = [
         DailyPoint(
             date_local=row["forecast_date"].isoformat(),
             lead_days=int(row["lead_days"]),
-            values={name: _finite(values[index]) for name, values in blended.items()},
-            methods={name: chosen[index] for name, chosen in methods.items()},
+            values={
+                name: _finite(result.point[index], variables[name])
+                for name, result in blended.items()
+            },
+            methods={name: result.methods[index] for name, result in blended.items()},
+            quantiles={
+                name: {
+                    level: value
+                    for level, raw in result.quantiles[index].items()
+                    if (value := _finite(raw, variables[name])) is not None
+                }
+                for name, result in blended.items()
+                if result.quantiles[index]
+            },
+            selection_reasons={
+                name: result.reasons[index] for name, result in blended.items()
+            },
         )
         for index, row in enumerate(frame.iter_rows(named=True))
     ]
+    _cohere_daily(points)
+    return points
 
 
 def _anchor_weight(minutes_ahead: int, tau_hours: float) -> float:
@@ -320,7 +443,9 @@ def _minutely_precip(snapshot: Snapshot) -> dict[datetime, tuple[float, float]]:
 
 
 def minutely_product(
-    snapshot: Snapshot, hourly_blend: dict[str, np.ndarray]
+    snapshot: Snapshot,
+    hourly_blend: dict[str, np.ndarray],
+    config: Config,
 ) -> list[MinutelyPoint]:
     """The anchored nowcast: hourly path interpolated to minutes + decayed residual."""
     frame = snapshot.hourly.sort("valid_time")
@@ -343,70 +468,122 @@ def minutely_product(
             if observed is not None:
                 now_blend = float(np.interp(0.0, leads[usable], path[usable]))
                 residual = observed - now_blend
-                interpolated += _anchor_weight(minute, _DEFAULT_TAU_HOURS) * residual
-            values[name] = round(interpolated, 3)
+                interpolated += (
+                    _anchor_weight(minute, config.predict.minutely_tau_hours) * residual
+                )
+            values[name] = _finite(interpolated, hourly_variable(name))
         intensity, pop = precip.get(valid, (None, None))
+        finite_intensity = (
+            _finite(
+                float(intensity),
+                VariableSpec(
+                    "precip_intensity_mmh",
+                    HOURLY_VARIABLES[0].kind,
+                    "mm/h",
+                    minimum=0.0,
+                ),
+            )
+            if intensity is not None
+            else None
+        )
+        finite_pop = (
+            _finite(float(pop), hourly_variable("pop")) if pop is not None else None
+        )
         points.append(
             MinutelyPoint(
                 valid_time=valid.isoformat(),
                 minutes_ahead=minute,
-                precip_intensity_mmh=intensity,
-                pop=pop,
-                **values,  # type: ignore[arg-type]
+                temp_c=values.get("temp_c"),
+                humidity_pct=values.get("humidity_pct"),
+                dew_point_c=values.get("dew_point_c"),
+                wind_speed_ms=values.get("wind_speed_ms"),
+                precip_intensity_mmh=finite_intensity,
+                pop=finite_pop,
+                methods={
+                    **dict.fromkeys(values, "anchored_hourly_blend"),
+                    **(
+                        {
+                            "precip_intensity_mmh": "native_equal_weight",
+                            "pop": "native_equal_weight",
+                        }
+                        if intensity is not None or pop is not None
+                        else {}
+                    ),
+                },
             )
         )
     return points
 
 
-def _dataset_fingerprint(config: Config) -> str:
-    manifest = config.dataset.dir / "manifest.json"
-    if not manifest.exists():
-        return "unknown"
-    loaded = json.loads(manifest.read_text(encoding="utf-8"))
-    return str(loaded.get("fingerprint", "unknown"))
-
-
-def _training_matrix(config: Config, product: str, *, required: bool) -> pl.DataFrame:
+def _training_matrix(
+    config: Config, product: str, issue_time: datetime
+) -> pl.DataFrame:
     path = matrix_path(config.dataset.dir, product, "live")
-    if path.exists():
-        return pl.read_parquet(path)
-    if required:
-        msg = f"missing {path}; run build-dataset before predicting"
-        raise NoForecastDataError(msg)
-    return pl.DataFrame()
+    if not path.exists():
+        return pl.DataFrame()
+    frame = pl.read_parquet(path)
+    if frame.is_empty():
+        return frame
+    known_at = (
+        daily_truth_known_at(frame, config.station.timezone)
+        if product == "daily"
+        else hourly_truth_known_at(frame)
+    )
+    return frame.with_columns(known_at).filter(
+        (pl.col("issue_time") <= issue_time) & (pl.col("truth_known_at") <= issue_time)
+    )
 
 
 def predict(
     config: Config,
     selections: SelectionMap,
     now: datetime | None = None,
-    semantics: TruthSemantics = TruthSemantics.INSTANTANEOUS,
+    semantics: TruthSemantics | Mapping[str, TruthSemantics] = (
+        TruthSemantics.INSTANTANEOUS
+    ),
     force_method: str | None = None,
 ) -> Forecast:
     """Assemble the whole forecast document for one issue time."""
     issue_time = (now or datetime.now(tz=UTC)).replace(second=0, microsecond=0)
+    if now is not None:
+        archived = load_archived_forecast(
+            config.predict.history_path, issue_time.isoformat()
+        )
+        if archived is not None:
+            return archived
     snapshot = build_snapshot(config, issue_time)
-    hourly_train = _training_matrix(config, "hourly", required=True)
-    daily_train = _training_matrix(config, "daily", required=False)
+    hourly_train = _training_matrix(config, "hourly", issue_time)
+    daily_train = _training_matrix(config, "daily", issue_time)
     hourly, hourly_blend = hourly_product(
         snapshot, hourly_train, selections, config, semantics, force_method
     )
     daily = (
         daily_product(snapshot, daily_train, selections, config, force_method)
-        if not daily_train.is_empty()
+        if not snapshot.daily.is_empty()
         else []
     )
+    release_ids = sorted(
+        {
+            selection.release_id
+            for selection in selections.values()
+            if selection.release_id is not None
+        }
+    )
+    degraded = not release_ids and force_method is None
     return Forecast(
         schema_version=SCHEMA_VERSION,
         issued_at=issue_time.isoformat(),
         latitude=config.station.latitude,
         longitude=config.station.longitude,
-        dataset_fingerprint=_dataset_fingerprint(config),
+        dataset_fingerprint=dataset_fingerprint(config),
         sources=list(matrix_sources(snapshot.hourly)),
         observation_at=snapshot.observation_at.isoformat()
         if snapshot.observation_at
         else None,
-        minutely=minutely_product(snapshot, hourly_blend),
+        minutely=minutely_product(snapshot, hourly_blend, config),
         hourly=hourly,
         daily=daily,
+        timezone=config.station.timezone,
+        status="degraded" if degraded else "ready",
+        release_ids=release_ids,
     )

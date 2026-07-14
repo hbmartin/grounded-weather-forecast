@@ -132,6 +132,19 @@ class TestBackfillLong:
         with pytest.raises(BackfillError, match="models"):
             backfill_long(config, date(2026, 3, 1), fetcher=fetch)
 
+    def test_rejects_nonpositive_chunk_size(self, tmp_path):
+        config = write_config(
+            tmp_path,
+            extra_toml=(
+                "\n[backfill.open_meteo]\n"
+                'models = ["gfs_seamless"]\n'
+                "start_date = 2026-01-01\n"
+            ),
+        )
+        fetch, _ = fetcher_for(fake_payload())
+        with pytest.raises(BackfillError, match="positive integer"):
+            backfill_long(config, date(2026, 3, 1), fetcher=fetch, chunk_days=0)
+
 
 class TestSyntheticMatrix:
     def test_matrix_is_tagged_and_scored(self, tmp_path):
@@ -148,6 +161,7 @@ class TestSyntheticMatrix:
         assert path == matrix_path(config.dataset.dir, "hourly", "synthetic")
         assert path.exists()
         assert count > 0
+        assert matrix_path(config.dataset.dir, "daily", "synthetic").exists()
 
         matrix = pl.read_parquet(path)
         assert matrix["source_kind"].unique().to_list() == ["synthetic"]

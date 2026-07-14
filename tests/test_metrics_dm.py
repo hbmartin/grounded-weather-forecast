@@ -57,3 +57,5 @@ class TestDieboldMariano:
             diebold_mariano(np.zeros(10), np.zeros(11))
         with pytest.raises(ValueError, match="horizon_steps"):
             diebold_mariano(np.zeros(10), np.zeros(10), horizon_steps=0)
+        with pytest.raises(ValueError, match="less than sample count"):
+            diebold_mariano(np.zeros(10), np.zeros(10), horizon_steps=10)

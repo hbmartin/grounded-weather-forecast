@@ -22,6 +22,7 @@ from omni_forecast.config import Config
 from omni_forecast.contracts import (
     ForecastMatrix,
     MixedProvenanceError,
+    Product,
     SourceKind,
     SupervisedSlice,
     TruthSemantics,
@@ -30,17 +31,15 @@ from omni_forecast.contracts import (
     fx_col,
     fxd_col,
     obs_col,
+    parse_fx_col,
     truth_col,
 )
 from omni_forecast.dataset.providers import (
     DAILY_COLUMN_MAP,
     HOURLY_COLUMN_MAP,
-    read_daily_long,
-    read_hourly_long,
-    read_minutely_long,
-    read_run_completions,
+    read_forecast_archive,
 )
-from omni_forecast.dataset.qc import apply_qc
+from omni_forecast.dataset.qc import apply_causal_qc, apply_qc
 from omni_forecast.dataset.snapshots import snapshot_long, snapshot_times
 from omni_forecast.dataset.station import read_observations
 from omni_forecast.dataset.truth import (
@@ -50,7 +49,7 @@ from omni_forecast.dataset.truth import (
     truth_minute,
 )
 from omni_forecast.leads import daily_bucket_expr, hourly_bucket_expr
-from omni_forecast.timeutil import local_date_expr
+from omni_forecast.timeutil import local_date_expr, local_day_minutes
 
 _SECONDS_PER_HOUR = 3600.0
 _OBS_TOLERANCE = timedelta(minutes=30)
@@ -167,7 +166,11 @@ def build_hourly_matrix(
             .dt.hour()
             .cast(pl.Int8)
             .alias("valid_hour_local"),
-            pl.col("valid_time").dt.month().cast(pl.Int8).alias("valid_month"),
+            pl.col("valid_time")
+            .dt.convert_time_zone(timezone_name)
+            .dt.month()
+            .cast(pl.Int8)
+            .alias("valid_month"),
         )
         .with_columns(hourly_bucket_expr(pl.col("lead_hours")).alias("lead_bucket"))
         .sort("issue_time", "valid_time")
@@ -220,6 +223,15 @@ def _equal_weight_daily_aggregates(
         pl.mean_horizontal([pl.col(c) for c in pop_cols]).alias("ew_pop"),
         pl.mean_horizontal([pl.col(c) for c in precip_cols]).alias("ew_precip"),
     )
+    dates = ew["forecast_date"].unique().sort()
+    day_lengths = pl.DataFrame(
+        {
+            "forecast_date": dates,
+            "expected_hours": [
+                local_day_minutes(day, timezone_name) / 60.0 for day in dates
+            ],
+        }
+    )
     return (
         ew.group_by("issue_time", "forecast_date")
         .agg(
@@ -227,10 +239,15 @@ def _equal_weight_daily_aggregates(
             pl.col("ew_temp").min().alias("ewagg__temp_min_c"),
             pl.col("ew_pop").max().alias("ewagg__pop"),
             pl.col("ew_precip").sum().alias("ewagg__precip_sum_mm"),
-            (pl.col("ew_temp").is_not_null().sum() / 24.0).alias(
-                "ewagg__coverage_frac"
-            ),
+            pl.col("ew_temp").is_not_null().sum().alias("covered_hours"),
         )
+        .join(day_lengths, on="forecast_date", how="left")
+        .with_columns(
+            (pl.col("covered_hours") / pl.col("expected_hours")).alias(
+                "ewagg__coverage_frac"
+            )
+        )
+        .drop("covered_hours", "expected_hours")
         .sort("issue_time", "forecast_date")
     )
 
@@ -365,17 +382,20 @@ def write_dataset(config: Config) -> DatasetManifest:
     channels = sorted(set(config.station.columns.values()))
     observations = read_observations(config.station)
     flagged = apply_qc(observations, config.qc, channels)
+    causal_flagged = apply_causal_qc(observations, config.qc, channels)
     minute = truth_minute(flagged, config)
+    causal_minute = truth_minute(causal_flagged, config)
     hourly_truth = truth_hourly(minute, config)
     daily_truth = truth_daily(minute, config)
 
-    hourly_long = read_hourly_long(config.forecasts)
-    daily_long_frame = read_daily_long(config.forecasts)
-    minutely_long = read_minutely_long(config.forecasts)
-    snapshots = snapshot_times(read_run_completions(config.forecasts))
+    archive = read_forecast_archive(config.forecasts)
+    hourly_long = archive.hourly
+    daily_long_frame = archive.daily
+    minutely_long = archive.minutely
+    snapshots = snapshot_times(archive.completions)
 
     hourly_matrix = build_hourly_matrix(
-        hourly_long, snapshots, hourly_truth, minute, config
+        hourly_long, snapshots, hourly_truth, causal_minute, config
     )
     daily_matrix = build_daily_matrix(
         daily_long_frame, snapshots, hourly_matrix, daily_truth, config
@@ -422,6 +442,72 @@ def build_truth(config: Config) -> tuple[pl.DataFrame, pl.DataFrame, pl.DataFram
     return minute, truth_hourly(minute, config), truth_daily(minute, config)
 
 
+def build_observation_features(config: Config) -> pl.DataFrame:
+    """Canonical issue-time observations using only past-dependent QC rules."""
+    channels = sorted(set(config.station.columns.values()))
+    observations = read_observations(config.station)
+    return truth_minute(apply_causal_qc(observations, config.qc, channels), config)
+
+
+def _synthetic_daily_matrix(
+    hourly_matrix: pl.DataFrame,
+    truth_daily_frame: pl.DataFrame,
+    config: Config,
+) -> pl.DataFrame:
+    """Derive daily provider targets from each synthetic hourly snapshot."""
+    if hourly_matrix.is_empty():
+        return pl.DataFrame()
+    timezone_name = config.station.timezone
+    keys = ["issue_time", "forecast_date"]
+    with_date = hourly_matrix.with_columns(
+        local_date_expr(pl.col("valid_time"), timezone_name).alias("forecast_date")
+    )
+    daily = with_date.select(keys).unique().sort(keys)
+    for source in matrix_sources(hourly_matrix):
+        expressions: list[pl.Expr] = []
+        for source_variable, daily_variable, method in (
+            ("temp_c", "temp_max_c", "max"),
+            ("temp_c", "temp_min_c", "min"),
+            ("pop", "pop", "max"),
+            ("precip_mm", "precip_sum_mm", "sum"),
+        ):
+            column = fx_col(source, source_variable)
+            if column not in with_date.columns:
+                continue
+            expr = getattr(pl.col(column), method)().alias(
+                fxd_col(source, daily_variable)
+            )
+            expressions.append(expr)
+        if expressions:
+            aggregated = with_date.group_by(keys).agg(*expressions)
+            daily = daily.join(aggregated, on=keys, how="left")
+    return (
+        daily.with_columns(
+            (
+                pl.col("forecast_date")
+                - local_date_expr(pl.col("issue_time"), timezone_name)
+            )
+            .dt.total_days()
+            .cast(pl.Int16)
+            .alias("lead_days"),
+            pl.lit(SourceKind.SYNTHETIC.value).alias("source_kind"),
+        )
+        .filter(pl.col("lead_days") >= 0)
+        .with_columns(
+            daily_bucket_expr(pl.col("lead_days").cast(pl.Float64)).alias("lead_bucket")
+        )
+        .join(
+            _equal_weight_daily_aggregates(hourly_matrix, config), on=keys, how="left"
+        )
+        .join(
+            truth_daily_frame.rename({"date_local": "forecast_date"}),
+            on="forecast_date",
+            how="left",
+        )
+        .sort(keys)
+    )
+
+
 def write_synthetic_matrix(
     config: Config, synthetic_long: pl.DataFrame
 ) -> tuple[Path, int]:
@@ -430,18 +516,23 @@ def write_synthetic_matrix(
     Snapshot times come from the backfill's own synthetic fetch times, since a
     backfilled archive has no ``forecast_runs`` rows to anchor to.
     """
-    minute, hourly_truth, _ = build_truth(config)
+    _, hourly_truth, daily_truth = build_truth(config)
+    causal_minute = build_observation_features(config)
     snapshots = (
         synthetic_long.select(pl.col("fetched_at").alias("issue_time"))
         .unique()
         .sort("issue_time")
     )
     matrix = build_hourly_matrix(
-        synthetic_long, snapshots, hourly_truth, minute, config
+        synthetic_long, snapshots, hourly_truth, causal_minute, config
     )
     config.dataset.dir.mkdir(parents=True, exist_ok=True)
     path = matrix_path(config.dataset.dir, "hourly", SourceKind.SYNTHETIC.value)
     matrix.write_parquet(path)
+    daily_matrix = _synthetic_daily_matrix(matrix, daily_truth, config)
+    daily_matrix.write_parquet(
+        matrix_path(config.dataset.dir, "daily", SourceKind.SYNTHETIC.value)
+    )
     synthetic_long.write_parquet(
         config.dataset.dir / "forecasts_long_synthetic.parquet"
     )
@@ -451,7 +542,7 @@ def write_synthetic_matrix(
 def matrix_sources(frame: pl.DataFrame) -> tuple[str, ...]:
     """Sources present in a wide matrix, from its fx column names."""
     sources = {
-        column.split("__")[1]
+        parse_fx_col(column)[0]
         for column in frame.columns
         if column.startswith(("fx__", "fxd__"))
     }
@@ -483,7 +574,7 @@ def to_forecast_matrix(
         raise ValueError(msg)
     column_builder = fxd_col if daily else fx_col
     lead_expr = (
-        pl.col("lead_days").cast(pl.Float64)
+        (pl.col("lead_days") * 24.0).cast(pl.Float64)
         if daily
         else pl.col("lead_hours").cast(pl.Float64)
     )
@@ -507,6 +598,7 @@ def to_forecast_matrix(
         values=values if usable.height else np.empty((0, len(chosen))),
         lead_hours=usable["__lead"].to_numpy().astype(np.float64),
         features=usable.select(feature_columns),
+        product=Product.DAILY if daily else Product.HOURLY,
     )
 
 
@@ -526,7 +618,7 @@ def to_supervised_slice(
         raise ValueError(msg)
     column_builder = fxd_col if daily else fx_col
     lead_expr = (
-        pl.col("lead_days").cast(pl.Float64)
+        (pl.col("lead_days") * 24.0).cast(pl.Float64)
         if daily
         else pl.col("lead_hours").cast(pl.Float64)
     )
@@ -552,6 +644,7 @@ def to_supervised_slice(
         values=values if usable.height else np.empty((0, len(sources))),
         lead_hours=usable["__lead"].to_numpy().astype(np.float64),
         features=usable.select(feature_columns),
+        product=Product.DAILY if daily else Product.HOURLY,
     )
     y = usable[truth_column].to_numpy().astype(np.float64)
     return SupervisedSlice(x=x, y=y, variable=variable, source_kind=SourceKind(kind))

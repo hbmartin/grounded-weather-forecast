@@ -32,12 +32,13 @@ def matrix_with_persistent_residual(days=40, residual_sd=3.0, decay_hours=8.0, s
     )
 
 
-class TestAnchoring:
-    @pytest.fixture(scope="class")
-    def slices(self):
-        matrix = matrix_with_persistent_residual()
-        return to_supervised_slice(matrix, TEMP)
+@pytest.fixture(scope="class")
+def slices():
+    matrix = matrix_with_persistent_residual()
+    return to_supervised_slice(matrix, TEMP)
 
+
+class TestAnchoring:
     def test_wins_at_short_leads_converges_later(self, slices):
         train = slices
         base = get_factory("grounded_equal_weight")().fit(train)
