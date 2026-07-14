@@ -1,3 +1,5 @@
+from datetime import UTC, datetime, timedelta
+
 import polars as pl
 from conftest import synthetic_hourly_matrix, utc, write_config
 
@@ -44,6 +46,9 @@ class TestSelectMethods:
             assert "lowest backtest MAE" in chosen.reason
         # grounding removes alpha's +3C bias, so it must win somewhere
         assert any(c.method_id == "grounded_equal_weight" for c in selections.values())
+        assert all(c.evaluation_id for c in selections.values())
+        assert all(c.release_id for c in selections.values())
+        assert list((config.artifacts_dir / "releases").glob("*.json"))
 
     def test_config_pin_overrides(self, tmp_path):
         config = scored_config(
@@ -68,6 +73,24 @@ class TestSelectMethods:
     def test_no_scores_is_empty(self, tmp_path):
         config = write_config(tmp_path)
         assert select_methods(config, tmp_path / "nothing") == {}
+
+    def test_historical_issue_rejects_future_evaluation(self, tmp_path):
+        config = scored_config(tmp_path)
+        as_of = utc(2026, 1, 1) - timedelta(days=1)
+        assert select_methods(config, config.dataset.dir / "scores", as_of=as_of) == {}
+
+    def test_historical_issue_loads_release_that_already_existed(self, tmp_path):
+        config = scored_config(tmp_path)
+        promoted = select_methods(config, config.dataset.dir / "scores")
+        restored = select_methods(
+            config,
+            config.dataset.dir / "scores",
+            as_of=datetime.now(tz=UTC) + timedelta(minutes=1),
+        )
+        assert restored
+        assert {choice.release_id for choice in restored.values()} == {
+            choice.release_id for choice in promoted.values()
+        }
 
 
 class TestMethodFor:
@@ -112,6 +135,12 @@ class TestScoresProvenance:
         selections = select_methods(config, config.dataset.dir / "scores")
         # both files load without a MixedProvenanceError
         assert selections
+        live_evaluation = pl.read_parquet(
+            scores_path(config.dataset.dir / "scores", "hourly", "live")
+        )["evaluation_id"][0]
+        assert {choice.evaluation_id for choice in selections.values()} == {
+            live_evaluation
+        }
         assert isinstance(
             pl.read_parquet(
                 scores_path(config.dataset.dir / "scores", "hourly", "synthetic")

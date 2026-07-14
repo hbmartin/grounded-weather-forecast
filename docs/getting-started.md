@@ -32,26 +32,30 @@ containing the forecasts that a set of weather APIs published for your location,
 ## Install
 
 ```bash
-git clone https://github.com/hbmartin/omni-forecast
-cd omni-forecast
-uv sync --dev
+uv tool install omni-forecast
 ```
 
-That's it — `uv` creates the virtual environment and installs everything. Check
+`uv` creates an isolated environment and exposes the command on your path. Check
 it worked:
 
 ```bash
-uv run omni-forecast --help
+omni-forecast --version
+omni-forecast --help
 ```
+
+To contribute to the project instead, clone the
+[source repository](https://github.com/hbmartin/omni-forecast) and run
+`uv sync --dev`.
 
 ---
 
 ## Configure
 
-Copy the example config and edit it:
+Download the example config and edit it:
 
 ```bash
-cp config.example.toml config.toml
+curl -L https://raw.githubusercontent.com/hbmartin/omni-forecast/main/config.example.toml \
+  -o config.toml
 ```
 
 `config.toml` is git-ignored, so your local paths stay local. Here is what each
@@ -106,6 +110,7 @@ above cover a standard AmbientWeather unit; if yours reports Celsius, write
 ```toml
 [forecasts]
 db_path = "crestline_forecasts.sqlite"
+immutable = false              # false while the collector writes this WAL DB
 sources = []                    # empty = use every provider in the archive
 max_forecast_age_hours = 12.0   # a forecast older than this is not used
 ```
@@ -120,7 +125,7 @@ dir = "data"                    # where parquet outputs go (git-ignored)
 dir = "reports"                 # where markdown leaderboards go
 
 [artifacts]
-dir = "artifacts"               # where fitted model coefficients go
+dir = "artifacts"               # alignment studies and promoted releases
 ```
 
 Defaults are sensible for `[qc]`, `[backtest]` and `[predict]` — you can ignore
@@ -133,7 +138,7 @@ them until you read [Advanced usage](advanced-usage.md).
 ### 1. Check your truth
 
 ```bash
-uv run omni-forecast qc
+omni-forecast qc
 ```
 
 This is the most important command to run first, and the one people skip. It
@@ -170,7 +175,7 @@ conclusions from anything downstream.
 ### 2. Build the dataset
 
 ```bash
-uv run omni-forecast build-dataset
+omni-forecast build-dataset
 ```
 
 This reads both databases and writes parquet files into `data/`: the QC'd truth
@@ -194,15 +199,17 @@ that number is small, your archive is young — see below.
 ### 3. Get a forecast
 
 ```bash
-uv run omni-forecast predict
+omni-forecast predict
 ```
 
 This prints a JSON document with all three products. Trimmed:
 
 ```json
 {
-  "schema_version": 1,
+  "schema_version": 2,
   "issued_at": "2026-03-22T17:00:00+00:00",
+  "status": "ready",
+  "release_ids": ["df227d411b814f78"],
   "observation_at": "2026-03-22T16:55:49+00:00",
   "sources": ["met_norway", "nws", "open_meteo", "..."],
   "minutely": [
@@ -228,6 +235,9 @@ This prints a JSON document with all three products. Trimmed:
   minutely forecast starts from what your yard says right now and relaxes toward
   the providers' consensus over the hour. That live reading is the one input no
   provider has.
+- `status` and `release_ids` — say whether compatible live evidence justified the
+  forecast and identify the promoted decision. A young archive emits an explicit
+  `degraded` equal-weight forecast rather than pretending grounding was fitted.
 - `methods` — **every single value tells you which method produced it.** When you
   wonder why tomorrow's high is 23.8 °C, the answer is in the document.
 - `lead_bucket` — how far ahead this is, grouped. Skill is measured per bucket
@@ -236,7 +246,7 @@ This prints a JSON document with all three products. Trimmed:
 Write it to a file instead of stdout:
 
 ```bash
-uv run omni-forecast predict --out forecast.json
+omni-forecast predict --out forecast.json
 ```
 
 ---
@@ -249,11 +259,12 @@ Your archive's most recent forecast is more than 12 hours old, so the system
 refuses to serve a stale forecast rather than pretending it is current. Either
 your polling cron is not running, or you are testing with an old archive.
 
-To reproduce a forecast *as it would have looked* at some past moment (handy for
-testing):
+To load the exact archived document previously served at an instant—or, if none
+was served then, reconstruct one using only data/evidence available by that
+instant (handy for testing):
 
 ```bash
-uv run omni-forecast predict --now 2026-03-22T17:00:00
+omni-forecast predict --now 2026-03-22T17:00:00
 ```
 
 ### `no rolling-origin folds. The archive spans 0.0 days ...`
@@ -277,8 +288,8 @@ one-day-old archive, there is nothing to do.
 Once you have an archive (real or backfilled) with some history:
 
 ```bash
-uv run omni-forecast backtest --source live      # or --source synthetic
-uv run omni-forecast report
+omni-forecast backtest --source live      # or --source synthetic
+omni-forecast report
 ```
 
 `report` writes markdown into `reports/` and prints the winners:
@@ -293,9 +304,10 @@ winners (scores_hourly_synthetic)
 └─────────┴───────────────┴─────────────┴───────────────┴──────┴──────────┘
 ```
 
-`predict` then automatically uses the winning method for each slice. **You do not
-have to choose a method** — the backtest chooses, and if it has no evidence for a
-slice, it falls back to a named default and says so.
+`predict` then uses only winners from a live evaluation run compatible with the
+current dataset. **You do not have to choose a method** — promotion chooses, and if
+it has no evidence for a slice, the document is marked `degraded`, uses fit-free
+equal weight, and says why.
 
 The markdown report has much more: skill against the best single provider,
 Diebold–Mariano significance tests (is that difference *real*, or noise?), a

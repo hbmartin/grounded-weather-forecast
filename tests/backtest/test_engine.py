@@ -45,6 +45,10 @@ class TestRunBacktest:
         assert set(scores["method_id"].unique()) == {"equal_weight", "climatology"}
         assert scores["y_pred"].null_count() == 0
         assert scores["source_kind"].unique().to_list() == ["live"]
+        assert scores["evaluation_id"].null_count() == 0
+        assert scores["dataset_fingerprint"].unique().to_list() == ["unknown"]
+        assert scores["source_set_json"].unique().to_list() == ['["alpha", "beta"]']
+        assert scores["semantics"].unique().to_list() == ["inst"]
         assert (scores["lead_hours"] > 0).all()
         # test rows strictly after each fold origin
         assert (scores["issue_time"] > scores["fold_origin"]).all()
@@ -91,6 +95,12 @@ class TestScoresIO:
         with pytest.raises(MixedProvenanceError):
             load_scores(mixed_path)
         assert load_scores(mixed_path, allow_mixed=True).height == mixed.height
+
+    def test_score_paths_preserve_window_and_evaluation(self, tmp_path):
+        first = scores_path(tmp_path, "hourly", "live", "expanding", "run-a")
+        second = scores_path(tmp_path, "hourly", "live", "rolling", "run-b")
+        assert first != second
+        assert "expanding_run-a" in first.stem
 
 
 class TestVariableLookup:

@@ -13,8 +13,10 @@ from conftest import (
 
 from omni_forecast.contracts import (
     MixedProvenanceError,
+    Product,
     SourceKind,
     TruthSemantics,
+    daily_variable,
     hourly_variable,
 )
 from omni_forecast.dataset.matrix import (
@@ -24,6 +26,7 @@ from omni_forecast.dataset.matrix import (
     build_hourly_matrix,
     matrix_path,
     matrix_sources,
+    to_forecast_matrix,
     to_supervised_slice,
     write_dataset,
 )
@@ -191,6 +194,11 @@ class TestBuildDailyMatrix:
         assert row["lead_days"] == 1  # issue Mar 22 local -> target Mar 23
         assert row["lead_bucket"] == "D1"
         assert row["source_kind"] == "live"
+        contract = to_forecast_matrix(
+            daily_matrix, daily_variable("temp_max_c"), daily=True
+        )
+        assert contract.product is Product.DAILY
+        assert contract.lead_hours[0] == 24.0
 
     def test_ewagg_from_hourly(self, fixture_config):
         config = fixture_config
@@ -216,6 +224,25 @@ class TestBuildDailyMatrix:
         assert row["ewagg__temp_max_c"] == pytest.approx(11.0)
         assert row["ewagg__temp_min_c"] == pytest.approx(11.0)
         assert agg.height >= 0
+
+    def test_ewagg_coverage_uses_dst_day_length(self, tmp_path):
+        config = write_config(tmp_path)
+        start = utc(2026, 3, 8, 8)
+        hourly = pl.DataFrame(
+            {
+                "issue_time": [utc(2026, 3, 8)] * 23,
+                "valid_time": [start + timedelta(hours=hour) for hour in range(23)],
+                "fx__nws__temp_c": [10.0] * 23,
+                "fx__nws__pop": [0.0] * 23,
+                "fx__nws__precip_mm": [0.0] * 23,
+            },
+            schema_overrides={
+                "issue_time": pl.Datetime("us", "UTC"),
+                "valid_time": pl.Datetime("us", "UTC"),
+            },
+        )
+        row = _equal_weight_daily_aggregates(hourly, config).row(0, named=True)
+        assert row["ewagg__coverage_frac"] == pytest.approx(1.0)
 
 
 class TestWriteDataset:

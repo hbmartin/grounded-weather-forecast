@@ -61,6 +61,9 @@ def diebold_mariano(
     if n < MIN_SAMPLES:
         msg = f"need at least {MIN_SAMPLES} paired losses, got {n}"
         raise ValueError(msg)
+    if horizon_steps >= n:
+        msg = f"horizon_steps must be less than sample count {n}: {horizon_steps}"
+        raise ValueError(msg)
     diff = loss_a - loss_b
     mean_diff = float(diff.mean())
     variance = _bartlett_hac_variance(diff, horizon_steps)

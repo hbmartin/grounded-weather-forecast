@@ -153,6 +153,6 @@ raw/
 *.jsonl.gz
 
 # omni-forecast generated outputs (paths configurable in config.toml)
-data/
-reports/
-artifacts/
+/data/
+/reports/
+/artifacts/

@@ -31,7 +31,7 @@ from omni_forecast.contracts import (
     SupervisedSlice,
     TargetKind,
 )
-from omni_forecast.leads import HOURLY_BUCKETS
+from omni_forecast.leads import buckets_for_product
 
 _MIN_MSE = 1e-6
 _MIN_ROWS_PER_SOURCE = 12
@@ -82,7 +82,7 @@ class InverseMseWeights:
             return 1.0 / np.maximum(mse, _MIN_MSE)
 
         fitter = PerBucketFitter[np.ndarray](
-            buckets=HOURLY_BUCKETS, fit_one=fit_weights
+            buckets=buckets_for_product(train.x.product), fit_one=fit_weights
         )
         self._fitted: FittedBuckets[np.ndarray] = fitter.fit(train.x.lead_hours)
         return self

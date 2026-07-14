@@ -35,10 +35,11 @@ from omni_forecast.contracts import (
     BoolArray,
     FloatArray,
     ForecastMatrix,
+    Product,
     SupervisedSlice,
     TargetKind,
 )
-from omni_forecast.leads import hourly_bucket
+from omni_forecast.leads import bucket_for_product
 
 _MAX_ETA = 0.5
 # The drift-vs-average-case knob. The loser's steady-state weight is roughly
@@ -148,7 +149,10 @@ class OnlineExperts:
         self._grounding = AffineGrounding().fit(train)
         corrected = self._grounding.transform(train.x)
         n_experts = len(train.x.sources)
-        buckets = [hourly_bucket(lead) or _GLOBAL_BUCKET for lead in train.x.lead_hours]
+        buckets = [
+            bucket_for_product(train.x.product, lead) or _GLOBAL_BUCKET
+            for lead in train.x.lead_hours
+        ]
         horizons = Counter(buckets)
         for row in range(train.x.n_rows):
             bucket = buckets[row]
@@ -161,9 +165,9 @@ class OnlineExperts:
             self._step(self._states[bucket], losses, awake)
         return self
 
-    def _state_for(self, lead: float, n_experts: int) -> _BucketState:
+    def _state_for(self, product: Product, lead: float, n_experts: int) -> _BucketState:
         """Fitted state for a lead, or a uniform default for unseen buckets."""
-        state = self._states.get(hourly_bucket(lead) or _GLOBAL_BUCKET)
+        state = self._states.get(bucket_for_product(product, lead) or _GLOBAL_BUCKET)
         if state is None or state.weights.shape[0] != n_experts:
             return _uniform(n_experts)
         return state
@@ -174,7 +178,7 @@ class OnlineExperts:
         point = np.full(x.n_rows, np.nan)
         for row in range(x.n_rows):
             awake = x.availability[row]
-            state = self._state_for(float(x.lead_hours[row]), n_experts)
+            state = self._state_for(x.product, float(x.lead_hours[row]), n_experts)
             weights = _awake_weights(state.weights, awake)
             if weights is None:
                 continue

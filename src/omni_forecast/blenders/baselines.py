@@ -7,7 +7,7 @@
 
 A NaN prediction means "this method has nothing to say for this row" (e.g.
 persistence without an issue-time observation); the engine stores it as null
-and scoring aligns methods pairwise on shared non-null rows.
+and promotion compares methods on one shared common-case mask with coverage shown.
 """
 
 import math
@@ -31,7 +31,7 @@ from omni_forecast.contracts import (
     TargetKind,
     obs_col,
 )
-from omni_forecast.leads import HOURLY_BUCKETS
+from omni_forecast.leads import buckets_for_product
 
 
 @dataclass
@@ -140,7 +140,7 @@ class BestProvider:
             return np.argsort(mae_per_source)
 
         fitter = PerBucketFitter[np.ndarray](
-            buckets=HOURLY_BUCKETS, fit_one=rank_sources
+            buckets=buckets_for_product(train.x.product), fit_one=rank_sources
         )
         self._fitted: FittedBuckets[np.ndarray] = fitter.fit(train.x.lead_hours)
         return self

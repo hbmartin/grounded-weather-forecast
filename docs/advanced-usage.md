@@ -21,7 +21,7 @@ start_date = 2025-06-15         # no earlier than your station truth begins
 ```
 
 ```bash
-uv run omni-forecast backfill --end 2026-07-12
+omni-forecast backfill --end 2026-07-12
 # backfilled 198072 forecast points
 # sources: open_meteo_ecmwf_ifs025, open_meteo_gfs_seamless, open_meteo_icon_seamless
 # synthetic matrix: 66024 rows -> data/hourly_matrix_synthetic.parquet
@@ -30,8 +30,8 @@ uv run omni-forecast backfill --end 2026-07-12
 Then backtest against it exactly as you would against live data:
 
 ```bash
-uv run omni-forecast backtest --source synthetic --products hourly
-uv run omni-forecast report
+omni-forecast backtest --source synthetic --products hourly,daily
+omni-forecast report
 ```
 
 ### What backfilled data is good for — and what it is not
@@ -62,7 +62,7 @@ yesterday).
 ## Driving the backtest
 
 ```bash
-uv run omni-forecast backtest \
+omni-forecast backtest \
     --source live|synthetic \
     --products hourly,daily \
     --methods all \
@@ -97,15 +97,16 @@ Whether a provider's "14:00 temperature" means *at* 14:00 or the *mean over*
 of fake bias.
 
 ```bash
-uv run omni-forecast alignment
+omni-forecast alignment
 # recommended: {'temp_c': 'inst', 'humidity_pct': 'mean', 'dew_point_c': 'inst', ...}
 # wrote artifacts/alignment.json
 ```
 
 `alignment` correlates every source's forecasts against *both* truth definitions
-and writes a recommendation. `--semantics auto` (the default) reads that artifact;
-`inst`/`mean` force one. The study needs ≥72 overlapping rows per source×variable
-to make a call, and reports `null` rather than guessing when it cannot.
+and writes one canonical recommendation per variable. `--semantics auto` (the
+default) applies each variable's own recommendation; `inst`/`mean` force one. The
+study needs ≥72 overlapping rows per source×variable to make a call, and reports
+`null` rather than guessing when it cannot.
 
 ### `--methods`
 
@@ -163,13 +164,13 @@ forecasts — a **self-verification** section.
 ## Serving
 
 ```bash
-uv run omni-forecast predict --out forecast.json
+omni-forecast predict --out forecast.json
 ```
 
 | flag | effect |
 |---|---|
 | `--method <id>` | Force one method for every slice, ignoring the leaderboard. Useful for A/B'ing. |
-| `--now <iso>` | Issue the forecast as of a past instant. **Reproduces a served forecast exactly**, which is how you debug one. |
+| `--now <iso>` | Return the exact archived document if that instant was served; otherwise reconstruct causally using only evidence available then. |
 | `--no-history` | Do not append to the self-verification history. |
 | `--semantics` | As for `backtest`. |
 | `--out -` | stdout (default). |
@@ -180,8 +181,10 @@ Method selection resolves in this order:
 [predict.methods] config pin   ->   per-slice backtest winner   ->   named fallback
 ```
 
-The fallback is `grounded_equal_weight`, and the reason (`"no backtest evidence
-for this slice"`) is recorded. **It never falls back to silence.**
+Only live scores matching the current dataset, source set, and requested issue time
+are promotable. The cold-start fallback is fit-free `equal_weight`; the document is
+marked `status = "degraded"` and records the reason. **It never presents an
+unfitted grounded method as trained.**
 
 Pin a method when you have a reason to override the leaderboard:
 
@@ -193,8 +196,9 @@ Pin a method when you have a reason to override the leaderboard:
 
 ### The self-verification loop
 
-Every served forecast is appended to `data/predict_history.parquet`. Later, when
-truth for those hours arrives, `report` scores it:
+Every served forecast is archived as an exact JSON document and appended under a
+file lock to `data/predict_history.parquet`. Later, when product-specific minute,
+hourly, or daily truth arrives, `report` scores it:
 
 ```
 ## Self-verification (served vs realized)
@@ -343,7 +347,7 @@ Then add the import to `blenders/__init__.py`. That's it — it now appears in
    (the contract raises), and the poisoning sentinel will catch you if you find
    another route.
 3. **`NaN` means "no opinion"**, not zero. The engine stores it as null and scores
-   methods pairwise on shared rows.
+   promotion candidates on one common-case mask, with coverage shown.
 4. **Be constructible fresh.** The registry stores a *factory*; the engine builds a
    new instance per fold. Do not cache state on the class.
 
@@ -446,13 +450,13 @@ hashes:
 dataset fingerprint: c5cdd0ee7777973f
 ```
 
-Fitted model state (grounding coefficients, weights, expert state, LightGBM
-boosters) is stored under `artifacts/{fingerprint}/{method_id}/{product}.{variable}/`
-with a manifest, so a model fitted against a dataset that no longer exists can be
-*detected* rather than silently served.
+Evaluation Runs and promoted Model Releases are stored with dataset, source-set,
+semantics, window, code, and configuration identity. Several blenders also expose
+serializable state through the artifact-store API, but serving currently refits from
+the causally compatible matrix for a newly requested issue time.
 
-To reproduce an emitted forecast exactly, `predict --now <its issued_at>` against
-the same fingerprint.
+Every emitted document is archived. `predict --now <its issued_at>` returns that
+exact archived document; an issue time never served is reconstructed causally.
 
 ---
 
@@ -461,9 +465,8 @@ the same fingerprint.
 Before you trust a number this system produces, read
 **[Limitations](limitations.md)**. In particular:
 
-- The live archive currently has **two snapshots**, so every leaderboard number
-  comes from backfilled NWP models and says nothing about your commercial
-  providers.
+- A young live archive can have too few snapshots for any live leaderboard. Synthetic
+  NWP results never justify serving choices for commercial providers.
 - Nothing under 24 h lead has been evaluated on real data, including the anchoring
   stage.
 - The evaluation harness has already caught three real bugs — grounding *injecting*

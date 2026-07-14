@@ -12,6 +12,7 @@ nav = [
   { "Theory and Concepts" = "theory.md" },
   { "Architecture" = "architecture.md" },
   { "Limitations" = "limitations.md" },
+  { "Releasing" = "releasing.md" },
   { "Decisions" = [
     { "SQLite files are the only upstream contract" = "adr/0001-sqlite-files-are-the-only-upstream-contract.md" },
     { "Anchored nowcast, not disaggregation" = "adr/0002-anchored-nowcast-instead-of-temporal-disaggregation.md" },

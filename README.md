@@ -24,7 +24,7 @@ leaderboard.
    variable × lead bucket. Most providers repackage the same global models, so
    their *shared* bias is invisible to any weighting scheme; only correction
    removes it. A bias correction by default — the slope is opt-in, for reasons
-   the data taught us (see [ADR 0004](docs/adr/0004-grounding-defaults-to-bias-only.md)).
+   the data taught us (see [ADR 0004](https://hbmartin.github.io/omni-forecast/adr/0004-grounding-defaults-to-bias-only/)).
 2. **Blending** — combining grounded sources: equal weight, inverse-MSE,
    gradient-boosted stacking, and online expert aggregation with sleeping
    experts (ragged provider horizons need no special casing) and fixed share
@@ -39,46 +39,64 @@ Brier/reliability for precipitation probability, with Diebold–Mariano
 significance per variable × lead bucket, under strict rolling-origin splits.
 Live and synthetic (backfilled) data are never pooled.
 
+## Installation
+
+omni-forecast requires Python 3.13 or newer. Install the command in an isolated
+environment with [uv](https://docs.astral.sh/uv/):
+
+```bash
+uv tool install omni-forecast
+omni-forecast --version
+```
+
 ## Usage
 
-Copy `config.example.toml` to `config.toml` and point it at your two SQLite
-files, coordinates, and elevation.
+Download the [example configuration](https://github.com/hbmartin/omni-forecast/blob/main/config.example.toml),
+save it as `config.toml`, and point it at your two SQLite files, coordinates,
+and elevation:
+
+```bash
+curl -L https://raw.githubusercontent.com/hbmartin/omni-forecast/main/config.example.toml \
+  -o config.toml
+```
 
 ```bash
 # 1. Inspect the station truth: per-channel bounds/spike/flatline flag counts
 #    and hourly/daily coverage after QC.
-uv run omni-forecast qc
+omni-forecast qc
 
 # 2. Materialize truth tables, canonical long frames, and the supervised
 #    hourly/daily matrices as parquet + manifest.json under [dataset].dir.
-uv run omni-forecast build-dataset
+omni-forecast build-dataset
 
 # 3. Optional cold start. A forecast archive is only useful once it holds months
 #    of stored *vintages*, so a new one can say nothing yet. Open-Meteo's
 #    Previous Runs API backfills real archived forecasts (leads of exactly 1-7
 #    days) for open NWP models, tagged `synthetic` and never pooled with live.
-uv run omni-forecast backfill --end 2026-07-12   # --models, --chunk-days
+omni-forecast backfill --end 2026-07-12   # --models, --chunk-days
 
-# 4. Study whether each provider's hourly value means "instantaneous" or "hour
-#    mean". Misalignment masquerades as provider bias; this measures it.
-uv run omni-forecast alignment
+# 4. Study whether each hourly variable should use instantaneous or interval-mean
+#    truth. Misalignment masquerades as provider bias; this measures it.
+omni-forecast alignment
 
-# 5. Rolling-origin backtest. Scores land in [dataset].dir/scores.
-uv run omni-forecast backtest --source live       # or --source synthetic
+# 5. Rolling-origin backtest. Identified evaluation runs land in
+#    [dataset].dir/scores without overwriting other windows/runs.
+omni-forecast backtest --source live       # or --source synthetic
 #   --methods all|<ids>  --products hourly,daily  --window expanding|rolling
 #   --hourly-variables ...  --daily-variables ...  --semantics auto|inst|mean
 
 # 6. Leaderboards (per-slice skill with Diebold-Mariano, aggregate, winners,
 #    absolute error, consumer %-within-3F), the provider error-correlation
 #    matrix, and self-verification of forecasts this system actually served.
-uv run omni-forecast report
+omni-forecast report
 
 # 7. Emit the current blended forecast (minutely + hourly + daily) as JSON.
-#    Every emitted forecast is appended to a history so it can later be scored
+#    Every emitted forecast carries ready/degraded status and release identity,
+#    and is appended atomically to a history so it can later be scored
 #    against the truth that arrives — backtest skill is an estimate, this is the
 #    measurement.
-uv run omni-forecast predict                      # to stdout
-uv run omni-forecast predict --out forecast.json
+omni-forecast predict                      # to stdout
+omni-forecast predict --out forecast.json
 #   --method auto|<id>   --now <iso>   --no-history   --semantics ...
 ```
 
@@ -92,19 +110,18 @@ to serve from stale provider data rather than guessing.
 
 ## Documentation
 
-- **[Getting started](docs/getting-started.md)** — install, configure, first forecast
-- **[Advanced usage](docs/advanced-usage.md)** — backfilling, tuning, reading the
+- **[Getting started](https://hbmartin.github.io/omni-forecast/getting-started/)** — install, configure, first forecast
+- **[Advanced usage](https://hbmartin.github.io/omni-forecast/advanced-usage/)** — backfilling, tuning, reading the
   leaderboard, adding your own blending method
-- **[Theory and concepts](docs/theory.md)** — why grounding beats weighting, what the
+- **[Theory and concepts](https://hbmartin.github.io/omni-forecast/theory/)** — why grounding beats weighting, what the
   forecast-combination puzzle costs you, and how the evaluation is kept honest
-- **[Architecture](docs/architecture.md)** — layers, contracts, storage, libraries,
+- **[Architecture](https://hbmartin.github.io/omni-forecast/architecture/)** — layers, contracts, storage, libraries,
   leakage defences
-- **[Limitations](docs/limitations.md)** — what this cannot do, and the three real
+- **[Limitations](https://hbmartin.github.io/omni-forecast/limitations/)** — what this cannot do, and the three real
   bugs the evaluation harness caught. **Read before trusting any number.**
-- [`CONTEXT.md`](CONTEXT.md) — project glossary (issue time, valid time, lead,
+- [`CONTEXT.md`](https://github.com/hbmartin/omni-forecast/blob/main/CONTEXT.md) — project glossary (issue time, valid time, lead,
   grounding, anchoring, …)
-- [`docs/adr/`](docs/adr) — architecture decision records
-- `aw2sqlite-database.md`, `omni-weather-forecast-apis-database.md` — upstream schema docs
+- [`docs/adr/`](https://github.com/hbmartin/omni-forecast/tree/main/docs/adr) — architecture decision records
 
 ## Development
 
@@ -117,6 +134,9 @@ uv run pyrefly check src && uv run ty check src
 uv run lizard -Eduplicate -C 27 src
 uv run pytest tests/ --cov=src --cov-report=term-missing
 ```
+
+See the [release guide](https://github.com/hbmartin/omni-forecast/blob/main/docs/releasing.md)
+for the TestPyPI and PyPI trusted publishing setup and checklist.
 
 ## License
 

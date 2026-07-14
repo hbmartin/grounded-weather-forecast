@@ -1,0 +1,75 @@
+# omni-forecast configuration. Copy to config.toml (gitignored) and edit paths.
+
+[station]
+db_path = "aw2sqlite.db"
+timezone = "America/Los_Angeles"
+latitude = 34.2768
+longitude = -117.1692
+elevation_m = 1400.0
+# Set true only for a static snapshot file; the live WAL database must use false.
+immutable = true
+
+# Station column -> canonical channel. Defaults cover a standard AmbientWeather
+# station; override or extend here.
+[station.columns]
+outTemp = "temp"
+outHumi = "humidity"
+avgwind = "wind_speed"
+gustspeed = "wind_gust"
+eventrain = "rain_counter"
+AbsPress = "pressure_station"
+
+# Canonical channel -> source unit (degF | pct | mph | inch | inHg | degC | ms | mm | hpa)
+[station.units]
+temp = "degF"
+humidity = "pct"
+wind_speed = "mph"
+wind_gust = "mph"
+rain_counter = "inch"
+pressure_station = "inHg"
+
+[forecasts]
+db_path = "crestline_forecasts.sqlite"
+# As with the station DB, keep false while the collector writes a WAL database.
+immutable = false
+# Empty = every source discovered in the archive; otherwise an allowlist of slugs.
+sources = []
+max_forecast_age_hours = 12.0
+
+[dataset]
+dir = "data"
+min_hour_coverage = 0.8
+min_day_coverage = 0.8
+pop_threshold_mm = 0.254
+
+[qc]
+# Metric units. Defaults exist for the standard channels; override here.
+[qc.bounds]
+temp = [-40.0, 55.0]
+[qc.max_step]
+temp = 5.0
+[qc.flatline_minutes]
+temp = 180
+
+[backfill.open_meteo]
+models = ["ecmwf_ifs025", "gfs_seamless", "icon_seamless"]
+start_date = 2024-01-01
+
+[backtest]
+initial_train_days = 90
+step_days = 7
+rolling_window_days = 180
+
+[predict]
+selection = "skill_per_slice"
+history_path = "data/predict_history.parquet"
+minutely_tau_hours = 3.0
+# Optional per-slice pins, e.g.:
+# [predict.methods]
+# "hourly.temp_c" = "gbm"
+
+[reports]
+dir = "reports"
+
+[artifacts]
+dir = "artifacts"

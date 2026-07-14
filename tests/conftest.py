@@ -197,8 +197,12 @@ def make_forecast_db(path, runs):
         for run in runs:
             run_cursor = connection.execute(
                 "INSERT INTO forecast_runs (latitude, longitude, completed_at)"
-                " VALUES (34.2768, -117.1692, ?)",
-                (run["completed_at"],),
+                " VALUES (?, ?, ?)",
+                (
+                    run.get("latitude", 34.2768),
+                    run.get("longitude", -117.1692),
+                    run["completed_at"],
+                ),
             )
             run_id = run_cursor.lastrowid
             for result in run.get("results", []):

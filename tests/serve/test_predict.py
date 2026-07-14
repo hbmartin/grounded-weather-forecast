@@ -41,14 +41,25 @@ def build_fixture(tmp_path, *, obs_temp_f=68.0):
         hourly = [
             (
                 NOW + timedelta(hours=lead),
-                {"temperature": 15.0 + offset, "humidity": 40.0, "wind_speed": 2.0},
+                {
+                    "temperature": 15.0 + offset,
+                    "humidity": 140.0,
+                    "wind_speed": -2.0,
+                    "precipitation": -5.0,
+                    "precipitation_probability": 2.0,
+                },
             )
             for lead in range(49)
         ]
         daily = [
             (
                 (NOW + timedelta(days=d)).strftime("%Y-%m-%d"),
-                {"temperature_max": 22.0 + offset, "temperature_min": 8.0 + offset},
+                {
+                    "temperature_max": 22.0 + offset,
+                    "temperature_min": 8.0 + offset,
+                    "precipitation_sum": -3.0,
+                    "precipitation_probability_max": 2.0,
+                },
             )
             for d in range(10)
         ]
@@ -63,6 +74,13 @@ def build_fixture(tmp_path, *, obs_temp_f=68.0):
                 ],
             }
         )
+    results.append(
+        {
+            "provider": "stale_minutely",
+            "fetched_at": (NOW - timedelta(hours=13)).isoformat(),
+            "minutely": [(NOW + timedelta(minutes=1), 99.0, 1.0)],
+        }
+    )
     make_forecast_db(
         tmp_path / "fx.sqlite",
         [{"completed_at": FETCH, "results": results}],
@@ -86,6 +104,7 @@ class TestSnapshot:
         assert snapshot.observation_at is not None
         assert snapshot.observation["temp_c"] == pytest.approx(20.0, abs=0.1)
         assert (snapshot.hourly["lead_hours"] >= 0).all()
+        assert "stale_minutely" not in snapshot.minutely["source"].to_list()
 
     def test_stale_archive_refuses(self, config):
         with pytest.raises(NoForecastDataError, match="no provider forecast"):
@@ -135,6 +154,17 @@ class TestPredict:
         assert values["temp_min_c"] is not None
         assert values["temp_max_c"] > values["temp_min_c"]
 
+    def test_emitted_values_obey_physical_bounds(self, config):
+        document = predict(config, {}, now=NOW)
+        for point in document.hourly:
+            assert point.values["humidity_pct"] == 100.0
+            assert point.values["wind_speed_ms"] == 0.0
+            assert point.values["precip_mm"] == 0.0
+            assert point.values["pop"] == 1.0
+        for point in document.daily:
+            assert point.values["precip_sum_mm"] == 0.0
+            assert point.values["pop"] == 1.0
+
     def test_force_method(self, config):
         document = predict(config, {}, now=NOW, force_method="equal_weight")
         methods = {m for p in document.hourly for m in p.methods.values()}
@@ -143,7 +173,8 @@ class TestPredict:
     def test_fallback_method_when_no_scores(self, config):
         document = predict(config, {}, now=NOW)
         methods = {m for p in document.hourly for m in p.methods.values()}
-        assert methods == {"grounded_equal_weight"}
+        assert methods == {"equal_weight"}
+        assert document.status == "degraded"
 
 
 class TestPredictCli:
@@ -182,3 +213,19 @@ class TestPredictCli:
         )
         assert code == 1
         assert "cannot predict" in capsys.readouterr().out
+
+    def test_stdout_is_json_only(self, tmp_path, capsys):
+        build_fixture(tmp_path)
+        code = main(
+            [
+                "--config",
+                str(tmp_path / "config.toml"),
+                "predict",
+                "--now",
+                NOW.isoformat(),
+            ]
+        )
+        assert code == 0
+        captured = capsys.readouterr()
+        assert json.loads(captured.out)["issued_at"] == NOW.isoformat()
+        assert "appended" in captured.err

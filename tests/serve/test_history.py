@@ -1,5 +1,7 @@
 import polars as pl
 import pytest
+from dataclasses import replace
+from datetime import date, timedelta
 from conftest import utc
 
 from omni_forecast.reports.verification import compare_to_backtest, verify_history
@@ -7,6 +9,7 @@ from omni_forecast.serve.history import (
     HISTORY_SCHEMA,
     append_history,
     forecast_to_rows,
+    load_archived_forecast,
     load_history,
 )
 from omni_forecast.serve.schema import DailyPoint, Forecast, HourlyPoint, MinutelyPoint
@@ -41,6 +44,7 @@ def make_forecast(temp=20.0):
                 methods={"temp_max_c": "gbm"},
             )
         ],
+        timezone="America/Los_Angeles",
     )
 
 
@@ -60,6 +64,15 @@ class TestHistory:
         assert append_history(make_forecast(20.0), path) == 2
         assert append_history(make_forecast(21.0), path) == 2
         assert load_history(path).height == 4
+        replayed = load_archived_forecast(path, ISSUED.isoformat())
+        assert replayed is not None
+        assert replayed.to_json() == make_forecast(21.0).to_json()
+
+    def test_daily_history_uses_local_midnight(self):
+        rows = forecast_to_rows(make_forecast())
+        daily = rows.filter(pl.col("product") == "daily").row(0, named=True)
+        assert daily["valid_time"] == utc(2026, 3, 23, 7)
+        assert str(daily["valid_date"]) == "2026-03-23"
 
     def test_load_missing_is_empty(self, tmp_path):
         assert load_history(tmp_path / "none.parquet").is_empty()
@@ -108,6 +121,51 @@ class TestVerification:
         row = compared.row(0, named=True)
         assert row["backtest_mae"] == pytest.approx(1.0)
         assert row["mae_gap"] == pytest.approx(row["live_mae"] - 1.0)
+
+    def test_scores_daily_rows_against_daily_truth(self, tmp_path):
+        path = tmp_path / "history.parquet"
+        for _ in range(6):
+            append_history(make_forecast(), path)
+        daily_truth = pl.DataFrame(
+            {
+                "date_local": [date(2026, 3, 23)],
+                "t__temp_max_c": [24.0],
+            }
+        )
+        live = verify_history(
+            path,
+            self.truth([20.0]),
+            truth_daily=daily_truth,
+        )
+        row = live.filter(pl.col("product") == "daily").row(0, named=True)
+        assert row["n"] == 6
+        assert row["live_mae"] == pytest.approx(1.0)
+
+    def test_scores_minutely_rows_at_minute_grain(self, tmp_path):
+        path = tmp_path / "history.parquet"
+        minutely = MinutelyPoint(
+            valid_time=(ISSUED + timedelta(minutes=1)).isoformat(),
+            minutes_ahead=1,
+            temp_c=20.0,
+            methods={"temp_c": "anchored_hourly_blend"},
+        )
+        for _ in range(6):
+            append_history(replace(make_forecast(), minutely=[minutely]), path)
+        truth_minute = pl.DataFrame(
+            {
+                "ts": [ISSUED + timedelta(minutes=1, seconds=30)],
+                "temp_c": [19.0],
+            },
+            schema_overrides={"ts": pl.Datetime("us", "UTC")},
+        )
+        live = verify_history(
+            path,
+            self.truth([20.0]),
+            truth_minute=truth_minute,
+        )
+        row = live.filter(pl.col("product") == "minutely").row(0, named=True)
+        assert row["n"] == 6
+        assert row["live_mae"] == pytest.approx(1.0)
 
     def test_empty_history(self, tmp_path):
         assert verify_history(tmp_path / "none.parquet", self.truth([20.0])).is_empty()

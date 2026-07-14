@@ -25,13 +25,16 @@ from omni_forecast.dataset.matrix import matrix_sources
 _MIN_ROWS = 72
 
 
-def _correlation(a: np.ndarray, b: np.ndarray) -> tuple[float | None, int]:
-    overlap = ~(np.isnan(a) | np.isnan(b))
+def _correlation(
+    a: np.ndarray, b: np.ndarray, overlap: np.ndarray | None = None
+) -> tuple[float | None, int]:
+    overlap = ~(np.isnan(a) | np.isnan(b)) if overlap is None else overlap
     n = int(overlap.sum())
     if n < _MIN_ROWS:
         return None, n
     with np.errstate(invalid="ignore"):
-        return float(np.corrcoef(a[overlap], b[overlap])[0, 1]), n
+        correlation = float(np.corrcoef(a[overlap], b[overlap])[0, 1])
+    return (correlation if np.isfinite(correlation) else None), n
 
 
 def alignment_study(matrix: pl.DataFrame) -> pl.DataFrame:
@@ -52,8 +55,11 @@ def alignment_study(matrix: pl.DataFrame) -> pl.DataFrame:
             if column not in matrix.columns:
                 continue
             forecast = matrix[column].to_numpy()
-            r_inst, n_inst = _correlation(forecast, inst_truth)
-            r_mean, n_mean = _correlation(forecast, mean_truth)
+            overlap = ~(
+                np.isnan(forecast) | np.isnan(inst_truth) | np.isnan(mean_truth)
+            )
+            r_inst, n_inst = _correlation(forecast, inst_truth, overlap)
+            r_mean, n_mean = _correlation(forecast, mean_truth, overlap)
             preferred: str | None = None
             if r_inst is not None and r_mean is not None:
                 preferred = (
@@ -84,23 +90,38 @@ def recommended_semantics(study: pl.DataFrame) -> dict[str, str]:
         if decided.is_empty():
             recommendations[str(variable[0])] = TruthSemantics.INSTANTANEOUS.value
             continue
-        weights = (
-            decided.group_by("preferred")
+        weights = {
+            str(row["preferred"]): int(row["n"])
+            for row in decided.group_by("preferred")
             .agg(pl.col("n").sum())
-            .sort("n", descending=True)
+            .iter_rows(named=True)
+        }
+        inst = TruthSemantics.INSTANTANEOUS.value
+        mean = TruthSemantics.INTERVAL_MEAN.value
+        recommendations[str(variable[0])] = (
+            mean if weights.get(mean, 0) > weights.get(inst, 0) else inst
         )
-        recommendations[str(variable[0])] = str(weights["preferred"][0])
     return recommendations
 
 
 def write_alignment(study: pl.DataFrame, path: Path) -> dict[str, object]:
     """Persist the study + recommendations; returns the artifact dict."""
+    sanitized = study.with_columns(
+        *(
+            pl.when(pl.col(column).is_finite())
+            .then(pl.col(column))
+            .otherwise(None)
+            .alias(column)
+            for column in ("r_inst", "r_mean")
+            if column in study.columns
+        )
+    )
     artifact: dict[str, object] = {
         "recommended": recommended_semantics(study),
-        "study": study.to_dicts(),
+        "study": sanitized.to_dicts(),
     }
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(artifact, indent=2), encoding="utf-8")
+    path.write_text(json.dumps(artifact, indent=2, allow_nan=False), encoding="utf-8")
     return artifact
 
 

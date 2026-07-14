@@ -11,6 +11,8 @@ from dataclasses import dataclass
 
 import polars as pl
 
+from omni_forecast.contracts import Product
+
 
 @dataclass(frozen=True, slots=True)
 class LeadBucket:
@@ -45,6 +47,11 @@ DAILY_BUCKETS: tuple[LeadBucket, ...] = (
     LeadBucket("D8-10", 8.0, 11.0),
 )
 
+DAILY_BUCKETS_HOURS: tuple[LeadBucket, ...] = tuple(
+    LeadBucket(bucket.label, bucket.lo * 24.0, bucket.hi * 24.0)
+    for bucket in DAILY_BUCKETS
+)
+
 HOURLY_BUCKET_LABELS: tuple[str, ...] = tuple(b.label for b in HOURLY_BUCKETS)
 DAILY_BUCKET_LABELS: tuple[str, ...] = tuple(b.label for b in DAILY_BUCKETS)
 
@@ -70,6 +77,15 @@ def daily_bucket(lead_days: float) -> str | None:
     from the product's perspective), 10 is the last product day.
     """
     return _bucket_label(DAILY_BUCKETS, lead_days)
+
+
+def buckets_for_product(product: Product) -> tuple[LeadBucket, ...]:
+    """Fit/evaluation buckets expressed in the matrix's hour lead unit."""
+    return DAILY_BUCKETS_HOURS if product is Product.DAILY else HOURLY_BUCKETS
+
+
+def bucket_for_product(product: Product, lead_hours: float) -> str | None:
+    return _bucket_label(buckets_for_product(product), lead_hours)
 
 
 def _bucket_expr(buckets: tuple[LeadBucket, ...], lead: pl.Expr) -> pl.Expr:

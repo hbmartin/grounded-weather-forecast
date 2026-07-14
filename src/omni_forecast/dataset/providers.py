@@ -8,6 +8,7 @@ Missing tables, empty sources, and NULL fetch timestamps are tolerated.
 
 import sqlite3
 from collections.abc import Mapping
+from dataclasses import dataclass
 
 import polars as pl
 
@@ -35,6 +36,17 @@ DAILY_COLUMN_MAP: Mapping[str, str] = {
 }
 
 _SECONDS_PER_HOUR = 3600.0
+_LOCATION_TOLERANCE = 1e-4
+
+
+@dataclass(frozen=True, slots=True)
+class ForecastArchive:
+    """One transactionally consistent view of every forecast product."""
+
+    hourly: pl.DataFrame
+    daily: pl.DataFrame
+    minutely: pl.DataFrame
+    completions: pl.DataFrame
 
 
 def source_slug(provider: str, model: str) -> str:
@@ -51,21 +63,49 @@ def _table_exists(connection: sqlite3.Connection, table: str) -> bool:
     return row is not None
 
 
+def _table_columns(connection: sqlite3.Connection, table: str) -> set[str]:
+    return {
+        str(row[1])
+        for row in connection.execute(f"PRAGMA table_info({table})").fetchall()
+    }
+
+
 def _fetch_points(
-    connection: sqlite3.Connection, points_table: str, point_columns: list[str]
+    connection: sqlite3.Connection,
+    forecasts: ForecastsConfig,
+    points_table: str,
+    point_columns: list[str],
 ) -> list[tuple[object, ...]]:
-    for required in (points_table, "source_forecasts", "provider_results"):
+    for required in (
+        points_table,
+        "source_forecasts",
+        "provider_results",
+        "forecast_runs",
+    ):
         if not _table_exists(connection, required):
             return []
+    if not {"latitude", "longitude"} <= _table_columns(connection, "forecast_runs"):
+        return []
     columns = ", ".join(f"p.{column}" for column in point_columns)
     query = (
         f"SELECT pr.run_id, sf.provider, sf.model, pr.fetched_at, {columns} "
         f"FROM {points_table} AS p "
         "JOIN source_forecasts AS sf ON sf.id = p.source_forecast_id "
         "JOIN provider_results AS pr ON pr.id = sf.provider_result_id "
-        "WHERE pr.status = 'success'"
+        "JOIN forecast_runs AS fr ON fr.id = pr.run_id "
+        "WHERE pr.status = 'success' "
+        "AND ABS(fr.latitude - ?) <= ? "
+        "AND ABS(fr.longitude - ?) <= ?"
     )
-    return connection.execute(query).fetchall()
+    return connection.execute(
+        query,
+        (
+            forecasts.latitude,
+            _LOCATION_TOLERANCE,
+            forecasts.longitude,
+            _LOCATION_TOLERANCE,
+        ),
+    ).fetchall()
 
 
 def _base_schema(point_columns: Mapping[str, pl.DataType]) -> dict[str, pl.DataType]:
@@ -98,17 +138,16 @@ def _open(forecasts: ForecastsConfig) -> sqlite3.Connection:
     if not forecasts.db_path.exists():
         msg = f"cannot open forecast archive {forecasts.db_path}: file not found"
         raise OSError(msg)
-    return sqlite3.connect(sqlite_uri(forecasts.db_path, immutable=True), uri=True)
+    return sqlite3.connect(
+        sqlite_uri(forecasts.db_path, immutable=forecasts.immutable), uri=True
+    )
 
 
-def read_hourly_long(forecasts: ForecastsConfig) -> pl.DataFrame:
-    """Hourly forecast points as a canonical long frame."""
+def _read_hourly_long(
+    connection: sqlite3.Connection, forecasts: ForecastsConfig
+) -> pl.DataFrame:
     point_columns = ["timestamp_unix", *HOURLY_COLUMN_MAP.keys()]
-    connection = _open(forecasts)
-    try:
-        rows = _fetch_points(connection, "hourly_points", point_columns)
-    finally:
-        connection.close()
+    rows = _fetch_points(connection, forecasts, "hourly_points", point_columns)
     schema = _base_schema(
         {"timestamp_unix": pl.Int64()}
         | {column: pl.Float64() for column in HOURLY_COLUMN_MAP}
@@ -144,14 +183,20 @@ def read_hourly_long(forecasts: ForecastsConfig) -> pl.DataFrame:
     )
 
 
-def read_daily_long(forecasts: ForecastsConfig) -> pl.DataFrame:
-    """Daily forecast points as a canonical long frame keyed by forecast date."""
-    point_columns = ["forecast_date", *DAILY_COLUMN_MAP.keys()]
+def read_hourly_long(forecasts: ForecastsConfig) -> pl.DataFrame:
+    """Hourly forecast points as a canonical long frame."""
     connection = _open(forecasts)
     try:
-        rows = _fetch_points(connection, "daily_points", point_columns)
+        return _read_hourly_long(connection, forecasts)
     finally:
         connection.close()
+
+
+def _read_daily_long(
+    connection: sqlite3.Connection, forecasts: ForecastsConfig
+) -> pl.DataFrame:
+    point_columns = ["forecast_date", *DAILY_COLUMN_MAP.keys()]
+    rows = _fetch_points(connection, forecasts, "daily_points", point_columns)
     schema = _base_schema(
         {"forecast_date": pl.String()}
         | {column: pl.Float64() for column in DAILY_COLUMN_MAP}
@@ -176,18 +221,24 @@ def read_daily_long(forecasts: ForecastsConfig) -> pl.DataFrame:
     )
 
 
-def read_minutely_long(forecasts: ForecastsConfig) -> pl.DataFrame:
-    """Minutely precipitation points (the only minutely content providers emit)."""
+def read_daily_long(forecasts: ForecastsConfig) -> pl.DataFrame:
+    """Daily forecast points as a canonical long frame keyed by forecast date."""
+    connection = _open(forecasts)
+    try:
+        return _read_daily_long(connection, forecasts)
+    finally:
+        connection.close()
+
+
+def _read_minutely_long(
+    connection: sqlite3.Connection, forecasts: ForecastsConfig
+) -> pl.DataFrame:
     point_columns = [
         "timestamp_unix",
         "precipitation_intensity",
         "precipitation_probability",
     ]
-    connection = _open(forecasts)
-    try:
-        rows = _fetch_points(connection, "minutely_points", point_columns)
-    finally:
-        connection.close()
+    rows = _fetch_points(connection, forecasts, "minutely_points", point_columns)
     schema = _base_schema(
         {
             "timestamp_unix": pl.Int64(),
@@ -225,17 +276,35 @@ def read_minutely_long(forecasts: ForecastsConfig) -> pl.DataFrame:
     )
 
 
-def read_run_completions(forecasts: ForecastsConfig) -> pl.DataFrame:
-    """``forecast_runs.completed_at`` instants (snapshot anchors)."""
+def read_minutely_long(forecasts: ForecastsConfig) -> pl.DataFrame:
+    """Minutely precipitation points (the only minutely content providers emit)."""
     connection = _open(forecasts)
     try:
-        if not _table_exists(connection, "forecast_runs"):
-            return pl.DataFrame(schema={"completed_at": pl.Datetime("us", "UTC")})
-        rows = connection.execute(
-            "SELECT completed_at FROM forecast_runs WHERE completed_at IS NOT NULL"
-        ).fetchall()
+        return _read_minutely_long(connection, forecasts)
     finally:
         connection.close()
+
+
+def _read_run_completions(
+    connection: sqlite3.Connection, forecasts: ForecastsConfig
+) -> pl.DataFrame:
+    if not _table_exists(connection, "forecast_runs"):
+        return pl.DataFrame(schema={"completed_at": pl.Datetime("us", "UTC")})
+    if not {"completed_at", "latitude", "longitude"} <= _table_columns(
+        connection, "forecast_runs"
+    ):
+        return pl.DataFrame(schema={"completed_at": pl.Datetime("us", "UTC")})
+    rows = connection.execute(
+        "SELECT completed_at FROM forecast_runs "
+        "WHERE completed_at IS NOT NULL "
+        "AND ABS(latitude - ?) <= ? AND ABS(longitude - ?) <= ?",
+        (
+            forecasts.latitude,
+            _LOCATION_TOLERANCE,
+            forecasts.longitude,
+            _LOCATION_TOLERANCE,
+        ),
+    ).fetchall()
     raw = pl.DataFrame(rows, schema={"completed_at_raw": pl.String()}, orient="row")
     return (
         raw.with_columns(
@@ -245,3 +314,27 @@ def read_run_completions(forecasts: ForecastsConfig) -> pl.DataFrame:
         .select("completed_at")
         .sort("completed_at")
     )
+
+
+def read_run_completions(forecasts: ForecastsConfig) -> pl.DataFrame:
+    """``forecast_runs.completed_at`` instants (snapshot anchors)."""
+    connection = _open(forecasts)
+    try:
+        return _read_run_completions(connection, forecasts)
+    finally:
+        connection.close()
+
+
+def read_forecast_archive(forecasts: ForecastsConfig) -> ForecastArchive:
+    """Read all products inside one SQLite snapshot transaction."""
+    connection = _open(forecasts)
+    try:
+        connection.execute("BEGIN")
+        return ForecastArchive(
+            hourly=_read_hourly_long(connection, forecasts),
+            daily=_read_daily_long(connection, forecasts),
+            minutely=_read_minutely_long(connection, forecasts),
+            completions=_read_run_completions(connection, forecasts),
+        )
+    finally:
+        connection.close()

@@ -6,6 +6,7 @@ from omni_forecast.contracts import (
     BlendResult,
     ContractViolationError,
     ForecastMatrix,
+    Product,
     SourceKind,
     SupervisedSlice,
     TruthSemantics,
@@ -39,6 +40,13 @@ class TestColumnBuilders:
 
     def test_fxd_round_trip(self):
         assert parse_fx_col(fxd_col("nws", "temp_max_c")) == ("nws", "temp_max_c")
+
+    def test_reserved_separator_round_trip(self):
+        source = "provider__model%experimental"
+        variable = "temp__c"
+        encoded = fx_col(source, variable)
+        assert encoded == "fx__provider%5F%5Fmodel%25experimental__temp%5F%5Fc"
+        assert parse_fx_col(encoded) == (source, variable)
 
     def test_parse_rejects_non_forecast(self):
         for bad in ("t__temp_c__inst", "obs__temp_c", "fx__only", "fx____", "plain"):
@@ -78,6 +86,7 @@ class TestForecastMatrix:
         assert not m.availability[0, 1]
         assert m.availability.sum() == m.values.size - 1
         assert m.n_rows == 4
+        assert m.product is Product.HOURLY
 
     def test_source_count_mismatch(self):
         with pytest.raises(ContractViolationError, match="columns for"):

@@ -72,6 +72,7 @@ class ForecastMatrix:
     availability: BoolArray         # (n, k) — explicitly ~isnan(values)
     lead_hours:   FloatArray        # (n,)
     features:     pl.DataFrame      # aligned context; NEVER truth columns
+    product:      Product           # controls lead buckets/capabilities
 
 @dataclass(frozen=True)
 class SupervisedSlice:
@@ -102,13 +103,13 @@ Design decisions worth knowing:
 - **The `features` frame may not contain truth.** `ForecastMatrix.__post_init__`
   raises if any column starts with `t__`. This is a runtime guard against the
   most likely form of leakage.
-- **Quantiles exist in the protocol from day one** although wave-1 methods are all
-  point forecasters, so that EMOS/conformal can be added later without a breaking
-  change or a re-backtest of everything.
+- **Quantiles travel end to end** through scores, forecast JSON, and served history.
+  Wave-1 methods are point forecasters, but EMOS/conformal can be added without a
+  storage or API break.
 - **`BlendResult.point` may contain `NaN`**, which means "this method has nothing
   to say about this row" (e.g. persistence with no recent observation). The engine
-  stores that as `null`; the leaderboard aligns methods pairwise on shared
-  non-null rows, so a method is never rewarded for declining to answer.
+  stores that as `null`; promotion compares all methods on one common-case mask and
+  reports coverage, so declining difficult rows cannot manufacture a win.
 
 ### Column naming
 
@@ -124,9 +125,9 @@ One convention, one place (`contracts.py` owns the builders and the parser):
 | `t__{var}` | truth, single semantics (gust, precip, PoP) |
 | `ewagg__{var}` | equal-weight aggregate of the hourly path over a local day |
 
-`__` is the only separator, because provider slugs contain single underscores
-(`open_meteo`, `met_norway`). `parse_fx_col()` is the inverse and refuses
-anything malformed.
+`__` is the structural separator. Column builders percent-escape separator and
+percent characters inside source/variable segments; `parse_fx_col()` is the exact
+inverse and refuses anything malformed.
 
 ---
 
@@ -141,7 +142,9 @@ anything malformed.
   parser tries both formats and coalesces. Missing tables, missing columns and
   NULL timestamps all degrade gracefully to empty/null rather than crashing — the
   upstream databases are explicitly documented as damaged.
-- `dataset/providers.py` — joins `hourly_points → source_forecasts →
+- `dataset/providers.py` — reads hourly, daily, minutely, and completion rows in one
+  SQLite transaction, filters every run to the configured coordinates, and joins
+  `hourly_points → source_forecasts →
   provider_results`, filters to `status = 'success'`, and **recomputes lead from
   the ISO `fetched_at` text**. It never reads `horizon_hours`, `fetched_at_unix`
   or `run_cycle`, all of which are NULL in the sample archive. A source slug is
@@ -188,8 +191,9 @@ Everything under `[dataset].dir` (git-ignored), all parquet:
 | `daily_matrix_live.parquet` | one row per (snapshot, target local date) |
 | `hourly_matrix_synthetic.parquet` | the same shape, backfilled provenance |
 | `manifest.json` | row counts, per-file SHA-256, and the **dataset fingerprint** |
-| `scores/scores_{product}_{kind}.parquet` | one row per (method, variable, test case) |
-| `predict_history.parquet` | every forecast this system has served |
+| `scores/scores_{product}_{kind}_{window}_{evaluation}.parquet` | one identified evaluation run, one row per (method, variable, test case) |
+| `predict_history.parquet` | every emitted value, atomically appended with release/method/quantile attribution |
+| `served_forecasts/*.json` | exact versioned documents for historical replay |
 
 **Matrices are keyed by provenance in the filename.** `..._live` and
 `..._synthetic` can never collide on disk, which makes the provenance wall a
@@ -199,8 +203,10 @@ The **scores frame** is the pivot of the whole design. It is deliberately *long
 and dumb*:
 
 ```
+evaluation_id | dataset_fingerprint | source_set_json | semantics | code_version
 method_id | variable | product | source_kind | window | fold_origin
           | issue_time | valid_time | lead_hours | lead_bucket | y_pred | y_true
+          | quantile_levels_json | quantiles_json
 ```
 
 The engine writes it and stops. Every leaderboard, skill score, DM test and
@@ -280,11 +286,11 @@ build_snapshot(config, now)          # the same as-of code the dataset build use
   -> append to predict_history.parquet
 ```
 
-`serve/selection.py` reads the persisted scores and picks the per-slice winner —
-it does not re-decide anything, because the leaderboard is the only thing allowed
-to declare winners. Config pins override; a slice with no evidence falls back to a
-**named** default (`grounded_equal_weight`) with the reason recorded in the
-output, never to silence.
+`serve/selection.py` reads only live Evaluation Runs compatible with the current
+dataset and requested issue time, then promotes the common-case, significance-aware
+per-slice winners into a Model Release. Config pins override. A slice with no
+compatible evidence uses the fit-free `equal_weight` fallback, marks the document
+`degraded`, and records the reason.
 
 Every emitted value carries the `method_id` that produced it. When someone asks
 "why is the 6 a.m. temperature 12 °C", the answer is in the document.

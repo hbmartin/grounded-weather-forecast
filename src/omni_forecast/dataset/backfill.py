@@ -148,14 +148,14 @@ def parse_previous_runs(
     if not frames:
         msg = "Previous Runs payload contained no usable day offsets"
         raise BackfillError(msg)
+    combined = pl.concat(frames, how="diagonal")
     missing = [
         canonical
         for canonical in HOURLY_COLUMN_MAP.values()
-        if canonical not in frames[0].columns
+        if canonical not in combined.columns
     ]
     return (
-        pl.concat(frames, how="diagonal")
-        .with_columns(
+        combined.with_columns(
             pl.col("valid_time").dt.replace_time_zone("UTC"),
             pl.col("fetched_at").dt.replace_time_zone("UTC"),
             pl.lit(None, dtype=pl.Int64).alias("run_id"),
@@ -186,6 +186,9 @@ def parse_previous_runs(
 
 
 def _chunks(start: date, end: date, days: int) -> list[tuple[date, date]]:
+    if days <= 0:
+        msg = f"chunk_days must be a positive integer, got {days}"
+        raise BackfillError(msg)
     spans: list[tuple[date, date]] = []
     cursor = start
     while cursor <= end:
@@ -210,6 +213,9 @@ def backfill_long(
     selected = tuple(models) if models else config.backfill.models
     if not selected:
         msg = "set [backfill.open_meteo].models to backfill"
+        raise BackfillError(msg)
+    if end < start:
+        msg = f"backfill end {end} precedes start {start}"
         raise BackfillError(msg)
     frames: list[pl.DataFrame] = []
     for model in selected:

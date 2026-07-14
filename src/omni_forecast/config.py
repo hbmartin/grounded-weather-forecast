@@ -4,13 +4,15 @@ The config carries everything location-specific (DB paths, coordinates,
 station column/unit mappings) so the codebase itself stays station-agnostic.
 """
 
+import math
 import tomllib
 from collections.abc import Mapping
 from dataclasses import dataclass
-from datetime import date
+from datetime import date, datetime
 from pathlib import Path
 from types import MappingProxyType
 from typing import Any
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 
 class ConfigError(ValueError):
@@ -76,6 +78,9 @@ class ForecastsConfig:
     db_path: Path
     sources: tuple[str, ...]
     max_forecast_age_hours: float
+    immutable: bool
+    latitude: float
+    longitude: float
 
 
 @dataclass(frozen=True, slots=True)
@@ -111,6 +116,7 @@ class PredictConfig:
     selection: str
     history_path: Path
     methods: Mapping[str, str]
+    minutely_tau_hours: float
 
 
 @dataclass(frozen=True, slots=True)
@@ -152,6 +158,38 @@ def _number(value: Any, key: str, context: str) -> float:
     raise ConfigError(msg)
 
 
+def _finite_number(value: Any, key: str, context: str) -> float:
+    number = _number(value, key, context)
+    if not math.isfinite(number):
+        msg = f"{key!r} in [{context}] must be finite"
+        raise ConfigError(msg)
+    return number
+
+
+def _positive_number(value: Any, key: str, context: str) -> float:
+    number = _finite_number(value, key, context)
+    if number <= 0.0:
+        msg = f"{key!r} in [{context}] must be > 0"
+        raise ConfigError(msg)
+    return number
+
+
+def _positive_int(value: Any, key: str, context: str) -> int:
+    number = _finite_number(value, key, context)
+    if not number.is_integer() or number <= 0.0:
+        msg = f"{key!r} in [{context}] must be a positive integer"
+        raise ConfigError(msg)
+    return int(number)
+
+
+def _fraction(value: Any, key: str, context: str) -> float:
+    number = _finite_number(value, key, context)
+    if not 0.0 <= number <= 1.0:
+        msg = f"{key!r} in [{context}] must be between 0 and 1"
+        raise ConfigError(msg)
+    return number
+
+
 def _str_map(value: Any, key: str, context: str) -> dict[str, str]:
     match value:
         case dict() as mapping if all(
@@ -167,25 +205,47 @@ def _station(raw: Mapping[str, Any]) -> StationConfig:
     section = _section(raw, "station")
     columns = dict(DEFAULT_STATION_COLUMNS)
     columns |= _str_map(section.get("columns", {}), "columns", "station")
+    duplicate_targets = sorted(
+        channel
+        for channel in set(columns.values())
+        if list(columns.values()).count(channel) > 1
+    )
+    if duplicate_targets:
+        msg = f"[station.columns] maps multiple database columns to {duplicate_targets}"
+        raise ConfigError(msg)
     units = dict(DEFAULT_STATION_UNITS)
     units |= _str_map(section.get("units", {}), "units", "station")
+    timezone = str(section.get("timezone", "UTC"))
+    try:
+        ZoneInfo(timezone)
+    except (ZoneInfoNotFoundError,) as exc:  # noqa: B013 - project exception style
+        msg = f"unknown [station].timezone {timezone!r}"
+        raise ConfigError(msg) from exc
+    latitude = _finite_number(
+        _require(section, "latitude", "station"), "latitude", "station"
+    )
+    longitude = _finite_number(
+        _require(section, "longitude", "station"), "longitude", "station"
+    )
+    if not -90.0 <= latitude <= 90.0:
+        raise ConfigError("'latitude' in [station] must be between -90 and 90")
+    if not -180.0 <= longitude <= 180.0:
+        raise ConfigError("'longitude' in [station] must be between -180 and 180")
     return StationConfig(
         db_path=Path(str(_require(section, "db_path", "station"))),
-        timezone=str(section.get("timezone", "UTC")),
-        latitude=_number(
-            _require(section, "latitude", "station"), "latitude", "station"
+        timezone=timezone,
+        latitude=latitude,
+        longitude=longitude,
+        elevation_m=_finite_number(
+            section.get("elevation_m", 0.0), "elevation_m", "station"
         ),
-        longitude=_number(
-            _require(section, "longitude", "station"), "longitude", "station"
-        ),
-        elevation_m=_number(section.get("elevation_m", 0.0), "elevation_m", "station"),
         immutable=bool(section.get("immutable", False)),
         columns=MappingProxyType(columns),
         units=MappingProxyType(units),
     )
 
 
-def _forecasts(raw: Mapping[str, Any]) -> ForecastsConfig:
+def _forecasts(raw: Mapping[str, Any], station: StationConfig) -> ForecastsConfig:
     section = _section(raw, "forecasts")
     sources = section.get("sources", [])
     if not isinstance(sources, list) or not all(isinstance(s, str) for s in sources):
@@ -194,11 +254,14 @@ def _forecasts(raw: Mapping[str, Any]) -> ForecastsConfig:
     return ForecastsConfig(
         db_path=Path(str(_require(section, "db_path", "forecasts"))),
         sources=tuple(sources),
-        max_forecast_age_hours=_number(
+        max_forecast_age_hours=_positive_number(
             section.get("max_forecast_age_hours", 12.0),
             "max_forecast_age_hours",
             "forecasts",
         ),
+        immutable=bool(section.get("immutable", False)),
+        latitude=station.latitude,
+        longitude=station.longitude,
     )
 
 
@@ -206,13 +269,13 @@ def _dataset(raw: Mapping[str, Any]) -> DatasetConfig:
     section = _section(raw, "dataset")
     return DatasetConfig(
         dir=Path(str(section.get("dir", "data"))),
-        min_hour_coverage=_number(
+        min_hour_coverage=_fraction(
             section.get("min_hour_coverage", 0.8), "min_hour_coverage", "dataset"
         ),
-        min_day_coverage=_number(
+        min_day_coverage=_fraction(
             section.get("min_day_coverage", 0.8), "min_day_coverage", "dataset"
         ),
-        pop_threshold_mm=_number(
+        pop_threshold_mm=_positive_number(
             section.get("pop_threshold_mm", 0.254), "pop_threshold_mm", "dataset"
         ),
     )
@@ -227,7 +290,16 @@ def _bounds_map(value: Any) -> dict[str, tuple[float, float]]:
                     case [lo, hi] if isinstance(lo, (int, float)) and isinstance(
                         hi, (int, float)
                     ):
-                        result[str(key)] = (float(lo), float(hi))
+                        low = float(lo)
+                        high = float(hi)
+                        if (
+                            not math.isfinite(low)
+                            or not math.isfinite(high)
+                            or low > high
+                        ):
+                            msg = f"bounds for {key!r} must be finite and ordered"
+                            raise ConfigError(msg)
+                        result[str(key)] = (low, high)
                     case _:
                         msg = f"bounds for {key!r} must be [low, high]"
                         raise ConfigError(msg)
@@ -241,11 +313,15 @@ def _qc(raw: Mapping[str, Any]) -> QcConfig:
     section = _section(raw, "qc")
     bounds = dict(DEFAULT_QC_BOUNDS) | _bounds_map(section.get("bounds", {}))
     max_step = dict(DEFAULT_QC_MAX_STEP)
-    for key, value in dict(section.get("max_step", {})).items():
-        max_step[str(key)] = _number(value, str(key), "qc.max_step")
+    max_step_section = _section(section, "max_step") if "max_step" in section else {}
+    for key, value in max_step_section.items():
+        max_step[str(key)] = _positive_number(value, str(key), "qc.max_step")
     flatline = dict(DEFAULT_QC_FLATLINE_MINUTES)
-    for key, value in dict(section.get("flatline_minutes", {})).items():
-        flatline[str(key)] = int(_number(value, str(key), "qc.flatline_minutes"))
+    flatline_section = (
+        _section(section, "flatline_minutes") if "flatline_minutes" in section else {}
+    )
+    for key, value in flatline_section.items():
+        flatline[str(key)] = _positive_int(value, str(key), "qc.flatline_minutes")
     return QcConfig(
         bounds=MappingProxyType(bounds),
         max_step=MappingProxyType(max_step),
@@ -264,10 +340,17 @@ def _backfill(raw: Mapping[str, Any]) -> BackfillConfig:
     match raw_start:
         case None:
             start = None
+        case datetime():
+            msg = "'start_date' in [backfill.open_meteo] must be a date, not datetime"
+            raise ConfigError(msg)
         case date():
             start = raw_start
         case str():
-            start = date.fromisoformat(raw_start)
+            try:
+                start = date.fromisoformat(raw_start)
+            except (ValueError,) as exc:  # noqa: B013 - project exception style
+                msg = "'start_date' in [backfill.open_meteo] must be YYYY-MM-DD"
+                raise ConfigError(msg) from exc
         case _:
             msg = "'start_date' in [backfill.open_meteo] must be a date"
             raise ConfigError(msg)
@@ -277,18 +360,14 @@ def _backfill(raw: Mapping[str, Any]) -> BackfillConfig:
 def _backtest(raw: Mapping[str, Any]) -> BacktestConfig:
     section = _section(raw, "backtest")
     return BacktestConfig(
-        initial_train_days=int(
-            _number(
-                section.get("initial_train_days", 90), "initial_train_days", "backtest"
-            )
+        initial_train_days=_positive_int(
+            section.get("initial_train_days", 90), "initial_train_days", "backtest"
         ),
-        step_days=int(_number(section.get("step_days", 7), "step_days", "backtest")),
-        rolling_window_days=int(
-            _number(
-                section.get("rolling_window_days", 180),
-                "rolling_window_days",
-                "backtest",
-            )
+        step_days=_positive_int(section.get("step_days", 7), "step_days", "backtest"),
+        rolling_window_days=_positive_int(
+            section.get("rolling_window_days", 180),
+            "rolling_window_days",
+            "backtest",
         ),
     )
 
@@ -303,6 +382,11 @@ def _predict(raw: Mapping[str, Any], dataset_dir: Path) -> PredictConfig:
         methods=MappingProxyType(
             _str_map(section.get("methods", {}), "methods", "predict")
         ),
+        minutely_tau_hours=_positive_number(
+            section.get("minutely_tau_hours", 3.0),
+            "minutely_tau_hours",
+            "predict",
+        ),
     )
 
 
@@ -314,9 +398,10 @@ def load_config(path: Path) -> Config:
         msg = f"cannot load config {path}: {exc}"
         raise ConfigError(msg) from exc
     dataset = _dataset(raw)
+    station = _station(raw)
     return Config(
-        station=_station(raw),
-        forecasts=_forecasts(raw),
+        station=station,
+        forecasts=_forecasts(raw, station),
         dataset=dataset,
         qc=_qc(raw),
         backfill=_backfill(raw),

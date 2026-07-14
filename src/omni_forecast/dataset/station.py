@@ -37,6 +37,9 @@ def _empty_frame(channels: list[str]) -> pl.DataFrame:
 def read_observations(station: StationConfig) -> pl.DataFrame:
     """Load, unit-convert, sort, and dedupe the station's minute samples."""
     channels = sorted(set(station.columns.values()))
+    if len(channels) != len(station.columns.values()):
+        msg = "station column mapping contains duplicate canonical channels"
+        raise ValueError(msg)
     if not station.db_path.exists():
         msg = f"cannot open station database {station.db_path}: file not found"
         raise OSError(msg)

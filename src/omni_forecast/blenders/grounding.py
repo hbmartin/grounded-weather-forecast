@@ -23,7 +23,7 @@ import numpy as np
 
 from omni_forecast.blenders.protocol import FittedBuckets, PerBucketFitter
 from omni_forecast.contracts import FloatArray, ForecastMatrix, SupervisedSlice
-from omni_forecast.leads import HOURLY_BUCKETS, LeadBucket
+from omni_forecast.leads import HOURLY_BUCKETS, LeadBucket, buckets_for_product
 
 IDENTITY: tuple[float, float] = (0.0, 1.0)
 BIAS_ONLY = 0.0
@@ -71,6 +71,7 @@ class AffineGrounding:
 
     def fit(self, train: SupervisedSlice) -> "AffineGrounding":
         self._sources = train.x.sources
+        self.buckets = buckets_for_product(train.x.product)
         values, y = train.x.values, train.y
         for index, source in enumerate(self._sources):
 

@@ -56,3 +56,15 @@ class TestArtifactStore:
 
     def test_empty_latest(self, tmp_path):
         assert ArtifactStore(root=tmp_path / "nothing").read_latest() == {}
+
+    def test_metadata_cannot_override_identity(self, tmp_path):
+        store = ArtifactStore(root=tmp_path / "artifacts")
+        with pytest.raises(ArtifactError, match="reserved keys"):
+            store.save(
+                fingerprint="real",
+                method_id="gbm",
+                product="hourly",
+                variable="temp_c",
+                state={},
+                meta={"dataset_fingerprint": "forged"},
+            )

@@ -7,7 +7,8 @@ from omni_forecast.blenders import (
     get_factory,
     register,
 )
-from omni_forecast.contracts import BlendResult
+from omni_forecast.blenders.registry import supports_product
+from omni_forecast.contracts import BlendResult, Product, hourly_variable
 
 
 class FakeBlender:
@@ -34,3 +35,11 @@ class TestRegistry:
     def test_unknown_method(self):
         with pytest.raises(UnknownMethodError, match="unknown method"):
             get_factory("does_not_exist")
+
+    def test_daily_excludes_hourly_only_methods(self):
+        assert not supports_product("persistence", Product.DAILY)
+        assert not supports_product("anchored_inverse_mse", Product.DAILY)
+        assert supports_product("equal_weight", Product.DAILY)
+        assert not supports_product(
+            "persistence", Product.HOURLY, hourly_variable("precip_mm")
+        )

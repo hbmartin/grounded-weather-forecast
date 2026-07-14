@@ -18,12 +18,12 @@ unless you *recorded it* last Tuesday. A forecast archive is the only input to
 this system that cannot be backfilled, bought, or recovered — and its clock
 starts the day you begin polling.
 
-As of this writing the live archive in this repo contains **two snapshots, eight
-minutes apart**. That is not enough to backtest anything at all, and the system
-says so rather than inventing a leaderboard:
+A newly started live archive may contain only a handful of snapshots. That is not
+enough to backtest anything, and the system says so rather than inventing a
+leaderboard. A typical early-run message is:
 
 ```
-hourly: 0 score rows -> data/scores/scores_hourly_live.parquet
+hourly: 0 score rows -> data/scores/scores_hourly_live_expanding.parquet
   hourly: no rolling-origin folds. The archive spans 0.0 days of issue times
   (2026-03-22 16:19:40 .. 2026-03-22 16:28:15) but a fold needs
   initial_train_days + step_days = 97. Keep polling, or backtest --source
@@ -57,10 +57,12 @@ this data.
 
 ## 3. What the synthetic backfill can and cannot tell you
 
-The Open-Meteo Previous Runs backfill is the cold-start escape hatch, and it is
-genuinely powerful: it produced **198,072 real archived forecast points** across
-three NWP models and 13 months, against real station truth, in six minutes. Every
-leaderboard number quoted in this repository comes from it.
+The Open-Meteo Previous Runs backfill is the cold-start escape hatch. It can
+produce a substantial local exploratory dataset, but no backfilled parquet or
+score artifact is shipped with this repository. Any concrete leaderboard result
+must therefore be regenerated against the operator's own station record and
+configuration; numbers shown below are historical illustrations, not packaged or
+production evidence.
 
 But its limits are structural, not incidental:
 
@@ -179,10 +181,12 @@ floor.
 
 ---
 
-## 5. What the current leaderboard does and does not say
+## 5. What one historical exploratory leaderboard did and did not say
 
-From 13 months of backfilled ECMWF/GFS/ICON forecasts against this station
-(hourly temperature, expanding window, 45 folds):
+In one prior local run using 13 months of backfilled ECMWF/GFS/ICON forecasts
+against one station (hourly temperature, expanding window, 45 folds), the report
+looked as follows. These values are illustrative and must not be interpreted as
+the repository's current evidence or as a release eligible for live serving:
 
 | lead bucket | winner | MAE (°C) | skill vs best single provider | DM *p* |
 |---|---|---|---|---|
@@ -226,8 +230,10 @@ It does **not** say:
   p-value precisely so a thin slice announces its own weakness. Treat `p` in
   D8–10 as advisory.
 - **A per-slice winner selected on the same scores used to rank is a form of
-  selection bias.** With 12 methods × 10 buckets, some winners are noise. This is
-  mitigated (DM tests, `n` reported, an explicit named fallback), not eliminated.
+  selection bias.** With 12 methods × 10 buckets, some winners are noise. Promotion
+  now requires a common-case comparison, at least 80% coverage, and significant
+  improvement over the best reference when choosing a challenger. This mitigates,
+  but does not eliminate, repeated-selection bias.
   The self-verification loop — scoring what we actually served against what
   actually happened — is the intended cure, and it needs live history to work.
 - **`bias` is computed on the same rows as MAE**; a method with low MAE and high
@@ -279,8 +285,9 @@ non-blocking:
 - **Single location.** Location is config, not a key in the model store. Adding a
   second station means a second config and a second dataset directory — no code
   change, but no shared learning either.
-- **Single writer.** Concurrent `build-dataset` runs against the same dataset
-  directory will race.
+- **Dataset build is single-writer.** Concurrent `build-dataset` runs against the
+  same dataset directory will race. Forecast-history appends themselves are locked
+  and atomically replaced.
 
 ---
 
