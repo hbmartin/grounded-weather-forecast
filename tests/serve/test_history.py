@@ -1,7 +1,11 @@
-import polars as pl
-import pytest
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
 from datetime import date, timedelta
+from threading import Barrier
+
+import polars as pl
+import pytest
+
 from conftest import utc
 
 from omni_forecast.reports.verification import compare_to_backtest, verify_history
@@ -67,6 +71,21 @@ class TestHistory:
         replayed = load_archived_forecast(path, ISSUED.isoformat())
         assert replayed is not None
         assert replayed.to_json() == make_forecast(21.0).to_json()
+
+    def test_concurrent_appends_are_serialized(self, tmp_path):
+        path = tmp_path / "history.parquet"
+        temperatures = tuple(float(value) for value in range(8))
+        barrier = Barrier(len(temperatures))
+
+        def append(temp):
+            barrier.wait()
+            return append_history(make_forecast(temp), path)
+
+        with ThreadPoolExecutor(max_workers=len(temperatures)) as executor:
+            rows_added = tuple(executor.map(append, temperatures))
+
+        assert rows_added == (2,) * len(temperatures)
+        assert load_history(path).height == 2 * len(temperatures)
 
     def test_daily_history_uses_local_midnight(self):
         rows = forecast_to_rows(make_forecast())

@@ -6,6 +6,7 @@ Blenders import contracts only, never the dataset layer.
 
 from dataclasses import dataclass
 from enum import StrEnum
+from itertools import pairwise
 from typing import Protocol, Self
 
 import numpy as np
@@ -279,9 +280,8 @@ class BlendResult:
                 if q.shape != expected:
                     msg = f"quantiles shape {q.shape} != {expected}"
                     raise ContractViolationError(msg)
-                if (
-                    any(not 0.0 < level < 1.0 for level in levels)
-                    or tuple(sorted(levels)) != levels
+                if any(not 0.0 < level < 1.0 for level in levels) or any(
+                    left >= right for left, right in pairwise(levels)
                 ):
                     msg = "quantile_levels must be strictly increasing inside (0, 1)"
                     raise ContractViolationError(msg)

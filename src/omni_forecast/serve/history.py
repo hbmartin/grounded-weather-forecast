@@ -6,7 +6,6 @@ history is what turns that estimate into a measurement, and it is the only way
 to catch a live path that has quietly diverged from the backtested one.
 """
 
-import fcntl
 from contextlib import contextmanager
 from datetime import date
 from pathlib import Path
@@ -14,6 +13,7 @@ from tempfile import NamedTemporaryFile
 from typing import Iterator
 
 import polars as pl
+from filelock import FileLock
 
 from omni_forecast.serve.schema import Forecast
 from omni_forecast.timeutil import local_day_start_utc
@@ -144,12 +144,8 @@ def _quantiles_json(quantiles: dict[str, float] | None) -> str | None:
 def _locked(path: Path) -> Iterator[None]:
     lock_path = path.with_suffix(f"{path.suffix}.lock")
     lock_path.parent.mkdir(parents=True, exist_ok=True)
-    with lock_path.open("a", encoding="utf-8") as lock:
-        fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
-        try:
-            yield
-        finally:
-            fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
+    with FileLock(lock_path):
+        yield
 
 
 def _atomic_write(frame: pl.DataFrame, path: Path) -> None:

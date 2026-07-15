@@ -184,3 +184,11 @@ class TestBlendResult:
                 quantiles=np.zeros((3, 3)),
                 quantile_levels=(0.1, 0.9),
             )
+
+    def test_duplicate_quantile_levels_rejected(self):
+        with pytest.raises(ContractViolationError, match="strictly increasing"):
+            BlendResult(
+                point=np.zeros(3),
+                quantiles=np.zeros((3, 2)),
+                quantile_levels=(0.1, 0.1),
+            )
