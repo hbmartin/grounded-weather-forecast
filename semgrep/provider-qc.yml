@@ -1,0 +1,23 @@
+rules:
+  - id: provider-qc-matrix-grouping-must-include-snapshot
+    languages: [python]
+    severity: ERROR
+    message: >-
+      Provider QC in a matrix builder must include issue_time in its grouping key
+      so historical forecast vintages are never compared with the active snapshot.
+    metadata:
+      category: correctness
+      technology: [python, polars]
+    pattern-either:
+      - pattern: |
+          apply_provider_qc(
+              ...,
+              group_key="valid_time",
+              ...
+          )
+      - pattern: |
+          apply_provider_qc(
+              ...,
+              group_key="forecast_date",
+              ...
+          )

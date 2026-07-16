@@ -130,6 +130,8 @@ Requires Python 3.13+ and [uv](https://docs.astral.sh/uv/).
 ```bash
 uv sync --dev
 uv run ruff check src --fix && uv run ruff format src tests
+uvx --from semgrep==1.170.0 semgrep scan --test --config semgrep/provider-qc.yml semgrep/tests/provider_qc_grouping.py
+uvx --from semgrep==1.170.0 semgrep scan --metrics=off --error --config semgrep/provider-qc.yml src/omni_forecast/dataset/matrix.py
 uv run pyrefly check src && uv run ty check src
 uv run lizard -Eduplicate -C 27 src
 uv run pytest tests/ --cov=src --cov-report=term-missing

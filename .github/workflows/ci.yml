@@ -45,6 +45,11 @@ jobs:
         run: |
           uv run ruff format --check src tests
 
+      - name: Run Semgrep guardrails
+        run: |
+          uvx --from semgrep==1.170.0 semgrep scan --test --config semgrep/provider-qc.yml semgrep/tests/provider_qc_grouping.py
+          uvx --from semgrep==1.170.0 semgrep scan --metrics=off --error --config semgrep/provider-qc.yml src/omni_forecast/dataset/matrix.py
+
       - name: Run Pyrefly check
         run: |
           uv run pyrefly check src
