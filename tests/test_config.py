@@ -10,6 +10,7 @@ MINIMAL = """
 db_path = "obs.db"
 latitude = 34.28
 longitude = -117.17
+elevation_m = 1400.0
 
 [forecasts]
 db_path = "fx.sqlite"
@@ -83,6 +84,12 @@ class TestMinimalConfig:
         assert cfg.forecasts.immutable is False
         assert cfg.dataset.dir == Path("data")
         assert cfg.dataset.pop_threshold_mm == 0.254
+        assert cfg.dataset.precip_reset_fraction == 0.5
+        assert cfg.provider_qc.enabled is True
+        assert cfg.provider_qc.mad_k == 5.0
+        assert cfg.provider_qc.min_sources == 4
+        assert cfg.provider_qc.bounds["pressure_sea_hpa"] == (850.0, 1090.0)
+        assert "pressure_sea_hpa" in cfg.provider_qc.cross_source_variables
         assert cfg.qc.bounds["temp"] == (-40.0, 55.0)
         assert cfg.qc.max_step["temp"] == 5.0
         assert cfg.qc.flatline_minutes["temp"] == 180
@@ -130,6 +137,29 @@ class TestErrors:
     def test_missing_required_key(self, tmp_path):
         with pytest.raises(ConfigError, match="missing required key 'db_path'"):
             load_config(write(tmp_path, "[station]\nlatitude=1.0\nlongitude=2.0\n"))
+
+    def test_missing_elevation_rejected(self, tmp_path):
+        text = MINIMAL.replace("elevation_m = 1400.0\n", "")
+        with pytest.raises(ConfigError, match="missing required key 'elevation_m'"):
+            load_config(write(tmp_path, text))
+
+    def test_bad_precip_reset_fraction(self, tmp_path):
+        text = MINIMAL + "\n[dataset]\nprecip_reset_fraction = 1.5\n"
+        with pytest.raises(ConfigError, match="between 0 and 1"):
+            load_config(write(tmp_path, text))
+
+    def test_provider_qc_overrides(self, tmp_path):
+        text = (
+            MINIMAL
+            + "\n[provider_qc]\nenabled = false\nmad_k = 3.0\n"
+            + "[provider_qc.bounds]\npressure_sea_hpa = [900.0, 1050.0]\n"
+        )
+        cfg = load_config(write(tmp_path, text))
+        assert cfg.provider_qc.enabled is False
+        assert cfg.provider_qc.mad_k == 3.0
+        assert cfg.provider_qc.bounds["pressure_sea_hpa"] == (900.0, 1050.0)
+        # defaults for un-overridden variables are preserved
+        assert cfg.provider_qc.bounds["temp_c"] == (-90.0, 60.0)
 
     def test_bad_number(self, tmp_path):
         text = MINIMAL.replace("latitude = 34.28", 'latitude = "north"')

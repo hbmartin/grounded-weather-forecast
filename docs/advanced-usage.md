@@ -285,6 +285,8 @@ report follows. Fewer buckets = more data per bucket but less lead resolution.
 
 ### QC thresholds (`[qc]` in config)
 
+`[qc]` bounds the **station** (truth) channels:
+
 ```toml
 [qc.bounds]
 temp = [-40.0, 55.0]          # metric units, per canonical channel
@@ -293,6 +295,32 @@ temp = 4.0                    # per minute; scales with the actual sample gap
 [qc.flatline_minutes]
 temp = 180                    # a run of identical values this long is a stuck sensor
 ```
+
+### Provider plausibility QC (`[provider_qc]` in config)
+
+`[provider_qc]` bounds the **provider** (forecast) values *before* grounding, so a
+mislabelled or garbage value (a snow depth in a liquid field, a pressure in the
+wrong unit, one provider's daily low far colder than every peer) is nulled and
+simply drops out of the availability mask rather than corrupting the fit. Two
+conservative filters run; both are on by default.
+
+```toml
+[provider_qc]
+enabled = true
+mad_k = 5.0                   # cross-source outlier: null a value that disagrees
+min_sources = 4              #   with peers at the same valid time by > mad_k scaled
+                             #   MADs AND the per-variable floor, once >= min_sources
+                             #   providers are present. Deliberately conservative so
+                             #   genuine provider diversity is preserved.
+[provider_qc.bounds]
+pressure_sea_hpa = [850.0, 1090.0]   # absolute physical bounds, per canonical variable
+[provider_qc.min_deviation]
+pressure_sea_hpa = 20.0              # the absolute floor for the cross-source rule
+```
+
+Skewed/zero-inflated fields (precipitation, PoP, gusts) get absolute bounds only;
+the cross-source rule applies to the roughly-Gaussian state variables listed in
+`cross_source_variables`.
 
 ---
 

@@ -17,7 +17,7 @@ NOW = utc(2026, 3, 22, 17, 0)
 FETCH = "2026-03-22T16:30:00+00:00"
 
 
-def build_fixture(tmp_path, *, obs_temp_f=68.0):
+def build_fixture(tmp_path, *, obs_temp_f=68.0, extra_toml=""):
     """A station with recent obs plus two providers with 48h of hourly data.
 
     The temperature wobbles: a dead-flat series would (correctly) be caught by
@@ -85,7 +85,12 @@ def build_fixture(tmp_path, *, obs_temp_f=68.0):
         tmp_path / "fx.sqlite",
         [{"completed_at": FETCH, "results": results}],
     )
-    config = write_config(tmp_path, min_hour_coverage=0.05, min_day_coverage=0.02)
+    config = write_config(
+        tmp_path,
+        min_hour_coverage=0.05,
+        min_day_coverage=0.02,
+        extra_toml=extra_toml,
+    )
     write_dataset(config)
     return config
 
@@ -93,6 +98,14 @@ def build_fixture(tmp_path, *, obs_temp_f=68.0):
 @pytest.fixture
 def config(tmp_path):
     return build_fixture(tmp_path)
+
+
+@pytest.fixture
+def config_no_provider_qc(tmp_path):
+    # The provider values in the fixture are deliberately out of physical bounds
+    # (humidity 140, wind -2, ...) to exercise the serve-layer clamp; disable the
+    # provider QC that would otherwise (correctly) null them before serving.
+    return build_fixture(tmp_path, extra_toml="[provider_qc]\nenabled = false")
 
 
 class TestSnapshot:
@@ -154,8 +167,8 @@ class TestPredict:
         assert values["temp_min_c"] is not None
         assert values["temp_max_c"] > values["temp_min_c"]
 
-    def test_emitted_values_obey_physical_bounds(self, config):
-        document = predict(config, {}, now=NOW)
+    def test_emitted_values_obey_physical_bounds(self, config_no_provider_qc):
+        document = predict(config_no_provider_qc, {}, now=NOW)
         for point in document.hourly:
             assert point.values["humidity_pct"] == 100.0
             assert point.values["wind_speed_ms"] == 0.0

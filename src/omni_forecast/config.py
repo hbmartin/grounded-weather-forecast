@@ -60,6 +60,52 @@ DEFAULT_QC_FLATLINE_MINUTES: Mapping[str, int] = MappingProxyType(
     {"temp": 180, "pressure_station": 360}
 )
 
+# Absolute physical plausibility bounds for provider (forecast) values, keyed by
+# canonical variable. These catch gross unit/garbage errors (e.g. a snow depth
+# written into a liquid field, a pressure in the wrong unit) before grounding.
+DEFAULT_PROVIDER_QC_BOUNDS: Mapping[str, tuple[float, float]] = MappingProxyType(
+    {
+        "temp_c": (-90.0, 60.0),
+        "temp_max_c": (-90.0, 60.0),
+        "temp_min_c": (-90.0, 60.0),
+        "dew_point_c": (-90.0, 45.0),
+        "humidity_pct": (0.0, 100.0),
+        "wind_speed_ms": (0.0, 120.0),
+        "wind_gust_ms": (0.0, 150.0),
+        "pressure_sea_hpa": (850.0, 1090.0),
+        "precip_mm": (0.0, 500.0),
+        "precip_sum_mm": (0.0, 2000.0),
+        "pop": (0.0, 1.0),
+    }
+)
+
+# Variables where a single provider disagreeing wildly with the others is far more
+# likely an error than genuine diversity (roughly Gaussian, not zero-inflated).
+# Skewed/zero-inflated fields (precip, pop, gusts) are deliberately excluded.
+DEFAULT_PROVIDER_QC_CROSS_SOURCE: tuple[str, ...] = (
+    "temp_c",
+    "temp_max_c",
+    "temp_min_c",
+    "dew_point_c",
+    "humidity_pct",
+    "pressure_sea_hpa",
+)
+
+# Minimum absolute deviation from the cross-source median before a value can be
+# flagged, so tightly-agreeing providers cannot make a merely-different value an
+# outlier. A value is nulled only when it exceeds BOTH k*scaled-MAD and this floor,
+# which keeps the pass conservative and preserves genuine provider diversity.
+DEFAULT_PROVIDER_QC_MIN_DEVIATION: Mapping[str, float] = MappingProxyType(
+    {
+        "temp_c": 8.0,
+        "temp_max_c": 8.0,
+        "temp_min_c": 8.0,
+        "dew_point_c": 8.0,
+        "humidity_pct": 40.0,
+        "pressure_sea_hpa": 20.0,
+    }
+)
+
 
 @dataclass(frozen=True, slots=True)
 class StationConfig:
@@ -89,6 +135,19 @@ class DatasetConfig:
     min_hour_coverage: float
     min_day_coverage: float
     pop_threshold_mm: float
+    precip_reset_fraction: float
+
+
+@dataclass(frozen=True, slots=True)
+class ProviderQcConfig:
+    """Plausibility QC applied to provider (forecast) values before grounding."""
+
+    enabled: bool
+    bounds: Mapping[str, tuple[float, float]]
+    cross_source_variables: tuple[str, ...]
+    mad_k: float
+    min_sources: int
+    min_deviation: Mapping[str, float]
 
 
 @dataclass(frozen=True, slots=True)
@@ -125,6 +184,7 @@ class Config:
     forecasts: ForecastsConfig
     dataset: DatasetConfig
     qc: QcConfig
+    provider_qc: ProviderQcConfig
     backfill: BackfillConfig
     backtest: BacktestConfig
     predict: PredictConfig
@@ -237,7 +297,7 @@ def _station(raw: Mapping[str, Any]) -> StationConfig:
         latitude=latitude,
         longitude=longitude,
         elevation_m=_finite_number(
-            section.get("elevation_m", 0.0), "elevation_m", "station"
+            _require(section, "elevation_m", "station"), "elevation_m", "station"
         ),
         immutable=bool(section.get("immutable", False)),
         columns=MappingProxyType(columns),
@@ -278,10 +338,15 @@ def _dataset(raw: Mapping[str, Any]) -> DatasetConfig:
         pop_threshold_mm=_positive_number(
             section.get("pop_threshold_mm", 0.254), "pop_threshold_mm", "dataset"
         ),
+        precip_reset_fraction=_fraction(
+            section.get("precip_reset_fraction", 0.5),
+            "precip_reset_fraction",
+            "dataset",
+        ),
     )
 
 
-def _bounds_map(value: Any) -> dict[str, tuple[float, float]]:
+def _bounds_map(value: Any, section: str = "qc") -> dict[str, tuple[float, float]]:
     match value:
         case dict() as mapping:
             result: dict[str, tuple[float, float]] = {}
@@ -305,7 +370,7 @@ def _bounds_map(value: Any) -> dict[str, tuple[float, float]]:
                         raise ConfigError(msg)
             return result
         case _:
-            msg = "'bounds' in [qc] must be a table"
+            msg = f"'bounds' in [{section}] must be a table"
             raise ConfigError(msg)
 
 
@@ -326,6 +391,46 @@ def _qc(raw: Mapping[str, Any]) -> QcConfig:
         bounds=MappingProxyType(bounds),
         max_step=MappingProxyType(max_step),
         flatline_minutes=MappingProxyType(flatline),
+    )
+
+
+def _deviation_map(value: Any) -> dict[str, float]:
+    match value:
+        case dict() as mapping:
+            return {
+                str(key): _positive_number(v, str(key), "provider_qc.min_deviation")
+                for key, v in mapping.items()
+            }
+        case _:
+            msg = "'min_deviation' in [provider_qc] must be a table"
+            raise ConfigError(msg)
+
+
+def _provider_qc(raw: Mapping[str, Any]) -> ProviderQcConfig:
+    section = _section(raw, "provider_qc") if "provider_qc" in raw else {}
+    bounds = dict(DEFAULT_PROVIDER_QC_BOUNDS) | _bounds_map(
+        section.get("bounds", {}), "provider_qc"
+    )
+    min_deviation = dict(DEFAULT_PROVIDER_QC_MIN_DEVIATION) | _deviation_map(
+        section.get("min_deviation", {})
+    )
+    cross_source = section.get(
+        "cross_source_variables", list(DEFAULT_PROVIDER_QC_CROSS_SOURCE)
+    )
+    if not isinstance(cross_source, list) or not all(
+        isinstance(v, str) for v in cross_source
+    ):
+        msg = "'cross_source_variables' in [provider_qc] must be a list of strings"
+        raise ConfigError(msg)
+    return ProviderQcConfig(
+        enabled=bool(section.get("enabled", True)),
+        bounds=MappingProxyType(bounds),
+        cross_source_variables=tuple(cross_source),
+        mad_k=_positive_number(section.get("mad_k", 5.0), "mad_k", "provider_qc"),
+        min_sources=_positive_int(
+            section.get("min_sources", 4), "min_sources", "provider_qc"
+        ),
+        min_deviation=MappingProxyType(min_deviation),
     )
 
 
@@ -404,6 +509,7 @@ def load_config(path: Path) -> Config:
         forecasts=_forecasts(raw, station),
         dataset=dataset,
         qc=_qc(raw),
+        provider_qc=_provider_qc(raw),
         backfill=_backfill(raw),
         backtest=_backtest(raw),
         predict=_predict(raw, dataset.dir),

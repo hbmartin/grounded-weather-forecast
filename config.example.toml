@@ -41,6 +41,26 @@ dir = "data"
 min_hour_coverage = 0.8
 min_day_coverage = 0.8
 pop_threshold_mm = 0.254
+# A rain-counter drop below this fraction of the prior value is a genuine reset
+# (the new value is the accumulation since it); a smaller dip is sensor noise and
+# adds no rain. Prevents a one-count jitter from inventing a full phantom event.
+precip_reset_fraction = 0.5
+
+# Plausibility QC on provider (forecast) values, applied before grounding. An
+# implausible value is nulled (it then simply drops out of the availability mask).
+[provider_qc]
+enabled = true
+# Robust cross-source outlier flagging: null a value that disagrees with the other
+# providers at the same valid time by more than mad_k scaled MADs AND the per-variable
+# min_deviation floor, but only once at least min_sources providers are present.
+mad_k = 5.0
+min_sources = 4
+# Absolute physical bounds per canonical variable (defaults cover every variable);
+# override here, e.g.:
+# [provider_qc.bounds]
+# pressure_sea_hpa = [850.0, 1090.0]
+# [provider_qc.min_deviation]
+# pressure_sea_hpa = 20.0
 
 [qc]
 # Metric units. Defaults exist for the standard channels; override here.

@@ -21,6 +21,7 @@ def qc_config(tmp_path):
 db_path = "x.db"
 latitude = 0.0
 longitude = 0.0
+elevation_m = 0.0
 [forecasts]
 db_path = "y.sqlite"
 """,

@@ -132,6 +132,40 @@ class TestTruthHourlyPrecip:
         row = hourly.filter(pl.col("valid_hour") == NOON).row(0, named=True)
         assert row["t__precip_mm"] == pytest.approx(0.5)
 
+    def test_counter_noise_dip_no_phantom_rain(self, tmp_path):
+        config = hourly_config(tmp_path, min_hour_coverage=0.4)
+        ts = minute_series(NOON, 40)
+        # A small sensor jitter (10.0 -> 9.8) is NOT a reset. The old rule treated
+        # every decrease as a reset and turned this into 9.8 mm of phantom rain.
+        counter = [10.0] * 20 + [9.8] * 20
+        minute = canonical_minute_frame(ts, rain_counter_mm=counter)
+        hourly = truth_hourly(minute, config)
+        row = hourly.filter(pl.col("valid_hour") == NOON).row(0, named=True)
+        assert row["t__precip_mm"] == pytest.approx(0.0)
+
+    def test_counter_dip_and_rebound_adds_no_phantom_rain(self, tmp_path):
+        config = hourly_config(tmp_path, min_hour_coverage=0.4)
+        ts = minute_series(NOON, 40)
+        # A dip and rebound (10.0 -> 9.8 -> 10.0) must credit no rain: the running
+        # max within the epoch never exceeds 10.0. A fraction-only rule would have
+        # credited 0.2 mm on the rebound.
+        counter = [10.0] * 10 + [9.8] * 10 + [10.0] * 20
+        minute = canonical_minute_frame(ts, rain_counter_mm=counter)
+        hourly = truth_hourly(minute, config)
+        row = hourly.filter(pl.col("valid_hour") == NOON).row(0, named=True)
+        assert row["t__precip_mm"] == pytest.approx(0.0)
+
+    def test_counter_reset_then_reaccumulate(self, tmp_path):
+        config = hourly_config(tmp_path, min_hour_coverage=0.4)
+        ts = minute_series(NOON, 40)
+        # A genuine reset (10.0 -> 0.3, a >50% drop) still counts its new value as
+        # the accumulation since the reset.
+        counter = [10.0] * 20 + [0.3] * 20
+        minute = canonical_minute_frame(ts, rain_counter_mm=counter)
+        hourly = truth_hourly(minute, config)
+        row = hourly.filter(pl.col("valid_hour") == NOON).row(0, named=True)
+        assert row["t__precip_mm"] == pytest.approx(0.3)
+
     def test_dry_hour_pop_zero(self, tmp_path):
         config = hourly_config(tmp_path, min_hour_coverage=0.4)
         ts = minute_series(NOON, 40)

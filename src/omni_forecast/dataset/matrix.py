@@ -34,6 +34,7 @@ from omni_forecast.contracts import (
     parse_fx_col,
     truth_col,
 )
+from omni_forecast.dataset.provider_qc import apply_provider_qc
 from omni_forecast.dataset.providers import (
     DAILY_COLUMN_MAP,
     HOURLY_COLUMN_MAP,
@@ -102,8 +103,14 @@ def build_hourly_matrix(
 ) -> pl.DataFrame:
     """One row per (issue snapshot, valid hour), sources wide, truth joined."""
     kind = assert_single_kind(hourly_long)
-    snap = snapshot_long(
-        hourly_long, snapshots, config.forecasts.max_forecast_age_hours
+    # Provider QC runs AFTER the as-of snapshot join, grouped per snapshot, so the
+    # cross-source outlier test never compares different historical vintages of the
+    # same valid time (which would flag a genuine, freshly-forecast weather shift).
+    snap = apply_provider_qc(
+        snapshot_long(hourly_long, snapshots, config.forecasts.max_forecast_age_hours),
+        config,
+        value_columns=HOURLY_MATRIX_VARIABLES,
+        group_key=["issue_time", "valid_time"],
     ).with_columns(
         (
             (pl.col("valid_time") - pl.col("issue_time")).dt.total_seconds()
@@ -261,7 +268,12 @@ def build_daily_matrix(
 ) -> pl.DataFrame:
     """One row per (issue snapshot, target local date)."""
     kind = assert_single_kind(daily_long)
-    snap = snapshot_long(daily_long, snapshots, config.forecasts.max_forecast_age_hours)
+    snap = apply_provider_qc(
+        snapshot_long(daily_long, snapshots, config.forecasts.max_forecast_age_hours),
+        config,
+        value_columns=DAILY_MATRIX_VARIABLES,
+        group_key=["issue_time", "forecast_date"],
+    )
     if snap.is_empty():
         return pl.DataFrame(
             schema={

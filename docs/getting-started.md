@@ -70,7 +70,8 @@ timezone = "America/Los_Angeles"  # YOUR local timezone. "Today's high" means
                                   # the max over the LOCAL calendar day.
 latitude  = 34.2768
 longitude = -117.1692
-elevation_m = 1400.0              # needed to reduce pressure to sea level
+elevation_m = 1400.0              # REQUIRED: reduces pressure to sea level and
+                                  # anchors the solar-geometry features
 immutable = true                  # true = a static snapshot file
                                   # false = a live database another process writes
 ```
@@ -120,6 +121,8 @@ max_forecast_age_hours = 12.0   # a forecast older than this is not used
 ```toml
 [dataset]
 dir = "data"                    # where parquet outputs go (git-ignored)
+precip_reset_fraction = 0.5     # a rain-counter drop below this fraction of the
+                                # prior value is a real reset; a smaller dip is noise
 
 [reports]
 dir = "reports"                 # where markdown leaderboards go
@@ -128,8 +131,8 @@ dir = "reports"                 # where markdown leaderboards go
 dir = "artifacts"               # alignment studies and promoted releases
 ```
 
-Defaults are sensible for `[qc]`, `[backtest]` and `[predict]` — you can ignore
-them until you read [Advanced usage](advanced-usage.md).
+Defaults are sensible for `[qc]`, `[provider_qc]`, `[backtest]` and `[predict]` —
+you can ignore them until you read [Advanced usage](advanced-usage.md).
 
 ---
 
