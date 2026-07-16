@@ -3,7 +3,7 @@ from pathlib import Path
 
 import pytest
 
-from omni_forecast.config import ConfigError, load_config
+from grounded_weather_forecast.config import ConfigError, load_config
 
 MINIMAL = """
 [station]

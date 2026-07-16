@@ -48,7 +48,7 @@ jobs:
         run: uvx --from twine==6.2.0 twine check dist/*
 
       - name: Smoke-test the built wheel
-        run: uv run --isolated --no-project --with dist/*.whl omni-forecast --version
+        run: uv run --isolated --no-project --with dist/*.whl grounded-weather-forecast --version
 
       - name: Store distributions
         uses: actions/upload-artifact@330a01c490aca151604b8cf639adc76d48f6c5d4 # v5.0.0
@@ -64,7 +64,7 @@ jobs:
     runs-on: ubuntu-latest
     environment:
       name: testpypi
-      url: https://test.pypi.org/p/omni-forecast
+      url: https://test.pypi.org/p/grounded-weather-forecast
     permissions:
       id-token: write
 
@@ -87,7 +87,7 @@ jobs:
     runs-on: ubuntu-latest
     environment:
       name: pypi
-      url: https://pypi.org/p/omni-forecast
+      url: https://pypi.org/p/grounded-weather-forecast
     permissions:
       id-token: write
 

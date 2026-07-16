@@ -4,8 +4,12 @@ import polars as pl
 import pytest
 from conftest import canonical_minute_frame, minute_series, utc, write_config
 
-from omni_forecast.dataset.qc import apply_qc
-from omni_forecast.dataset.truth import truth_daily, truth_hourly, truth_minute
+from grounded_weather_forecast.dataset.qc import apply_qc
+from grounded_weather_forecast.dataset.truth import (
+    truth_daily,
+    truth_hourly,
+    truth_minute,
+)
 
 NOON = utc(2026, 7, 13, 12, 0)
 

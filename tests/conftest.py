@@ -5,9 +5,9 @@ import numpy as np
 import polars as pl
 import pytest
 
-from omni_forecast.config import load_config
-from omni_forecast.leads import hourly_bucket
-from omni_forecast.timeutil import utc
+from grounded_weather_forecast.config import load_config
+from grounded_weather_forecast.leads import hourly_bucket
+from grounded_weather_forecast.timeutil import utc
 
 STATION_DB_COLUMNS = (
     "outTemp",

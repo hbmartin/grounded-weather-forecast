@@ -5,12 +5,12 @@ import polars as pl
 import pytest
 from conftest import synthetic_hourly_matrix
 
-from omni_forecast.blenders import get_factory
-from omni_forecast.blenders.experts import OnlineExperts
-from omni_forecast.blenders.grounding import AffineGrounding
-from omni_forecast.contracts import hourly_variable
-from omni_forecast.dataset.matrix import to_supervised_slice
-from omni_forecast.metrics.deterministic import mae
+from grounded_weather_forecast.blenders import get_factory
+from grounded_weather_forecast.blenders.experts import OnlineExperts
+from grounded_weather_forecast.blenders.grounding import AffineGrounding
+from grounded_weather_forecast.contracts import hourly_variable
+from grounded_weather_forecast.dataset.matrix import to_supervised_slice
+from grounded_weather_forecast.metrics.deterministic import mae
 
 TEMP = hourly_variable("temp_c")
 SCHEMES = ("ewa", "boa")

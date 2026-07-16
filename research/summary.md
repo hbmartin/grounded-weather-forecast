@@ -52,7 +52,7 @@ The tensions worth internalizing:
 Since you expect to implement several approaches in parallel, the thing to freeze first is the *contract*, not any method:
 
 ```
-omni-forecast/
+grounded-weather-forecast/
   src/omni-forecase/
     dataset/     # ATTACH both sqlite DBs; unit conversion (station→metric);
                  # truth QC; truth aggregation; per-provider timestamp-semantics

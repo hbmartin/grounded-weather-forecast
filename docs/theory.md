@@ -1,6 +1,6 @@
 # Theory and concepts
 
-This page explains *what* omni-forecast computes and *why* those choices are the
+This page explains *what* grounded-weather-forecast computes and *why* those choices are the
 right ones for this problem. It assumes you are comfortable with regression and
 basic time-series ideas, but not that you know meteorological post-processing.
 

@@ -11,7 +11,7 @@ from conftest import (
     write_config,
 )
 
-from omni_forecast.contracts import (
+from grounded_weather_forecast.contracts import (
     MixedProvenanceError,
     Product,
     SourceKind,
@@ -19,7 +19,7 @@ from omni_forecast.contracts import (
     daily_variable,
     hourly_variable,
 )
-from omni_forecast.dataset.matrix import (
+from grounded_weather_forecast.dataset.matrix import (
     _equal_weight_daily_aggregates,
     assert_single_kind,
     build_daily_matrix,
@@ -30,13 +30,13 @@ from omni_forecast.dataset.matrix import (
     to_supervised_slice,
     write_dataset,
 )
-from omni_forecast.dataset.providers import (
+from grounded_weather_forecast.dataset.providers import (
     read_daily_long,
     read_hourly_long,
     read_run_completions,
 )
-from omni_forecast.dataset.snapshots import snapshot_times
-from omni_forecast.dataset.truth import truth_daily, truth_hourly
+from grounded_weather_forecast.dataset.snapshots import snapshot_times
+from grounded_weather_forecast.dataset.truth import truth_daily, truth_hourly
 
 FETCH = "2026-03-22T11:30:00+00:00"
 ISSUE = utc(2026, 3, 22, 12, 0, 30)

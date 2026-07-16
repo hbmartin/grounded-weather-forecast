@@ -4,14 +4,14 @@ from datetime import timedelta
 import pytest
 from conftest import make_forecast_db, make_station_db, minute_series, utc, write_config
 
-from omni_forecast.cli import main
-from omni_forecast.dataset.matrix import write_dataset
-from omni_forecast.serve.predict import (
+from grounded_weather_forecast.cli import main
+from grounded_weather_forecast.dataset.matrix import write_dataset
+from grounded_weather_forecast.serve.predict import (
     NoForecastDataError,
     build_snapshot,
     predict,
 )
-from omni_forecast.serve.schema import SCHEMA_VERSION
+from grounded_weather_forecast.serve.schema import SCHEMA_VERSION
 
 NOW = utc(2026, 3, 22, 17, 0)
 FETCH = "2026-03-22T16:30:00+00:00"

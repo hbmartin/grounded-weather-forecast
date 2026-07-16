@@ -3,8 +3,8 @@ import sqlite3
 import pytest
 from conftest import make_station_db, write_config
 
-from omni_forecast.dataset.station import read_observations, sqlite_uri
-from omni_forecast.timeutil import utc
+from grounded_weather_forecast.dataset.station import read_observations, sqlite_uri
+from grounded_weather_forecast.timeutil import utc
 
 
 @pytest.fixture

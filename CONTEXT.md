@@ -1,4 +1,4 @@
-# omni-forecast
+# grounded-weather-forecast
 
 Blends multiple providers' weather forecasts into station-grounded minutely/hourly/daily
 forecasts for a single personal weather station, with a backtest leaderboard as the sole
@@ -19,7 +19,7 @@ archive snapshot. This anchors dataset snapshots.
 _Avoid_: fetched at
 
 **Forecast issued at**:
-The instant omni-forecast emits a product. Training evidence, observations, provider
+The instant grounded-weather-forecast emits a product. Training evidence, observations, provider
 rows, and promoted releases must all have been available by this instant.
 _Avoid_: fetch time, run time
 

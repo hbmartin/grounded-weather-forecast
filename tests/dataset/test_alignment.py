@@ -2,7 +2,7 @@ import numpy as np
 import polars as pl
 from conftest import synthetic_hourly_matrix, utc
 
-from omni_forecast.dataset.alignment import (
+from grounded_weather_forecast.dataset.alignment import (
     alignment_study,
     load_recommended,
     recommended_semantics,

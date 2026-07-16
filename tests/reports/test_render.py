@@ -1,6 +1,6 @@
 import polars as pl
 
-from omni_forecast.reports.render import (
+from grounded_weather_forecast.reports.render import (
     frame_to_markdown,
     print_summary,
     write_markdown_report,

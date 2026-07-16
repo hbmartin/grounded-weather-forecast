@@ -1,9 +1,9 @@
 [project]
-site_name = "omni-forecast"
+site_name = "grounded-weather-forecast"
 site_description = "Station-grounded blending of multi-provider weather forecasts: bias correction, anchoring, and blending judged by a backtest leaderboard."
-site_url = "https://hbmartin.github.io/omni-forecast/"
-repo_url = "https://github.com/hbmartin/omni-forecast"
-repo_name = "hbmartin/omni-forecast"
+site_url = "https://hbmartin.github.io/grounded-weather-forecast/"
+repo_url = "https://github.com/hbmartin/grounded-weather-forecast"
+repo_name = "hbmartin/grounded-weather-forecast"
 
 nav = [
   { "Home" = "index.md" },

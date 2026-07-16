@@ -3,7 +3,7 @@ import math
 import polars as pl
 import pytest
 
-from omni_forecast.units import (
+from grounded_weather_forecast.units import (
     convert_expr,
     dew_point_c,
     dew_point_expr,

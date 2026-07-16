@@ -5,7 +5,7 @@ import polars as pl
 from hypothesis import given
 from hypothesis import strategies as st
 
-from omni_forecast.leads import (
+from grounded_weather_forecast.leads import (
     DAILY_BUCKET_LABELS,
     HOURLY_BUCKET_LABELS,
     HOURLY_BUCKETS,

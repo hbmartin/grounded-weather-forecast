@@ -2,7 +2,7 @@ import numpy as np
 import polars as pl
 import pytest
 
-from omni_forecast.contracts import (
+from grounded_weather_forecast.contracts import (
     BlendResult,
     ContractViolationError,
     ForecastMatrix,

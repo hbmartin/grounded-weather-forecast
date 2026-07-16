@@ -1,8 +1,8 @@
 import polars as pl
 from conftest import minute_series, utc
 
-from omni_forecast.config import load_config
-from omni_forecast.dataset.qc import (
+from grounded_weather_forecast.config import load_config
+from grounded_weather_forecast.dataset.qc import (
     QC_FLATLINE,
     QC_OUT_OF_BOUNDS,
     QC_SPIKE,

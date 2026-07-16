@@ -6,7 +6,7 @@ from conftest import utc, write_config
 from hypothesis import given, settings
 from hypothesis import strategies as st
 
-from omni_forecast.backtest.splits import (
+from grounded_weather_forecast.backtest.splits import (
     daily_truth_known_at,
     fold_plans,
     hourly_truth_known_at,

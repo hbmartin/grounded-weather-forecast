@@ -1,5 +1,5 @@
 [project]
-name = "omni-forecast"
+name = "grounded-weather-forecast"
 version = "0.1.0"
 description = "Station-grounded blending of multi-provider weather forecasts: bias correction, anchoring, and blending judged by a backtest leaderboard."
 readme = "README.md"
@@ -44,13 +44,13 @@ keywords = [
 ]
 
 [project.scripts]
-omni-forecast = "omni_forecast.cli:main"
+grounded-weather-forecast = "grounded_weather_forecast.cli:main"
 
 [project.urls]
-Homepage = "https://github.com/hbmartin/omni-forecast"
-Documentation = "https://hbmartin.github.io/omni-forecast/"
-Repository = "https://github.com/hbmartin/omni-forecast"
-Issues = "https://github.com/hbmartin/omni-forecast/issues"
+Homepage = "https://github.com/hbmartin/grounded-weather-forecast"
+Documentation = "https://hbmartin.github.io/grounded-weather-forecast/"
+Repository = "https://github.com/hbmartin/grounded-weather-forecast"
+Issues = "https://github.com/hbmartin/grounded-weather-forecast/issues"
 
 [build-system]
 requires = ["uv_build>=0.10.9,<0.11.0"]

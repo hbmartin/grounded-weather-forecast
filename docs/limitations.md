@@ -45,7 +45,7 @@ database contains 76,507 samples spanning 2025-06-14 → 2026-07-13, but:
 - Only ~1,700 of ~9,400 calendar hours (~18%) have an instantaneous truth value.
 - Pressure is missing for ~32% of samples; other channels ~4%.
 
-This is not a bug in omni-forecast — it is what the station recorded — but it has
+This is not a bug in grounded-weather-forecast — it is what the station recorded — but it has
 teeth. It means the **expanding** training window is seasonally unrepresentative
 (all-summer training, spring testing), which is precisely the condition that
 broke grounding (§4.1). It also means the **rolling** window is often *empty*

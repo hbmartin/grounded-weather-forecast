@@ -32,19 +32,19 @@ containing the forecasts that a set of weather APIs published for your location,
 ## Install
 
 ```bash
-uv tool install omni-forecast
+uv tool install grounded-weather-forecast
 ```
 
 `uv` creates an isolated environment and exposes the command on your path. Check
 it worked:
 
 ```bash
-omni-forecast --version
-omni-forecast --help
+grounded-weather-forecast --version
+grounded-weather-forecast --help
 ```
 
 To contribute to the project instead, clone the
-[source repository](https://github.com/hbmartin/omni-forecast) and run
+[source repository](https://github.com/hbmartin/grounded-weather-forecast) and run
 `uv sync --dev`.
 
 ---
@@ -54,7 +54,7 @@ To contribute to the project instead, clone the
 Download the example config and edit it:
 
 ```bash
-curl -L https://raw.githubusercontent.com/hbmartin/omni-forecast/main/config.example.toml \
+curl -L https://raw.githubusercontent.com/hbmartin/grounded-weather-forecast/main/config.example.toml \
   -o config.toml
 ```
 
@@ -141,7 +141,7 @@ you can ignore them until you read [Advanced usage](advanced-usage.md).
 ### 1. Check your truth
 
 ```bash
-omni-forecast qc
+grounded-weather-forecast qc
 ```
 
 This is the most important command to run first, and the one people skip. It
@@ -178,7 +178,7 @@ conclusions from anything downstream.
 ### 2. Build the dataset
 
 ```bash
-omni-forecast build-dataset
+grounded-weather-forecast build-dataset
 ```
 
 This reads both databases and writes parquet files into `data/`: the QC'd truth
@@ -202,7 +202,7 @@ that number is small, your archive is young — see below.
 ### 3. Get a forecast
 
 ```bash
-omni-forecast predict
+grounded-weather-forecast predict
 ```
 
 This prints a JSON document with all three products. Trimmed:
@@ -249,7 +249,7 @@ This prints a JSON document with all three products. Trimmed:
 Write it to a file instead of stdout:
 
 ```bash
-omni-forecast predict --out forecast.json
+grounded-weather-forecast predict --out forecast.json
 ```
 
 ---
@@ -267,7 +267,7 @@ was served then, reconstruct one using only data/evidence available by that
 instant (handy for testing):
 
 ```bash
-omni-forecast predict --now 2026-03-22T17:00:00
+grounded-weather-forecast predict --now 2026-03-22T17:00:00
 ```
 
 ### `no rolling-origin folds. The archive spans 0.0 days ...`
@@ -291,8 +291,8 @@ one-day-old archive, there is nothing to do.
 Once you have an archive (real or backfilled) with some history:
 
 ```bash
-omni-forecast backtest --source live      # or --source synthetic
-omni-forecast report
+grounded-weather-forecast backtest --source live      # or --source synthetic
+grounded-weather-forecast report
 ```
 
 `report` writes markdown into `reports/` and prints the winners:
@@ -322,7 +322,7 @@ what actually happened.
 
 ## 5. Start the cron (do this today)
 
-This is the highest-value thing you can do, and it is not part of omni-forecast —
+This is the highest-value thing you can do, and it is not part of grounded-weather-forecast —
 it belongs to the upstream `omni-weather-forecast-apis` project. Something like:
 
 ```cron

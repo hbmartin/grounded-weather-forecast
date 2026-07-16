@@ -3,7 +3,7 @@ import sqlite3
 import pytest
 from conftest import make_forecast_db, utc, write_config
 
-from omni_forecast.dataset.providers import (
+from grounded_weather_forecast.dataset.providers import (
     read_forecast_archive,
     read_daily_long,
     read_hourly_long,

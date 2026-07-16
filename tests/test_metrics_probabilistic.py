@@ -1,7 +1,7 @@
 import numpy as np
 import pytest
 
-from omni_forecast.metrics.probabilistic import (
+from grounded_weather_forecast.metrics.probabilistic import (
     brier,
     crps_ensemble,
     crps_from_quantiles,

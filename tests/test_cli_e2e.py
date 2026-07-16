@@ -6,7 +6,7 @@ from datetime import timedelta
 import pytest
 from conftest import make_forecast_db, make_station_db, utc, write_config
 
-from omni_forecast.cli import main
+from grounded_weather_forecast.cli import main
 
 DAYS = 15
 START = utc(2026, 2, 1)

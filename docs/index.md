@@ -1,8 +1,8 @@
-# omni-forecast
+# grounded-weather-forecast
 
 Station-grounded blending of multi-provider weather forecasts.
 
-omni-forecast turns two SQLite files — a personal weather station's minute-level
+grounded-weather-forecast turns two SQLite files — a personal weather station's minute-level
 observation log ([ambientweather2sqlite](https://github.com/hbmartin/ambientweather2sqlite))
 and a multi-provider forecast archive
 ([omni-weather-forecast-apis](https://github.com/hbmartin/omni-weather-forecast-apis)) —

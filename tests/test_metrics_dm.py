@@ -1,7 +1,7 @@
 import numpy as np
 import pytest
 
-from omni_forecast.metrics.dm import diebold_mariano
+from grounded_weather_forecast.metrics.dm import diebold_mariano
 
 
 class TestDieboldMariano:

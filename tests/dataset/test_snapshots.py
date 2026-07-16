@@ -1,7 +1,7 @@
 import polars as pl
 from conftest import utc
 
-from omni_forecast.dataset.snapshots import (
+from grounded_weather_forecast.dataset.snapshots import (
     as_of_selection,
     snapshot_long,
     snapshot_times,

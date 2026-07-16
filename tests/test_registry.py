@@ -1,14 +1,14 @@
 import numpy as np
 import pytest
 
-from omni_forecast.blenders import (
+from grounded_weather_forecast.blenders import (
     UnknownMethodError,
     available_methods,
     get_factory,
     register,
 )
-from omni_forecast.blenders.registry import supports_product
-from omni_forecast.contracts import BlendResult, Product, hourly_variable
+from grounded_weather_forecast.blenders.registry import supports_product
+from grounded_weather_forecast.contracts import BlendResult, Product, hourly_variable
 
 
 class FakeBlender:

@@ -8,15 +8,23 @@ import pytest
 
 from conftest import utc
 
-from omni_forecast.reports.verification import compare_to_backtest, verify_history
-from omni_forecast.serve.history import (
+from grounded_weather_forecast.reports.verification import (
+    compare_to_backtest,
+    verify_history,
+)
+from grounded_weather_forecast.serve.history import (
     HISTORY_SCHEMA,
     append_history,
     forecast_to_rows,
     load_archived_forecast,
     load_history,
 )
-from omni_forecast.serve.schema import DailyPoint, Forecast, HourlyPoint, MinutelyPoint
+from grounded_weather_forecast.serve.schema import (
+    DailyPoint,
+    Forecast,
+    HourlyPoint,
+    MinutelyPoint,
+)
 
 ISSUED = utc(2026, 3, 22, 17, 0)
 

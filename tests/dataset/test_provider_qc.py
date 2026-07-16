@@ -1,7 +1,7 @@
 import polars as pl
 from conftest import utc, write_config
 
-from omni_forecast.dataset.provider_qc import apply_provider_qc
+from grounded_weather_forecast.dataset.provider_qc import apply_provider_qc
 
 VALID = utc(2026, 7, 13, 12, 0)
 

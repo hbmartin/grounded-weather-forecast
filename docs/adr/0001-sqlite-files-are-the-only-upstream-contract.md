@@ -1,6 +1,6 @@
 # SQLite files are the only upstream contract
 
-omni-forecast consumes two SQLite databases — the aw2sqlite `observations` file and the
+grounded-weather-forecast consumes two SQLite databases — the aw2sqlite `observations` file and the
 omni-weather-forecast-apis archive — as its entire interface to the upstream projects. We
 deliberately do not import either upstream Python package and there is no fetch-fresh path
 in `predict`; fresh data arrives only via the upstream cron. This keeps the harness

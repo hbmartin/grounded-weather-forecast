@@ -1,6 +1,6 @@
 # Architecture
 
-This page describes how omni-forecast is built: the layers, the contracts
+This page describes how grounded-weather-forecast is built: the layers, the contracts
 between them, the storage formats, the libraries, and the tooling gates. It is
 written for someone who is about to change the code.
 

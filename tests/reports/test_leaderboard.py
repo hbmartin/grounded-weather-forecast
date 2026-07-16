@@ -2,9 +2,9 @@ import polars as pl
 import pytest
 from conftest import synthetic_hourly_matrix, write_config
 
-from omni_forecast.backtest.engine import BacktestRequest, run_backtest
-from omni_forecast.contracts import hourly_variable
-from omni_forecast.reports.leaderboard import (
+from grounded_weather_forecast.backtest.engine import BacktestRequest, run_backtest
+from grounded_weather_forecast.contracts import hourly_variable
+from grounded_weather_forecast.reports.leaderboard import (
     aggregate_leaderboard,
     leaderboard,
     slice_winners,
@@ -70,7 +70,7 @@ class TestLeaderboard:
         assert keys.unique().height == winners.height
 
     def test_empty_scores(self):
-        from omni_forecast.backtest.scores import empty_scores
+        from grounded_weather_forecast.backtest.scores import empty_scores
 
         assert leaderboard(empty_scores()).is_empty()
 

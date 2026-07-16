@@ -3,10 +3,10 @@ from datetime import UTC, datetime, timedelta
 import polars as pl
 from conftest import synthetic_hourly_matrix, utc, write_config
 
-from omni_forecast.backtest.engine import BacktestRequest, run_backtest
-from omni_forecast.backtest.scores import scores_path, write_scores
-from omni_forecast.contracts import hourly_variable
-from omni_forecast.serve.selection import (
+from grounded_weather_forecast.backtest.engine import BacktestRequest, run_backtest
+from grounded_weather_forecast.backtest.scores import scores_path, write_scores
+from grounded_weather_forecast.contracts import hourly_variable
+from grounded_weather_forecast.serve.selection import (
     FALLBACK_METHOD,
     Selection,
     method_for,

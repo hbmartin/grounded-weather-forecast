@@ -2,7 +2,7 @@ import sqlite3
 
 from conftest import make_station_db, write_config
 
-from omni_forecast.cli import main
+from grounded_weather_forecast.cli import main
 
 
 class TestQcCommand:

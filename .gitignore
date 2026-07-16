@@ -152,7 +152,7 @@ config.toml
 raw/
 *.jsonl.gz
 
-# omni-forecast generated outputs (paths configurable in config.toml)
+# grounded-weather-forecast generated outputs (paths configurable in config.toml)
 /data/
 /reports/
 /artifacts/

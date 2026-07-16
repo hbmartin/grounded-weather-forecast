@@ -3,13 +3,13 @@ import polars as pl
 import pytest
 from conftest import synthetic_hourly_matrix
 
-from omni_forecast.blenders import available_methods, get_factory
-from omni_forecast.blenders.protocol import (
+from grounded_weather_forecast.blenders import available_methods, get_factory
+from grounded_weather_forecast.blenders.protocol import (
     finalize_point,
     masked_average,
     renormalize_weights,
 )
-from omni_forecast.contracts import (
+from grounded_weather_forecast.contracts import (
     ForecastMatrix,
     SourceKind,
     SupervisedSlice,
@@ -17,7 +17,7 @@ from omni_forecast.contracts import (
     VariableSpec,
     hourly_variable,
 )
-from omni_forecast.dataset.matrix import to_supervised_slice
+from grounded_weather_forecast.dataset.matrix import to_supervised_slice
 
 TEMP = hourly_variable("temp_c")
 

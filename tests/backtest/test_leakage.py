@@ -12,10 +12,10 @@ import polars as pl
 import pytest
 from conftest import synthetic_hourly_matrix, write_config
 
-from omni_forecast.backtest.engine import BacktestRequest, run_backtest
-from omni_forecast.backtest.splits import fold_plans, hourly_truth_known_at
-from omni_forecast.blenders import get_factory
-from omni_forecast.contracts import MixedProvenanceError, hourly_variable
+from grounded_weather_forecast.backtest.engine import BacktestRequest, run_backtest
+from grounded_weather_forecast.backtest.splits import fold_plans, hourly_truth_known_at
+from grounded_weather_forecast.blenders import get_factory
+from grounded_weather_forecast.contracts import MixedProvenanceError, hourly_variable
 
 REQUEST = BacktestRequest(
     variables=(hourly_variable("temp_c"),),

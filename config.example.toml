@@ -1,4 +1,4 @@
-# omni-forecast configuration. Copy to config.toml (gitignored) and edit paths.
+# grounded-weather-forecast configuration. Copy to config.toml (gitignored) and edit paths.
 
 [station]
 db_path = "aw2sqlite.db"

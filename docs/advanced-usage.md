@@ -21,7 +21,7 @@ start_date = 2025-06-15         # no earlier than your station truth begins
 ```
 
 ```bash
-omni-forecast backfill --end 2026-07-12
+grounded-weather-forecast backfill --end 2026-07-12
 # backfilled 198072 forecast points
 # sources: open_meteo_ecmwf_ifs025, open_meteo_gfs_seamless, open_meteo_icon_seamless
 # synthetic matrix: 66024 rows -> data/hourly_matrix_synthetic.parquet
@@ -30,8 +30,8 @@ omni-forecast backfill --end 2026-07-12
 Then backtest against it exactly as you would against live data:
 
 ```bash
-omni-forecast backtest --source synthetic --products hourly,daily
-omni-forecast report
+grounded-weather-forecast backtest --source synthetic --products hourly,daily
+grounded-weather-forecast report
 ```
 
 ### What backfilled data is good for — and what it is not
@@ -62,7 +62,7 @@ yesterday).
 ## Driving the backtest
 
 ```bash
-omni-forecast backtest \
+grounded-weather-forecast backtest \
     --source live|synthetic \
     --products hourly,daily \
     --methods all \
@@ -97,7 +97,7 @@ Whether a provider's "14:00 temperature" means *at* 14:00 or the *mean over*
 of fake bias.
 
 ```bash
-omni-forecast alignment
+grounded-weather-forecast alignment
 # recommended: {'temp_c': 'inst', 'humidity_pct': 'mean', 'dew_point_c': 'inst', ...}
 # wrote artifacts/alignment.json
 ```
@@ -164,7 +164,7 @@ forecasts — a **self-verification** section.
 ## Serving
 
 ```bash
-omni-forecast predict --out forecast.json
+grounded-weather-forecast predict --out forecast.json
 ```
 
 | flag | effect |
@@ -329,15 +329,15 @@ the cross-source rule applies to the roughly-Gaussian state variables listed in
 A blender is anything satisfying the protocol. That is the whole interface:
 
 ```python
-# src/omni_forecast/blenders/mine.py
+# src/grounded_weather_forecast/blenders/mine.py
 from dataclasses import dataclass
 from typing import Self
 import numpy as np
 
-from omni_forecast.blenders.grounding import AffineGrounding
-from omni_forecast.blenders.protocol import finalize_point, masked_average
-from omni_forecast.blenders.registry import register
-from omni_forecast.contracts import (
+from grounded_weather_forecast.blenders.grounding import AffineGrounding
+from grounded_weather_forecast.blenders.protocol import finalize_point, masked_average
+from grounded_weather_forecast.blenders.registry import register
+from grounded_weather_forecast.contracts import (
     BlendResult, ForecastMatrix, SupervisedSlice, TargetKind,
 )
 
@@ -409,13 +409,13 @@ The CLI is a thin wrapper. Everything is importable:
 from pathlib import Path
 import polars as pl
 
-from omni_forecast.config import load_config
-from omni_forecast.contracts import hourly_variable
-from omni_forecast.dataset.matrix import to_supervised_slice, matrix_path
-from omni_forecast.backtest.engine import BacktestRequest, run_backtest
-from omni_forecast.reports.leaderboard import leaderboard, slice_winners
-from omni_forecast.serve.predict import predict
-from omni_forecast.serve.selection import select_methods
+from grounded_weather_forecast.config import load_config
+from grounded_weather_forecast.contracts import hourly_variable
+from grounded_weather_forecast.dataset.matrix import to_supervised_slice, matrix_path
+from grounded_weather_forecast.backtest.engine import BacktestRequest, run_backtest
+from grounded_weather_forecast.reports.leaderboard import leaderboard, slice_winners
+from grounded_weather_forecast.serve.predict import predict
+from grounded_weather_forecast.serve.selection import select_methods
 
 config = load_config(Path("config.toml"))
 

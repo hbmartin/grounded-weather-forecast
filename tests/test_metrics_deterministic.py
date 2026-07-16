@@ -1,7 +1,7 @@
 import numpy as np
 import pytest
 
-from omni_forecast.metrics.deterministic import (
+from grounded_weather_forecast.metrics.deterministic import (
     EmptyScoreError,
     bias,
     mae,

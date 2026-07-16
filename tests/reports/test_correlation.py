@@ -1,8 +1,8 @@
 import pytest
 from conftest import synthetic_hourly_matrix
 
-from omni_forecast.contracts import hourly_variable
-from omni_forecast.reports.correlation import error_correlation
+from grounded_weather_forecast.contracts import hourly_variable
+from grounded_weather_forecast.reports.correlation import error_correlation
 
 TEMP = hourly_variable("temp_c")
 

@@ -2,19 +2,19 @@ import polars as pl
 import pytest
 from conftest import synthetic_hourly_matrix, write_config
 
-from omni_forecast.backtest.engine import (
+from grounded_weather_forecast.backtest.engine import (
     BacktestRequest,
     run_backtest,
     variables_from_names,
 )
-from omni_forecast.backtest.scores import (
+from grounded_weather_forecast.backtest.scores import (
     SCORES_SCHEMA,
     empty_scores,
     load_scores,
     scores_path,
     write_scores,
 )
-from omni_forecast.contracts import (
+from grounded_weather_forecast.contracts import (
     HOURLY_VARIABLES,
     MixedProvenanceError,
     hourly_variable,

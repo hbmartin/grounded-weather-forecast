@@ -2,7 +2,7 @@ from datetime import date
 
 import polars as pl
 
-from omni_forecast.timeutil import (
+from grounded_weather_forecast.timeutil import (
     local_date_expr,
     local_day_minutes,
     local_day_start_utc,

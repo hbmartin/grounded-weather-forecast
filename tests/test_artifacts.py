@@ -1,6 +1,6 @@
 import pytest
 
-from omni_forecast.artifacts import ArtifactError, ArtifactStore
+from grounded_weather_forecast.artifacts import ArtifactError, ArtifactStore
 
 
 class TestArtifactStore:

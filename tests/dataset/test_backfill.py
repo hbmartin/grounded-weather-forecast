@@ -4,8 +4,12 @@ import polars as pl
 import pytest
 from conftest import make_station_db, minute_series, utc, write_config
 
-from omni_forecast.contracts import MixedProvenanceError, SourceKind, hourly_variable
-from omni_forecast.dataset.backfill import (
+from grounded_weather_forecast.contracts import (
+    MixedProvenanceError,
+    SourceKind,
+    hourly_variable,
+)
+from grounded_weather_forecast.dataset.backfill import (
     BACKFILL_VARIABLES,
     MAX_PREVIOUS_DAYS,
     BackfillError,
@@ -13,7 +17,7 @@ from omni_forecast.dataset.backfill import (
     build_url,
     parse_previous_runs,
 )
-from omni_forecast.dataset.matrix import (
+from grounded_weather_forecast.dataset.matrix import (
     assert_single_kind,
     matrix_path,
     to_supervised_slice,

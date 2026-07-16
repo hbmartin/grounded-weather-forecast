@@ -17,9 +17,9 @@ Register pending trusted publishers in both
 
 | Field | Value |
 | --- | --- |
-| PyPI project name | `omni-forecast` |
+| PyPI project name | `grounded-weather-forecast` |
 | GitHub owner | `hbmartin` |
-| GitHub repository | `omni-forecast` |
+| GitHub repository | `grounded-weather-forecast` |
 | Workflow | `publish.yml` |
 | Environment | `pypi` on PyPI; `testpypi` on TestPyPI |
 
@@ -52,7 +52,7 @@ creates the project when a pending publisher is configured.
    ```
 
 3. Merge the release commit into `main` and confirm the CI and Docs workflows
-   pass. Verify that <https://hbmartin.github.io/omni-forecast/> is live before
+   pass. Verify that <https://hbmartin.github.io/grounded-weather-forecast/> is live before
    publishing because it is included in the package metadata.
 
 4. Manually run the **Publish** workflow against that commit to upload it to
