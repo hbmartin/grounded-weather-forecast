@@ -125,6 +125,61 @@ class TestBuildHourlyMatrix:
         matrix = build_hourly_matrix(empty, snapshots, hourly_truth, minute, config)
         assert matrix.is_empty()
 
+    def test_provider_qc_does_not_mix_historical_vintages(self, tmp_path):
+        sources = ("alpha", "beta", "gamma", "delta", "epsilon")
+        fetched_times = (
+            utc(2026, 3, 22, 6),
+            utc(2026, 3, 22, 7),
+            utc(2026, 3, 22, 8),
+            utc(2026, 3, 22, 9),
+            utc(2026, 3, 22, 11, 30),
+        )
+        make_forecast_db(
+            tmp_path / "fx.sqlite",
+            [
+                {
+                    "completed_at": (fetched_at + timedelta(minutes=5)).isoformat(),
+                    "results": [
+                        {
+                            "provider": source,
+                            "fetched_at": fetched_at.isoformat(),
+                            "hourly": [
+                                (
+                                    VALID,
+                                    {
+                                        "pressure_sea": 1040.0
+                                        if fetched_at == fetched_times[-1]
+                                        else 1010.0
+                                    },
+                                )
+                            ],
+                        }
+                        for source in sources
+                    ],
+                }
+                for fetched_at in fetched_times
+            ],
+        )
+        config = write_config(tmp_path, sources=sources, min_hour_coverage=0.1)
+        snapshots = pl.DataFrame(
+            {"issue_time": [ISSUE]},
+            schema={"issue_time": pl.Datetime("us", "UTC")},
+        )
+        minute, hourly_truth, _ = truth_frames(config)
+
+        matrix = build_hourly_matrix(
+            read_hourly_long(config.forecasts),
+            snapshots,
+            hourly_truth,
+            minute,
+            config,
+        )
+
+        row = matrix.row(0, named=True)
+        assert {row[f"fx__{source}__pressure_sea_hpa"] for source in sources} == {
+            1040.0
+        }
+
 
 class TestProvenance:
     def test_mixed_kinds_rejected(self):
