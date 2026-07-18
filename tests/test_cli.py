@@ -137,3 +137,26 @@ def test_predict_reports_unsupported_method_without_traceback(
 
     assert code == 1
     assert "cannot predict: method 'persistence'" in capsys.readouterr().out
+
+
+def test_ensemble_store_failure_is_an_actionable_cli_error(
+    tmp_path, capsys, monkeypatch
+):
+    write_config(tmp_path)
+    monkeypatch.setattr(
+        "grounded_weather_forecast.dataset.ensembles.ingest_ensembles",
+        lambda _config: pl.DataFrame({"model": ["gefs"]}),
+    )
+
+    def fail_append(_path, _fresh):
+        raise OSError("disk full")
+
+    monkeypatch.setattr(
+        "grounded_weather_forecast.dataset.ensembles.append_ensembles",
+        fail_append,
+    )
+
+    code = main(["--config", str(tmp_path / "config.toml"), "ingest-ensembles"])
+
+    assert code == 1
+    assert "ensemble ingest failed: disk full" in capsys.readouterr().out

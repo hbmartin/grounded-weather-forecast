@@ -502,11 +502,11 @@ def _cmd_ingest_ensembles(config: Config, args: argparse.Namespace) -> int:
         config = replace(config, ensembles=replace(config.ensembles, models=models))
     try:
         fresh = ingest_ensembles(config)
+        path = ensembles_path(config)
+        new_rows, total_rows = append_ensembles(path, fresh)
     except (EnsembleError, OSError, ValueError) as exc:
         print(f"ensemble ingest failed: {exc}")
         return 1
-    path = ensembles_path(config)
-    new_rows, total_rows = append_ensembles(path, fresh)
     models_seen = ", ".join(sorted(fresh["model"].unique().to_list()))
     print(f"ingested {fresh.height} statistic rows from {models_seen}")
     print(f"ensembles store: +{new_rows} new rows, {total_rows} total -> {path}")

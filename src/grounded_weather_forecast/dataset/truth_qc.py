@@ -75,12 +75,15 @@ def fit_shield_error(
     load = solar_load(toa_wm2[usable], wind_ms[usable])
     residual = residual_c[usable]
     design = np.column_stack([np.ones(n), load])
-    coefficients, *_ = np.linalg.lstsq(design, residual, rcond=None)
+    coefficients, _, rank, _ = np.linalg.lstsq(design, residual, rcond=None)
+    if rank < design.shape[1]:
+        return None
     fitted_residual = residual - design @ coefficients
     dof = max(n - 2, 1)
     sigma2 = float(fitted_residual @ fitted_residual) / dof
-    gram_inverse = np.linalg.inv(design.T @ design)
-    slope_se = float(np.sqrt(sigma2 * gram_inverse[1, 1]))
+    gram_inverse = np.linalg.pinv(design.T @ design)
+    slope_variance = max(float(sigma2 * gram_inverse[1, 1]), 0.0)
+    slope_se = float(np.sqrt(slope_variance))
     return ShieldFit(
         slope_c_per_unit=float(coefficients[1]),
         intercept_c=float(coefficients[0]),

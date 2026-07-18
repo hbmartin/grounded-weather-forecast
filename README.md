@@ -87,8 +87,12 @@ grounded-weather-forecast backfill --end 2026-07-12   # --models, --chunk-days
 #    A second backfill provider reads dynamical.org's free Zarr archives of
 #    FULL forecast cycles (GEFS since 2020, AIFS-ENS since 2025-07) at native
 #    3-6h steps — populating the sub-24h lead buckets Previous Runs cannot.
-#    Requires the optional dependencies: uv sync --extra backfill
+#    For an installed CLI, put the extra in that same tool environment:
+uv tool install --force 'grounded-weather-forecast[backfill]'
 grounded-weather-forecast backfill --provider dynamical --start 2026-06-01
+#    From a checkout instead:
+#    uv sync --extra backfill
+#    uv run grounded-weather-forecast backfill --provider dynamical --start 2026-06-01
 
 # 5. Study whether each hourly variable should use instantaneous or interval-mean
 #    truth. Misalignment masquerades as provider bias; this measures it.

@@ -226,9 +226,12 @@ class AnchoredEmpirical:
             if denominator <= 0.0:
                 continue
             raw_weights[index] = np.clip(float(r0 @ e) / denominator, 0.0, 1.0)
-            trend_bin = trend[in_bin]
-            if self.use_trend and np.isfinite(trend_bin).all():
-                centered = e - raw_weights[index] * r0
+            trend_usable = in_bin & np.isfinite(trend)
+            if self.use_trend and int(trend_usable.sum()) >= _MIN_BIN_ROWS:
+                trend_bin = trend[trend_usable]
+                centered = (
+                    errors[trend_usable] - raw_weights[index] * residuals[trend_usable]
+                )
                 trend_denominator = float(trend_bin @ trend_bin)
                 if trend_denominator > 0.0:
                     trend_weights[index] = np.clip(

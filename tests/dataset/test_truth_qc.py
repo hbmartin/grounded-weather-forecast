@@ -165,6 +165,12 @@ class TestShieldFit:
         toa = np.full(50, 800.0)
         assert fit_shield_error(np.zeros(50), toa, np.ones(50)) is None
 
+    def test_rank_deficient_solar_load_returns_none(self):
+        n = 200
+        toa = np.full(n, 800.0)
+        wind = np.full(n, 2.0)
+        assert fit_shield_error(np.linspace(-1.0, 1.0, n), toa, wind) is None
+
 
 class TestConfigSection:
     def test_defaults_and_token_env(self, tmp_path, monkeypatch):

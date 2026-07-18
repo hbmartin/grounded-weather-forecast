@@ -766,6 +766,46 @@ def _lead_zero_path(
     )
 
 
+def _minute_path(
+    leads: np.ndarray,
+    path: np.ndarray,
+    methods: list[str],
+    lead: float,
+) -> tuple[float, float, bool]:
+    """Interpolate within one anchoring regime and return its lead-zero value."""
+    order = np.argsort(leads, kind="stable")
+    ordered_leads = leads[order]
+    ordered_path = path[order]
+    ordered_methods = [methods[index] for index in order]
+    if ordered_leads.shape[0] == 1:
+        value = float(ordered_path[0])
+        return value, value, ordered_methods[0].startswith("anchored")
+    right = int(np.searchsorted(ordered_leads, lead, side="left"))
+    left = max(min(right - 1, ordered_leads.shape[0] - 2), 0)
+    right = left + 1
+    anchored = (
+        ordered_methods[left].startswith("anchored"),
+        ordered_methods[right].startswith("anchored"),
+    )
+    if anchored[0] != anchored[1]:
+        distances = (
+            abs(lead - float(ordered_leads[left])),
+            abs(float(ordered_leads[right]) - lead),
+        )
+        chosen = right if distances[1] < distances[0] else left
+        value = float(ordered_path[chosen])
+        return value, value, anchored[chosen]
+    segment_leads, segment_path = _lead_zero_path(
+        ordered_leads[[left, right]],
+        ordered_path[[left, right]],
+    )
+    return (
+        float(np.interp(lead, segment_leads, segment_path)),
+        float(segment_path[0]),
+        anchored[0],
+    )
+
+
 def minutely_product(
     snapshot: Snapshot,
     hourly_blend: dict[str, VariableBlend],
@@ -795,14 +835,20 @@ def minutely_product(
                 continue
             usable = np.isfinite(blend.point)
             usable_leads, path = leads[usable], blend.point[usable]
-            extended_leads, extended_path = _lead_zero_path(usable_leads, path)
-            interpolated = float(np.interp(lead, extended_leads, extended_path))
-            observed = snapshot.observation.get(name)
-            already_anchored = bool(blend.methods) and blend.methods[0].startswith(
-                "anchored"
+            usable_methods = [
+                method
+                for method, available in zip(blend.methods, usable, strict=True)
+                if available
+            ]
+            interpolated, now_forecast, already_anchored = _minute_path(
+                usable_leads,
+                path,
+                usable_methods,
+                lead,
             )
+            observed = snapshot.observation.get(name)
             if observed is not None and not already_anchored:
-                residual = observed - _now_forecast(usable_leads, path)
+                residual = observed - now_forecast
                 interpolated += (
                     _anchor_weight(minute, config.predict.minutely_tau_hours) * residual
                 )

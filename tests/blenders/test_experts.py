@@ -9,7 +9,11 @@ from conftest import synthetic_hourly_matrix
 from grounded_weather_forecast.blenders import get_factory
 from grounded_weather_forecast.blenders.experts import OnlineExperts
 from grounded_weather_forecast.blenders.grounding import AffineGrounding
-from grounded_weather_forecast.contracts import hourly_variable
+from grounded_weather_forecast.contracts import (
+    ForecastMatrix,
+    SupervisedSlice,
+    hourly_variable,
+)
 from grounded_weather_forecast.dataset.matrix import to_supervised_slice
 from grounded_weather_forecast.metrics.deterministic import mae
 
@@ -213,3 +217,35 @@ class TestOnlineAdvance:
             OnlineExperts.from_state(
                 {"scheme": "ewa", "sources": ["alpha"], "buckets": {}}, "ewa"
             )
+
+    def test_reordered_sources_require_full_replay(self):
+        train = to_supervised_slice(synthetic_hourly_matrix(days=4), TEMP)
+        experts = OnlineExperts(method_id="ewa", scheme="ewa").fit(train)
+        reordered_x = ForecastMatrix.build(
+            sources=tuple(reversed(train.x.sources)),
+            values=train.x.values[:, ::-1],
+            lead_hours=train.x.lead_hours,
+            features=train.x.features,
+            product=train.x.product,
+        )
+        reordered = SupervisedSlice(
+            x=reordered_x,
+            y=train.y,
+            variable=train.variable,
+            source_kind=train.source_kind,
+        )
+
+        with pytest.raises(ValueError, match="source order changed"):
+            experts.advance(reordered)
+
+    def test_state_later_than_training_history_requires_full_replay(self):
+        matrix = synthetic_hourly_matrix(days=8)
+        full = to_supervised_slice(matrix, TEMP)
+        cutoff = matrix["valid_time"].min() + timedelta(days=3)
+        historical = to_supervised_slice(
+            matrix.filter(pl.col("valid_time") <= cutoff), TEMP
+        )
+        experts = OnlineExperts(method_id="ewa", scheme="ewa").fit(full)
+
+        with pytest.raises(ValueError, match="extends beyond"):
+            experts.advance(historical)

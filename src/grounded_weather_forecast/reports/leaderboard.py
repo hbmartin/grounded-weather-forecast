@@ -53,8 +53,31 @@ _PROBABILISTIC_EMPTY: Mapping[str, float | None] = {
 }
 
 
-def _level_index(levels: Sequence[float], target: float) -> int:
-    return int(np.argmin(np.abs(np.asarray(levels) - target)))
+def _level_index(levels: Sequence[float], target: float) -> int | None:
+    matches = np.flatnonzero(
+        np.isclose(np.asarray(levels), target, rtol=0.0, atol=1e-9)
+    )
+    return int(matches[0]) if matches.size else None
+
+
+def _interval_metrics(
+    y: np.ndarray,
+    grids: np.ndarray,
+    levels: Sequence[float],
+    lower: float,
+    upper: float,
+) -> tuple[float | None, float | None]:
+    lower_index = _level_index(levels, lower)
+    upper_index = _level_index(levels, upper)
+    if lower_index is None or upper_index is None:
+        return None, None
+    coverage = empirical_coverage(
+        y,
+        grids[:, lower_index],
+        grids[:, upper_index],
+    )
+    sharpness = float(np.mean(grids[:, upper_index] - grids[:, lower_index]))
+    return coverage, sharpness
 
 
 def _probabilistic_columns(method_scores: pl.DataFrame) -> dict[str, float | None]:
@@ -89,30 +112,19 @@ def _probabilistic_columns(method_scores: pl.DataFrame) -> dict[str, float | Non
     )
     pit = pit_from_quantiles(y, grids, tuple(levels))
     counts, _ = np.histogram(pit, bins=_PIT_BINS, range=(0.0, 1.0))
+    coverage80, sharpness = _interval_metrics(y, grids, levels, 0.1, 0.9)
+    coverage90, _ = _interval_metrics(y, grids, levels, 0.05, 0.95)
     return {
         "crps": crps_from_quantiles(y, grids, levels),
         "pinball": pinball,
-        "coverage80": empirical_coverage(
-            y,
-            grids[:, _level_index(levels, 0.1)],
-            grids[:, _level_index(levels, 0.9)],
-        ),
-        "coverage90": empirical_coverage(
-            y,
-            grids[:, _level_index(levels, 0.05)],
-            grids[:, _level_index(levels, 0.95)],
-        ),
+        "coverage80": coverage80,
+        "coverage90": coverage90,
         "pit_chi2_p": (
             float(stats.chisquare(counts).pvalue)
             if y.shape[0] >= _MIN_PIT_SAMPLES
             else None
         ),
-        "sharpness": float(
-            np.mean(
-                grids[:, _level_index(levels, 0.9)]
-                - grids[:, _level_index(levels, 0.1)]
-            )
-        ),
+        "sharpness": sharpness,
     }
 
 

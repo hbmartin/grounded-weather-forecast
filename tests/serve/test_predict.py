@@ -410,6 +410,26 @@ class TestMinutelySinglePass:
             if point.dew_point_c is not None and point.temp_c is not None
         )
 
+    def test_mixed_anchor_regimes_are_not_interpolated(self, la_config):
+        from grounded_weather_forecast.serve.predict import (
+            VariableBlend,
+            minutely_product,
+        )
+
+        snapshot, path = self.make_snapshot()
+        blend = VariableBlend(
+            point=path,
+            methods=["anchored_fitted_grounded", "grounded_equal_weight"],
+            reasons=["", ""],
+            release_ids=[None, None],
+            quantiles=[{}, {}],
+        )
+
+        points = minutely_product(snapshot, {"temp_c": blend}, la_config)
+
+        assert points[0].temp_c == pytest.approx(path[0])
+        assert points[-1].temp_c == pytest.approx(path[0])
+
 
 class TestPhysicalCoherence:
     def test_hourly_points_and_differing_quantile_grids_are_coherent(self):

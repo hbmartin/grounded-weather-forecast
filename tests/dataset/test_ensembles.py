@@ -1,4 +1,5 @@
 from concurrent.futures import ThreadPoolExecutor
+from dataclasses import replace
 from datetime import datetime, timedelta
 from threading import Barrier
 
@@ -13,6 +14,7 @@ from conftest import (
 )
 
 from grounded_weather_forecast.contracts import hourly_variable
+from grounded_weather_forecast.config import EnsemblesConfig
 from grounded_weather_forecast.dataset.ensembles import (
     EnsembleError,
     append_ensembles,
@@ -22,6 +24,7 @@ from grounded_weather_forecast.dataset.ensembles import (
     parse_ensemble,
 )
 from grounded_weather_forecast.dataset.matrix import (
+    _active_ensembles,
     build_hourly_matrix,
     to_supervised_slice,
 )
@@ -224,6 +227,24 @@ class TestEnsembleFeatures:
         wide = ensemble_features(combined, _snapshots(ISSUE), 12.0)
         row = wide.filter(pl.col("valid_time") == VALID).row(0, named=True)
         assert row["ens__gefs__temp_c__mean"] == pytest.approx(112.0)
+
+    def test_dataset_uses_only_currently_configured_rows(self, tmp_path):
+        config = write_config(tmp_path)
+        store = tmp_path / "data" / "ensembles.parquet"
+        active = parse_ensemble(payload(), "gefs", FETCHED, VARIABLES)
+        stale = parse_ensemble(payload(), "retired", FETCHED, VARIABLES)
+        append_ensembles(store, pl.concat([active, stale]))
+
+        assert _active_ensembles(config) is None
+
+        configured = replace(
+            config,
+            ensembles=EnsemblesConfig(models=("gefs",), variables=("temp_c",)),
+        )
+        selected = _active_ensembles(configured)
+        assert selected is not None
+        assert set(selected["model"]) == {"gefs"}
+        assert set(selected["variable"]) == {"temp_c"}
 
 
 class TestMatrixIntegration:

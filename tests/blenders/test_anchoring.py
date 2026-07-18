@@ -155,3 +155,16 @@ class TestAnchoredEmpirical:
         fitted_mae = mae(fitted.predict(train.x).point, train.y)
         trend_mae = mae(trend.predict(train.x).point, train.y)
         assert trend_mae <= 1.1 * fitted_mae
+
+    def test_trend_fit_uses_finite_subset(self):
+        anchored = get_factory("anchored_trend_grounded")()
+        lead = np.full(30, 0.5)
+        residuals = np.ones(30)
+        trend = np.linspace(-1.0, 1.0, 30)
+        errors = residuals + 2.0 * trend
+        trend[:5] = np.nan
+
+        anchored._fit_bins(lead, residuals, errors, trend)
+
+        assert anchored._trend_weights is not None
+        assert anchored._trend_weights[0] == pytest.approx(2.0)

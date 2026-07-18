@@ -148,6 +148,10 @@ reviews_triage
 config.toml
 .agents
 
+# Local agent/MCP configuration may contain credentials or broad permissions.
+.mcp.json
+settings.local.json
+
 # Raw HTTP payload archives (contain provider URLs incl. API keys)
 raw/
 *.jsonl.gz
