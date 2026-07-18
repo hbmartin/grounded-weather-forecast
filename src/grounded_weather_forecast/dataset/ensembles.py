@@ -33,6 +33,7 @@ from grounded_weather_forecast.dataset.backfill import (
     http_fetcher,
 )
 from grounded_weather_forecast.dataset.snapshots import snapshot_long
+from grounded_weather_forecast.storage import atomic_write_parquet, locked_path
 
 ENSEMBLE_URL = "https://ensemble-api.open-meteo.com/v1/ensemble"
 FEATURE_PREFIX = "ens__"
@@ -163,16 +164,18 @@ def ingest_ensembles(
     if not config.ensembles.models:
         msg = "set [ensembles].models to ingest ensemble statistics"
         raise EnsembleError(msg)
-    fetched_at = (now or datetime.now(tz=UTC)).replace(microsecond=0)
-    frames = [
-        parse_ensemble(
-            dict(fetcher(build_ensemble_url(config, model))),
-            model,
-            fetched_at,
-            config.ensembles.variables,
+    frames: list[pl.DataFrame] = []
+    for model in config.ensembles.models:
+        payload = dict(fetcher(build_ensemble_url(config, model)))
+        fetched_at = (now or datetime.now(tz=UTC)).replace(microsecond=0)
+        frames.append(
+            parse_ensemble(
+                payload,
+                model,
+                fetched_at,
+                config.ensembles.variables,
+            )
         )
-        for model in config.ensembles.models
-    ]
     return pl.concat(frames).sort(list(_KEY))
 
 
@@ -184,15 +187,15 @@ def load_ensembles(path: Path) -> pl.DataFrame:
 
 def append_ensembles(path: Path, fresh: pl.DataFrame) -> tuple[int, int]:
     """Append-dedupe onto the parquet store; returns (new_rows, total_rows)."""
-    existing = load_ensembles(path)
-    combined = (
-        pl.concat([existing, fresh.select(existing.columns)], how="vertical")
-        .unique(subset=list(_KEY), keep="first")
-        .sort(list(_KEY))
-    )
-    path.parent.mkdir(parents=True, exist_ok=True)
-    combined.write_parquet(path)
-    return combined.height - existing.height, combined.height
+    with locked_path(path):
+        existing = load_ensembles(path)
+        combined = (
+            pl.concat([existing, fresh.select(existing.columns)], how="vertical")
+            .unique(subset=list(_KEY), keep="first")
+            .sort(list(_KEY))
+        )
+        atomic_write_parquet(combined, path)
+        return combined.height - existing.height, combined.height
 
 
 def ensemble_features(

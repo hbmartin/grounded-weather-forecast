@@ -21,7 +21,11 @@ from grounded_weather_forecast.evaluation import (
     config_fingerprint,
     dataset_fingerprint,
 )
-from grounded_weather_forecast.reports.leaderboard import leaderboard, slice_winners
+from grounded_weather_forecast.reports.leaderboard import (
+    DEFAULT_REFERENCES,
+    leaderboard,
+    slice_winners,
+)
 
 FALLBACK_METHOD = "equal_weight"
 
@@ -40,6 +44,7 @@ class Selection:
 
 
 type SelectionMap = Mapping[tuple[str, str, str], Selection]
+type SliceKey = tuple[str, str, str]
 
 
 def _pins(config: Config) -> dict[tuple[str, str], str]:
@@ -80,6 +85,106 @@ def _compatible_scores(
         if not scores.is_empty():
             candidates.append(scores)
     return candidates
+
+
+def _newest_complete_slices(
+    candidates: list[pl.DataFrame],
+) -> dict[SliceKey, pl.DataFrame]:
+    """Newest atomic evaluation per slice containing both reference methods."""
+    if not candidates:
+        return {}
+    combined = pl.concat(candidates, how="diagonal_relaxed")
+    selected: dict[SliceKey, tuple[datetime, str, pl.DataFrame]] = {}
+    for evaluation_key, evaluation in combined.partition_by(
+        "evaluation_id", as_dict=True
+    ).items():
+        evaluation_id = str(evaluation_key[0])
+        created_at = evaluation["evaluation_created_at"].max()
+        if not isinstance(created_at, datetime):
+            continue
+        for slice_key, frame in evaluation.partition_by(
+            ["product", "variable", "lead_bucket"], as_dict=True
+        ).items():
+            methods = {str(method) for method in frame["method_id"].unique().to_list()}
+            if not set(DEFAULT_REFERENCES) <= methods:
+                continue
+            product, variable, lead_bucket = (str(part) for part in slice_key)
+            key: SliceKey = (product, variable, lead_bucket)
+            previous = selected.get(key)
+            marker = (created_at, evaluation_id)
+            if previous is None or marker > previous[:2]:
+                selected[key] = (created_at, evaluation_id, frame)
+    return {key: selected[key][2] for key in sorted(selected)}
+
+
+def _selection_payload(
+    selections: Mapping[SliceKey, Selection],
+) -> dict[str, dict[str, object]]:
+    return {
+        ".".join(key): {
+            "method_id": selected.method_id,
+            "reason": selected.reason,
+            "evaluation_id": selected.evaluation_id,
+            "n": selected.n,
+            "mae": selected.mae,
+        }
+        for key, selected in sorted(selections.items())
+    }
+
+
+def _evaluation_contexts(
+    selected_scores: list[pl.DataFrame],
+) -> tuple[dict[str, object], ...]:
+    if not selected_scores:
+        return ()
+    combined = pl.concat(selected_scores, how="diagonal_relaxed")
+    contexts: list[dict[str, object]] = []
+    for evaluation_key, frame in combined.partition_by(
+        "evaluation_id", as_dict=True
+    ).items():
+        contexts.append(
+            {
+                "evaluation_id": str(evaluation_key[0]),
+                "source_kind": str(frame["source_kind"][0]),
+                "source_set_json": str(frame["source_set_json"][0]),
+                "semantics": {
+                    str(row["variable"]): str(row["semantics"])
+                    for row in frame.select("variable", "semantics")
+                    .unique()
+                    .iter_rows(named=True)
+                },
+                "window": str(frame["window"][0]),
+                "code_version": str(frame["code_version"][0]),
+                "config_fingerprint": str(frame["config_fingerprint"][0]),
+            }
+        )
+    return tuple(sorted(contexts, key=lambda context: str(context["evaluation_id"])))
+
+
+def _make_release(
+    config: Config,
+    selections: Mapping[SliceKey, Selection],
+    selected_scores: list[pl.DataFrame],
+) -> ModelRelease:
+    evaluation_ids = tuple(
+        sorted(
+            {
+                selected.evaluation_id
+                for selected in selections.values()
+                if selected.evaluation_id is not None
+            }
+        )
+    )
+    return ModelRelease.create(
+        dataset=dataset_fingerprint(config),
+        configuration=config_fingerprint(config),
+        evaluation_ids=evaluation_ids,
+        evaluation_contexts=_evaluation_contexts(selected_scores),
+        training_cutoff=max(
+            (frame["valid_time"].max() for frame in selected_scores), default=None
+        ),
+        selections=_selection_payload(selections),
+    )
 
 
 def _release_as_of(config: Config, as_of: datetime) -> SelectionMap | None:
@@ -141,102 +246,70 @@ def select_methods(
     pinned = _pins(config)
     selections: dict[tuple[str, str, str], Selection] = {}
     compatible = _compatible_scores(config, scores_dir, as_of)
+    slices = _newest_complete_slices(compatible)
     selected_scores: list[pl.DataFrame] = []
-    for product in ("hourly", "daily"):
-        product_frames = [
-            frame.filter(pl.col("product") == product) for frame in compatible
-        ]
-        product_frames = [frame for frame in product_frames if not frame.is_empty()]
-        if not product_frames:
-            continue
-        combined = pl.concat(product_frames, how="diagonal_relaxed")
-        if "evaluation_created_at" in combined.columns:
-            latest = combined["evaluation_created_at"].max()
-            combined = combined.filter(pl.col("evaluation_created_at") == latest)
-        selected_scores.append(combined)
+    fallbacks: dict[SliceKey, Selection] = {}
+    for key, frame in slices.items():
+        board = leaderboard(frame)
         winners = slice_winners(
-            leaderboard(combined),
-            scores=combined,
+            board,
+            scores=frame,
             rule=config.promotion.rule,
             alpha=config.promotion.alpha,
         )
-        evaluation_id = (
-            str(combined["evaluation_id"][0])
-            if "evaluation_id" in combined.columns
-            else "legacy"
+        if winners.is_empty():
+            continue
+        selected_scores.append(frame)
+        evaluation_id = str(frame["evaluation_id"][0])
+        row = winners.row(0, named=True)
+        selections[key] = Selection(
+            method_id=str(row["method_id"]),
+            reason="lowest backtest MAE among promotable common-case methods",
+            n=int(row["n"]),
+            mae=float(row["mae"]),
+            evaluation_id=evaluation_id,
+            dataset_fingerprint=dataset_fingerprint(config),
         )
-        for row in winners.iter_rows(named=True):
-            key = (row["product"], row["variable"], row["lead_bucket"])
-            selections[key] = Selection(
-                method_id=row["method_id"],
-                reason="lowest backtest MAE among promotable common-case methods",
-                n=int(row["n"]),
-                mae=float(row["mae"]),
+        fallback_rows = board.filter(pl.col("method_id") == FALLBACK_METHOD).sort("mae")
+        if not fallback_rows.is_empty():
+            fallback = fallback_rows.row(0, named=True)
+            fallbacks[key] = Selection(
+                method_id=FALLBACK_METHOD,
+                reason="reference fallback",
+                n=int(fallback["n"]),
+                mae=float(fallback["mae"]),
                 evaluation_id=evaluation_id,
                 dataset_fingerprint=dataset_fingerprint(config),
             )
+    for (product, variable), method_id in pinned.items():
+        for key in [key for key in selections if key[:2] == (product, variable)]:
+            selections[key] = replace(
+                selections[key], method_id=method_id, reason="pinned in config"
+            )
+    if not selections:
+        return selections
+    prospective = _make_release(config, selections, selected_scores)
+    selections = {
+        key: replace(selected, release_id=prospective.release_id)
+        for key, selected in selections.items()
+    }
+    fallbacks = {
+        key: replace(selected, release_id=prospective.release_id)
+        for key, selected in fallbacks.items()
+    }
     selections = apply_live_gate(
         selections,
         _live_verification(config),
         factor=config.promotion.live_gap_factor,
         min_n=config.promotion.min_live_n,
+        fallbacks=fallbacks,
     )
-    for (product, variable), method_id in pinned.items():
-        for key in [k for k in selections if k[:2] == (product, variable)]:
-            selections[key] = replace(
-                selections[key], method_id=method_id, reason="pinned in config"
-            )
-    if selections:
-        evaluation_ids = tuple(
-            sorted(
-                {
-                    selected.evaluation_id
-                    for selected in selections.values()
-                    if selected.evaluation_id is not None
-                }
-            )
-        )
-        release = ModelRelease.create(
-            dataset=dataset_fingerprint(config),
-            configuration=config_fingerprint(config),
-            evaluation_ids=evaluation_ids,
-            evaluation_contexts=tuple(
-                {
-                    "evaluation_id": str(frame["evaluation_id"][0]),
-                    "source_kind": str(frame["source_kind"][0]),
-                    "source_set_json": str(frame["source_set_json"][0]),
-                    "semantics": {
-                        str(row["variable"]): str(row["semantics"])
-                        for row in frame.select("variable", "semantics")
-                        .unique()
-                        .iter_rows(named=True)
-                    },
-                    "window": str(frame["window"][0]),
-                    "code_version": str(frame["code_version"][0]),
-                    "config_fingerprint": str(frame["config_fingerprint"][0]),
-                }
-                for frame in selected_scores
-            ),
-            training_cutoff=max(
-                (frame["valid_time"].max() for frame in selected_scores), default=None
-            ),
-            selections={
-                ".".join(key): {
-                    "method_id": selected.method_id,
-                    "reason": selected.reason,
-                    "evaluation_id": selected.evaluation_id,
-                    "n": selected.n,
-                    "mae": selected.mae,
-                }
-                for key, selected in selections.items()
-            },
-        )
-        release.write(config.artifacts_dir / "releases")
-        selections = {
-            key: replace(selected, release_id=release.release_id)
-            for key, selected in selections.items()
-        }
-    return selections
+    release = _make_release(config, selections, selected_scores)
+    release.write(config.artifacts_dir / "releases")
+    return {
+        key: replace(selected, release_id=release.release_id)
+        for key, selected in selections.items()
+    }
 
 
 def _live_verification(config: Config) -> pl.DataFrame:
@@ -258,6 +331,7 @@ def apply_live_gate(
     *,
     factor: float,
     min_n: int,
+    fallbacks: Mapping[SliceKey, Selection] | None = None,
 ) -> dict[tuple[str, str, str], Selection]:
     """Close the self-verification loop: demote methods that underdeliver live.
 
@@ -267,27 +341,65 @@ def apply_live_gate(
     catch by itself. The verdict travels in the selection reason, so the
     release ledger records every demotion.
     """
-    if live.is_empty():
+    identity_columns = {"lead_bucket", "dataset_fingerprint", "release_id"}
+    if live.is_empty() or not identity_columns <= set(live.columns):
         return selections
     by_key = {
-        (str(row["product"]), str(row["variable"]), str(row["method_id"])): row
+        (
+            str(row["product"]),
+            str(row["variable"]),
+            str(row["lead_bucket"]),
+            str(row["method_id"]),
+            str(row["dataset_fingerprint"]),
+            str(row["release_id"]),
+        ): row
         for row in live.iter_rows(named=True)
+        if row["dataset_fingerprint"] is not None and row["release_id"] is not None
     }
     gated = dict(selections)
     for key, selected in selections.items():
-        product, variable, _bucket = key
-        row = by_key.get((product, variable, selected.method_id))
-        if row is None or selected.mae is None:
+        product, variable, bucket = key
+        if (
+            selected.method_id == FALLBACK_METHOD
+            or selected.reason == "pinned in config"
+            or selected.mae is None
+            or selected.dataset_fingerprint is None
+            or selected.release_id is None
+        ):
+            continue
+        row = by_key.get(
+            (
+                product,
+                variable,
+                bucket,
+                selected.method_id,
+                selected.dataset_fingerprint,
+                selected.release_id,
+            )
+        )
+        if row is None:
             continue
         live_mae = float(row["live_mae"])
         if int(row["n"]) >= min_n and live_mae > factor * selected.mae:
+            fallback = (
+                fallbacks.get(key)
+                if fallbacks is not None
+                else Selection(
+                    FALLBACK_METHOD,
+                    reason="reference fallback",
+                    dataset_fingerprint=selected.dataset_fingerprint,
+                )
+            )
+            if fallback is None:
+                continue
             gated[key] = replace(
-                selected,
-                method_id=FALLBACK_METHOD,
+                fallback,
                 reason=(
                     f"demoted {selected.method_id}: live MAE {live_mae:.3f} vs "
                     f"backtest {selected.mae:.3f} (factor {factor})"
                 ),
+                dataset_fingerprint=selected.dataset_fingerprint,
+                release_id=selected.release_id,
             )
     return gated
 

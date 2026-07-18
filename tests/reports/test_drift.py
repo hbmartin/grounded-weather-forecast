@@ -1,3 +1,5 @@
+import json
+
 import numpy as np
 import polars as pl
 from conftest import synthetic_hourly_matrix
@@ -8,6 +10,7 @@ from grounded_weather_forecast.reports.drift import (
     drift_report,
     page_hinkley,
     residual_alarms,
+    write_drift_artifact,
 )
 
 TEMP = hourly_variable("temp_c")
@@ -38,6 +41,13 @@ class TestPageHinkley:
         alarmed, _ = page_hinkley(rng.normal(0.0, 1.0, 300))
         assert not alarmed
 
+    def test_detects_a_downward_step(self):
+        rng = np.random.default_rng(3)
+        series = np.concatenate([rng.normal(0.0, 1.0, 200), rng.normal(-3.0, 1.0, 100)])
+        alarmed, excursion = page_hinkley(series)
+        assert alarmed
+        assert excursion > 12.0
+
 
 class TestConsensusTier:
     def test_swapped_source_alarms_fast(self):
@@ -65,3 +75,16 @@ class TestResidualTier:
         report = drift_report(swap_matrix(offset=6.0), (TEMP,))
         assert not report.is_empty()
         assert set(report["tier"].unique().to_list()) <= {"consensus", "residual"}
+        assert report["lead_bucket"].null_count() == 0
+
+    def test_horizon_row_duplication_does_not_change_residual_alarms(self):
+        matrix = swap_matrix(offset=6.0)
+        original = residual_alarms(matrix, TEMP)
+        duplicated = residual_alarms(pl.concat([matrix] * 16), TEMP)
+        assert duplicated == original
+
+    def test_artifact_is_schema_version_two(self, tmp_path):
+        path = tmp_path / "drift.json"
+        write_drift_artifact(drift_report(swap_matrix(), (TEMP,)), path)
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        assert payload["schema_version"] == 2

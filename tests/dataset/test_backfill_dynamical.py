@@ -122,6 +122,21 @@ class TestBackfillDynamicalLong:
                 opener=lambda _id: fake_dataset(),
             )
 
+    def test_catalog_errors_are_normalized_with_model_context(self, config):
+        def fail_open(_catalog_id):
+            raise LookupError("catalog unavailable")
+
+        with pytest.raises(
+            DynamicalBackfillError,
+            match=r"'gefs'.*LookupError: catalog unavailable",
+        ):
+            backfill_dynamical_long(
+                config,
+                date(2026, 6, 1),
+                date(2026, 6, 2),
+                opener=fail_open,
+            )
+
 
 class TestMergeSyntheticLong:
     def test_re_running_a_backfill_is_idempotent(self, config):

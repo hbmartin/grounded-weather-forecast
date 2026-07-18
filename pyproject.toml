@@ -52,6 +52,13 @@ Documentation = "https://hbmartin.github.io/grounded-weather-forecast/"
 Repository = "https://github.com/hbmartin/grounded-weather-forecast"
 Issues = "https://github.com/hbmartin/grounded-weather-forecast/issues"
 
+[project.optional-dependencies]
+backfill = [
+    "dynamical-catalog>=0.1",
+    "xarray>=2024.10",
+    "zarr>=3.0",
+]
+
 [build-system]
 requires = ["uv_build>=0.11.28,<0.12.0"]
 build-backend = "uv_build"
@@ -59,12 +66,12 @@ build-backend = "uv_build"
 [tool.uv.build-backend]
 source-include = ["config.example.toml"]
 
+[[tool.uv.index]]
+name = "pypi"
+url = "https://pypi.org/simple"
+default = true
+
 [dependency-groups]
-backfill = [
-    "dynamical-catalog>=0.1",
-    "xarray>=2024.10",
-    "zarr>=3.0",
-]
 dev = [
     "codecov>=2.1.13",
     "deptry>=0.23.0",
@@ -143,5 +150,7 @@ line-ending = "auto"
 
 [tool.deptry.per_rule_ignores]
 # lightgbm is imported dynamically (importlib) so the package stays importable
-# on platforms where its wheels lag; deptry cannot see the string import.
-DEP002 = ["lightgbm"]
+# on platforms where its wheels lag. The backfill extra is also lazy:
+# dynamical-catalog is imported by string, while xarray and zarr are runtime
+# engines used behind that catalog API. Deptry cannot see those relationships.
+DEP002 = ["dynamical-catalog", "lightgbm", "xarray", "zarr"]

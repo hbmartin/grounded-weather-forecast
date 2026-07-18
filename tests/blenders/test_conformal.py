@@ -68,6 +68,34 @@ class TestConformal:
         state = conformal.to_state()
         assert state["coverages"] == [0.5, 0.8, 0.9]
         assert len(state["cells"]) > 0
+        assert state["schema_version"] == 2
+        assert state["calibration"]["strategy"] == "chronological_70_30"
+        assert state["calibration"]["proper_rows"] >= 60
+        assert state["calibration"]["calibration_rows"] >= 20
+
+    def test_only_later_out_of_sample_rows_update_cells(self):
+        matrix = synthetic_hourly_matrix(days=20, noise_sd=1.0, seed=45)
+        train = to_supervised_slice(matrix, TEMP)
+        conformal = get_factory("conformal_gew")().fit(train)
+        state = conformal.to_state()
+        updates = sum(cell["updates"] for cell in state["cells"].values())
+        assert updates == state["calibration"]["calibration_rows"]
+        assert updates < train.x.n_rows
+
+    def test_proper_training_excludes_truth_unresolved_at_cutoff(self):
+        matrix = synthetic_hourly_matrix(days=20, noise_sd=1.0, seed=46)
+        train = to_supervised_slice(matrix, TEMP)
+        conformal = get_factory("conformal_gew")().fit(train)
+        state = conformal.to_state()
+        issue = train.x.features["issue_time"].cast(pl.Int64).to_numpy()
+        cutoff = state["calibration"]["cutoff_issue_us"]
+        naively_resolved = int(
+            np.sum(
+                (issue < cutoff)
+                & (train.x.features["valid_time"].cast(pl.Int64).to_numpy() <= cutoff)
+            )
+        )
+        assert state["calibration"]["proper_rows"] < naively_resolved
 
     def test_thin_cells_emit_no_quantiles(self):
         matrix = synthetic_hourly_matrix(days=1, max_lead=6, seed=44)

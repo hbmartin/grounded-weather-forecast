@@ -23,12 +23,28 @@ def pinball_loss(y: FloatArray, quantile_pred: FloatArray, level: float) -> floa
 def crps_from_quantiles(
     y: FloatArray, quantiles: FloatArray, levels: tuple[float, ...]
 ) -> float:
-    """CRPS approximated from a quantile grid: 2x mean pinball across levels."""
+    """Approximate CRPS by integrating pinball loss over probability levels."""
     if quantiles.shape != (y.shape[0], len(levels)):
         msg = f"quantiles shape {quantiles.shape} != ({y.shape[0]}, {len(levels)})"
         raise ValueError(msg)
+    level_array = np.asarray(levels, dtype=np.float64)
+    if (
+        level_array.size == 0
+        or not np.all((level_array > 0.0) & (level_array < 1.0))
+        or not np.all(np.diff(level_array) > 0.0)
+    ):
+        msg = "quantile levels must be strictly increasing within (0, 1)"
+        raise ValueError(msg)
+    boundaries = np.concatenate(
+        (
+            np.asarray([0.0]),
+            (level_array[:-1] + level_array[1:]) / 2.0,
+            np.asarray([1.0]),
+        )
+    )
+    weights = np.diff(boundaries)
     losses = [pinball_loss(y, quantiles[:, i], level) for i, level in enumerate(levels)]
-    return 2.0 * float(np.mean(losses))
+    return 2.0 * float(np.dot(weights, losses))
 
 
 def crps_ensemble(y: FloatArray, ensemble: FloatArray) -> float:

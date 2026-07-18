@@ -14,6 +14,7 @@ because it is the only genuinely minute-resolution signal they publish.
 
 import math
 from collections.abc import Mapping
+from contextlib import suppress
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 
@@ -24,15 +25,23 @@ from grounded_weather_forecast.backtest.splits import (
     daily_truth_known_at,
     hourly_truth_known_at,
 )
-from grounded_weather_forecast.blenders.registry import get_factory
+from grounded_weather_forecast.blenders.registry import (
+    UnknownMethodError,
+    get_factory,
+    supports_product,
+)
 from grounded_weather_forecast.config import Config
 from grounded_weather_forecast.contracts import (
     DAILY_VARIABLES,
     HOURLY_VARIABLES,
+    Blender,
     BlendResult,
     ForecastMatrix,
+    Product,
+    SupervisedSlice,
     TruthSemantics,
     VariableSpec,
+    daily_variable,
     hourly_variable,
 )
 from grounded_weather_forecast.dataset.ensembles import (
@@ -81,6 +90,10 @@ _MINUTELY_VARIABLES = (
 
 class NoForecastDataError(RuntimeError):
     """No provider forecast is fresh enough to serve from."""
+
+
+class UnsupportedMethodError(ValueError):
+    """An explicit serving method violates the product/variable contract."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -177,17 +190,16 @@ _STATEFUL_METHODS = frozenset({"ewa", "boa"})
 
 def _stateful_blender(
     method_id: str,
-    slice_,
+    slice_: SupervisedSlice,
     config: Config,
     product: str,
     variable_name: str,
-):
-    """Warm-started online experts: load state, advance past the watermark, save.
+) -> Blender:
+    """Warm-started online experts: validate state, advance its cursors, save.
 
-    Activates the artifact store on the serve path: a serve costs O(rows
-    resolved since the last serve) instead of a full batch replay, and the
-    drift-adaptive weights genuinely persist between serves. Fingerprint or
-    source-set mismatch falls back to a full refit — yesterday's behavior.
+    The latest state may come from an older dataset fingerprint: its schema,
+    source set, and processed-prefix digests decide compatibility. Any
+    mismatch falls back to a full replay.
     """
     from grounded_weather_forecast.artifacts import (  # noqa: PLC0415
         ArtifactError,
@@ -201,8 +213,7 @@ def _stateful_blender(
     fingerprint = dataset_fingerprint(config)
     blender = None
     try:
-        state = store.load_state(
-            fingerprint=fingerprint,
+        _, state = store.load_latest_state(
             method_id=method_id,
             product=product,
             variable=variable_name,
@@ -216,7 +227,7 @@ def _stateful_blender(
         if not isinstance(fitted, OnlineExperts):  # pragma: no cover - registry gap
             return fitted
         blender = fitted
-    try:
+    with suppress(OSError):
         store.save(
             fingerprint=fingerprint,
             method_id=method_id,
@@ -224,8 +235,6 @@ def _stateful_blender(
             variable=variable_name,
             state=blender.to_state(),
         )
-    except OSError:
-        pass  # persistence is an optimization, never a serve failure
     return blender
 
 
@@ -276,6 +285,40 @@ def _cold_start_equal_weight(
         return np.where(counts > 0, totals / counts, np.nan)
 
 
+def _validated_selection(
+    selection: Selection,
+    product: Product,
+    variable: VariableSpec,
+    *,
+    explicit: bool,
+) -> Selection:
+    """Validate registration and compatibility before fitting a method."""
+    try:
+        get_factory(selection.method_id)
+    except UnknownMethodError as exc:
+        if explicit:
+            raise UnsupportedMethodError(str(exc.args[0])) from exc
+        return Selection(
+            "equal_weight",
+            reason=f"degraded stale selection: unknown method {selection.method_id}",
+        )
+    if supports_product(selection.method_id, product, variable):
+        return selection
+    if explicit:
+        msg = (
+            f"method {selection.method_id!r} does not support "
+            f"{product.value}.{variable.name}; choose a compatible method or use auto"
+        )
+        raise UnsupportedMethodError(msg)
+    return Selection(
+        "equal_weight",
+        reason=(
+            f"degraded stale selection: {selection.method_id} does not "
+            f"support {product.value}.{variable.name}"
+        ),
+    )
+
+
 def _blend_variable(
     train: pl.DataFrame,
     predict_frame: pl.DataFrame,
@@ -301,6 +344,16 @@ def _blend_variable(
         else method_for(selections, product, variable.name, bucket, config)
         for bucket in buckets
     ]
+    product_kind = Product.DAILY if daily else Product.HOURLY
+    chosen = [
+        _validated_selection(
+            selection,
+            product_kind,
+            variable,
+            explicit=force_method is not None or selection.reason == "pinned in config",
+        )
+        for selection in chosen
+    ]
     fitted = _fit_methods(
         train,
         predict_frame,
@@ -317,8 +370,12 @@ def _blend_variable(
         return VariableBlend(
             point=point,
             methods=["equal_weight"] * predict_frame.height,
-            reasons=["degraded cold start: no scoreable training truth"]
-            * predict_frame.height,
+            reasons=[
+                selection.reason
+                if selection.reason.startswith("degraded stale selection:")
+                else "degraded cold start: no scoreable training truth"
+                for selection in chosen
+            ],
             release_ids=[None] * predict_frame.height,
             quantiles=[{} for _ in range(predict_frame.height)],
         )
@@ -357,26 +414,188 @@ def _finite(value: float, variable: VariableSpec | None = None) -> float | None:
     return round(bounded, 3)
 
 
+def _quantile_grid(raw: dict[str, float]) -> tuple[np.ndarray, np.ndarray]:
+    pairs = sorted((float(level), value) for level, value in raw.items())
+    if not pairs:
+        return np.empty(0), np.empty(0)
+    return (
+        np.asarray([level for level, _ in pairs], dtype=np.float64),
+        np.asarray([value for _, value in pairs], dtype=np.float64),
+    )
+
+
+def _curve_on(
+    raw: dict[str, float], point: float | None, levels: np.ndarray
+) -> np.ndarray:
+    source_levels, values = _quantile_grid(raw)
+    if source_levels.size:
+        return np.interp(levels, source_levels, values)
+    fallback = np.nan if point is None else point
+    return np.full(levels.shape[0], fallback, dtype=np.float64)
+
+
+def _write_curve(
+    raw: dict[str, float], union_levels: np.ndarray, curve: np.ndarray
+) -> None:
+    source_levels, _ = _quantile_grid(raw)
+    if not source_levels.size:
+        return
+    coherent = np.maximum.accumulate(curve)
+    mapped = np.interp(source_levels, union_levels, coherent)
+    for key in tuple(raw):
+        raw[key] = float(np.interp(float(key), source_levels, mapped))
+
+
+def _enforce_mapped_pair(
+    lower_q: dict[str, float],
+    upper_q: dict[str, float],
+    lower_point: float | None,
+    upper_point: float | None,
+    union: np.ndarray,
+    *,
+    adjust: str,
+) -> None:
+    """Conservatively preserve coherence after mapping to unequal knot grids."""
+    if adjust in {"lower", "both"} and lower_q:
+        lower_levels, lower_values = _quantile_grid(lower_q)
+        previous = float(union[0])
+        for index, level in enumerate(lower_levels):
+            bound = float(_curve_on(upper_q, upper_point, np.array([previous]))[0])
+            lower_values[index] = min(lower_values[index], bound)
+            previous = float(level)
+        lower_values = np.maximum.accumulate(lower_values)
+        for key, value in zip(sorted(lower_q, key=float), lower_values, strict=True):
+            lower_q[key] = float(value)
+    if adjust in {"upper", "both"} and upper_q:
+        upper_levels, upper_values = _quantile_grid(upper_q)
+        for index, _level in enumerate(upper_levels):
+            next_level = (
+                float(upper_levels[index + 1])
+                if index + 1 < upper_levels.shape[0]
+                else float(union[-1])
+            )
+            bound = float(_curve_on(lower_q, lower_point, np.array([next_level]))[0])
+            upper_values[index] = max(upper_values[index], bound)
+        upper_values = np.maximum.accumulate(upper_values)
+        for key, value in zip(sorted(upper_q, key=float), upper_values, strict=True):
+            upper_q[key] = float(value)
+
+
+def _cohere_pair(
+    values: dict[str, float | None],
+    quantiles: dict[str, dict[str, float]],
+    lower_name: str,
+    upper_name: str,
+    *,
+    adjust: str,
+) -> None:
+    """Enforce ``lower <= upper`` on points and every advertised quantile."""
+    lower_q = quantiles.get(lower_name, {})
+    upper_q = quantiles.get(upper_name, {})
+    lower_levels, _ = _quantile_grid(lower_q)
+    upper_levels, _ = _quantile_grid(upper_q)
+    union = np.unique(np.concatenate((lower_levels, upper_levels)))
+    if union.size:
+        lower_curve = _curve_on(lower_q, values.get(lower_name), union)
+        upper_curve = _curve_on(upper_q, values.get(upper_name), union)
+        paired = np.isfinite(lower_curve) & np.isfinite(upper_curve)
+        match adjust:
+            case "lower":
+                lower_curve[paired] = np.minimum(
+                    lower_curve[paired], upper_curve[paired]
+                )
+            case "upper":
+                upper_curve[paired] = np.maximum(
+                    upper_curve[paired], lower_curve[paired]
+                )
+            case "both":
+                original_lower = lower_curve.copy()
+                lower_curve[paired] = np.minimum(
+                    original_lower[paired], upper_curve[paired]
+                )
+                upper_curve[paired] = np.maximum(
+                    original_lower[paired], upper_curve[paired]
+                )
+            case _:  # pragma: no cover - private invariant
+                msg = f"unknown coherence adjustment: {adjust}"
+                raise ValueError(msg)
+        _write_curve(lower_q, union, lower_curve)
+        _write_curve(upper_q, union, upper_curve)
+        _enforce_mapped_pair(
+            lower_q,
+            upper_q,
+            values.get(lower_name),
+            values.get(upper_name),
+            union,
+            adjust=adjust,
+        )
+    lower = values.get(lower_name)
+    upper = values.get(upper_name)
+    if lower is not None and upper is not None:
+        match adjust:
+            case "lower":
+                values[lower_name] = min(lower, upper)
+            case "upper":
+                values[upper_name] = max(upper, lower)
+            case "both":
+                values[lower_name], values[upper_name] = (
+                    min(lower, upper),
+                    max(lower, upper),
+                )
+
+
+def _keep_points_inside_quantiles(
+    values: dict[str, float | None], quantiles: dict[str, dict[str, float]]
+) -> None:
+    for name, raw in quantiles.items():
+        point = values.get(name)
+        finite = [value for value in raw.values() if math.isfinite(value)]
+        if point is not None and finite:
+            values[name] = min(max(point, min(finite)), max(finite))
+
+
 def _cohere_hourly(points: list[HourlyPoint]) -> None:
-    """Enforce cross-variable physical relationships after marginal clipping."""
+    """Enforce cross-variable relationships on points and distributions."""
     for point in points:
-        values = point.values
-        temperature = values.get("temp_c")
-        dew_point = values.get("dew_point_c")
+        _cohere_pair(
+            point.values,
+            point.quantiles,
+            "dew_point_c",
+            "temp_c",
+            adjust="lower",
+        )
+        _cohere_pair(
+            point.values,
+            point.quantiles,
+            "wind_speed_ms",
+            "wind_gust_ms",
+            adjust="upper",
+        )
+        _keep_points_inside_quantiles(point.values, point.quantiles)
+        temperature = point.values.get("temp_c")
+        dew_point = point.values.get("dew_point_c")
         if temperature is not None and dew_point is not None:
-            values["dew_point_c"] = min(dew_point, temperature)
-        speed = values.get("wind_speed_ms")
-        gust = values.get("wind_gust_ms")
+            point.values["dew_point_c"] = min(dew_point, temperature)
+        speed = point.values.get("wind_speed_ms")
+        gust = point.values.get("wind_gust_ms")
         if speed is not None and gust is not None:
-            values["wind_gust_ms"] = max(gust, speed)
+            point.values["wind_gust_ms"] = max(gust, speed)
 
 
 def _cohere_daily(points: list[DailyPoint]) -> None:
     for point in points:
-        high = point.values.get("temp_max_c")
+        _cohere_pair(
+            point.values,
+            point.quantiles,
+            "temp_min_c",
+            "temp_max_c",
+            adjust="both",
+        )
+        _keep_points_inside_quantiles(point.values, point.quantiles)
         low = point.values.get("temp_min_c")
-        if high is not None and low is not None and high < low:
-            point.values["temp_max_c"], point.values["temp_min_c"] = low, high
+        high = point.values.get("temp_max_c")
+        if low is not None and high is not None and low > high:
+            point.values["temp_min_c"], point.values["temp_max_c"] = high, low
 
 
 def hourly_product(
@@ -533,6 +752,20 @@ def _now_forecast(leads: np.ndarray, path: np.ndarray) -> float:
     return float(path[0])
 
 
+def _lead_zero_path(
+    leads: np.ndarray, path: np.ndarray
+) -> tuple[np.ndarray, np.ndarray]:
+    """Prepend the same lead-zero extrapolation used by the anchor residual."""
+    order = np.argsort(leads, kind="stable")
+    ordered_leads, ordered_path = leads[order], path[order]
+    if ordered_leads[0] <= 0.0:
+        return ordered_leads, ordered_path
+    return (
+        np.insert(ordered_leads, 0, 0.0),
+        np.insert(ordered_path, 0, _now_forecast(ordered_leads, ordered_path)),
+    )
+
+
 def minutely_product(
     snapshot: Snapshot,
     hourly_blend: dict[str, VariableBlend],
@@ -562,7 +795,8 @@ def minutely_product(
                 continue
             usable = np.isfinite(blend.point)
             usable_leads, path = leads[usable], blend.point[usable]
-            interpolated = float(np.interp(lead, usable_leads, path))
+            extended_leads, extended_path = _lead_zero_path(usable_leads, path)
+            interpolated = float(np.interp(lead, extended_leads, extended_path))
             observed = snapshot.observation.get(name)
             already_anchored = bool(blend.methods) and blend.methods[0].startswith(
                 "anchored"
@@ -573,6 +807,10 @@ def minutely_product(
                     _anchor_weight(minute, config.predict.minutely_tau_hours) * residual
                 )
             values[name] = _finite(interpolated, hourly_variable(name))
+        temperature = values.get("temp_c")
+        dew_point = values.get("dew_point_c")
+        if temperature is not None and dew_point is not None:
+            values["dew_point_c"] = min(dew_point, temperature)
         intensity, pop = precip.get(valid, (None, None))
         finite_intensity = (
             _finite(
@@ -635,6 +873,29 @@ def _training_matrix(
     )
 
 
+def _supported_release_ids(selections: SelectionMap) -> list[str]:
+    release_ids: set[str] = set()
+    for (product_name, variable_name, _), selection in selections.items():
+        try:
+            product = Product(product_name)
+            variable = (
+                daily_variable(variable_name)
+                if product is Product.DAILY
+                else hourly_variable(variable_name)
+            )
+        except (KeyError, ValueError):
+            continue
+        try:
+            get_factory(selection.method_id)
+        except UnknownMethodError:
+            continue
+        if selection.release_id is not None and supports_product(
+            selection.method_id, product, variable
+        ):
+            release_ids.add(selection.release_id)
+    return sorted(release_ids)
+
+
 def predict(
     config: Config,
     selections: SelectionMap,
@@ -663,13 +924,7 @@ def predict(
         if not snapshot.daily.is_empty()
         else []
     )
-    release_ids = sorted(
-        {
-            selection.release_id
-            for selection in selections.values()
-            if selection.release_id is not None
-        }
-    )
+    release_ids = _supported_release_ids(selections)
     degraded = not release_ids and force_method is None
     status_reason = (
         no_evidence_reason(config, config.dataset.dir / "scores") if degraded else None

@@ -2,10 +2,9 @@
 
 Ensemble Model Output Statistics (Gneiting et al. 2005): a Gaussian predictive
 distribution whose mean is an affine function of the base blend and whose
-spread is linked to ensemble dispersion, fitted by minimizing the closed-form
-Gaussian CRPS. The original design point was thin data (40-day sliding
-windows); here the fit uses exponential recency weights instead of a hard
-window, so a seasonally drifting archive down-weights the far past smoothly.
+spread is linked to ensemble dispersion. Unbounded variables minimize the
+closed-form Gaussian CRPS. Bounded variables optimize weighted truncated-normal
+likelihood, matching the family used for their emitted quantiles.
 
 The spread predictor prefers real ensemble standard deviations (the ``ens__*``
 statistics from the Ensemble API ingest) and falls back to the cross-provider
@@ -61,11 +60,16 @@ def gaussian_crps(y: FloatArray, mu: FloatArray, sigma: FloatArray) -> FloatArra
     )
 
 
-def _spread(x: ForecastMatrix) -> FloatArray:
+def _spread(x: ForecastMatrix, variable_name: str) -> FloatArray:
     """Per-row dispersion: real ensemble sd where ingested, provider sd else."""
     sd_columns = [
-        c for c in x.features.columns if c.startswith("ens__") and c.endswith("__sd")
+        c
+        for c in x.features.columns
+        if c.startswith("ens__") and c.endswith(f"__{variable_name}__sd")
     ]
+    with np.errstate(invalid="ignore"):
+        provider_sd = np.nanstd(np.where(x.availability, x.values, np.nan), axis=1)
+    provider_sd = np.nan_to_num(provider_sd, nan=0.0)
     if sd_columns:
         block = (
             x.features.select(sd_columns)
@@ -75,12 +79,8 @@ def _spread(x: ForecastMatrix) -> FloatArray:
         )
         with np.errstate(invalid="ignore"):
             ensemble_sd = np.nanmean(block, axis=1)
-        if np.isfinite(ensemble_sd).any():
-            fallback = float(np.nanmedian(ensemble_sd))
-            return np.where(np.isfinite(ensemble_sd), ensemble_sd, fallback)
-    with np.errstate(invalid="ignore"):
-        provider_sd = np.nanstd(np.where(x.availability, x.values, np.nan), axis=1)
-    return np.nan_to_num(provider_sd, nan=0.0)
+        return np.where(np.isfinite(ensemble_sd), ensemble_sd, provider_sd)
+    return provider_sd
 
 
 def _recency_weights(x: ForecastMatrix) -> FloatArray:
@@ -102,15 +102,16 @@ class Emos:
     _kind: TargetKind = TargetKind.CONTINUOUS
     _variable: VariableSpec | None = None
     _parameters: FloatArray | None = None
+    _fit_family: str = "gaussian"
 
     def fit(self, train: SupervisedSlice) -> Self:
         self._kind = train.variable.kind
         self._variable = train.variable
         self._base = self.base_factory().fit(train)
         base_point = self._base.predict(train.x).point
-        spread = _spread(train.x)
+        spread = _spread(train.x, train.variable.name)
         weights = _recency_weights(train.x)
-        scored = np.isfinite(base_point)
+        scored = np.isfinite(base_point) & np.isfinite(train.y)
         if int(scored.sum()) < _MIN_FIT_ROWS:
             self._parameters = None
             return self
@@ -120,10 +121,25 @@ class Emos:
         w = weights[scored] / weights[scored].sum()
         residual_sd = max(float(np.std(y - base)), _MIN_SIGMA)
 
+        minimum = train.variable.minimum
+        maximum = train.variable.maximum
+        bounded = minimum is not None or maximum is not None
+        stats = import_module("scipy.stats") if bounded else None
+        self._fit_family = "truncated_normal" if bounded else "gaussian"
+
         def loss(parameters: FloatArray) -> float:
             a, b, c, d = parameters
             mu = a + b * base
             sigma = np.maximum(np.exp(c + d * log_spread), _MIN_SIGMA)
+            if stats is not None:
+                lower = -np.inf if minimum is None else (minimum - mu) / sigma
+                upper = np.inf if maximum is None else (maximum - mu) / sigma
+                log_likelihood = stats.truncnorm.logpdf(
+                    y, lower, upper, loc=mu, scale=sigma
+                )
+                if not np.isfinite(log_likelihood).all():
+                    return float("inf")
+                return float(-(w * log_likelihood).sum())
             return float((w * gaussian_crps(y, mu, sigma)).sum())
 
         optimize = import_module("scipy.optimize")
@@ -143,7 +159,8 @@ class Emos:
             raise RuntimeError(msg)
         a, b, c, d = self._parameters
         mu = a + b * base_point
-        log_spread = np.log(np.maximum(_spread(x), _MIN_SIGMA))
+        variable_name = self._variable.name if self._variable else ""
+        log_spread = np.log(np.maximum(_spread(x, variable_name), _MIN_SIGMA))
         sigma = np.maximum(np.exp(c + d * log_spread), _MIN_SIGMA)
         return mu, sigma
 
@@ -151,11 +168,13 @@ class Emos:
         stats = import_module("scipy.stats")
         levels = np.asarray(QUANTILE_LEVELS)
         minimum = self._variable.minimum if self._variable else None
-        if minimum is not None and self._variable and self._variable.maximum is None:
-            a = (minimum - mu) / sigma
+        maximum = self._variable.maximum if self._variable else None
+        if minimum is not None or maximum is not None:
+            a = -np.inf if minimum is None else (minimum - mu) / sigma
+            b = np.inf if maximum is None else (maximum - mu) / sigma
             return np.column_stack(
                 [
-                    stats.truncnorm.ppf(level, a, np.inf, loc=mu, scale=sigma)
+                    stats.truncnorm.ppf(level, a, b, loc=mu, scale=sigma)
                     for level in levels
                 ]
             )

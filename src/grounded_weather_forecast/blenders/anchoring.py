@@ -250,7 +250,9 @@ class AnchoredEmpirical:
         self._trend_weights = trend_weights
 
     def _weights_at(self, lead: FloatArray, weights: FloatArray) -> FloatArray:
-        return np.interp(lead, _bin_centers(), weights, right=0.0)
+        centers = np.append(_bin_centers(), _FIT_BIN_EDGES[-1])
+        tapered = np.append(weights, 0.0)
+        return np.interp(lead, centers, tapered, right=0.0)
 
     def predict(self, x: ForecastMatrix) -> BlendResult:
         base_point = self._base.predict(x).point

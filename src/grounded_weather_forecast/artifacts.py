@@ -76,6 +76,39 @@ class ArtifactStore:
             raise ArtifactError(msg)
         return loaded
 
+    def load_latest_state(
+        self, *, method_id: str, product: str, variable: str
+    ) -> tuple[str, dict[str, Any]]:
+        """Load the newest state for a slice, independent of dataset identity.
+
+        Stateful online methods validate their own processed history before
+        advancing, so a new dataset fingerprint does not by itself force a
+        replay. The pointer identity is checked before it is trusted.
+        """
+        key = f"{product}.{variable}.{method_id}"
+        pointer = self.read_latest().get(key)
+        if not isinstance(pointer, dict):
+            msg = f"no latest artifact for {key}"
+            raise ArtifactError(msg)
+        expected = {
+            "method_id": method_id,
+            "product": product,
+            "variable": variable,
+        }
+        if any(pointer.get(name) != value for name, value in expected.items()):
+            msg = f"inconsistent latest artifact pointer for {key}"
+            raise ArtifactError(msg)
+        fingerprint = pointer.get("fingerprint")
+        if not isinstance(fingerprint, str) or not fingerprint:
+            msg = f"latest artifact pointer for {key} has no fingerprint"
+            raise ArtifactError(msg)
+        return fingerprint, self.load_state(
+            fingerprint=fingerprint,
+            method_id=method_id,
+            product=product,
+            variable=variable,
+        )
+
     def _latest_path(self) -> Path:
         return self.root / "latest.json"
 

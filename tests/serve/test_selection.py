@@ -4,7 +4,11 @@ import polars as pl
 from conftest import synthetic_hourly_matrix, utc, write_config
 
 from grounded_weather_forecast.backtest.engine import BacktestRequest, run_backtest
-from grounded_weather_forecast.backtest.scores import scores_path, write_scores
+from grounded_weather_forecast.backtest.scores import (
+    load_scores,
+    scores_path,
+    write_scores,
+)
 from grounded_weather_forecast.contracts import hourly_variable
 from grounded_weather_forecast.serve.selection import (
     FALLBACK_METHOD,
@@ -91,6 +95,63 @@ class TestSelectMethods:
         assert {choice.release_id for choice in restored.values()} == {
             choice.release_id for choice in promoted.values()
         }
+
+    def test_new_targeted_evaluation_updates_only_its_slice(self, tmp_path):
+        config = scored_config(tmp_path)
+        scores_dir = config.dataset.dir / "scores"
+        original = load_scores(next(scores_dir.glob("scores_*.parquet")))
+        original_evaluation = str(original["evaluation_id"][0])
+        target_bucket = str(original["lead_bucket"].unique().sort()[0])
+        targeted = original.filter(pl.col("lead_bucket") == target_bucket).with_columns(
+            pl.lit("targeted-evaluation").alias("evaluation_id"),
+            (pl.col("evaluation_created_at") + pl.duration(hours=1)).alias(
+                "evaluation_created_at"
+            ),
+        )
+        write_scores(targeted, scores_dir / "scores_hourly_live_targeted.parquet")
+
+        selections = select_methods(config, scores_dir)
+        assert selections[("hourly", "temp_c", target_bucket)].evaluation_id == (
+            "targeted-evaluation"
+        )
+        assert {
+            selected.evaluation_id
+            for key, selected in selections.items()
+            if key[2] != target_bucket
+        } == {original_evaluation}
+
+    def test_challenger_only_evaluation_is_ignored_for_promotion(self, tmp_path):
+        config = scored_config(tmp_path)
+        scores_dir = config.dataset.dir / "scores"
+        original = load_scores(next(scores_dir.glob("scores_*.parquet")))
+        original_evaluation = str(original["evaluation_id"][0])
+        challenger_only = original.filter(
+            pl.col("method_id") == "grounded_equal_weight"
+        ).with_columns(
+            pl.lit("challenger-only").alias("evaluation_id"),
+            (pl.col("evaluation_created_at") + pl.duration(hours=1)).alias(
+                "evaluation_created_at"
+            ),
+        )
+        write_scores(
+            challenger_only, scores_dir / "scores_hourly_live_challenger.parquet"
+        )
+
+        selections = select_methods(config, scores_dir)
+        assert {selected.evaluation_id for selected in selections.values()} == {
+            original_evaluation
+        }
+
+    def test_no_complete_reference_evaluation_fails_closed(self, tmp_path):
+        config = scored_config(tmp_path)
+        scores_dir = config.dataset.dir / "scores"
+        path = next(scores_dir.glob("scores_*.parquet"))
+        challenger_only = load_scores(path).filter(
+            pl.col("method_id") == "grounded_equal_weight"
+        )
+        path.unlink()
+        write_scores(challenger_only, scores_dir / "scores_hourly_live_partial.parquet")
+        assert select_methods(config, scores_dir) == {}
 
 
 class TestMethodFor:

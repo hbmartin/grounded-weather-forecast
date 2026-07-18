@@ -21,12 +21,13 @@ Aggregation) uses a second-order update whose per-expert rate shrinks with
 accumulated regret variance, so it adapts faster when losses are volatile.
 """
 
+import hashlib
+import json
 from collections import Counter
 from dataclasses import dataclass, field
 from typing import Literal, Self
 
 import numpy as np
-import polars as pl
 
 from grounded_weather_forecast.blenders.grounding import AffineGrounding
 from grounded_weather_forecast.blenders.protocol import finalize_point
@@ -51,6 +52,7 @@ _MAX_ETA = 0.5
 _SHARE = 0.005
 _MIN_AWAKE = 2
 _GLOBAL_BUCKET = "__global__"
+_STATE_SCHEMA_VERSION = 2
 
 
 @dataclass
@@ -59,6 +61,17 @@ class _BucketState:
     regret_variance: FloatArray
     horizon: int
     steps: int = 0
+
+
+@dataclass(frozen=True)
+class _BucketProgress:
+    """Identity of the exact history prefix already consumed by one bucket."""
+
+    resolution_us: int
+    issue_us: int
+    lead_hours: float
+    rows: int
+    prefix_digest: str
 
 
 def _uniform(n_experts: int) -> _BucketState:
@@ -91,7 +104,7 @@ class OnlineExperts:
     _variable: VariableSpec | None = None
     _grounding: AffineGrounding = field(default_factory=AffineGrounding)
     _states: dict[str, _BucketState] = field(default_factory=dict)
-    _watermark: str | None = None
+    _progress: dict[str, _BucketProgress] = field(default_factory=dict)
     _sources: tuple[str, ...] = ()
 
     def _update_factor(
@@ -152,29 +165,106 @@ class OnlineExperts:
     def fit(self, train: SupervisedSlice) -> Self:
         self._kind = train.variable.kind
         self._variable = train.variable
+        self._states.clear()
+        self._progress.clear()
         self._grounding = AffineGrounding().fit(train)
         self._replay(train)
         return self
 
     def advance(self, train: SupervisedSlice) -> Self:
-        """True online continuation: consume only rows past the watermark.
+        """Continue from per-bucket target-resolution cursors.
 
-        The training matrix IS the pending-loss queue — rows whose truth
-        resolved since the last serve are exactly the rows with a newer
-        ``issue_time``. Weights carry over; the batch replay of ``fit`` is
-        never re-run, so a serve costs O(new rows), not O(history). The
-        grounding is re-fit each call (a cheap batch OLS): expert weights are
-        the drift-adaptive state worth persisting, grounded corrections are
-        not — matching how the online-aggregation literature grounds
-        per round.
+        A forecast's loss becomes available at its target time, not its issue
+        time. Each lead bucket therefore owns a cursor ordered by target time,
+        issue time, and lead. A digest of the processed prefix detects archive
+        corrections or retention changes; callers then discard the state and
+        replay rather than silently combining incompatible histories.
         """
         self._kind = train.variable.kind
         self._variable = train.variable
         self._grounding = AffineGrounding().fit(train)
-        self._replay(train, after=self._watermark)
+        self._replay(train)
         return self
 
-    def _replay(self, train: SupervisedSlice, after: str | None = None) -> None:
+    @staticmethod
+    def _time_us(x: ForecastMatrix, name: str) -> np.ndarray | None:
+        if name not in x.features.columns:
+            return None
+        values = x.features[name].to_numpy()
+        try:
+            return values.astype("datetime64[us]").astype(np.int64)
+        except (TypeError, ValueError):
+            return np.asarray(
+                [np.datetime64(value, "us").astype(np.int64) for value in values],
+                dtype=np.int64,
+            )
+
+    @classmethod
+    def _row_times(cls, x: ForecastMatrix) -> tuple[np.ndarray, np.ndarray]:
+        issue = cls._time_us(x, "issue_time")
+        if issue is None:
+            issue = np.arange(x.n_rows, dtype=np.int64)
+        resolution = cls._time_us(x, "valid_time")
+        if resolution is None:
+            resolution = cls._time_us(x, "forecast_date")
+        if resolution is None:
+            resolution = issue + np.rint(x.lead_hours * 3_600_000_000).astype(np.int64)
+        return resolution, issue
+
+    @staticmethod
+    def _digest_rows(train: SupervisedSlice, rows: np.ndarray) -> str:
+        digest = hashlib.sha256()
+        digest.update(
+            json.dumps(
+                {
+                    "sources": train.x.sources,
+                    "product": train.x.product.value,
+                    "variable": train.variable.name,
+                },
+                sort_keys=True,
+            ).encode()
+        )
+        values = train.x.values[rows].astype("<f8", copy=True)
+        values[np.isnan(values)] = np.nan
+        digest.update(values.tobytes())
+        digest.update(train.y[rows].astype("<f8", copy=False).tobytes())
+        digest.update(train.x.lead_hours[rows].astype("<f8", copy=False).tobytes())
+        resolution, issue = OnlineExperts._row_times(train.x)
+        digest.update(resolution[rows].astype("<i8", copy=False).tobytes())
+        digest.update(issue[rows].astype("<i8", copy=False).tobytes())
+        return digest.hexdigest()
+
+    @staticmethod
+    def _after_cursor(
+        resolution: int,
+        issue: int,
+        lead: float,
+        progress: _BucketProgress,
+    ) -> bool:
+        return (resolution, issue, lead) > (
+            progress.resolution_us,
+            progress.issue_us,
+            progress.lead_hours,
+        )
+
+    def _bucket_rows(
+        self,
+        train: SupervisedSlice,
+        bucket: str,
+        buckets: list[str],
+        resolution: np.ndarray,
+        issue: np.ndarray,
+    ) -> np.ndarray:
+        rows = np.asarray(
+            [row for row, label in enumerate(buckets) if label == bucket],
+            dtype=np.int64,
+        )
+        if not rows.size:
+            return rows
+        order = np.lexsort((train.x.lead_hours[rows], issue[rows], resolution[rows]))
+        return rows[order]
+
+    def _replay(self, train: SupervisedSlice) -> None:
         self._sources = train.x.sources
         corrected = self._grounding.transform(train.x)
         n_experts = len(train.x.sources)
@@ -183,29 +273,56 @@ class OnlineExperts:
             for lead in train.x.lead_hours
         ]
         horizons = Counter(buckets)
-        issue = (
-            train.x.features["issue_time"].cast(pl.Datetime("us", "UTC")).to_numpy()
-            if "issue_time" in train.x.features.columns
-            else None
-        )
-        threshold = np.datetime64(after) if after and issue is not None else None
-        order = np.argsort(issue, kind="stable") if issue is not None else None
-        rows = order if order is not None else np.arange(train.x.n_rows)
-        for row in rows:
-            if threshold is not None and issue is not None and issue[row] <= threshold:
-                continue
-            bucket = buckets[row]
-            if bucket not in self._states:
-                fresh = _uniform(n_experts)
-                fresh.horizon = horizons[bucket]
-                self._states[bucket] = fresh
-            awake = train.x.availability[row]
-            losses = np.where(awake, (corrected[row] - train.y[row]) ** 2, 0.0)
-            self._step(self._states[bucket], losses, awake)
-        if issue is not None and issue.shape[0]:
-            newest = str(np.datetime_as_string(issue.max(), unit="us"))
-            if self._watermark is None or newest > self._watermark:
-                self._watermark = newest
+        resolution, issue = self._row_times(train.x)
+        for bucket in sorted(set(buckets) | set(self._progress)):
+            rows = self._bucket_rows(train, bucket, buckets, resolution, issue)
+            previous = self._progress.get(bucket)
+            if previous is not None:
+                prefix = np.asarray(
+                    [
+                        row
+                        for row in rows
+                        if not self._after_cursor(
+                            int(resolution[row]),
+                            int(issue[row]),
+                            float(train.x.lead_hours[row]),
+                            previous,
+                        )
+                    ],
+                    dtype=np.int64,
+                )
+                if (
+                    prefix.shape[0] != previous.rows
+                    or self._digest_rows(train, prefix) != previous.prefix_digest
+                ):
+                    msg = f"processed expert history changed for bucket {bucket!r}"
+                    raise ValueError(msg)
+            else:
+                prefix = np.empty(0, dtype=np.int64)
+            new_rows = rows[prefix.shape[0] :]
+            for row in new_rows:
+                if bucket not in self._states:
+                    fresh = _uniform(n_experts)
+                    fresh.horizon = horizons[bucket]
+                    self._states[bucket] = fresh
+                else:
+                    self._states[bucket].horizon = max(
+                        self._states[bucket].horizon, horizons[bucket]
+                    )
+                awake = train.x.availability[row]
+                losses = np.where(awake, (corrected[row] - train.y[row]) ** 2, 0.0)
+                self._step(self._states[bucket], losses, awake)
+            if not rows.size:
+                msg = f"processed expert bucket disappeared: {bucket!r}"
+                raise ValueError(msg)
+            last = int(rows[-1])
+            self._progress[bucket] = _BucketProgress(
+                resolution_us=int(resolution[last]),
+                issue_us=int(issue[last]),
+                lead_hours=float(train.x.lead_hours[last]),
+                rows=int(rows.shape[0]),
+                prefix_digest=self._digest_rows(train, rows),
+            )
 
     def _state_for(self, product: Product, lead: float, n_experts: int) -> _BucketState:
         """Fitted state for a lead, or a uniform default for unseen buckets."""
@@ -238,9 +355,9 @@ class OnlineExperts:
 
     def to_state(self) -> dict[str, object]:
         return {
+            "schema_version": _STATE_SCHEMA_VERSION,
             "scheme": self.scheme,
             "share": self.share,
-            "watermark": self._watermark,
             "sources": list(self._sources),
             "buckets": {
                 label: {
@@ -251,12 +368,25 @@ class OnlineExperts:
                 }
                 for label, state in self._states.items()
             },
+            "progress": {
+                label: {
+                    "resolution_us": progress.resolution_us,
+                    "issue_us": progress.issue_us,
+                    "lead_hours": progress.lead_hours,
+                    "rows": progress.rows,
+                    "prefix_digest": progress.prefix_digest,
+                }
+                for label, progress in self._progress.items()
+            },
             "grounding": self._grounding.to_state(),
         }
 
     @classmethod
     def from_state(cls, state: dict[str, object], method_id: str) -> "OnlineExperts":
         """Rehydrate persisted weights; grounding re-fits on the next advance."""
+        if state.get("schema_version") != _STATE_SCHEMA_VERSION:
+            msg = "legacy or unknown expert state schema; full replay required"
+            raise ValueError(msg)
         match state.get("scheme"):
             case "ewa":
                 scheme: Literal["ewa", "boa"] = "ewa"
@@ -269,9 +399,6 @@ class OnlineExperts:
         share = state.get("share")
         if isinstance(share, (int, float)):
             experts.share = float(share)
-        watermark = state.get("watermark")
-        if isinstance(watermark, str):
-            experts._watermark = watermark
         sources = state.get("sources")
         if isinstance(sources, list):
             experts._sources = tuple(str(s) for s in sources)
@@ -290,6 +417,39 @@ class OnlineExperts:
                     horizon=int(horizon) if isinstance(horizon, (int, float)) else 1,
                     steps=int(steps) if isinstance(steps, (int, float)) else 0,
                 )
+        progress = state.get("progress")
+        if not isinstance(progress, dict):
+            msg = "expert state has no processed-prefix metadata"
+            raise ValueError(msg)
+        for label, raw in progress.items():
+            if not isinstance(raw, dict):
+                msg = f"corrupt expert progress for bucket {label!r}"
+                raise ValueError(msg)
+            resolution_us = raw.get("resolution_us")
+            issue_us = raw.get("issue_us")
+            lead_hours = raw.get("lead_hours")
+            rows = raw.get("rows")
+            prefix_digest = raw.get("prefix_digest")
+            numeric = (int, float)
+            if (
+                not isinstance(resolution_us, numeric)
+                or not isinstance(issue_us, numeric)
+                or not isinstance(lead_hours, numeric)
+                or not isinstance(rows, numeric)
+                or not isinstance(prefix_digest, str)
+            ):
+                msg = f"corrupt expert progress for bucket {label!r}"
+                raise ValueError(msg)
+            experts._progress[str(label)] = _BucketProgress(
+                resolution_us=int(resolution_us),
+                issue_us=int(issue_us),
+                lead_hours=float(lead_hours),
+                rows=int(rows),
+                prefix_digest=prefix_digest,
+            )
+        if set(experts._states) != set(experts._progress):
+            msg = "expert state buckets and progress do not match"
+            raise ValueError(msg)
         return experts
 
 

@@ -21,6 +21,7 @@ from grounded_weather_forecast.contracts import (
 )
 from grounded_weather_forecast.dataset.matrix import (
     _equal_weight_daily_aggregates,
+    _observation_trends,
     assert_single_kind,
     build_daily_matrix,
     build_hourly_matrix,
@@ -116,6 +117,50 @@ class TestBuildHourlyMatrix:
         assert row["valid_hour_local"] == 11  # 18 UTC = 11:00 PDT
         assert row["obs__temp_c"] == pytest.approx(5.0)  # issue-time obs
         assert row["t__temp_c__inst"] == pytest.approx(9.0)  # valid-time truth
+
+    def test_trends_use_clock_time_on_irregular_observations(self):
+        minutes = (0, 1, 2, 4, 5, 6, 10, 11, 12, 14, 15)
+        times = [ISSUE + timedelta(minutes=minute) for minute in minutes]
+        frame = canonical_minute_frame(
+            times, temp_c=[float(minute) for minute in minutes]
+        )
+
+        trends = _observation_trends(frame)
+
+        final = trends.filter(pl.col("ts") == times[-1]).row(0, named=True)
+        assert final["obs__temp_c__trend15m"] == pytest.approx(60.0)
+
+    def test_trends_are_null_across_observation_gap(self):
+        minutes = (0, 1, 2, 20, 21, 22)
+        times = [ISSUE + timedelta(minutes=minute) for minute in minutes]
+        frame = canonical_minute_frame(
+            times, temp_c=[float(minute) for minute in minutes]
+        )
+
+        trends = _observation_trends(frame)
+
+        final = trends.filter(pl.col("ts") == times[-1]).row(0, named=True)
+        assert final["obs__temp_c__trend15m"] is None
+
+    def test_trends_support_regular_five_minute_cadence(self):
+        times = [ISSUE + timedelta(minutes=minute) for minute in range(0, 31, 5)]
+        frame = canonical_minute_frame(
+            times, temp_c=[float(minute) for minute in range(0, 31, 5)]
+        )
+
+        trends = _observation_trends(frame)
+
+        final = trends.filter(pl.col("ts") == times[-1]).row(0, named=True)
+        assert final["obs__temp_c__trend15m"] == pytest.approx(60.0)
+
+    def test_trends_require_three_observations_across_span(self):
+        times = [ISSUE, ISSUE + timedelta(minutes=10)]
+        frame = canonical_minute_frame(times, temp_c=[0.0, 10.0])
+
+        trends = _observation_trends(frame)
+
+        final = trends.filter(pl.col("ts") == times[-1]).row(0, named=True)
+        assert final["obs__temp_c__trend15m"] is None
 
     def test_empty_long_gives_empty_matrix(self, fixture_config):
         config = fixture_config
@@ -218,6 +263,8 @@ class TestSupervisedSlice:
         assert s.source_kind is SourceKind.LIVE
         assert all(not c.startswith("t__") for c in s.x.features.columns)
         assert not any(c.endswith("_cov") for c in s.x.features.columns)
+        assert s.x.features["valid_time"][0] == VALID
+        assert s.x.features["truth_known_at"][0] == VALID + timedelta(hours=2)
 
     def test_matrix_sources(self, fixture_config):
         config = fixture_config
@@ -254,6 +301,8 @@ class TestBuildDailyMatrix:
         )
         assert contract.product is Product.DAILY
         assert contract.lead_hours[0] == 24.0
+        assert contract.features["forecast_date"][0].isoformat() == "2026-03-23"
+        assert contract.features["truth_known_at"][0] == utc(2026, 3, 24, 8)
 
     def test_ewagg_from_hourly(self, fixture_config):
         config = fixture_config

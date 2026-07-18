@@ -77,7 +77,8 @@ start_date = 2024-01-01
 
 # dynamical.org Zarr backfill (`backfill --provider dynamical`): full forecast
 # cycles at native 3-6h steps, i.e. the sub-24h leads the Previous Runs API
-# cannot supply. Free and keyless; needs `uv sync --group backfill`.
+# cannot supply. Free and keyless; install with `uv sync --extra backfill`
+# from a checkout or `grounded-weather-forecast[backfill]` as a package extra.
 # fetched_at = init + publication_lag_hours, so short-lead skill is never
 # inflated by pretending a cycle was visible before it was published.
 [backfill.dynamical]
@@ -90,6 +91,8 @@ max_lead_hours = 48.0
 # stored as ens__* FEATURE columns — honest uncertainty from real members —
 # never as blend sources. Open-Meteo keeps only the latest run's members, so
 # run the ingest cron at least once per model cycle.
+# `build-dataset` must run after each ingest before those features are available
+# to backtests and serving.
 [ensembles]
 models = [
     "ncep_gefs025",                  # GEFS, 31 members (physics)
@@ -103,7 +106,7 @@ models = [
 # ships only when the reference is statistically excluded from the set of
 # best methods) or "legacy" (single Diebold-Mariano test). live_gap_factor
 # demotes a served method whose realized MAE exceeds its backtest promise.
-# Neighbor-station truth cross-checks (`truth-qc`): Synoptic Data free tier,
+# Neighbor-station truth cross-checks (`truth-qc --days 30`): Synoptic Data free tier,
 # https://synopticdata.com/ — a "$VAR" token reads the environment variable.
 # Catches slow sensor drift (>1 degC vs lapse-adjusted neighbor consensus)
 # and decorrelation (a failing shield can look plausible for months).

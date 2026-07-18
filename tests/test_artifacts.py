@@ -1,3 +1,5 @@
+import json
+
 import pytest
 
 from grounded_weather_forecast.artifacts import ArtifactError, ArtifactStore
@@ -43,6 +45,28 @@ class TestArtifactStore:
         )
         latest = store.read_latest()
         assert latest["hourly.temp_c.gbm"]["fingerprint"] == "bbb"
+        fingerprint, state = store.load_latest_state(
+            method_id="gbm", product="hourly", variable="temp_c"
+        )
+        assert fingerprint == "bbb"
+        assert state == {}
+
+    def test_latest_state_rejects_inconsistent_pointer(self, tmp_path):
+        store = ArtifactStore(root=tmp_path / "artifacts")
+        store.save(
+            fingerprint="aaa",
+            method_id="gbm",
+            product="hourly",
+            variable="temp_c",
+            state={},
+        )
+        latest = store.read_latest()
+        latest["hourly.temp_c.gbm"]["variable"] = "wind_speed_ms"
+        store._latest_path().write_text(json.dumps(latest), encoding="utf-8")
+        with pytest.raises(ArtifactError, match="inconsistent"):
+            store.load_latest_state(
+                method_id="gbm", product="hourly", variable="temp_c"
+            )
 
     def test_missing_artifact_raises(self, tmp_path):
         store = ArtifactStore(root=tmp_path / "artifacts")

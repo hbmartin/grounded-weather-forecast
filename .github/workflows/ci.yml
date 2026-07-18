@@ -25,6 +25,11 @@ jobs:
       - name: Set up Python ${{ matrix.python-version }}
         run: uv python install ${{ matrix.python-version }}
 
+      - name: Verify locked dependencies
+        run: |
+          uv lock --check
+          uv run --no-project python scripts/check_lock_hosts.py
+
       - name: Cache uv dependencies
         uses: actions/cache@v4
         with:
@@ -98,6 +103,11 @@ jobs:
 
       - name: Set up Python 3.13
         run: uv python install 3.13
+
+      - name: Verify locked dependencies
+        run: |
+          uv lock --check
+          uv run --no-project python scripts/check_lock_hosts.py
 
       - name: Install runtime dependencies
         run: uv sync --locked --no-dev

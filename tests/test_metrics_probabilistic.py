@@ -45,6 +45,16 @@ class TestCrps:
             y, wide, levels
         )
 
+    def test_uneven_levels_are_weighted_by_probability_span(self):
+        y = np.asarray([0.4])
+        levels = (0.05, 0.1, 0.25, 0.75, 0.9, 0.95)
+        quantiles = np.asarray([[-2.0, -1.0, -0.5, 0.5, 1.0, 2.0]])
+        assert crps_from_quantiles(y, quantiles, levels) == pytest.approx(0.2325)
+
+    def test_levels_must_be_strictly_increasing(self):
+        with pytest.raises(ValueError, match="strictly increasing"):
+            crps_from_quantiles(np.zeros(1), np.zeros((1, 2)), (0.9, 0.1))
+
     def test_ensemble_perfect_forecast(self):
         y = np.array([1.0, 2.0])
         ensemble = np.array([[1.0, 1.0, 1.0], [2.0, 2.0, 2.0]])

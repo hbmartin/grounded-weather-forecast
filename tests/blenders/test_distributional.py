@@ -1,9 +1,11 @@
 import numpy as np
+import polars as pl
 import pytest
 from conftest import synthetic_hourly_matrix, write_config
 
 from grounded_weather_forecast.backtest.engine import BacktestRequest, run_backtest
 from grounded_weather_forecast.blenders import get_factory
+from grounded_weather_forecast.blenders.emos import _spread
 from grounded_weather_forecast.blenders.idr import pava_isotonic
 from grounded_weather_forecast.blenders.protocol import finalize_quantiles
 from grounded_weather_forecast.contracts import TargetKind, hourly_variable
@@ -40,6 +42,24 @@ class TestFinalizeQuantiles:
 
 
 class TestEmos:
+    def test_spread_uses_only_the_target_variable(self):
+        train = to_supervised_slice(gaussian_matrix(days=2), TEMP)
+        features = train.x.features.with_columns(
+            pl.Series("ens__gefs__temp_c__sd", np.ones(train.x.n_rows)),
+            pl.Series(
+                "ens__gefs__pressure_sea_hpa__sd",
+                np.ones(train.x.n_rows) * 101.0,
+            ),
+        )
+        x = type(train.x).build(
+            sources=train.x.sources,
+            values=train.x.values,
+            lead_hours=train.x.lead_hours,
+            features=features,
+            product=train.x.product,
+        )
+        np.testing.assert_allclose(_spread(x, "temp_c"), 1.0)
+
     def test_recovers_dispersion_and_calibrates(self):
         train = to_supervised_slice(gaussian_matrix(), TEMP)
         emos = get_factory("emos")().fit(train)
@@ -61,6 +81,22 @@ class TestEmos:
         emos = get_factory("emos")().fit(train)
         assert emos.predict(train.x).quantiles is None
 
+    def test_bounded_variable_fits_the_served_truncated_family(self):
+        matrix = gaussian_matrix().rename(
+            {
+                "fx__alpha__temp_c": "fx__alpha__wind_speed_ms",
+                "fx__beta__temp_c": "fx__beta__wind_speed_ms",
+                "t__temp_c__inst": "t__wind_speed_ms__inst",
+                "t__temp_c__mean": "t__wind_speed_ms__mean",
+            }
+        )
+        train = to_supervised_slice(matrix, WIND)
+        emos = get_factory("emos")().fit(train)
+        result = emos.predict(train.x)
+        assert emos._fit_family == "truncated_normal"
+        assert result.quantiles is not None
+        assert (result.quantiles >= 0.0).all()
+
 
 class TestIdr:
     def test_pit_is_calibrated_in_sample(self):
@@ -81,6 +117,58 @@ class TestIdr:
         order = np.argsort(base)
         medians = result.quantiles[order, 9]
         assert (np.diff(medians) >= -1e-9).all()
+
+    def test_tied_covariates_are_invariant_to_row_order(self):
+        train = to_supervised_slice(gaussian_matrix(), TEMP)
+        tied_values = np.zeros_like(train.x.values)
+        tied_x = type(train.x).build(
+            sources=train.x.sources,
+            values=tied_values,
+            lead_hours=train.x.lead_hours,
+            features=train.x.features,
+            product=train.x.product,
+        )
+        tied_train = type(train)(
+            x=tied_x,
+            y=train.y,
+            variable=train.variable,
+            source_kind=train.source_kind,
+        )
+        base = get_factory("idr")().fit(tied_train)
+        reverse = np.arange(train.x.n_rows - 1, -1, -1)
+        reversed_features = train.x.features.with_columns(pl.Series("__row", reverse))
+        reversed_train = type(train)(
+            x=type(train.x).build(
+                sources=train.x.sources,
+                values=tied_values[reverse],
+                lead_hours=train.x.lead_hours[reverse],
+                features=reversed_features.sort("__row").drop("__row"),
+                product=train.x.product,
+            ),
+            y=train.y[reverse],
+            variable=train.variable,
+            source_kind=train.source_kind,
+        )
+        reordered = get_factory("idr")().fit(reversed_train)
+        np.testing.assert_allclose(base._sorted_x, reordered._sorted_x)
+        np.testing.assert_allclose(base._cdf_stack, reordered._cdf_stack)
+
+    def test_missing_point_masks_the_entire_distribution(self):
+        train = to_supervised_slice(gaussian_matrix(), TEMP)
+        idr = get_factory("idr")().fit(train)
+        values = train.x.values.copy()
+        values[0] = np.nan
+        x = type(train.x).build(
+            sources=train.x.sources,
+            values=values,
+            lead_hours=train.x.lead_hours,
+            features=train.x.features,
+            product=train.x.product,
+        )
+        result = idr.predict(x)
+        assert np.isnan(result.point[0])
+        assert result.quantiles is not None
+        assert np.isnan(result.quantiles[0]).all()
 
 
 class TestLeaderboardProbabilisticColumns:

@@ -14,7 +14,7 @@ are dropped, and synthetic short-lead skill is never inflated by pretending
 the archive saw a cycle before it existed.
 
 Heavy dependencies (dynamical-catalog, xarray, zarr/icechunk) live in the
-optional ``backfill`` dependency group and are imported lazily, mirroring the
+optional ``backfill`` extra and are imported lazily, mirroring the
 lightgbm pattern.
 """
 
@@ -70,7 +70,7 @@ def open_catalog_dataset(catalog_id: str) -> Any:  # pragma: no cover - network
     if not HAVE_DYNAMICAL:
         msg = (
             "the dynamical backfill needs the optional dependencies: "
-            "uv sync --group backfill"
+            "uv sync --extra backfill"
         )
         raise DynamicalBackfillError(msg)
     return import_module("dynamical_catalog").open(catalog_id)
@@ -149,7 +149,7 @@ def _long_frame(
         {
             "fetched_at": fetched,
             "valid_time": valid_times,
-            **{name: values for name, values in columns.items()},
+            **dict(columns),
         }
     ).with_columns(
         pl.col("fetched_at").cast(pl.Datetime("us")).dt.replace_time_zone("UTC"),
@@ -206,20 +206,29 @@ def backfill_dynamical_long(
     frames: list[pl.DataFrame] = []
     for model in selected:
         spec = DYNAMICAL_DATASETS[model]
-        dataset = opener(spec.catalog_id)
-        point = _point_selection(
-            dataset, config.station.latitude, config.station.longitude
-        )
-        window = point.sel(
-            init_time=slice(
-                np.datetime64(start_instant.replace(tzinfo=None)),
-                np.datetime64(end_instant.replace(tzinfo=None)),
-            ),
-            lead_time=slice(np.timedelta64(0, "s"), max_lead),
-        )
-        if window["init_time"].shape[0] == 0:
-            continue
-        frames.append(_long_frame(_member_mean(window), spec, lag))
+        try:
+            dataset = opener(spec.catalog_id)
+            point = _point_selection(
+                dataset, config.station.latitude, config.station.longitude
+            )
+            window = point.sel(
+                init_time=slice(
+                    np.datetime64(start_instant.replace(tzinfo=None)),
+                    np.datetime64(end_instant.replace(tzinfo=None)),
+                ),
+                lead_time=slice(np.timedelta64(0, "s"), max_lead),
+            )
+            if window["init_time"].shape[0] == 0:
+                continue
+            frames.append(_long_frame(_member_mean(window), spec, lag))
+        except Exception as exc:
+            if isinstance(exc, DynamicalBackfillError):
+                raise
+            msg = (
+                f"dynamical backfill failed for {model!r} "
+                f"({spec.catalog_id}): {type(exc).__name__}: {exc}"
+            )
+            raise DynamicalBackfillError(msg) from exc
     if not frames:
         msg = "no dynamical cycles found in the requested window"
         raise DynamicalBackfillError(msg)

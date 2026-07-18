@@ -5,7 +5,6 @@ from threading import Barrier
 
 import polars as pl
 import pytest
-
 from conftest import utc
 
 from grounded_weather_forecast.reports.verification import (
@@ -128,6 +127,8 @@ class TestVerification:
         assert row["n"] == 6
         assert row["live_mae"] == pytest.approx((2 + 1 + 0 + 1 + 2 + 3) / 6)
         assert row["live_bias"] == pytest.approx(0.5)
+        assert row["lead_bucket"] == "1-3h"
+        assert row["dataset_fingerprint"] == "abc123"
 
     def test_compares_to_backtest_expectation(self, tmp_path):
         path = tmp_path / "history.parquet"
@@ -168,6 +169,27 @@ class TestVerification:
         assert row["n"] == 6
         assert row["live_mae"] == pytest.approx(1.0)
 
+    def test_scores_daily_when_hourly_truth_is_empty(self, tmp_path):
+        path = tmp_path / "history.parquet"
+        for _ in range(6):
+            append_history(make_forecast(), path)
+        daily_truth = pl.DataFrame(
+            {
+                "date_local": [date(2026, 3, 23)],
+                "t__temp_max_c": [24.0],
+            }
+        )
+
+        live = verify_history(
+            path,
+            self.truth([]),
+            truth_daily=daily_truth,
+        )
+
+        row = live.filter(pl.col("product") == "daily").row(0, named=True)
+        assert row["n"] == 6
+        assert row["live_mae"] == pytest.approx(1.0)
+
     def test_scores_minutely_rows_at_minute_grain(self, tmp_path):
         path = tmp_path / "history.parquet"
         minutely = MinutelyPoint(
@@ -193,6 +215,57 @@ class TestVerification:
         row = live.filter(pl.col("product") == "minutely").row(0, named=True)
         assert row["n"] == 6
         assert row["live_mae"] == pytest.approx(1.0)
+
+    def test_scores_minutely_when_hourly_truth_is_empty(self, tmp_path):
+        path = tmp_path / "history.parquet"
+        minutely = MinutelyPoint(
+            valid_time=(ISSUED + timedelta(minutes=1)).isoformat(),
+            minutes_ahead=1,
+            temp_c=20.0,
+            methods={"temp_c": "anchored_hourly_blend"},
+        )
+        for _ in range(6):
+            append_history(replace(make_forecast(), minutely=[minutely]), path)
+        truth_minute = pl.DataFrame(
+            {
+                "ts": [ISSUED + timedelta(minutes=1, seconds=30)],
+                "temp_c": [19.0],
+            },
+            schema_overrides={"ts": pl.Datetime("us", "UTC")},
+        )
+
+        live = verify_history(
+            path,
+            self.truth([]),
+            truth_minute=truth_minute,
+        )
+
+        row = live.filter(pl.col("product") == "minutely").row(0, named=True)
+        assert row["n"] == 6
+        assert row["live_mae"] == pytest.approx(1.0)
+
+    def test_release_and_bucket_cohorts_are_scored_separately(self, tmp_path):
+        path = tmp_path / "history.parquet"
+        base = make_forecast()
+        long_point = replace(base.hourly[0], lead_hours=30.0)
+        for _ in range(5):
+            append_history(replace(base, release_ids=["release-short"]), path)
+            append_history(
+                replace(
+                    base,
+                    release_ids=["release-long"],
+                    hourly=[long_point],
+                ),
+                path,
+            )
+        live = verify_history(path, self.truth([20.0]))
+        hourly = live.filter(pl.col("product") == "hourly")
+        assert hourly.height == 2
+        assert set(hourly["lead_bucket"].to_list()) == {"1-3h", "24-48h"}
+        assert set(hourly["release_id"].to_list()) == {
+            "release-short",
+            "release-long",
+        }
 
     def test_empty_history(self, tmp_path):
         assert verify_history(tmp_path / "none.parquet", self.truth([20.0])).is_empty()

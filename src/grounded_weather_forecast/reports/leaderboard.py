@@ -8,7 +8,7 @@ pools live and synthetic scores.
 """
 
 import json
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 
 import numpy as np
 import polars as pl
@@ -18,7 +18,7 @@ from grounded_weather_forecast.metrics.deterministic import bias, mae, pct_withi
 from grounded_weather_forecast.metrics.dm import diebold_mariano
 from grounded_weather_forecast.metrics.probabilistic import (
     brier,
-    crps_ensemble,
+    crps_from_quantiles,
     empirical_coverage,
     pinball_loss,
     pit_from_quantiles,
@@ -41,6 +41,7 @@ CONSUMER_TOLERANCES: Mapping[str, float] = {
 }
 
 _MIN_DM_SAMPLES = 8
+_MIN_PIT_SAMPLES = 50
 _PIT_BINS = 10
 _PROBABILISTIC_EMPTY: Mapping[str, float | None] = {
     "crps": None,
@@ -52,7 +53,7 @@ _PROBABILISTIC_EMPTY: Mapping[str, float | None] = {
 }
 
 
-def _level_index(levels: list[float], target: float) -> int:
+def _level_index(levels: Sequence[float], target: float) -> int:
     return int(np.argmin(np.abs(np.asarray(levels) - target)))
 
 
@@ -69,7 +70,7 @@ def _probabilistic_columns(method_scores: pl.DataFrame) -> dict[str, float | Non
     with_quantiles = method_scores.drop_nulls("quantiles_json")
     if with_quantiles.is_empty():
         return empty
-    levels = json.loads(with_quantiles["quantile_levels_json"][0])
+    levels = tuple(json.loads(with_quantiles["quantile_levels_json"][0]))
     if not levels:
         return empty
     grids = np.asarray(
@@ -89,7 +90,7 @@ def _probabilistic_columns(method_scores: pl.DataFrame) -> dict[str, float | Non
     pit = pit_from_quantiles(y, grids, tuple(levels))
     counts, _ = np.histogram(pit, bins=_PIT_BINS, range=(0.0, 1.0))
     return {
-        "crps": crps_ensemble(y, grids),
+        "crps": crps_from_quantiles(y, grids, levels),
         "pinball": pinball,
         "coverage80": empirical_coverage(
             y,
@@ -101,7 +102,11 @@ def _probabilistic_columns(method_scores: pl.DataFrame) -> dict[str, float | Non
             grids[:, _level_index(levels, 0.05)],
             grids[:, _level_index(levels, 0.95)],
         ),
-        "pit_chi2_p": float(stats.chisquare(counts).pvalue),
+        "pit_chi2_p": (
+            float(stats.chisquare(counts).pvalue)
+            if y.shape[0] >= _MIN_PIT_SAMPLES
+            else None
+        ),
         "sharpness": float(
             np.mean(
                 grids[:, _level_index(levels, 0.9)]
@@ -272,33 +277,54 @@ def _legacy_gate(
     return candidate if strong else reference
 
 
+def _reference_fallback(
+    references: tuple[dict[str, object], ...],
+) -> dict[str, object]:
+    """The named serving incumbent, or the best remaining reference."""
+    for reference in references:
+        if reference["method_id"] == "equal_weight":
+            return reference
+
+    def row_mae(row: dict[str, object]) -> float:
+        value = row["mae"]
+        return float(value) if isinstance(value, (int, float)) else float("inf")
+
+    return min(references, key=row_mae)
+
+
 def _mcs_gate(
     candidate: dict[str, object],
-    reference: dict[str, object],
+    references: tuple[dict[str, object], ...],
     slice_scores: pl.DataFrame,
+    eligible_methods: tuple[str, ...],
     alpha: float,
 ) -> dict[str, object]:
-    """Promote only when the reference is *excluded* from the MCS.
+    """Promote only when every reference is excluded from the MCS.
 
-    A challenger inside the confidence set alongside the reference is
-    statistically indistinguishable from it — keep the reference. Thin data
-    yields a large set, so promotion defaults to the incumbent.
+    Sparse, ineligible methods are deliberately excluded before constructing
+    the common-case matrix. Thin data never falls back to a more permissive
+    test: the best eligible reference continues serving.
     """
     from grounded_weather_forecast.reports.mcs import (  # noqa: PLC0415
         collapsed_loss_matrix,
         model_confidence_set,
     )
 
-    built = collapsed_loss_matrix(slice_scores)
+    fallback = _reference_fallback(references)
+    built = collapsed_loss_matrix(slice_scores, method_ids=eligible_methods)
     if built is None:
-        return _legacy_gate(candidate, reference)
+        return fallback
     matrix, methods = built
+    if matrix.shape[0] < _MIN_DM_SAMPLES:
+        return fallback
     result = model_confidence_set(matrix, methods, alpha=alpha)
     candidate_id = str(candidate["method_id"])
-    reference_id = str(reference["method_id"])
-    if result.contains(candidate_id) and not result.contains(reference_id):
+    reference_ids = tuple(str(reference["method_id"]) for reference in references)
+    if result.contains(candidate_id) and all(
+        not result.contains(reference_id) for reference_id in reference_ids
+    ):
         return candidate
-    return reference
+    return fallback
 
 
 def slice_winners(
@@ -323,25 +349,48 @@ def slice_winners(
             & (pl.col("n") >= 8)
             & (pl.col("n_valid_times") >= 8)
         )
-        ranked = (eligible if not eligible.is_empty() else group).sort("mae")
+        if eligible.is_empty():
+            continue
+        ranked = eligible.sort("mae")
         candidate = ranked.row(0, named=True)
-        references = ranked.filter(pl.col("method_id").is_in(DEFAULT_REFERENCES))
-        if (
-            candidate["method_id"] not in DEFAULT_REFERENCES
-            and not references.is_empty()
-        ):
-            reference = references.sort("mae").row(0, named=True)
-            if rule == "mcs" and scores is not None:
+        reference_rows = tuple(
+            ranked.filter(pl.col("method_id").is_in(DEFAULT_REFERENCES))
+            .sort("mae")
+            .iter_rows(named=True)
+        )
+        if candidate["method_id"] not in DEFAULT_REFERENCES:
+            present_references = {
+                str(reference["method_id"]) for reference in reference_rows
+            }
+            if not set(DEFAULT_REFERENCES) <= present_references:
+                if reference_rows:
+                    candidate = _reference_fallback(reference_rows)
+                else:
+                    continue
+            elif rule == "mcs" and scores is not None:
                 product, variable, lead_bucket = slice_key
                 slice_scores = scores.filter(
                     (pl.col("product") == product)
                     & (pl.col("variable") == variable)
                     & (pl.col("lead_bucket") == lead_bucket)
                 )
-                candidate = _mcs_gate(candidate, reference, slice_scores, alpha)
-            else:
-                candidate = _legacy_gate(candidate, reference)
+                candidate = _mcs_gate(
+                    candidate,
+                    reference_rows,
+                    slice_scores,
+                    tuple(str(method) for method in ranked["method_id"].to_list()),
+                    alpha,
+                )
+            elif any(
+                _legacy_gate(candidate, reference) is not candidate
+                for reference in reference_rows
+            ):
+                candidate = _reference_fallback(reference_rows)
         winners.append(candidate)
+    if not winners:
+        return board.select(
+            "product", "variable", "lead_bucket", "method_id", "n", "mae"
+        ).head(0)
     return (
         pl.DataFrame(winners)
         .select("product", "variable", "lead_bucket", "method_id", "n", "mae")

@@ -18,6 +18,10 @@ from pathlib import Path
 import numpy as np
 import polars as pl
 
+from grounded_weather_forecast.backtest.splits import (
+    daily_truth_known_at,
+    hourly_truth_known_at,
+)
 from grounded_weather_forecast.config import Config
 from grounded_weather_forecast.contracts import (
     CONTEXT_FEATURE_COLUMNS,
@@ -103,6 +107,9 @@ def _pivot(
 
 _TREND_MEDIAN_MINUTES = 5
 _TREND_SPAN_MINUTES = 10
+_TREND_MATCH_TOLERANCE = timedelta(minutes=5)
+_TREND_SUPPORT_MINUTES = _TREND_SPAN_MINUTES + 5
+_TREND_MIN_SUPPORT_SAMPLES = 3
 
 
 def _observation_trends(truth_minute_frame: pl.DataFrame) -> pl.DataFrame:
@@ -110,22 +117,86 @@ def _observation_trends(truth_minute_frame: pl.DataFrame) -> pl.DataFrame:
 
     Slope between two 5-minute rolling medians ten minutes apart: robust to a
     single spike, and exactly the derivative a trend-aware anchor needs.
-    Windows are row-counted at the station's ~1-minute cadence; the 30-minute
-    join tolerance bounds how stale a gap can make the estimate.
+    Both windows are clock-time based. The older median must be within five
+    minutes of ten minutes ago, the slope uses the actual elapsed time, and at
+    least three observations must support the span. A regular five-minute
+    station cadence therefore remains usable while gaps and two-point slopes
+    remain explicit nulls.
     """
     ordered = truth_minute_frame.sort("ts")
-    smoothed = {
-        v: pl.col(v).rolling_median(window_size=_TREND_MEDIAN_MINUTES)
-        for v in OBS_VARIABLES
-    }
-    return ordered.select(
+    median_names = {variable: f"__median__{variable}" for variable in OBS_VARIABLES}
+    count_names = {variable: f"__count__{variable}" for variable in OBS_VARIABLES}
+    support_names = {variable: f"__support__{variable}" for variable in OBS_VARIABLES}
+    smoothed = (
+        ordered.rolling(index_column="ts", period=f"{_TREND_MEDIAN_MINUTES}m")
+        .agg(
+            *(
+                expression
+                for variable in OBS_VARIABLES
+                for expression in (
+                    pl.col(variable).median().alias(median_names[variable]),
+                    pl.col(variable).count().alias(count_names[variable]),
+                )
+            )
+        )
+        .join(
+            ordered.rolling(index_column="ts", period=f"{_TREND_SUPPORT_MINUTES}m").agg(
+                *(
+                    pl.col(variable).count().alias(support_names[variable])
+                    for variable in OBS_VARIABLES
+                )
+            ),
+            on="ts",
+            how="left",
+        )
+    )
+    previous = smoothed.rename(
+        {
+            "ts": "__previous_ts",
+            **{
+                name: f"{name}__previous"
+                for name in (*median_names.values(), *count_names.values())
+            },
+        }
+    )
+    matched = (
+        smoothed.with_columns(
+            (pl.col("ts") - timedelta(minutes=_TREND_SPAN_MINUTES)).alias(
+                "__trend_target"
+            )
+        )
+        .join_asof(
+            previous,
+            left_on="__trend_target",
+            right_on="__previous_ts",
+            strategy="backward",
+            tolerance=_TREND_MATCH_TOLERANCE,
+        )
+        .with_columns(
+            (
+                (pl.col("ts") - pl.col("__previous_ts")).dt.total_seconds()
+                / _SECONDS_PER_HOUR
+            ).alias("__elapsed_hours")
+        )
+    )
+    return matched.select(
         "ts",
         *(
-            (
-                (median - median.shift(_TREND_SPAN_MINUTES))
-                / (_TREND_SPAN_MINUTES / 60.0)
-            ).alias(f"{obs_col(v)}__trend15m")
-            for v, median in smoothed.items()
+            pl.when(
+                (pl.col(count_names[variable]) > 0)
+                & (pl.col(f"{count_names[variable]}__previous") > 0)
+                & (pl.col(support_names[variable]) >= _TREND_MIN_SUPPORT_SAMPLES)
+                & (pl.col("__elapsed_hours") > 0.0)
+            )
+            .then(
+                (
+                    pl.col(median_names[variable])
+                    - pl.col(f"{median_names[variable]}__previous")
+                )
+                / pl.col("__elapsed_hours")
+            )
+            .alias(f"{obs_col(variable)}__trend15m")
+            for variable in OBS_VARIABLES
         ),
     )
 
@@ -239,7 +310,7 @@ def build_hourly_matrix(
         )
         if not spread.is_empty():
             joined = joined.join(spread, on=["issue_time", "valid_time"], how="left")
-    return (
+    matrix = (
         joined.join(
             truth_hourly_frame.rename({"valid_hour": "valid_time"}),
             on="valid_time",
@@ -266,6 +337,7 @@ def build_hourly_matrix(
         .pipe(_with_cyclical_and_solar, config)
         .sort("issue_time", "valid_time")
     )
+    return matrix.with_columns(hourly_truth_known_at(matrix))
 
 
 def _empty_hourly_matrix() -> pl.DataFrame:
@@ -273,6 +345,7 @@ def _empty_hourly_matrix() -> pl.DataFrame:
         schema={
             "issue_time": pl.Datetime("us", "UTC"),
             "valid_time": pl.Datetime("us", "UTC"),
+            "truth_known_at": pl.Datetime("us", "UTC"),
             "lead_hours": pl.Float64(),
             "lead_bucket": pl.String(),
             "source_kind": pl.String(),
@@ -374,7 +447,7 @@ def build_daily_matrix(
     wide = snap.select(index).unique(maintain_order=True).sort(index)
     for variable in DAILY_MATRIX_VARIABLES:
         wide = wide.join(_pivot(snap, index, variable, fxd_col), on=index, how="left")
-    return (
+    matrix = (
         wide.with_columns(
             (
                 pl.col("forecast_date")
@@ -401,6 +474,7 @@ def build_daily_matrix(
         )
         .sort("issue_time", "forecast_date")
     )
+    return matrix.with_columns(daily_truth_known_at(matrix, timezone_name))
 
 
 def matrix_path(directory: Path, product: str, source_kind: str) -> Path:
@@ -716,6 +790,9 @@ def to_forecast_matrix(
         if c
         in (
             "issue_time",
+            "valid_time",
+            "forecast_date",
+            "truth_known_at",
             "lead_bucket",
             "valid_hour_local",
             "valid_month",
@@ -769,6 +846,9 @@ def to_supervised_slice(
         if c
         in (
             "issue_time",
+            "valid_time",
+            "forecast_date",
+            "truth_known_at",
             "lead_bucket",
             "valid_hour_local",
             "valid_month",

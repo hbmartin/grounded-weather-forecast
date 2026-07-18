@@ -177,6 +177,15 @@ conclusions from anything downstream.
 
 ### 2. Build the dataset
 
+If `[ensembles].models` is configured, ingest the latest ensemble cycles first:
+
+```bash
+grounded-weather-forecast ingest-ensembles
+```
+
+Ensemble statistics are materialized into the matrix, so every later ingest
+must be followed by another `build-dataset` before backtesting or serving.
+
 ```bash
 grounded-weather-forecast build-dataset
 ```

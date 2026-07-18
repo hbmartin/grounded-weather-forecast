@@ -1,12 +1,14 @@
-"""Online conformal intervals: guaranteed coverage under drift.
+"""Adaptive conformal intervals calibrated on later, out-of-sample forecasts.
 
 A compact conformal-PID-style tracker (Angelopoulos, Candès & Tibshirani
 2023; SAOCP-adjacent): per (lead bucket x day/night) cell, an online quantile
 tracker follows the absolute-residual quantile of the base blend (the P term)
 and a slow integrator nudges the radius whenever realized coverage drifts
 from target (the I term, which is what recovers coverage through regime
-shifts and archive gaps). Distribution-free, ~a dozen floats of state per
-cell, and the state serializes for the serve path.
+shifts and archive gaps). The base model is retained from a chronological
+proper-training split; only predictions for the later calibration split update
+the interval tracker. This avoids the optimistic in-sample residuals that would
+result from evaluating a flexible base model on rows it already fitted.
 
 This supersedes plain ACI from the original improvement plan: ACI's single
 learning rate either oscillates or lags; tracking the score quantile at a
@@ -34,6 +36,7 @@ from grounded_weather_forecast.contracts import (
     BlendResult,
     FloatArray,
     ForecastMatrix,
+    SourceKind,
     SupervisedSlice,
     TargetKind,
     VariableSpec,
@@ -48,6 +51,11 @@ _INTEGRATOR_GAIN = 0.02
 _INTEGRATOR_SATURATION = 25.0
 _SCALE_DECAY = 0.02
 _MIN_UPDATES = 20
+_MIN_PROPER_ROWS = 60
+_MIN_CALIBRATION_ROWS = 20
+_PROPER_FRACTION = 0.7
+_HOURLY_RESOLUTION_DELAY_US = 2 * 3_600_000_000
+_DAILY_RESOLUTION_DELAY_US = 25 * 3_600_000_000
 
 
 @dataclass
@@ -114,10 +122,45 @@ def _day_flags(x: ForecastMatrix) -> np.ndarray:
     return np.zeros(x.n_rows, dtype=bool)
 
 
-def _replay_order(x: ForecastMatrix) -> np.ndarray:
-    if "issue_time" not in x.features.columns:
-        return np.arange(x.n_rows)
-    return np.argsort(x.features["issue_time"].to_numpy(), kind="stable")
+def _time_us(x: ForecastMatrix, column: str) -> np.ndarray | None:
+    if column not in x.features.columns:
+        return None
+    values = x.features[column].to_numpy()
+    try:
+        return values.astype("datetime64[us]").astype(np.int64)
+    except (TypeError, ValueError):
+        return np.asarray(
+            [np.datetime64(value, "us").astype(np.int64) for value in values],
+            dtype=np.int64,
+        )
+
+
+def _resolution_us(x: ForecastMatrix, issue_us: np.ndarray) -> np.ndarray:
+    if (known := _time_us(x, "truth_known_at")) is not None:
+        return known
+    if (valid := _time_us(x, "valid_time")) is not None:
+        return valid + _HOURLY_RESOLUTION_DELAY_US
+    if (forecast_date := _time_us(x, "forecast_date")) is not None:
+        # Persisted daily matrices carry the exact timezone-aware value. This
+        # conservative fallback supports manually constructed contracts.
+        return forecast_date + _DAILY_RESOLUTION_DELAY_US
+    return issue_us + np.rint(x.lead_hours * 3_600_000_000).astype(np.int64)
+
+
+def _subset(train: SupervisedSlice, rows: np.ndarray) -> SupervisedSlice:
+    x = ForecastMatrix.build(
+        sources=train.x.sources,
+        values=train.x.values[rows],
+        lead_hours=train.x.lead_hours[rows],
+        features=train.x.features[rows],
+        product=train.x.product,
+    )
+    return SupervisedSlice(
+        x=x,
+        y=train.y[rows],
+        variable=train.variable,
+        source_kind=SourceKind(train.source_kind),
+    )
 
 
 @dataclass
@@ -129,26 +172,83 @@ class Conformal:
     _kind: TargetKind = TargetKind.CONTINUOUS
     _variable: VariableSpec | None = None
     _cells: dict[tuple[str, bool], _CellState] = field(default_factory=dict)
+    _split_metadata: dict[str, object] = field(default_factory=dict)
 
     def fit(self, train: SupervisedSlice) -> Self:
         self._kind = train.variable.kind
         self._variable = train.variable
-        self._base = self.base_factory().fit(train)
+        self._cells.clear()
+        issue = _time_us(train.x, "issue_time")
+        if issue is None:
+            self._base = self.base_factory().fit(train)
+            self._split_metadata = {
+                "strategy": "point_only",
+                "reason": "issue_time feature unavailable",
+                "proper_rows": train.x.n_rows,
+                "calibration_rows": 0,
+            }
+            return self
+        unique_issues = np.unique(issue)
+        split_index = int(np.floor(unique_issues.shape[0] * _PROPER_FRACTION))
+        split_index = min(max(split_index, 1), max(unique_issues.shape[0] - 1, 1))
+        if unique_issues.shape[0] < 2:
+            self._base = self.base_factory().fit(train)
+            self._split_metadata = {
+                "strategy": "point_only",
+                "reason": "fewer than two issue times",
+                "proper_rows": train.x.n_rows,
+                "calibration_rows": 0,
+            }
+            return self
+        cutoff = int(unique_issues[split_index])
+        resolution = _resolution_us(train.x, issue)
+        proper_rows = np.flatnonzero((issue < cutoff) & (resolution <= cutoff))
+        calibration_rows = np.flatnonzero(issue >= cutoff)
+        if (
+            proper_rows.shape[0] < _MIN_PROPER_ROWS
+            or calibration_rows.shape[0] < _MIN_CALIBRATION_ROWS
+        ):
+            self._base = self.base_factory().fit(train)
+            self._split_metadata = {
+                "strategy": "point_only",
+                "reason": "chronological split below minimum row counts",
+                "proper_rows": int(proper_rows.shape[0]),
+                "calibration_rows": int(calibration_rows.shape[0]),
+                "cutoff_issue_us": cutoff,
+            }
+            return self
+        proper = _subset(train, proper_rows)
+        self._base = self.base_factory().fit(proper)
         base_point = self._base.predict(train.x).point
         scores = np.abs(train.y - base_point)
         labels = _bucket_labels(
             train.x.lead_hours, buckets_for_product(train.x.product)
         )
         day = _day_flags(train.x)
-        for row in _replay_order(train.x):
+        order = np.lexsort(
+            (
+                train.x.lead_hours[calibration_rows],
+                issue[calibration_rows],
+                resolution[calibration_rows],
+            )
+        )
+        for row in calibration_rows[order]:
             if not np.isfinite(scores[row]):
                 continue
             key = (labels[row], bool(day[row]))
             cell = self._cells.setdefault(key, _fresh_cell())
             cell.update(float(scores[row]))
+        self._split_metadata = {
+            "strategy": "chronological_70_30",
+            "proper_rows": int(proper_rows.shape[0]),
+            "calibration_rows": int(calibration_rows.shape[0]),
+            "cutoff_issue_us": cutoff,
+            "minimum_proper_rows": _MIN_PROPER_ROWS,
+            "minimum_calibration_rows": _MIN_CALIBRATION_ROWS,
+        }
         return self
 
-    def _cell_for(self, label: str, is_day: bool) -> _CellState | None:
+    def _cell_for(self, label: str, *, is_day: bool) -> _CellState | None:
         # fall back across day/night before giving up on the bucket
         for key in ((label, is_day), (label, not is_day)):
             cell = self._cells.get(key)
@@ -162,7 +262,7 @@ class Conformal:
         day = _day_flags(x)
         radii = np.full((x.n_rows, len(COVERAGES)), np.nan)
         for row in range(x.n_rows):
-            cell = self._cell_for(labels[row], bool(day[row]))
+            cell = self._cell_for(labels[row], is_day=bool(day[row]))
             if cell is None:
                 continue
             radii[row] = [
@@ -192,6 +292,7 @@ class Conformal:
 
     def to_state(self) -> dict[str, object]:
         return {
+            "schema_version": 2,
             "cells": {
                 f"{label}|{'day' if is_day else 'night'}": {
                     "radii": cell.radii.tolist(),
@@ -202,6 +303,7 @@ class Conformal:
                 for (label, is_day), cell in sorted(self._cells.items())
             },
             "coverages": list(COVERAGES),
+            "calibration": self._split_metadata,
         }
 
 

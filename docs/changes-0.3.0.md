@@ -46,6 +46,7 @@ migration step 3.
    a fresh `backtest` + `report` complete against the new matrix:
 
    ```bash
+   grounded-weather-forecast ingest-ensembles
    grounded-weather-forecast build-dataset
    grounded-weather-forecast backtest --source live   # repopulate evidence
    grounded-weather-forecast report
@@ -55,6 +56,7 @@ migration step 3.
    `config.example.toml` for verified ids incl. Google WeatherNext 2) and add
    `grounded-weather-forecast ingest-ensembles` to the cron — at least once
    per model cycle, since Open-Meteo retains only the latest run's members.
+   Build the dataset after ingestion so the new statistics reach the matrix.
    Without the section nothing changes.
 
 5. **Upstream: NBM provider.** `omni-weather-forecast-apis` gained a keyless
@@ -297,24 +299,28 @@ scoring-semantics changes that alter reported numbers; one Python-API rename
   GEFS/AIFS-ENS cycles at native 3–6 h steps populate the 0–24 h lead buckets
   Previous Runs never could (verified live: 0–1 h through 12–24 h buckets now
   score). `fetched_at = init + publication_lag` (6 h default) keeps short-lead
-  skill honest. New optional dependency group: `uv sync --group backfill`.
+  skill honest. Install the published optional extra with
+  `uv sync --extra backfill` or `grounded-weather-forecast[backfill]`.
 - **M7** anchoring rework: `_ANCHOR_MAX_LEAD` 3→6 h; `anchored_fitted_*` fit
   per-lead-bin regression weights (LAMP-style — exponential and INCA
   persist-then-ramp emerge as special cases); `anchored_trend_grounded` adds
   the observed 15-min tendency with a capped fitted gain; the minutely
   product anchors exactly ONCE against the selected path and extrapolates the
   now-forecast to lead 0 instead of clamping.
-- **M8** distributions: `emos` (CRPS-fit Gaussian head, spread from `ens__*`
-  sd, truncated normal for bounded variables) and `idr` (hand-rolled PAVA
+- **M8** distributions: `emos` (CRPS-fit Gaussian head for unbounded variables,
+  matching truncated-normal fit and quantiles for bounded variables, spread
+  from same-variable `ens__*` sd) and `idr` (hand-rolled PAVA
   isotonic distributional regression — the zero-tuning benchmark) emit
   19-level quantile grids through a shared `finalize_quantiles` (monotone
   rearrangement + bounds); the leaderboard now reports CRPS, pinball,
   coverage@80/90, PIT χ², and sharpness for any quantile emitter; a latent
   NaN-in-JSON bug in score persistence was fixed before it could trigger.
 - **M9** `conformal_gew`/`conformal_ewma`: compact conformal-PID-style online
-  quantile tracking + coverage integrator per (lead bucket × day/night) —
-  coverage provably recovers through variance regime shifts (tested), ~a
-  dozen floats of state per cell.
+  quantile tracking + coverage integrator per (lead bucket × day/night), fit
+  from a chronological 70/30 proper-training/calibration split so only later
+  out-of-sample residuals update interval state. The adaptive tracker recovers
+  near-nominal empirical coverage after tested variance shifts; it makes no
+  unconditional finite-sample coverage claim under arbitrary drift.
 - **M10** honest promotion: `reports/mcs.py` (moving-block-bootstrap t-max
   Model Confidence Set over per-valid-time losses) gates `slice_winners` —
   a challenger ships only when the reference is *excluded* from the set
@@ -329,11 +335,12 @@ scoring-semantics changes that alter reported numbers; one Python-API rename
   `reports/drift.py` runs two tiers — instant provider-vs-consensus z-scores
   and truth-based Page–Hinkley with a length-scaled threshold — into
   `reports/drift.md` + `artifacts/drift.json`.
-- **M12** truth QC: `truth-qc` cross-checks the station against 3+
+- **M12** truth QC: `truth-qc --days 30` cross-checks the station against 3+
   lapse-adjusted Synoptic neighbors (30-day drift alert at 1 °C; rolling 72 h
   correlation < 0.9 flags the plausible-looking failing sensor) and fits the
-  radiation-shield error model (daytime residual ~ S/(1+u), using the M4
-  TOA irradiance and the co-located anemometer). Nothing auto-adjusts truth;
+  radiation-shield error model (independent station-minus-neighbor residual
+  ~ S/(1+u), using the M4 TOA irradiance and co-located anemometer). Missing
+  overlap is reported as unknown rather than healthy. Nothing auto-adjusts truth;
   WMO-SPICE gauge catch-efficiency is explicitly deferred until its published
   coefficients are transcribed and real rain exists to validate against.
 

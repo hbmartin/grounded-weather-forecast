@@ -7,6 +7,7 @@ from conftest import write_config
 
 from grounded_weather_forecast.dataset.neighbors import (
     cross_check,
+    fetch_neighbor_checks,
     neighbor_consensus,
     parse_neighbors,
 )
@@ -86,6 +87,55 @@ class TestNeighbors:
         neighbors = parse_neighbors(payload(), SITE_ELEVATION, 300.0, 6.5)
         checks = cross_check(broken, neighbor_consensus(neighbors))
         assert checks.correlation_alert
+
+    def test_no_overlap_is_unknown_not_healthy(self):
+        consensus = pl.DataFrame(
+            {
+                "valid_hour": [START - timedelta(days=1)],
+                "consensus_c": [20.0],
+            },
+            schema_overrides={"valid_hour": pl.Datetime("us", "UTC")},
+        )
+
+        checks = cross_check(station_truth(), consensus)
+
+        assert checks.drift_alert is None
+        assert checks.correlation_alert is None
+        assert checks.overlap_hours == 0
+        assert "no overlapping" in checks.drift_reason
+
+    def test_comparison_exposes_independent_residual_and_wind(self):
+        neighbors = parse_neighbors(payload(), SITE_ELEVATION, 300.0, 6.5)
+        truth = station_truth().with_columns(
+            pl.lit(2.0).alias("t__wind_speed_ms__inst")
+        )
+
+        checks = cross_check(truth, neighbor_consensus(neighbors))
+
+        assert {
+            "difference",
+            "consensus_c",
+            "t__wind_speed_ms__inst",
+        } <= set(checks.comparison.columns)
+        row = checks.comparison.row(0, named=True)
+        assert row["difference"] == pytest.approx(
+            row["t__temp_c__inst"] - row["consensus_c"]
+        )
+
+    def test_fetch_defaults_to_thirty_days(self, tmp_path):
+        config = write_config(
+            tmp_path,
+            extra_toml='[truth_qc]\nsynoptic_token = "test-token"\n',
+        )
+        urls: list[str] = []
+
+        def fetcher(url):
+            urls.append(url)
+            return {"STATION": []}
+
+        fetch_neighbor_checks(config, station_truth(), fetcher=fetcher)
+
+        assert "recent=43200" in urls[0]
 
 
 class TestShieldFit:

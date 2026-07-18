@@ -1,4 +1,6 @@
-from datetime import timedelta
+from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime, timedelta
+from threading import Barrier
 
 import numpy as np
 import polars as pl
@@ -102,6 +104,35 @@ class TestIngestAndAppend:
         assert len(seen) == 2
         assert sorted(frame["model"].unique().to_list()) == ["aifs", "gefs"]
 
+    def test_each_model_is_stamped_after_its_fetch(self, tmp_path, monkeypatch):
+        config = self.make_config(tmp_path)
+        stamps = iter(
+            (
+                utc(2026, 3, 22, 11, 31),
+                utc(2026, 3, 22, 11, 32),
+            )
+        )
+
+        class TickingDateTime(datetime):
+            @classmethod
+            def now(cls, tz=None):
+                del tz
+                return next(stamps)
+
+        monkeypatch.setattr(
+            "grounded_weather_forecast.dataset.ensembles.datetime",
+            TickingDateTime,
+        )
+        frame = ingest_ensembles(config, fetcher=lambda _url: payload())
+        fetched = {
+            model: group["fetched_at"][0]
+            for (model,), group in frame.group_by("model", maintain_order=True)
+        }
+        assert fetched == {
+            "gefs": utc(2026, 3, 22, 11, 31),
+            "aifs": utc(2026, 3, 22, 11, 32),
+        }
+
     def test_no_models_raises(self, tmp_path):
         config = write_config(tmp_path)
         with pytest.raises(EnsembleError, match="models"):
@@ -116,6 +147,43 @@ class TestIngestAndAppend:
         assert first_new == frame.height
         assert second_new == 0
         assert first_total == second_total == frame.height
+
+    def test_concurrent_appends_do_not_lose_models(self, tmp_path):
+        store = tmp_path / "data" / "ensembles.parquet"
+        models = tuple(f"model-{index}" for index in range(6))
+        frames = tuple(
+            parse_ensemble(payload(), model, FETCHED, VARIABLES) for model in models
+        )
+        barrier = Barrier(len(frames))
+
+        def append(frame):
+            barrier.wait()
+            return append_ensembles(store, frame)
+
+        with ThreadPoolExecutor(max_workers=len(frames)) as executor:
+            tuple(executor.map(append, frames))
+
+        saved = pl.read_parquet(store)
+        assert set(saved["model"].unique()) == set(models)
+        assert saved.height == sum(frame.height for frame in frames)
+
+    def test_failed_atomic_append_preserves_existing_store(self, tmp_path, monkeypatch):
+        store = tmp_path / "data" / "ensembles.parquet"
+        first = parse_ensemble(payload(), "first", FETCHED, VARIABLES)
+        append_ensembles(store, first)
+
+        def fail_write(_frame, _path):
+            raise OSError("disk full")
+
+        monkeypatch.setattr(
+            "grounded_weather_forecast.dataset.ensembles.atomic_write_parquet",
+            fail_write,
+        )
+        second = parse_ensemble(payload(), "second", FETCHED, VARIABLES)
+        with pytest.raises(OSError, match="disk full"):
+            append_ensembles(store, second)
+
+        assert pl.read_parquet(store).equals(first)
 
 
 def _snapshots(*times):

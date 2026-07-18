@@ -38,6 +38,11 @@ class TestModelConfidenceSet:
         result = model_confidence_set(losses_matrix(n=5)[:, :3], ids)
         assert result.survivors == ids
 
+    def test_deterministic_loss_difference_eliminates_worse_method(self):
+        losses = np.column_stack((np.zeros(40), np.full(40, 2.0)))
+        result = model_confidence_set(losses, ("challenger", "equal_weight"))
+        assert result.survivors == ("challenger",)
+
 
 def scores_frame(gap: float, n_times=80, seed=9):
     """Two methods with independent errors; ``gap`` shrinks the challenger's.
@@ -56,6 +61,7 @@ def scores_frame(gap: float, n_times=80, seed=9):
         reference_noise = rng.normal(0.0, 1.0)
         rows.append(("challenger", issue, valid, truth + challenger_noise, truth))
         rows.append(("equal_weight", issue, valid, truth + reference_noise, truth))
+        rows.append(("best_provider", issue, valid, truth + reference_noise, truth))
     return pl.DataFrame(
         {
             "method_id": [r[0] for r in rows],
@@ -93,24 +99,70 @@ class TestMcsPromotionGate:
         built = collapsed_loss_matrix(scores)
         assert built is not None
         matrix, methods = built
-        assert matrix.shape == (20, 2)
-        assert methods == ("challenger", "equal_weight")
+        assert matrix.shape == (20, 3)
+        assert methods == ("best_provider", "challenger", "equal_weight")
+
+    def test_ineligible_sparse_method_does_not_shrink_common_cases(self):
+        scores = scores_frame(gap=0.1, n_times=20)
+        sparse = (
+            scores.filter(pl.col("method_id") == "challenger")
+            .head(1)
+            .with_columns(pl.lit("sparse").alias("method_id"))
+        )
+        built = collapsed_loss_matrix(
+            pl.concat([scores, sparse]),
+            method_ids=("best_provider", "challenger", "equal_weight"),
+        )
+        assert built is not None
+        matrix, methods = built
+        assert matrix.shape == (20, 3)
+        assert "sparse" not in methods
 
 
 class TestLiveGate:
     def make_selection(self, mae=1.0):
         return {
             ("hourly", "temp_c", "24-48h"): Selection(
-                method_id="gbm", reason="won", n=100, mae=mae
+                method_id="gbm",
+                reason="won",
+                n=100,
+                mae=mae,
+                evaluation_id="eval-gbm",
+                dataset_fingerprint="dataset-a",
+                release_id="release-a",
             )
         }
 
-    def live_frame(self, live_mae, n=50):
+    def fallback(self):
+        return {
+            ("hourly", "temp_c", "24-48h"): Selection(
+                method_id="equal_weight",
+                reason="reference",
+                n=88,
+                mae=1.2,
+                evaluation_id="eval-reference",
+                dataset_fingerprint="dataset-a",
+                release_id="release-a",
+            )
+        }
+
+    def live_frame(
+        self,
+        live_mae,
+        n=50,
+        *,
+        bucket="24-48h",
+        dataset="dataset-a",
+        release="release-a",
+    ):
         return pl.DataFrame(
             {
                 "product": ["hourly"],
                 "variable": ["temp_c"],
+                "lead_bucket": [bucket],
                 "method_id": ["gbm"],
+                "dataset_fingerprint": [dataset],
+                "release_id": [release],
                 "n": [n],
                 "live_mae": [live_mae],
                 "live_rmse": [live_mae],
@@ -124,10 +176,14 @@ class TestLiveGate:
             self.live_frame(live_mae=2.0),
             factor=1.5,
             min_n=24,
+            fallbacks=self.fallback(),
         )
         selected = gated[("hourly", "temp_c", "24-48h")]
         assert selected.method_id == "equal_weight"
         assert "demoted gbm" in selected.reason
+        assert selected.n == 88
+        assert selected.mae == 1.2
+        assert selected.evaluation_id == "eval-reference"
 
     def test_delivering_method_survives(self):
         gated = apply_live_gate(
@@ -135,6 +191,7 @@ class TestLiveGate:
             self.live_frame(live_mae=1.1),
             factor=1.5,
             min_n=24,
+            fallbacks=self.fallback(),
         )
         assert gated[("hourly", "temp_c", "24-48h")].method_id == "gbm"
 
@@ -144,6 +201,7 @@ class TestLiveGate:
             self.live_frame(live_mae=5.0, n=5),
             factor=1.5,
             min_n=24,
+            fallbacks=self.fallback(),
         )
         assert gated[("hourly", "temp_c", "24-48h")].method_id == "gbm"
 
@@ -152,6 +210,28 @@ class TestLiveGate:
         assert (
             apply_live_gate(selections, pl.DataFrame(), factor=1.5, min_n=24)
             == selections
+        )
+
+    def test_other_bucket_or_release_cannot_demote(self):
+        for live in (
+            self.live_frame(5.0, bucket="1-3h"),
+            self.live_frame(5.0, dataset="dataset-b"),
+            self.live_frame(5.0, release="release-b"),
+        ):
+            gated = apply_live_gate(
+                self.make_selection(),
+                live,
+                factor=1.5,
+                min_n=24,
+                fallbacks=self.fallback(),
+            )
+            assert gated[("hourly", "temp_c", "24-48h")].method_id == "gbm"
+
+    def test_legacy_live_rows_cannot_drive_automatic_demotion(self):
+        legacy = self.live_frame(5.0).drop("dataset_fingerprint", "release_id")
+        assert (
+            apply_live_gate(self.make_selection(), legacy, factor=1.5, min_n=24)
+            == self.make_selection()
         )
 
 

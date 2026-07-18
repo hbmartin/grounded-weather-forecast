@@ -100,7 +100,7 @@ def build_parser() -> argparse.ArgumentParser:
         default="open_meteo",
         help="open_meteo: Previous Runs (24h-multiple leads); dynamical:"
         " dynamical.org full cycles at native steps (sub-24h leads; needs"
-        " the 'backfill' dependency group)",
+        " the 'backfill' optional extra)",
     )
     backfill.add_argument(
         "--models",
@@ -111,13 +111,15 @@ def build_parser() -> argparse.ArgumentParser:
         "--start",
         type=date.fromisoformat,
         default=None,
-        help="first init date, YYYY-MM-DD (default: the provider's config start_date)",
+        help="first valid date for open_meteo or first initialization date for"
+        " dynamical, YYYY-MM-DD (default: the provider's config start_date)",
     )
     backfill.add_argument(
         "--end",
         type=date.fromisoformat,
         default=None,
-        help="last valid date to fetch, YYYY-MM-DD (default: yesterday)",
+        help="last valid date for open_meteo or last initialization date for"
+        " dynamical, YYYY-MM-DD (default: yesterday)",
     )
     backfill.add_argument(
         "--chunk-days",
@@ -125,10 +127,16 @@ def build_parser() -> argparse.ArgumentParser:
         default=90,
         help="days per request (open_meteo only; default: 90)",
     )
-    subparsers.add_parser(
+    truth_qc = subparsers.add_parser(
         "truth-qc",
         help="cross-check station truth against lapse-adjusted Synoptic"
         " neighbors and fit the radiation-shield error model",
+    )
+    truth_qc.add_argument(
+        "--days",
+        type=int,
+        default=30,
+        help="neighbor history window in days (default: 30)",
     )
     ingest = subparsers.add_parser(
         "ingest-ensembles",
@@ -325,7 +333,9 @@ def _cmd_alignment(config: Config) -> int:
     return 0
 
 
-def _dynamical_long(config: Config, args: argparse.Namespace, end: date):
+def _dynamical_long(
+    config: Config, args: argparse.Namespace, end: date
+) -> pl.DataFrame:
     from grounded_weather_forecast.dataset.backfill_dynamical import (  # noqa: PLC0415
         backfill_dynamical_long,
     )
@@ -358,7 +368,11 @@ def _cmd_backfill(config: Config, args: argparse.Namespace) -> int:
             case _:
                 models = _split_csv(args.models)
                 long_frame = backfill_long(
-                    config, end, models=models or None, chunk_days=args.chunk_days
+                    config,
+                    end,
+                    models=models or None,
+                    chunk_days=args.chunk_days,
+                    start=args.start,
                 )
     except (BackfillError, DynamicalBackfillError, OSError, ValueError) as exc:
         print(f"backfill failed: {exc}")
@@ -370,7 +384,7 @@ def _cmd_backfill(config: Config, args: argparse.Namespace) -> int:
     return 0
 
 
-def _cmd_truth_qc(config: Config) -> int:
+def _cmd_truth_qc(config: Config, args: argparse.Namespace) -> int:
     import json  # noqa: PLC0415
 
     import numpy as np  # noqa: PLC0415
@@ -388,31 +402,45 @@ def _cmd_truth_qc(config: Config) -> int:
     )
     from grounded_weather_forecast.solar import toa_irradiance_wm2  # noqa: PLC0415
 
-    minute, hourly_truth, _daily = build_truth(config)
+    if args.days <= 0:
+        print("truth-qc failed: --days must be a positive integer")
+        return 1
+    _minute, hourly_truth, _daily = build_truth(config)
     try:
-        checks = fetch_neighbor_checks(config, hourly_truth)
+        checks = fetch_neighbor_checks(config, hourly_truth, hours=args.days * 24)
     except (NeighborError, OSError, ValueError) as exc:
         print(f"truth-qc failed: {exc}")
         return 1
     artifact: dict[str, object] = {
+        "schema_version": 2,
+        "history_days": args.days,
         "n_neighbors": checks.n_neighbors,
+        "overlap_hours": checks.overlap_hours,
         "drift_alert": checks.drift_alert,
+        "drift_reason": checks.drift_reason,
         "correlation_alert": checks.correlation_alert,
+        "correlation_reason": checks.correlation_reason,
         "daily_drift": checks.daily_drift.to_dicts(),
+        "shield_alert": None,
+        "shield_reason": "insufficient independent daytime neighbor overlap",
     }
-    shield_note = "insufficient daytime overlap for the shield fit"
-    if not minute.is_empty() and "wind_speed_ms" in minute.columns:
-        scored = minute.drop_nulls(["temp_c", "wind_speed_ms"])
+    shield_note = str(artifact["shield_reason"])
+    wind_column = "t__wind_speed_ms__inst"
+    if wind_column in checks.comparison.columns:
+        scored = checks.comparison.drop_nulls(["difference", wind_column])
         if scored.height:
-            epoch = scored["ts"].dt.epoch(time_unit="s").to_numpy().astype(np.float64)
+            epoch = (
+                scored["valid_hour"]
+                .dt.epoch(time_unit="s")
+                .to_numpy()
+                .astype(np.float64)
+            )
             toa = toa_irradiance_wm2(
                 epoch, config.station.latitude, config.station.longitude
             )
-            residual = (
-                scored["temp_c"].to_numpy()
-                - scored["temp_c"].rolling_median(window_size=180).to_numpy()
-            )
-            fit = fit_shield_error(residual, toa, scored["wind_speed_ms"].to_numpy())
+            residual = scored["difference"].to_numpy().astype(np.float64)
+            wind = scored[wind_column].to_numpy().astype(np.float64)
+            fit = fit_shield_error(residual, toa, wind)
             if fit is not None:
                 artifact["shield_fit"] = {
                     "slope_c_per_unit": fit.slope_c_per_unit,
@@ -421,6 +449,11 @@ def _cmd_truth_qc(config: Config) -> int:
                     "n_daytime": fit.n_daytime,
                     "significant": fit.significant,
                 }
+                artifact["shield_alert"] = fit.significant
+                artifact["shield_reason"] = (
+                    f"slope {fit.slope_c_per_unit:+.2f} C per unit load "
+                    f"(se {fit.slope_se:.2f}, n={fit.n_daytime})"
+                )
                 shield_note = (
                     f"slope {fit.slope_c_per_unit:+.2f} degC per unit load "
                     f"(se {fit.slope_se:.2f}, n={fit.n_daytime}); a growing "
@@ -440,12 +473,18 @@ def _cmd_truth_qc(config: Config) -> int:
         ],
     )
     print(f"neighbors: {checks.n_neighbors}")
+    print(f"overlap: {checks.overlap_hours} hours")
     print(
         f"drift alert: {checks.drift_alert}  correlation alert: {checks.correlation_alert}"
     )
     print(f"shield: {shield_note}")
     print(f"wrote {config.artifacts_dir / 'truth_qc.json'}")
-    return 0
+    evaluable = (
+        checks.drift_alert is not None,
+        checks.correlation_alert is not None,
+        artifact["shield_alert"] is not None,
+    )
+    return 0 if any(evaluable) else 2
 
 
 def _cmd_ingest_ensembles(config: Config, args: argparse.Namespace) -> int:
@@ -478,6 +517,7 @@ def _cmd_predict(config: Config, args: argparse.Namespace) -> int:
     from grounded_weather_forecast.serve.history import append_history  # noqa: PLC0415
     from grounded_weather_forecast.serve.predict import (  # noqa: PLC0415
         NoForecastDataError,
+        UnsupportedMethodError,
         predict,
     )
     from grounded_weather_forecast.serve.selection import (  # noqa: PLC0415
@@ -505,7 +545,7 @@ def _cmd_predict(config: Config, args: argparse.Namespace) -> int:
             ),
             force_method=forced,
         )
-    except NoForecastDataError as exc:
+    except (NoForecastDataError, UnsupportedMethodError) as exc:
         print(f"cannot predict: {exc}")
         return 1
 
@@ -769,7 +809,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         case "ingest-ensembles":
             return _cmd_ingest_ensembles(config, args)
         case "truth-qc":
-            return _cmd_truth_qc(config)
+            return _cmd_truth_qc(config, args)
         case "predict":
             return _cmd_predict(config, args)
         case _:  # pragma: no cover - argparse enforces the choices

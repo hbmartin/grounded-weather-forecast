@@ -76,10 +76,24 @@ def model_confidence_set(
         boot_means = relative[indices].mean(axis=1)  # (B, k)
         deviations = boot_means - means
         std = np.sqrt(np.mean(deviations**2, axis=0))
-        std = np.where(std <= 0.0, np.inf, std)
-        t_stats = means / std
+        zero_variance = std <= 0.0
+        deterministic = np.where(
+            means > 0.0, np.inf, np.where(means < 0.0, -np.inf, 0.0)
+        )
+        t_stats = np.divide(
+            means,
+            std,
+            out=deterministic,
+            where=~zero_variance,
+        )
         t_max = float(t_stats.max())
-        boot_t_max = (deviations / std).max(axis=1)
+        boot_t = np.divide(
+            deviations,
+            std,
+            out=np.zeros_like(deviations),
+            where=~zero_variance,
+        )
+        boot_t_max = boot_t.max(axis=1)
         p_raw = float(np.mean(boot_t_max >= t_max))
         # elimination p-values are non-decreasing along the sequence
         mcs_p = max(mcs_p, p_raw)
@@ -94,6 +108,8 @@ def model_confidence_set(
 
 def collapsed_loss_matrix(
     slice_scores: pl.DataFrame,
+    *,
+    method_ids: tuple[str, ...] | None = None,
 ) -> tuple[FloatArray, tuple[str, ...]] | None:
     """Common-case losses collapsed per valid_time, methods as columns.
 
@@ -101,6 +117,8 @@ def collapsed_loss_matrix(
     must be common) — the leaderboard's own-case scoring is unaffected.
     """
     frame = slice_scores.drop_nulls("y_pred")
+    if method_ids is not None:
+        frame = frame.filter(pl.col("method_id").is_in(method_ids))
     methods = tuple(sorted(frame["method_id"].unique().to_list()))
     if len(methods) < 2:
         return None

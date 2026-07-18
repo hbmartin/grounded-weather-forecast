@@ -14,6 +14,12 @@ offsets: `temperature_2m_previous_day3` is what the model predicted for *this*
 valid hour, three days earlier. That is a real forecast archive with lead as a
 controlled variable, and it can be fetched today.
 
+The Open-Meteo provider interprets `--start` and `--end` as inclusive
+**valid dates**. The dynamical provider interprets them as inclusive forecast
+**initialization dates**. Install the latter from a checkout with
+`uv sync --extra backfill`, or install the published
+`grounded-weather-forecast[backfill]` extra.
+
 ```toml
 [backfill.open_meteo]
 models = ["ecmwf_ifs025", "gfs_seamless", "icon_seamless"]
@@ -53,7 +59,8 @@ Synthetic and live rows are stored in separate files, tagged `source_kind`, and
 any attempt to pool them raises `MixedProvenanceError`. This is deliberate: a
 leaderboard built on three NWP models says nothing about eight consumer APIs.
 
-Flags: `--models` (override the config list), `--chunk-days` (default 90 —
+Flags: `--models` (override the config list), `--start` (override the configured
+valid-date start), `--chunk-days` (default 90 —
 requests are chunked to keep URLs and responses sane), `--end` (default:
 yesterday).
 

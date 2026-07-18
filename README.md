@@ -68,11 +68,17 @@ curl -L https://raw.githubusercontent.com/hbmartin/grounded-weather-forecast/mai
 #    and hourly/daily coverage after QC.
 grounded-weather-forecast qc
 
-# 2. Materialize truth tables, canonical long frames, and the supervised
+# 2. Optional: poll the Open-Meteo Ensemble API before building matrices.
+#    Real ensemble spread becomes leakage-safe ens__* feature columns. Run
+#    this once per model cycle; configure [ensembles].models.
+grounded-weather-forecast ingest-ensembles              # --models <ids>
+
+# 3. Materialize truth tables, canonical long frames, and the supervised
 #    hourly/daily matrices as parquet + manifest.json under [dataset].dir.
+#    Re-run this after every ensemble ingest before backtesting or serving.
 grounded-weather-forecast build-dataset
 
-# 3. Optional cold start. A forecast archive is only useful once it holds months
+# 4. Optional cold start. A forecast archive is only useful once it holds months
 #    of stored *vintages*, so a new one can say nothing yet. Open-Meteo's
 #    Previous Runs API backfills real archived forecasts (leads of exactly 1-7
 #    days) for open NWP models, tagged `synthetic` and never pooled with live.
@@ -81,37 +87,30 @@ grounded-weather-forecast backfill --end 2026-07-12   # --models, --chunk-days
 #    A second backfill provider reads dynamical.org's free Zarr archives of
 #    FULL forecast cycles (GEFS since 2020, AIFS-ENS since 2025-07) at native
 #    3-6h steps — populating the sub-24h lead buckets Previous Runs cannot.
-#    Requires the optional dependencies: uv sync --group backfill
+#    Requires the optional dependencies: uv sync --extra backfill
 grounded-weather-forecast backfill --provider dynamical --start 2026-06-01
 
-# 4. Study whether each hourly variable should use instantaneous or interval-mean
+# 5. Study whether each hourly variable should use instantaneous or interval-mean
 #    truth. Misalignment masquerades as provider bias; this measures it.
 grounded-weather-forecast alignment
 
-# 5. Rolling-origin backtest. Identified evaluation runs land in
+# 6. Rolling-origin backtest. Identified evaluation runs land in
 #    [dataset].dir/scores without overwriting other windows/runs.
 grounded-weather-forecast backtest --source live       # or --source synthetic
 #   --methods all|<ids>  --products hourly,daily  --window expanding|rolling
 #   --hourly-variables ...  --daily-variables ...  --semantics auto|inst|mean
 
-# 5b. Optional: poll the Open-Meteo Ensemble API (GEFS, AIFS-ENS, AIGEFS, ...)
-#    and append per-model spread statistics to the ensembles parquet store.
-#    Real ensemble spread becomes leakage-safe ens__* feature columns in the
-#    hourly matrix — honest uncertainty the correlated provider columns cannot
-#    supply. Run at least once per model cycle; configure [ensembles].models.
-grounded-weather-forecast ingest-ensembles              # --models <ids>
-
-# 5c. Optional: cross-check station truth against lapse-adjusted Synoptic
+# 6b. Optional: cross-check station truth against lapse-adjusted Synoptic
 #    neighbors (free-signup token) and fit the radiation-shield error model.
 #    A drifting or decorrelating sensor alarms here before it poisons truth.
-grounded-weather-forecast truth-qc
+grounded-weather-forecast truth-qc                      # --days 30
 
-# 6. Leaderboards (per-slice skill with Diebold-Mariano, aggregate, winners,
+# 7. Leaderboards (per-slice skill with Diebold-Mariano, aggregate, winners,
 #    absolute error, consumer %-within-3F), the provider error-correlation
 #    matrix, and self-verification of forecasts this system actually served.
 grounded-weather-forecast report
 
-# 7. Emit the current blended forecast (minutely + hourly + daily) as JSON.
+# 8. Emit the current blended forecast (minutely + hourly + daily) as JSON.
 #    Every emitted forecast carries ready/degraded status and release identity,
 #    and is appended atomically to a history so it can later be scored
 #    against the truth that arrives — backtest skill is an estimate, this is the

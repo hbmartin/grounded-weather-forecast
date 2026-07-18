@@ -1,4 +1,4 @@
-from importlib.metadata import version
+from importlib.metadata import metadata, version
 
 import pytest
 
@@ -18,4 +18,23 @@ def test_cli_reports_installed_version(capsys):
     assert (
         capsys.readouterr().out.strip()
         == f"grounded-weather-forecast {version('grounded-weather-forecast')}"
+    )
+
+
+def test_backfill_extra_is_published_in_distribution_metadata():
+    package = metadata("grounded-weather-forecast")
+    assert "backfill" in package.get_all("Provides-Extra", [])
+    requirements = package.get_all("Requires-Dist", [])
+    assert any(
+        requirement.startswith("dynamical-catalog")
+        and "extra == 'backfill'" in requirement
+        for requirement in requirements
+    )
+    assert any(
+        requirement.startswith("xarray") and "extra == 'backfill'" in requirement
+        for requirement in requirements
+    )
+    assert any(
+        requirement.startswith("zarr") and "extra == 'backfill'" in requirement
+        for requirement in requirements
     )

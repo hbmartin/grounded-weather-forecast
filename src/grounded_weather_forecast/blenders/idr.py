@@ -98,23 +98,35 @@ class Idr:
         y = train.y[scored]
         order = np.argsort(x, kind="stable")
         x_sorted, y_sorted = x[order], y[order]
+        unique_x, first, counts = np.unique(
+            x_sorted, return_index=True, return_counts=True
+        )
         thresholds = np.unique(np.quantile(y_sorted, _THRESHOLD_LEVELS))
         # P(Y <= z | x) must be non-increasing in x, so fit the exceedance
-        # indicator isotonically and read the CDF as its complement.
-        cdf = np.empty((x_sorted.shape[0], thresholds.shape[0]))
+        # indicator isotonically and read the CDF as its complement. Equal
+        # covariates are pooled first so their fitted distribution cannot
+        # depend on stable-sort input order.
+        cdf = np.empty((unique_x.shape[0], thresholds.shape[0]))
         for column, z in enumerate(thresholds):
-            exceeds = (y_sorted > z).astype(np.float64)
-            cdf[:, column] = 1.0 - pava_isotonic(exceeds)
+            raw_exceeds = (y_sorted > z).astype(np.float64)
+            grouped_exceeds = np.add.reduceat(raw_exceeds, first) / counts
+            cdf[:, column] = 1.0 - pava_isotonic(
+                grouped_exceeds, counts.astype(np.float64)
+            )
         # enforce monotonicity across thresholds too (finite-sample wiggles)
         self._cdf_stack = np.maximum.accumulate(cdf, axis=1)
-        self._sorted_x = x_sorted
+        self._sorted_x = unique_x
         self._thresholds = thresholds
         return self
 
     def _quantile_rows(self, base_point: FloatArray) -> FloatArray:
-        assert self._sorted_x is not None
-        assert self._cdf_stack is not None
-        assert self._thresholds is not None
+        if (
+            self._sorted_x is None
+            or self._cdf_stack is None
+            or self._thresholds is None
+        ):
+            msg = "IDR distribution missing; fit before requesting quantiles"
+            raise RuntimeError(msg)
         positions = np.clip(
             np.searchsorted(self._sorted_x, base_point, side="right") - 1,
             0,
@@ -144,8 +156,10 @@ class Idr:
             self._kind,
             self._variable,
         )
+        missing = ~np.isfinite(base_point)
+        quantiles[missing] = np.nan
         point = np.where(
-            np.isfinite(base_point),
+            ~missing,
             quantiles[:, len(QUANTILE_LEVELS) // 2],
             np.nan,
         )

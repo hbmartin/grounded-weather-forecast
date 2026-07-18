@@ -204,9 +204,11 @@ def backfill_long(
     models: Sequence[str] | None = None,
     fetcher: Fetcher = http_fetcher,
     chunk_days: int = 90,
+    *,
+    start: date | None = None,
 ) -> pl.DataFrame:
-    """Fetch every configured model over the configured range as one long frame."""
-    start = config.backfill.start_date
+    """Fetch models over an inclusive valid-date range as one long frame."""
+    start = start or config.backfill.start_date
     if start is None:
         msg = "set [backfill.open_meteo].start_date to backfill"
         raise BackfillError(msg)

@@ -1,4 +1,5 @@
 import json
+from datetime import timedelta
 
 import numpy as np
 import polars as pl
@@ -107,11 +108,11 @@ class TestOnlineAdvance:
         matrix = synthetic_hourly_matrix(days=30, noise_sd=0.4, seed=61)
         full = to_supervised_slice(matrix, TEMP)
         midpoint = (
-            matrix["issue_time"].min()
-            + (matrix["issue_time"].max() - matrix["issue_time"].min()) / 2
+            matrix["valid_time"].min()
+            + (matrix["valid_time"].max() - matrix["valid_time"].min()) / 2
         )
         first_half = to_supervised_slice(
-            matrix.filter(pl.col("issue_time") <= midpoint), TEMP
+            matrix.filter(pl.col("valid_time") <= midpoint), TEMP
         )
         grounding = AffineGrounding().fit(full)
         batch = OnlineExperts(method_id="boa", scheme="boa")
@@ -120,7 +121,7 @@ class TestOnlineAdvance:
         incremental = OnlineExperts(method_id="boa", scheme="boa")
         incremental._grounding = grounding
         incremental._replay(first_half)
-        incremental._replay(full, after=incremental._watermark)
+        incremental._replay(full)
         for label, state in batch._states.items():
             np.testing.assert_allclose(
                 incremental._states[label].weights, state.weights, atol=1e-12
@@ -132,11 +133,11 @@ class TestOnlineAdvance:
         matrix = synthetic_hourly_matrix(days=30, noise_sd=0.4, seed=61)
         full = to_supervised_slice(matrix, TEMP)
         midpoint = (
-            matrix["issue_time"].min()
-            + (matrix["issue_time"].max() - matrix["issue_time"].min()) / 2
+            matrix["valid_time"].min()
+            + (matrix["valid_time"].max() - matrix["valid_time"].min()) / 2
         )
         first_half = to_supervised_slice(
-            matrix.filter(pl.col("issue_time") <= midpoint), TEMP
+            matrix.filter(pl.col("valid_time") <= midpoint), TEMP
         )
         batch = OnlineExperts(method_id="boa", scheme="boa").fit(full)
         incremental = OnlineExperts(method_id="boa", scheme="boa").fit(first_half)
@@ -168,9 +169,47 @@ class TestOnlineAdvance:
         experts = OnlineExperts(method_id="boa", scheme="boa").fit(train)
         state = experts.to_state()
         restored = OnlineExperts.from_state(state, "boa")
-        assert restored._watermark == experts._watermark
+        assert restored._progress == experts._progress
         assert restored._sources == experts._sources
         for label, bucket_state in experts._states.items():
             np.testing.assert_array_equal(
                 restored._states[label].weights, bucket_state.weights
+            )
+
+    def test_later_resolving_lead_for_same_issue_is_consumed(self):
+        matrix = synthetic_hourly_matrix(days=4, max_lead=12, seed=64)
+        first_resolution = matrix["valid_time"].min()
+        short = to_supervised_slice(
+            matrix.filter(
+                pl.col("valid_time") <= first_resolution + timedelta(hours=3)
+            ),
+            TEMP,
+        )
+        full = to_supervised_slice(matrix, TEMP)
+        experts = OnlineExperts(method_id="ewa", scheme="ewa").fit(short)
+
+        assert "6-12h" not in experts._states
+        experts.advance(full)
+
+        assert experts._states["6-12h"].steps > 0
+        assert experts._progress["6-12h"].rows > 0
+
+    def test_historical_correction_invalidates_incremental_state(self):
+        matrix = synthetic_hourly_matrix(days=4, max_lead=12, seed=65)
+        train = to_supervised_slice(matrix, TEMP)
+        experts = OnlineExperts(method_id="ewa", scheme="ewa").fit(train)
+        corrected = matrix.with_columns(
+            pl.when(pl.int_range(pl.len()) == 0)
+            .then(pl.col("fx__alpha__temp_c") + 5.0)
+            .otherwise(pl.col("fx__alpha__temp_c"))
+            .alias("fx__alpha__temp_c")
+        )
+
+        with pytest.raises(ValueError, match="history changed"):
+            experts.advance(to_supervised_slice(corrected, TEMP))
+
+    def test_legacy_state_requires_full_replay(self):
+        with pytest.raises(ValueError, match="legacy"):
+            OnlineExperts.from_state(
+                {"scheme": "ewa", "sources": ["alpha"], "buckets": {}}, "ewa"
             )

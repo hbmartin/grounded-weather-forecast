@@ -37,6 +37,8 @@ _DRIFT_ALERT_C = 1.0
 _CORRELATION_FLOOR = 0.9
 _CORRELATION_WINDOW_HOURS = 72
 _DRIFT_WINDOW_DAYS = 30
+_MIN_DRIFT_DAYS = 7
+_DEFAULT_HISTORY_HOURS = 30 * 24
 
 
 class NeighborError(RuntimeError):
@@ -49,9 +51,13 @@ class NeighborChecks:
 
     daily_drift: pl.DataFrame  # date, station_minus_consensus_c
     rolling_correlation: pl.DataFrame  # valid_hour, correlation
-    drift_alert: bool
-    correlation_alert: bool
+    comparison: pl.DataFrame  # station, consensus, wind, and difference by hour
+    drift_alert: bool | None
+    correlation_alert: bool | None
     n_neighbors: int
+    overlap_hours: int
+    drift_reason: str
+    correlation_reason: str
 
 
 def resolve_token(raw: str) -> str:
@@ -127,10 +133,7 @@ def parse_neighbors(
                 pl.DataFrame(
                     {
                         "stid": [r[0] for r in rows],
-                        "ts": [
-                            datetime.fromisoformat(r[1].replace("Z", "+00:00"))
-                            for r in rows
-                        ],
+                        "ts": [datetime.fromisoformat(r[1]) for r in rows],
                         "temp_c": [r[2] for r in rows],
                     },
                     schema_overrides={"ts": pl.Datetime("us", "UTC")},
@@ -173,9 +176,12 @@ def neighbor_consensus(neighbors: pl.DataFrame) -> pl.DataFrame:
 
 def cross_check(truth_hourly: pl.DataFrame, consensus: pl.DataFrame) -> NeighborChecks:
     """Station-vs-consensus drift and decorrelation verdicts."""
+    truth_columns = ["valid_hour", "t__temp_c__inst"]
+    if "t__wind_speed_ms__inst" in truth_hourly.columns:
+        truth_columns.append("t__wind_speed_ms__inst")
     joined = (
-        truth_hourly.select("valid_hour", "t__temp_c__inst")
-        .drop_nulls()
+        truth_hourly.select(truth_columns)
+        .drop_nulls(["valid_hour", "t__temp_c__inst"])
         .join(consensus, on="valid_hour", how="inner")
         .with_columns(
             (pl.col("t__temp_c__inst") - pl.col("consensus_c")).alias("difference")
@@ -189,7 +195,18 @@ def cross_check(truth_hourly: pl.DataFrame, consensus: pl.DataFrame) -> Neighbor
         empty_corr = pl.DataFrame(
             schema={"valid_hour": pl.Datetime("us", "UTC"), "correlation": pl.Float64()}
         )
-        return NeighborChecks(empty_daily, empty_corr, False, False, 0)
+        reason = "no overlapping station and neighbor-consensus hours"
+        return NeighborChecks(
+            daily_drift=empty_daily,
+            rolling_correlation=empty_corr,
+            comparison=joined,
+            drift_alert=None,
+            correlation_alert=None,
+            n_neighbors=0,
+            overlap_hours=0,
+            drift_reason=reason,
+            correlation_reason=reason,
+        )
     daily = (
         joined.group_by(pl.col("valid_hour").dt.date().alias("date"))
         .agg(pl.col("difference").median().alias("station_minus_consensus_c"))
@@ -197,7 +214,12 @@ def cross_check(truth_hourly: pl.DataFrame, consensus: pl.DataFrame) -> Neighbor
     )
     recent = daily.tail(_DRIFT_WINDOW_DAYS)
     recent_median = recent["station_minus_consensus_c"].median()
-    drift = float(recent_median) if isinstance(recent_median, (int, float)) else 0.0
+    drift = (
+        float(recent_median)
+        if isinstance(recent_median, (int, float))
+        else float("nan")
+    )
+    drift_evaluable = recent.height >= _MIN_DRIFT_DAYS and np.isfinite(drift)
     correlation = joined.with_columns(
         pl.rolling_corr(
             pl.col("t__temp_c__inst"),
@@ -210,14 +232,27 @@ def cross_check(truth_hourly: pl.DataFrame, consensus: pl.DataFrame) -> Neighbor
     latest_correlation = (
         float(latest["correlation"][0]) if latest.height else float("nan")
     )
+    correlation_evaluable = np.isfinite(latest_correlation)
     return NeighborChecks(
         daily_drift=daily,
         rolling_correlation=correlation,
-        drift_alert=abs(drift) > _DRIFT_ALERT_C,
+        comparison=joined,
+        drift_alert=abs(drift) > _DRIFT_ALERT_C if drift_evaluable else None,
         correlation_alert=(
-            np.isfinite(latest_correlation) and latest_correlation < _CORRELATION_FLOOR
+            latest_correlation < _CORRELATION_FLOOR if correlation_evaluable else None
         ),
         n_neighbors=0,
+        overlap_hours=joined.height,
+        drift_reason=(
+            f"{recent.height} daily comparisons; recent median bias {drift:+.2f} C"
+            if drift_evaluable
+            else f"need at least {_MIN_DRIFT_DAYS} daily comparisons; got {recent.height}"
+        ),
+        correlation_reason=(
+            f"latest rolling correlation {latest_correlation:.3f}"
+            if correlation_evaluable
+            else "need at least 36 overlapping hourly comparisons"
+        ),
     )
 
 
@@ -225,7 +260,7 @@ def fetch_neighbor_checks(
     config: Config,
     truth_hourly: pl.DataFrame,
     fetcher: Fetcher = http_fetcher,
-    hours: int = 7 * 24,
+    hours: int = _DEFAULT_HISTORY_HOURS,
     now: datetime | None = None,
 ) -> NeighborChecks:
     """One cron pass: fetch, adjust, consense, verdict."""
@@ -242,7 +277,11 @@ def fetch_neighbor_checks(
     return NeighborChecks(
         daily_drift=checks.daily_drift,
         rolling_correlation=checks.rolling_correlation,
+        comparison=checks.comparison,
         drift_alert=checks.drift_alert,
         correlation_alert=checks.correlation_alert,
         n_neighbors=n_neighbors,
+        overlap_hours=checks.overlap_hours,
+        drift_reason=checks.drift_reason,
+        correlation_reason=checks.correlation_reason,
     )

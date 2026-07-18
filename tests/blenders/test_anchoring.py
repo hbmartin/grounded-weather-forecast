@@ -137,6 +137,17 @@ class TestAnchoredEmpirical:
         assert weights is not None
         assert (np.diff(weights) <= 1e-12).all()
 
+    def test_last_fitted_bin_tapers_continuously_to_24_hours(self):
+        train = to_supervised_slice(self.persistence_matrix(sigma=3.0), TEMP)
+        anchored = get_factory("anchored_fitted_grounded")().fit(train)
+        weights = anchored._residual_weights
+        assert weights is not None
+        sampled = anchored._weights_at(np.array([18.0, 18.01, 21.0, 24.0]), weights)
+        assert sampled[0] == pytest.approx(weights[-1])
+        assert sampled[1] < sampled[0]
+        assert sampled[1] > sampled[2] > sampled[3]
+        assert sampled[3] == 0.0
+
     def test_trend_variant_registered_and_sane(self):
         train = to_supervised_slice(self.persistence_matrix(), TEMP)
         fitted = get_factory("anchored_fitted_grounded")().fit(train)

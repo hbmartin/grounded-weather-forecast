@@ -127,6 +127,27 @@ class TestBackfillLong:
         with pytest.raises(BackfillError, match="start_date"):
             backfill_long(config, date(2026, 3, 1), fetcher=fetch)
 
+    def test_explicit_start_overrides_config(self, tmp_path):
+        config = write_config(
+            tmp_path,
+            extra_toml=(
+                "\n[backfill.open_meteo]\n"
+                'models = ["gfs_seamless"]\n'
+                "start_date = 2026-01-01\n"
+            ),
+        )
+        fetch, calls = fetcher_for(fake_payload())
+
+        backfill_long(
+            config,
+            date(2026, 3, 1),
+            fetcher=fetch,
+            start=date(2026, 2, 1),
+        )
+
+        assert len(calls) == 1
+        assert "start_date=2026-02-01" in calls[0]
+
     def test_requires_models(self, tmp_path):
         config = write_config(
             tmp_path,

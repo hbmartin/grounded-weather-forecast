@@ -1,4 +1,5 @@
 import json
+import math
 from datetime import timedelta
 
 import pytest
@@ -8,10 +9,12 @@ from grounded_weather_forecast.cli import main
 from grounded_weather_forecast.dataset.matrix import write_dataset
 from grounded_weather_forecast.serve.predict import (
     NoForecastDataError,
+    UnsupportedMethodError,
     build_snapshot,
     predict,
 )
 from grounded_weather_forecast.serve.schema import SCHEMA_VERSION
+from grounded_weather_forecast.serve.selection import Selection
 
 NOW = utc(2026, 3, 22, 17, 0)
 FETCH = "2026-03-22T16:30:00+00:00"
@@ -183,6 +186,42 @@ class TestPredict:
         methods = {m for p in document.hourly for m in p.methods.values()}
         assert methods == {"equal_weight"}
 
+    def test_unsupported_forced_method_fails_the_whole_prediction(self, config):
+        with pytest.raises(UnsupportedMethodError, match="hourly.precip_mm"):
+            predict(config, {}, now=NOW, force_method="persistence")
+
+    def test_unsupported_stale_selection_degrades_without_provenance(self, config):
+        selections = {
+            ("hourly", "precip_mm", "0-1h"): Selection(
+                "persistence",
+                reason="old release",
+                release_id="stale-release",
+                evaluation_id="old-evaluation",
+                dataset_fingerprint="old-data",
+            )
+        }
+        document = predict(config, selections, now=NOW)
+        first = document.hourly[0]
+        assert first.methods["precip_mm"] == "equal_weight"
+        assert "degraded stale selection" in first.selection_reasons["precip_mm"]
+        assert "stale-release" not in document.release_ids
+
+    def test_unknown_stale_selection_degrades_without_provenance(self, config):
+        selections = {
+            ("hourly", "temp_c", "0-1h"): Selection(
+                "retired_method",
+                reason="old release",
+                release_id="retired-release",
+                evaluation_id="old-evaluation",
+                dataset_fingerprint="old-data",
+            )
+        }
+        document = predict(config, selections, now=NOW)
+        first = document.hourly[0]
+        assert first.methods["temp_c"] == "equal_weight"
+        assert "unknown method retired_method" in first.selection_reasons["temp_c"]
+        assert "retired-release" not in document.release_ids
+
     def test_fallback_method_when_no_scores(self, config):
         document = predict(config, {}, now=NOW)
         methods = {m for p in document.hourly for m in p.methods.values()}
@@ -243,6 +282,46 @@ class TestPredictCli:
         assert json.loads(captured.out)["issued_at"] == NOW.isoformat()
         assert "appended" in captured.err
 
+    def test_unsupported_forced_method_is_an_actionable_cli_error(
+        self, tmp_path, capsys
+    ):
+        build_fixture(tmp_path)
+        code = main(
+            [
+                "--config",
+                str(tmp_path / "config.toml"),
+                "predict",
+                "--now",
+                NOW.isoformat(),
+                "--method",
+                "persistence",
+                "--no-history",
+            ]
+        )
+        assert code == 1
+        output = capsys.readouterr().out
+        assert "cannot predict" in output
+        assert "does not support hourly.precip_mm" in output
+
+    def test_unknown_forced_method_is_an_actionable_cli_error(self, tmp_path, capsys):
+        build_fixture(tmp_path)
+        code = main(
+            [
+                "--config",
+                str(tmp_path / "config.toml"),
+                "predict",
+                "--now",
+                NOW.isoformat(),
+                "--method",
+                "retired_method",
+                "--no-history",
+            ]
+        )
+        assert code == 1
+        output = capsys.readouterr().out
+        assert "cannot predict" in output
+        assert "unknown method 'retired_method'" in output
+
 
 class TestMinutelySinglePass:
     """Anchoring is applied exactly once, by whichever stage was promoted."""
@@ -291,9 +370,9 @@ class TestMinutelySinglePass:
             {"temp_c": self.blend(path, "anchored_fitted_grounded")},
             la_config,
         )
-        # pure interpolation: minute 1 clamps to the first hourly value, and
-        # the 10-degree observation is deliberately ignored (already anchored)
-        assert points[0].temp_c == pytest.approx(20.0)
+        # pure interpolation on the lead-zero-extended hourly path; the
+        # 10-degree observation is deliberately ignored (already anchored)
+        assert points[0].temp_c == pytest.approx(19.0 + 1.0 / 60.0, abs=0.001)
 
     def test_unanchored_selection_converges_to_the_observation(self, la_config):
         from grounded_weather_forecast.serve.predict import minutely_product
@@ -304,12 +383,116 @@ class TestMinutelySinglePass:
             {"temp_c": self.blend(path, "grounded_equal_weight")},
             la_config,
         )
-        # base extrapolates to 19.0 at lead 0; residual = 10 - 19 = -9;
-        # minute 1 = interp(20.0) + w*(−9) with w ~ 1 -> about 11
-        assert points[0].temp_c == pytest.approx(11.0, abs=0.1)
+        # Both the base path and residual use the 19.0 lead-zero extrapolation,
+        # so the first minute stays continuous with the observation.
+        expected_first = 19.0 + 1.0 / 60.0 + math.exp(-(1 / 60) / 3.0) * -9.0
+        assert points[0].temp_c == pytest.approx(expected_first, abs=0.02)
         # minute 60: w = exp(-1/tau) with the 3h config default
-        import math
-
         expected = 20.0 + math.exp(-1.0 / 3.0) * -9.0
         assert points[-1].temp_c == pytest.approx(expected, abs=0.1)
         assert points[-1].temp_c > points[0].temp_c  # decaying toward the path
+
+    def test_minutely_dew_point_is_not_above_temperature(self, la_config):
+        from grounded_weather_forecast.serve.predict import minutely_product
+
+        snapshot, path = self.make_snapshot()
+        points = minutely_product(
+            snapshot,
+            {
+                "temp_c": self.blend(path, "anchored_fitted_grounded"),
+                "dew_point_c": self.blend(path + 5.0, "anchored_fitted_grounded"),
+            },
+            la_config,
+        )
+        assert all(
+            point.dew_point_c <= point.temp_c
+            for point in points
+            if point.dew_point_c is not None and point.temp_c is not None
+        )
+
+
+class TestPhysicalCoherence:
+    def test_hourly_points_and_differing_quantile_grids_are_coherent(self):
+        import numpy as np
+
+        from grounded_weather_forecast.serve.predict import _cohere_hourly
+        from grounded_weather_forecast.serve.schema import HourlyPoint
+
+        point = HourlyPoint(
+            valid_time=NOW.isoformat(),
+            lead_hours=1.0,
+            values={
+                "temp_c": 1.0,
+                "dew_point_c": 5.0,
+                "wind_speed_ms": 3.0,
+                "wind_gust_ms": 1.0,
+            },
+            quantiles={
+                "temp_c": {"0.1": 0.0, "0.9": 2.0},
+                "dew_point_c": {"0.25": 3.0, "0.75": 4.0},
+                "wind_speed_ms": {"0.2": 2.0, "0.8": 4.0},
+                "wind_gust_ms": {"0.1": 0.0, "0.9": 1.0},
+            },
+        )
+        _cohere_hourly([point])
+
+        assert point.values["dew_point_c"] <= point.values["temp_c"]
+        assert point.values["wind_gust_ms"] >= point.values["wind_speed_ms"]
+        levels = np.array([0.1, 0.2, 0.25, 0.75, 0.8, 0.9])
+
+        def curve(name):
+            raw = point.quantiles[name]
+            x = np.array([float(level) for level in raw])
+            y = np.array(list(raw.values()))
+            order = np.argsort(x)
+            return np.interp(levels, x[order], y[order])
+
+        assert (curve("dew_point_c") <= curve("temp_c") + 1e-12).all()
+        assert (curve("wind_gust_ms") >= curve("wind_speed_ms") - 1e-12).all()
+        for name, value in point.values.items():
+            quantiles = point.quantiles[name].values()
+            assert min(quantiles) <= value <= max(quantiles)
+
+    def test_daily_low_high_points_and_quantiles_are_coherent(self):
+        import numpy as np
+
+        from grounded_weather_forecast.serve.predict import _cohere_daily
+        from grounded_weather_forecast.serve.schema import DailyPoint
+
+        point = DailyPoint(
+            date_local="2026-03-22",
+            lead_days=1,
+            values={"temp_min_c": 12.0, "temp_max_c": 8.0},
+            quantiles={
+                "temp_min_c": {"0.25": 10.0, "0.75": 14.0},
+                "temp_max_c": {"0.1": 5.0, "0.9": 9.0},
+            },
+        )
+        _cohere_daily([point])
+        assert point.values["temp_min_c"] <= point.values["temp_max_c"]
+        levels = np.array([0.1, 0.25, 0.75, 0.9])
+
+        def curve(name):
+            raw = point.quantiles[name]
+            x = np.array([float(level) for level in raw])
+            y = np.array(list(raw.values()))
+            order = np.argsort(x)
+            return np.interp(levels, x[order], y[order])
+
+        assert (curve("temp_min_c") <= curve("temp_max_c") + 1e-12).all()
+
+    def test_point_clipping_cannot_reintroduce_dew_point_violation(self):
+        from grounded_weather_forecast.serve.predict import _cohere_hourly
+        from grounded_weather_forecast.serve.schema import HourlyPoint
+
+        point = HourlyPoint(
+            valid_time=NOW.isoformat(),
+            lead_hours=1.0,
+            values={"temp_c": 10.0, "dew_point_c": 12.0},
+            quantiles={"temp_c": {"0.1": 0.0, "0.9": 5.0}},
+        )
+
+        _cohere_hourly([point])
+
+        assert point.values["temp_c"] == 5.0
+        assert point.values["dew_point_c"] == 5.0

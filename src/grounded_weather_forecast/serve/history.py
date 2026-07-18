@@ -6,16 +6,17 @@ history is what turns that estimate into a measurement, and it is the only way
 to catch a live path that has quietly diverged from the backtested one.
 """
 
-from contextlib import contextmanager
 from datetime import date
 from pathlib import Path
-from tempfile import NamedTemporaryFile
-from typing import Iterator
 
 import polars as pl
-from filelock import FileLock
 
 from grounded_weather_forecast.serve.schema import Forecast
+from grounded_weather_forecast.storage import (
+    atomic_write_parquet,
+    atomic_write_text,
+    locked_path,
+)
 from grounded_weather_forecast.timeutil import local_day_start_utc
 
 HISTORY_SCHEMA: pl.Schema = pl.Schema(
@@ -140,35 +141,11 @@ def _quantiles_json(quantiles: dict[str, float] | None) -> str | None:
     return json.dumps(quantiles, sort_keys=True)
 
 
-@contextmanager
-def _locked(path: Path) -> Iterator[None]:
-    lock_path = path.with_suffix(f"{path.suffix}.lock")
-    lock_path.parent.mkdir(parents=True, exist_ok=True)
-    with FileLock(lock_path):
-        yield
-
-
-def _atomic_write(frame: pl.DataFrame, path: Path) -> None:
-    with NamedTemporaryFile(dir=path.parent, suffix=".parquet", delete=False) as tmp:
-        temporary = Path(tmp.name)
-    try:
-        frame.write_parquet(temporary)
-        temporary.replace(path)
-    finally:
-        temporary.unlink(missing_ok=True)
-
-
 def _archive_document(forecast: Forecast, history_path: Path) -> None:
     directory = history_path.parent / "served_forecasts"
-    directory.mkdir(parents=True, exist_ok=True)
     safe_issue = forecast.issued_at.replace(":", "-").replace("+", "_")
     destination = directory / f"{safe_issue}.json"
-    with NamedTemporaryFile(
-        dir=directory, suffix=".json", mode="w", delete=False
-    ) as tmp:
-        tmp.write(forecast.to_json())
-        temporary = Path(tmp.name)
-    temporary.replace(destination)
+    atomic_write_text(forecast.to_json(), destination)
 
 
 def load_archived_forecast(history_path: Path, issued_at: str) -> Forecast | None:
@@ -186,9 +163,9 @@ def append_history(forecast: Forecast, path: Path) -> int:
     if fresh.is_empty():
         return 0
     path.parent.mkdir(parents=True, exist_ok=True)
-    with _locked(path):
+    with locked_path(path):
         combined = pl.concat([load_history(path), fresh]) if path.exists() else fresh
-        _atomic_write(combined, path)
+        atomic_write_parquet(combined, path)
         _archive_document(forecast, path)
     return fresh.height
 
