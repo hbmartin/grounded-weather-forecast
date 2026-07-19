@@ -19,6 +19,7 @@ import polars as pl
 from grounded_weather_forecast.config import Config
 from grounded_weather_forecast.contracts import (
     age_col,
+    finite_number,
     provider_age_hours,
     provider_age_is_fresh,
 )
@@ -247,10 +248,12 @@ def _truth_alerts(inputs: AlertInputs) -> tuple[Alert, ...]:
         hourly.sort("valid_hour") if "valid_hour" in hourly.columns else hourly
     ).tail(24 * 7)
     thin: dict[str, float] = {}
+    unusable: list[str] = []
     for column in hourly_columns:
-        mean = recent_hourly[column].mean()
-        if isinstance(mean, (int, float)) and float(mean) < hour_floor:
-            thin[column] = float(mean)
+        if (mean := finite_number(recent_hourly[column].mean())) is None:
+            unusable.append(column)
+        elif mean < hour_floor:
+            thin[column] = mean
     daily = inputs.daily_truth
     daily_columns = [
         column
@@ -266,16 +269,31 @@ def _truth_alerts(inputs: AlertInputs) -> tuple[Alert, ...]:
             "rain_coverage": "daily.rain",
         }
         for column in daily_columns:
-            mean = recent_daily[column].mean()
-            if isinstance(mean, (int, float)) and float(mean) < day_floor:
-                thin[daily_labels[column]] = float(mean)
+            if (mean := finite_number(recent_daily[column].mean())) is None:
+                unusable.append(daily_labels[column])
+            elif mean < day_floor:
+                thin[daily_labels[column]] = mean
+    alerts: list[Alert] = []
+    if unusable:
+        alerts.append(
+            Alert(
+                severity="red",
+                zone="B",
+                panel_id="truth-thinning",
+                message=(
+                    "no usable truth-coverage samples: "
+                    f"{', '.join(sorted(unusable))}; coverage is absent, not high"
+                ),
+                threshold=threshold,
+            )
+        )
     if not thin:
-        return ()
+        return tuple(alerts)
     detail = ", ".join(
         f"{column.removesuffix('_cov')}={value:.2f}"
         for column, value in sorted(thin.items())
     )
-    return (
+    alerts.append(
         Alert(
             severity="amber",
             zone="B",
@@ -285,8 +303,9 @@ def _truth_alerts(inputs: AlertInputs) -> tuple[Alert, ...]:
                 "affected periods are nulled out of training"
             ),
             threshold=threshold,
-        ),
+        )
     )
+    return tuple(alerts)
 
 
 def _sensor_alerts(inputs: AlertInputs) -> tuple[Alert, ...]:
@@ -699,9 +718,24 @@ def _silent_empty_alerts(inputs: AlertInputs) -> tuple[Alert, ...]:
                 )
             )
     if inputs.archive_location is not None:
-        latitude, longitude = inputs.archive_location
         station = inputs.config.station
-        if (
+        latitude = finite_number(inputs.archive_location[0])
+        longitude = finite_number(inputs.archive_location[1])
+        if latitude is None or longitude is None:
+            alerts.append(
+                Alert(
+                    severity="red",
+                    zone="A",
+                    panel_id="silent-empty",
+                    message=(
+                        "forecast archive records a non-finite location "
+                        f"{inputs.archive_location}; it cannot be checked against "
+                        "the configured station"
+                    ),
+                    threshold=threshold,
+                )
+            )
+        elif (
             abs(latitude - station.latitude) > LOCATION_TOLERANCE
             or abs(longitude - station.longitude) > LOCATION_TOLERANCE
         ):

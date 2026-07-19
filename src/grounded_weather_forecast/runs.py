@@ -3,7 +3,7 @@
 import hashlib
 import os
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 
 import polars as pl
@@ -13,6 +13,8 @@ from grounded_weather_forecast.config import Config
 from grounded_weather_forecast.storage import atomic_write_parquet, locked_path
 
 _LOCK_TIMEOUT_SECONDS = 5.0
+_RETENTION_DAYS = 90
+_MAX_ROWS = 50_000
 
 RUNS_SCHEMA = pl.Schema(
     {
@@ -56,6 +58,14 @@ def runs_path(config: Config) -> Path:
     return config.dataset.dir / "runs.parquet"
 
 
+def prune_runs(frame: pl.DataFrame, *, now: datetime) -> pl.DataFrame:
+    """Bound the ledger by age, then by row count as a burst backstop."""
+    if frame.is_empty():
+        return frame
+    horizon = now - timedelta(days=_RETENTION_DAYS)
+    return frame.filter(pl.col("started_at") >= horizon).tail(_MAX_ROWS)
+
+
 def append_run(record: RunRecord, path: Path) -> None:
     """Append one ledger row; telemetry failures never reach the command."""
     try:
@@ -63,7 +73,10 @@ def append_run(record: RunRecord, path: Path) -> None:
         path.parent.mkdir(parents=True, exist_ok=True)
         with locked_path(path, timeout=_LOCK_TIMEOUT_SECONDS):
             combined = pl.concat([load_runs(path), fresh]) if path.exists() else fresh
-            atomic_write_parquet(combined, path)
+            # The whole file is rewritten under the lock anyway, so pruning is
+            # free here — and without it the ledger grows without bound at the
+            # documented 10-minute `predict` cadence.
+            atomic_write_parquet(prune_runs(combined, now=record.ended_at), path)
     except (OSError, ValueError, Timeout, pl.exceptions.PolarsError):
         return
 

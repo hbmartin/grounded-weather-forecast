@@ -44,11 +44,8 @@ from grounded_weather_forecast.contracts import (
     daily_variable,
     hourly_variable,
 )
-from grounded_weather_forecast.dataset.ensembles import (
-    ensembles_path,
-    load_ensembles,
-)
 from grounded_weather_forecast.dataset.matrix import (
+    active_ensembles,
     build_daily_matrix,
     build_hourly_matrix,
     build_observation_features,
@@ -152,7 +149,10 @@ def build_snapshot(config: Config, issue_time: datetime) -> Snapshot:
         hourly_truth,
         causal_minute,
         config,
-        ensembles=load_ensembles(ensembles_path(config)),
+        # Must match the dataset build exactly: training filters ensemble rows
+        # to the configured models/variables, so serving must too or EMOS fits
+        # its spread coefficient against one predictor and applies it to another.
+        ensembles=active_ensembles(config),
     ).filter(pl.col("lead_hours") <= HOURLY_HORIZON_HOURS)
     daily = build_daily_matrix(
         archive.daily, snapshots, hourly, daily_truth, config
@@ -798,18 +798,11 @@ def _minute_path(
     right = int(np.searchsorted(ordered_leads, lead, side="left"))
     left = max(min(right - 1, ordered_leads.shape[0] - 2), 0)
     right = left + 1
-    anchored = (
-        ordered_methods[left].startswith("anchored"),
-        ordered_methods[right].startswith("anchored"),
-    )
-    if anchored[0] != anchored[1]:
-        distances = (
-            abs(lead - float(ordered_leads[left])),
-            abs(float(ordered_leads[right]) - lead),
-        )
-        chosen = right if distances[1] < distances[0] else left
-        value = float(ordered_path[chosen])
-        return value, value, anchored[chosen]
+    # The regime of the row that owns lead zero governs the whole minutely
+    # range. Switching regime mid-range would both step the path and flip the
+    # anchoring decision partway through, so the nowcast would ignore the live
+    # observation for the minutes on the anchored side.
+    anchored = ordered_methods[left].startswith("anchored")
     segment_leads, segment_path = _lead_zero_path(
         ordered_leads[[left, right]],
         ordered_path[[left, right]],
@@ -817,7 +810,7 @@ def _minute_path(
     return (
         float(np.interp(lead, segment_leads, segment_path)),
         float(segment_path[0]),
-        anchored[0],
+        anchored,
     )
 
 

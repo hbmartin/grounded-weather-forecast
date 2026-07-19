@@ -130,13 +130,16 @@ grounded-weather-forecast predict --out forecast.json
 
 Every command takes `--config <path>` (default `config.toml`). Once that
 configuration loads successfully, the invocation appends one row to
-`[dataset].dir/runs.parquet` — an append-only ledger (command, timing, exit
+`[dataset].dir/runs.parquet` — a rolling ledger (command, timing, exit
 status, dataset/config fingerprints) that the dashboard renders as the pipeline
-heartbeat. Parser and configuration-loading failures cannot be recorded because
-the ledger destination comes from that configuration. Each `predict` run additionally
-snapshots the fitted models' internals (grounding coefficients, expert
-weights, GBM importances, anchoring decay) into `[artifacts].dir/observability/`
-for the dashboard's glass-box zone; snapshot failures never affect serving.
+heartbeat, kept to the last 90 days and 50,000 rows so it stays bounded under a
+scheduled cadence. Parser and configuration-loading failures cannot be recorded
+because the ledger destination comes from that configuration. Each `predict` run
+additionally snapshots the fitted models' internals (grounding coefficients,
+expert weights, GBM importances, anchoring decay) into
+`[artifacts].dir/observability/` for the dashboard's glass-box zone, reclaiming
+snapshot trees superseded by a newer dataset fingerprint; snapshot failures
+never affect serving.
 
 ## Status
 

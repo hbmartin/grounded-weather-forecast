@@ -162,16 +162,26 @@ def age_col(source: str) -> str:
     return f"age{COLUMN_SEPARATOR}{source}"
 
 
-def provider_age_hours(value: object) -> float | None:
-    """Normalize a finite provider age; missing and invalid values become ``None``."""
+def finite_number(value: object) -> float | None:
+    """A real, finite number, or ``None`` for missing/non-numeric/NaN/inf.
+
+    The single numeric guard for operator-facing evidence. ``isinstance``
+    admits ``NaN`` (and ``bool``), and every ``NaN`` comparison is ``False``,
+    so a raw ``isinstance`` check silently renders a broken signal as healthy.
+    """
     match value:
         case bool():
             return None
         case int() | float():
-            hours = float(value)
-            return hours if math.isfinite(hours) else None
+            number = float(value)
+            return number if math.isfinite(number) else None
         case _:
             return None
+
+
+def provider_age_hours(value: object) -> float | None:
+    """Normalize a finite provider age; missing and invalid values become ``None``."""
+    return finite_number(value)
 
 
 def provider_age_is_fresh(value: object, cap_hours: float) -> bool:

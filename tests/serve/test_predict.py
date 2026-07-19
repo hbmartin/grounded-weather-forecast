@@ -410,7 +410,13 @@ class TestMinutelySinglePass:
             if point.dew_point_c is not None and point.temp_c is not None
         )
 
-    def test_mixed_anchor_regimes_are_not_interpolated(self, la_config):
+    def test_mixed_anchor_regimes_follow_the_lead_zero_regime(self, la_config):
+        """The row owning lead zero decides anchoring for the whole range.
+
+        Switching regime partway would both step the path and flip the
+        anchoring decision mid-range. Here lead zero is anchored, so the
+        config decay must not be re-applied and the path stays continuous.
+        """
         from grounded_weather_forecast.serve.predict import (
             VariableBlend,
             minutely_product,
@@ -426,9 +432,65 @@ class TestMinutelySinglePass:
         )
 
         points = minutely_product(snapshot, {"temp_c": blend}, la_config)
+        values = [point.temp_c for point in points]
 
-        assert points[0].temp_c == pytest.approx(path[0])
-        assert points[-1].temp_c == pytest.approx(path[0])
+        # Already anchored: the 10.0 C observation is not pulled in again.
+        assert min(values) > 15.0
+        # Continuous, and arriving at the hourly value at lead 1 h.
+        assert values[-1] == pytest.approx(path[0])
+        assert max(abs(b - a) for a, b in zip(values, values[1:])) < 0.1
+
+    def test_mixed_anchor_regimes_do_not_step_inside_the_horizon(self, la_config):
+        """Regression: the bracketing midpoint falling inside the 60-min horizon.
+
+        With sub-hourly first leads (the normal case for a non-o'clock issue
+        time) the old nearest-neighbour fallback produced a flat line with one
+        large jump, and flipped `already_anchored` halfway, so the live
+        observation was ignored for the minutes on the anchored side.
+        """
+        import numpy as np
+        import polars as pl
+
+        from grounded_weather_forecast.serve.predict import (
+            Snapshot,
+            VariableBlend,
+            minutely_product,
+        )
+        from grounded_weather_forecast.timeutil import utc
+
+        issue = utc(2026, 3, 22, 12, 37)
+        hourly = pl.DataFrame(
+            {
+                "valid_time": [utc(2026, 3, 22, 13), utc(2026, 3, 22, 14)],
+                "lead_hours": [23.0 / 60.0, 83.0 / 60.0],
+            },
+            schema_overrides={"valid_time": pl.Datetime("us", "UTC")},
+        )
+        snapshot = Snapshot(
+            issue_time=issue,
+            hourly=hourly,
+            daily=pl.DataFrame(),
+            minutely=pl.DataFrame(),
+            observation={"temp_c": 21.0},
+            observation_at=issue,
+        )
+        blend = VariableBlend(
+            point=np.array([20.0, 23.0]),
+            methods=["grounded_equal_weight", "anchored_fitted_grounded"],
+            reasons=["", ""],
+            release_ids=[None, None],
+            quantiles=[{}, {}],
+        )
+
+        values = [
+            point.temp_c
+            for point in minutely_product(snapshot, {"temp_c": blend}, la_config)
+        ]
+
+        jumps = [abs(b - a) for a, b in zip(values, values[1:])]
+        assert max(jumps) < 0.2, "minutely path must not step between regimes"
+        # Lead zero is un-anchored, so the live observation is honoured.
+        assert values[0] == pytest.approx(21.0, abs=0.5)
 
 
 class TestPhysicalCoherence:

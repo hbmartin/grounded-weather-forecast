@@ -837,13 +837,15 @@ def _record_run(
     exit_code: int | None,
 ) -> None:
     """Append this invocation to the run ledger; never raises."""
-    from grounded_weather_forecast import runs  # noqa: PLC0415
-    from grounded_weather_forecast.evaluation import (  # noqa: PLC0415
-        config_fingerprint,
-        dataset_fingerprint,
-    )
-
     try:
+        # Inside the try: this runs from a `finally`, so an import failure
+        # escaping here would replace the real command's result or exception.
+        from grounded_weather_forecast import runs  # noqa: PLC0415
+        from grounded_weather_forecast.evaluation import (  # noqa: PLC0415
+            config_fingerprint,
+            dataset_fingerprint,
+        )
+
         error = sys.exc_info()[1]
         try:
             dataset_print = dataset_fingerprint(config)

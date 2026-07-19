@@ -544,7 +544,7 @@ class DatasetManifest:
         )
 
 
-def _active_ensembles(config: Config) -> pl.DataFrame | None:
+def active_ensembles(config: Config) -> pl.DataFrame | None:
     """Persisted ensemble rows still enabled by the active configuration."""
     if not config.ensembles.enabled:
         return None
@@ -577,7 +577,7 @@ def write_dataset(config: Config) -> DatasetManifest:
     minutely_long = archive.minutely
     snapshots = snapshot_times(archive.completions)
 
-    ensembles = _active_ensembles(config)
+    ensembles = active_ensembles(config)
     hourly_matrix = build_hourly_matrix(
         hourly_long,
         snapshots,

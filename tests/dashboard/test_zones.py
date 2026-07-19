@@ -152,9 +152,80 @@ def test_zone_f_selection_reason_shares(tmp_path):
     zone = serving.build(ctx, Derived())
     reasons_panel = next(panel for panel in zone.panels if panel.panel_id == "f2")
     shares = {stat.label: stat.value for stat in reasons_panel.stats}
-    assert shares["degraded share"] == "100%"
-    assert reasons_panel.status == "amber"
+    assert shares["degraded share (last 1d)"] == "100%"
+    assert shares["degraded share (lifetime)"] == "100%"
+    assert reasons_panel.status == "red"
     assert reasons_panel.chart is not None
+
+
+def _degraded_history(healthy: int, degraded: int) -> pl.DataFrame:
+    """Served history with `degraded` recent degraded rows after `healthy` old ones."""
+    rows = healthy + degraded
+    return pl.DataFrame(
+        {
+            "issued_at": [NOW - timedelta(days=30)] * healthy + [NOW] * degraded,
+            "product": ["hourly"] * rows,
+            "variable": ["temp_c"] * rows,
+            "valid_time": [NOW + timedelta(hours=1)] * rows,
+            "valid_date": [None] * rows,
+            "lead_hours": [1.0] * rows,
+            "method_id": ["equal_weight"] * rows,
+            "y_pred": [10.0] * rows,
+            "dataset_fingerprint": ["f"] * rows,
+            "release_id": [None] * rows,
+            "selection_reason": ["winner: emos"] * healthy
+            + ["degraded: no evidence"] * degraded,
+            "quantiles_json": [None] * rows,
+        },
+        schema=HISTORY_SCHEMA,
+    )
+
+
+def test_zone_f_degraded_share_is_judged_on_the_trailing_window(tmp_path):
+    """A lifetime share is diluted by history; today's degradation must show."""
+    config = write_config(tmp_path)
+    # 100% degraded right now, but only 7% of all rows ever served.
+    ctx = DashboardContext(
+        config=config, now=NOW, history=_degraded_history(healthy=5000, degraded=400)
+    )
+    panel = next(
+        p for p in serving.build(ctx, Derived()).panels if p.panel_id == "f2"
+    )
+    shares = {stat.label: stat.value for stat in panel.stats}
+    assert shares["degraded share (last 1d)"] == "100%"
+    assert shares["degraded share (lifetime)"] == "7%"
+    assert panel.status == "red"
+
+
+def test_zone_f_near_total_degradation_is_not_green(tmp_path):
+    """999/1000 degraded must not read 'ok' just because it is under 100%."""
+    config = write_config(tmp_path)
+    ctx = DashboardContext(
+        config=config, now=NOW, history=_degraded_history(healthy=0, degraded=999)
+    )
+    panel = next(
+        p for p in serving.build(ctx, Derived()).panels if p.panel_id == "f2"
+    )
+    assert panel.status == "red"
+
+
+def test_zone_f_unusable_live_scores_are_not_reported_as_a_young_archive(tmp_path):
+    """A damaged artifact and an empty one must not render the same."""
+    config = write_config(tmp_path)
+    ctx = DashboardContext(config=config, now=NOW)
+    young = next(
+        p
+        for p in serving.build(ctx, Derived()).panels
+        if p.panel_id == "f1"
+    )
+    damaged = next(
+        p
+        for p in serving.build(ctx, Derived(live_scores_unusable=True)).panels
+        if p.panel_id == "f1"
+    )
+    assert young.status == "info"
+    assert damaged.status == "red"
+    assert "could not be read" in (damaged.empty_reason or "")
 
 
 def test_zone_f_verification_labels_include_lead_bucket(tmp_path):

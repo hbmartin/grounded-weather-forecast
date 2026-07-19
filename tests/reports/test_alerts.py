@@ -514,3 +514,77 @@ def test_alerts_sorted_most_severe_first(tmp_path):
     order = {"red": 0, "amber": 1, "info": 2}
     ranks = [order[alert.severity] for alert in alerts]
     assert ranks == sorted(ranks)
+
+
+class TestDegenerateEvidenceIsNeverGreen:
+    """Populated-but-degenerate artifacts must never render as healthy.
+
+    Absent inputs were already covered; the gap was evidence that exists but
+    carries no usable numbers. ``isinstance(x, (int, float))`` admits NaN and
+    every NaN comparison is False, so these all used to return no alert.
+    """
+
+    def _hourly_truth(self, values):
+        return pl.DataFrame(
+            {
+                "valid_hour": [NOW - timedelta(hours=index) for index in range(3)],
+                "temp_c_cov": values,
+            },
+            schema_overrides={"valid_hour": pl.Datetime("us", "UTC")},
+        )
+
+    @pytest.mark.parametrize(
+        ("label", "values"),
+        [
+            ("all-null", [None, None, None]),
+            ("all-nan", [float("nan")] * 3),
+        ],
+    )
+    def test_unusable_truth_coverage_fires_red(self, tmp_path, label, values):
+        alerts = evaluate_alerts(
+            make_inputs(tmp_path, hourly_truth=self._hourly_truth(values))
+        )
+        thinning = by_panel(alerts, "truth-thinning")
+        assert [alert.severity for alert in thinning] == ["red"], label
+        assert "no usable truth-coverage samples" in thinning[0].message
+
+    def test_real_coverage_below_floor_still_fires_amber(self, tmp_path):
+        alerts = evaluate_alerts(
+            make_inputs(tmp_path, hourly_truth=self._hourly_truth([0.1, 0.1, 0.1]))
+        )
+        thinning = by_panel(alerts, "truth-thinning")
+        assert [alert.severity for alert in thinning] == ["amber"]
+
+    def test_healthy_coverage_is_silent(self, tmp_path):
+        alerts = evaluate_alerts(
+            make_inputs(tmp_path, hourly_truth=self._hourly_truth([1.0, 1.0, 1.0]))
+        )
+        assert by_panel(alerts, "truth-thinning") == []
+
+    def test_nan_provider_age_is_reported_not_swallowed(self, tmp_path):
+        matrix = pl.DataFrame(
+            {
+                "issue_time": [NOW],
+                "age__alpha": [float("nan")],
+                "age__beta": [1.0],
+            },
+            schema_overrides={"issue_time": pl.Datetime("us", "UTC")},
+        )
+        alerts = evaluate_alerts(
+            make_inputs(tmp_path, manifest=MANIFEST, hourly_matrix=matrix)
+        )
+        dropped = by_panel(alerts, "provider-dropped")
+        assert dropped, "a NaN age must not read as a healthy provider"
+        assert "alpha" in dropped[0].message
+
+    def test_non_finite_archive_location_fires_red(self, tmp_path):
+        alerts = evaluate_alerts(
+            make_inputs(
+                tmp_path,
+                manifest=MANIFEST,
+                archive_location=(float("nan"), float("nan")),
+            )
+        )
+        empties = by_panel(alerts, "silent-empty")
+        assert any("non-finite location" in alert.message for alert in empties)
+        assert all(alert.severity == "red" for alert in empties)
