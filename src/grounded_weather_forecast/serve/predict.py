@@ -546,44 +546,45 @@ def _cohere_pair(
         lower_curve = _curve_on(lower_q, values.get(lower_name), union)
         upper_curve = _curve_on(upper_q, values.get(upper_name), union)
         paired = np.isfinite(lower_curve) & np.isfinite(upper_curve)
-        match adjust:
-            case "lower":
-                lower_curve[paired] = np.minimum(
-                    lower_curve[paired], upper_curve[paired]
+        already_coherent = (
+            not paired.any() or (lower_curve[paired] <= upper_curve[paired]).all()
+        )
+        if not already_coherent:
+            match adjust:
+                case "lower":
+                    lower_curve[paired] = np.minimum(
+                        lower_curve[paired], upper_curve[paired]
+                    )
+                case "upper":
+                    upper_curve[paired] = np.maximum(
+                        upper_curve[paired], lower_curve[paired]
+                    )
+                case "both":
+                    original_lower = lower_curve.copy()
+                    lower_curve[paired] = np.minimum(
+                        original_lower[paired], upper_curve[paired]
+                    )
+                    upper_curve[paired] = np.maximum(
+                        original_lower[paired], upper_curve[paired]
+                    )
+                case _:  # pragma: no cover - private invariant
+                    msg = f"unknown coherence adjustment: {adjust}"
+                    raise ValueError(msg)
+            _write_curve(lower_q, union, lower_curve)
+            _write_curve(upper_q, union, upper_curve)
+            # Mapping the repaired union curve back to unequal source grids
+            # discards knots owned only by the other curve. The neighbour
+            # projection restores between-knot coherence, but is intentionally
+            # skipped for already-valid inputs because it is not a no-op.
+            if not np.array_equal(lower_levels, upper_levels):
+                _enforce_mapped_pair(
+                    lower_q,
+                    upper_q,
+                    values.get(lower_name),
+                    values.get(upper_name),
+                    union,
+                    adjust=adjust,
                 )
-            case "upper":
-                upper_curve[paired] = np.maximum(
-                    upper_curve[paired], lower_curve[paired]
-                )
-            case "both":
-                original_lower = lower_curve.copy()
-                lower_curve[paired] = np.minimum(
-                    original_lower[paired], upper_curve[paired]
-                )
-                upper_curve[paired] = np.maximum(
-                    original_lower[paired], upper_curve[paired]
-                )
-            case _:  # pragma: no cover - private invariant
-                msg = f"unknown coherence adjustment: {adjust}"
-                raise ValueError(msg)
-        _write_curve(lower_q, union, lower_curve)
-        _write_curve(upper_q, union, upper_curve)
-        # `_enforce_mapped_pair` bounds each knot against its NEIGHBOUR, which
-        # is what keeps two curves coherent between knots once they are
-        # reconstructed on different grids. On a shared grid the union-grid
-        # comparison above is already exact everywhere, so running it would
-        # only clamp each level against an adjacent one and pull an
-        # already-coherent distribution in — on the conformal grid that means
-        # bounding the lower q75 by the upper q25.
-        if not np.array_equal(lower_levels, upper_levels):
-            _enforce_mapped_pair(
-                lower_q,
-                upper_q,
-                values.get(lower_name),
-                values.get(upper_name),
-                union,
-                adjust=adjust,
-            )
     lower = values.get(lower_name)
     upper = values.get(upper_name)
     if lower is not None and upper is not None:

@@ -7,5 +7,6 @@ in `predict`; fresh data arrives only via the upstream cron. This keeps the harn
 runnable against any archive vintage (backtests must work on years-old files), immune to
 upstream release churn, and honest about the append-only nature of the archive. The cost —
 no shared Pydantic models, schema drift must be tolerated defensively — was accepted
-knowingly; the schemas are documented in `aw2sqlite-database.md` and
-`omni-weather-forecast-apis-database.md`.
+knowingly; the schemas are documented in
+[`upstream/aw2sqlite-database.md`](../upstream/aw2sqlite-database.md) and
+[`upstream/omni-weather-forecast-apis-database.md`](../upstream/omni-weather-forecast-apis-database.md).

@@ -163,7 +163,11 @@ def _reasons_panel(ctx: DashboardContext) -> Panel:
     # rows to judge, and saying so beats reporting a confident 0%; zone A owns
     # the "nothing served recently" verdict.
     recent = history.filter(
-        pl.col("issued_at") >= ctx.now - timedelta(days=_DEGRADED_WINDOW_DAYS)
+        pl.col("issued_at").is_between(
+            ctx.now - timedelta(days=_DEGRADED_WINDOW_DAYS),
+            ctx.now,
+            closed="both",
+        )
     )
     recent_share = _degraded_share(recent)
     # Judge on the trailing window: a lifetime share is diluted by every

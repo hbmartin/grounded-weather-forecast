@@ -14,6 +14,10 @@ nav = [
   { "Limitations" = "limitations.md" },
   { "Scheduling" = "scheduling.md" },
   { "Operator Dashboard" = "dashboard.md" },
+  { "Upstream database contracts" = [
+    { "ambientweather2sqlite" = "upstream/aw2sqlite-database.md" },
+    { "omni-weather-forecast-apis" = "upstream/omni-weather-forecast-apis-database.md" },
+  ] },
   { "Improvement Plan" = "improvement-plan.md" },
   { "Releasing" = "releasing.md" },
   { "Decisions" = [

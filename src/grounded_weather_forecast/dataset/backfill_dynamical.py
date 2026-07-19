@@ -66,6 +66,15 @@ class DynamicalBackfillError(RuntimeError):
     """The dynamical.org dataset was unavailable or malformed."""
 
 
+def _dynamical_error_types() -> tuple[type[Exception], ...]:
+    """The optional catalog's public error base, when the extra is installed."""
+    if not HAVE_DYNAMICAL:
+        return ()
+    module = import_module("dynamical_catalog")
+    error_type = getattr(module, "DynamicalCatalogError", None)
+    return (error_type,) if isinstance(error_type, type) else ()
+
+
 def open_catalog_dataset(catalog_id: str) -> Any:  # pragma: no cover - network
     if not HAVE_DYNAMICAL:
         msg = (
@@ -221,13 +230,22 @@ def backfill_dynamical_long(
             if window["init_time"].shape[0] == 0:
                 continue
             frames.append(_long_frame(_member_mean(window), spec, lag))
-        except DynamicalBackfillError:
+        except (DynamicalBackfillError,):  # noqa: B013 - project tuple convention
             raise
         # The Zarr/xarray/icechunk stack raises a wide and version-dependent
-        # set of its own errors; name the kinds a remote store actually
-        # produces rather than swallowing everything, so a MemoryError or a
-        # programming mistake still surfaces as itself.
-        except (OSError, ValueError, LookupError, TypeError) as exc:
+        # set of its own errors. Catch through Exception only to cross the lazy
+        # optional-dependency boundary, then re-raise programming failures and
+        # normalize the catalog's documented hierarchy plus data/store errors.
+        except (Exception,) as exc:  # noqa: B013 - filtered immediately below
+            expected = (
+                OSError,
+                ValueError,
+                LookupError,
+                TypeError,
+                *_dynamical_error_types(),
+            )
+            if not isinstance(exc, expected):
+                raise
             msg = (
                 f"dynamical backfill failed for {model!r} "
                 f"({spec.catalog_id}): {type(exc).__name__}: {exc}"

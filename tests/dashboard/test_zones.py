@@ -401,6 +401,21 @@ def test_zone_f_degraded_share_ignores_rows_that_carry_no_selection(tmp_path):
     assert panel.status == "red"
 
 
+def test_zone_f_trailing_window_excludes_future_rows(tmp_path):
+    config = write_config(tmp_path)
+    history = _degraded_history(healthy=1, degraded=0).with_columns(
+        pl.lit(NOW + timedelta(days=2)).alias("issued_at"),
+        pl.lit("degraded: clock skew").alias("selection_reason"),
+    )
+    ctx = DashboardContext(config=config, now=NOW, history=history)
+
+    panel = next(p for p in serving.build(ctx, Derived()).panels if p.panel_id == "f2")
+
+    shares = {stat.label: stat.value for stat in panel.stats}
+    assert shares["degraded share (last 1d)"] == "—"
+    assert panel.status == "ok"
+
+
 def test_zone_b_worst_channel_drives_the_qc_verdict(tmp_path):
     """One dead sensor among many clean ones must not average away.
 

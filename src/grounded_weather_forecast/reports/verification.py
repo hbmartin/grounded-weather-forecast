@@ -6,6 +6,7 @@ between the two is the signal that the serving path has drifted from the
 backtested one — the one failure a backtest can never catch by itself.
 """
 
+from datetime import datetime
 from pathlib import Path
 
 import polars as pl
@@ -57,9 +58,17 @@ def verify_history(
     truth_hourly: pl.DataFrame,
     truth_minute: pl.DataFrame | None = None,
     truth_daily: pl.DataFrame | None = None,
+    *,
+    issued_after: datetime | None = None,
+    issued_before: datetime | None = None,
 ) -> pl.DataFrame:
     """Realized skill scoped to the exact served slice and release cohort."""
-    history = load_history(history_path).with_columns(
+    history = load_history(history_path)
+    if issued_after is not None:
+        history = history.filter(pl.col("issued_at") >= issued_after)
+    if issued_before is not None:
+        history = history.filter(pl.col("issued_at") <= issued_before)
+    history = history.with_columns(
         pl.when(pl.col("product") == "daily")
         .then(daily_bucket_expr(pl.col("lead_hours") / 24.0))
         .otherwise(hourly_bucket_expr(pl.col("lead_hours")))

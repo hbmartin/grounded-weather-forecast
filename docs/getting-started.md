@@ -218,7 +218,7 @@ This prints a JSON document with all three products. Trimmed:
 
 ```json
 {
-  "schema_version": 2,
+  "schema_version": 3,
   "issued_at": "2026-03-22T17:00:00+00:00",
   "status": "ready",
   "release_ids": ["df227d411b814f78"],
@@ -231,7 +231,8 @@ This prints a JSON document with all three products. Trimmed:
   "hourly": [
     {"valid_time": "...T18:00:00+00:00", "lead_hours": 1.0, "lead_bucket": "1-3h",
      "values":  {"temp_c": 20.83, "wind_speed_ms": 1.2, "pop": 0.0},
-     "methods": {"temp_c": "grounded_equal_weight", "pop": "equal_weight"}}
+     "methods": {"temp_c": "grounded_equal_weight", "pop": "equal_weight"},
+     "release_ids": {"temp_c": "df227d411b814f78"}}
   ],
   "daily": [
     {"date_local": "2026-03-23", "lead_days": 1,
@@ -248,8 +249,9 @@ This prints a JSON document with all three products. Trimmed:
   the providers' consensus over the hour. That live reading is the one input no
   provider has.
 - `status` and `release_ids` — say whether compatible live evidence justified the
-  forecast and identify the promoted decision. A young archive emits an explicit
-  `degraded` equal-weight forecast rather than pretending grounding was fitted.
+  forecast and identify the promoted decision, both at document level and per
+  hourly/daily variable in schema 3. A young archive emits an explicit `degraded`
+  equal-weight forecast rather than pretending grounding was fitted.
 - `methods` — **every single value tells you which method produced it.** When you
   wonder why tomorrow's high is 23.8 °C, the answer is in the document.
 - `lead_bucket` — how far ahead this is, grouped. Skill is measured per bucket

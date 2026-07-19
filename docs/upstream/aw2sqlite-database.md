@@ -1,5 +1,10 @@
 # Database design
 
+> Reference snapshot from
+> [`ambientweather2sqlite` commit `79ada2c`](https://github.com/hbmartin/ambientweather2sqlite/blob/79ada2c407054dc02b1775e492a24741abd2414a/docs/database.md).
+> It documents this project's upstream SQLite contract; the upstream page is
+> authoritative if the two diverge.
+
 ambientweather2sqlite stores each station sample as one row in a single SQLite
 table. The table starts with only a timestamp and grows sideways as the station
 reports new sensors. This keeps the database directly queryable with ordinary

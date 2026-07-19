@@ -253,6 +253,12 @@ def cross_check(truth_hourly: pl.DataFrame, consensus: pl.DataFrame) -> Neighbor
             f"latest rolling correlation {latest_correlation:.3f}"
             if correlation_evaluable
             else (
+                "rolling correlation is undefined because the station or "
+                f"neighbor consensus has zero variance across {joined.height} "
+                "overlapping hourly comparisons"
+            )
+            if joined.height >= _MIN_CORRELATION_SAMPLES
+            else (
                 f"need at least {_MIN_CORRELATION_SAMPLES} overlapping hourly"
                 f" comparisons; got {joined.height}"
             )

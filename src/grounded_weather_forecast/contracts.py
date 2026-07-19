@@ -300,8 +300,10 @@ class SupervisedSlice:
         if self.y.shape != (self.x.n_rows,):
             msg = f"y shape {self.y.shape} != ({self.x.n_rows},)"
             raise ContractViolationError(msg)
-        if np.isnan(self.y).any():
-            msg = "y contains NaN; null-truth rows must be excluded upstream"
+        if not np.isfinite(self.y).all():
+            msg = (
+                "y contains NaN or infinite values; invalid truth rows must be excluded"
+            )
             raise ContractViolationError(msg)
 
 

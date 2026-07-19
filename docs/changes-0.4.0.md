@@ -48,14 +48,19 @@ Two serving-visible corrections landed alongside the dashboard:
   the row owning lead zero now governs the whole range and the path stays
   interpolated.
 
-One existing artifact schema changed: `truth_daily.parquet` now emits
-`rain_coverage`, which was previously computed and dropped before the final
-select. No migration is required — `build-dataset` rewrites the file, and
-readers tolerate its absence — but a daily truth parquet written by 0.3.0
-will not carry the column until the next rebuild. Everything else is
-additive, the dashboard renders honest "not yet" states wherever history
-hasn't accumulated, and CI's lizard step now excludes the vendored Chart.js
-asset (`-x "*/dashboard/assets/*"`).
+Two existing artifact schemas changed:
+
+- `truth_daily.parquet` now emits `rain_coverage`, which was previously
+  computed and dropped before the final select. `build-dataset` rewrites the
+  file and readers tolerate its absence.
+- The emitted forecast document is schema version 3. Hourly and daily points
+  now carry a `release_ids` map so each variable is attributable to the exact
+  promotion that selected its method. Schema-1/2 documents remain readable;
+  document-level release fallback is used only for those legacy versions.
+
+No manual migration is required. The dashboard renders honest "not yet" states
+wherever history has not accumulated, and CI's lizard step excludes the
+vendored Chart.js asset (`-x "*/dashboard/assets/*"`).
 
 ## Upgrade
 

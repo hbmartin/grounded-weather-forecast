@@ -80,6 +80,10 @@ jobs:
           uv run pytest tests/ --cov=src --cov-report=xml --cov-report=term-missing
 
       - name: Upload coverage to Codecov
+        # Forks and repositories without a configured token must still run
+        # the enforced local coverage gate above; external reporting is
+        # optional and must not turn a passing test suite red.
+        if: ${{ secrets.CODECOV_TOKEN != '' }}
         uses: codecov/codecov-action@v5
         with:
           files: coverage.xml
