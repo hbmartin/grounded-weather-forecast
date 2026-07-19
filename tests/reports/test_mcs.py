@@ -212,20 +212,79 @@ class TestLiveGate:
             == selections
         )
 
-    def test_other_bucket_or_release_cannot_demote(self):
-        for live in (
+    def test_another_slice_cannot_demote(self):
+        """Evidence about a different slice says nothing about this one."""
+        gated = apply_live_gate(
+            self.make_selection(),
             self.live_frame(5.0, bucket="1-3h"),
-            self.live_frame(5.0, dataset="dataset-b"),
+            factor=1.5,
+            min_n=24,
+            fallbacks=self.fallback(),
+        )
+        assert gated[("hourly", "temp_c", "24-48h")].method_id == "gbm"
+
+    def test_an_ineligible_release_cannot_demote(self):
+        """A release written under an incompatible config is not evidence.
+
+        This is the safety the old dataset/release equality check was reaching
+        for, expressed where it belongs: eligibility is decided from the
+        ledger, not from an identity that rotates with data volume.
+        """
+        gated = apply_live_gate(
+            self.make_selection(),
             self.live_frame(5.0, release="release-b"),
-        ):
-            gated = apply_live_gate(
-                self.make_selection(),
-                live,
-                factor=1.5,
-                min_n=24,
-                fallbacks=self.fallback(),
-            )
-            assert gated[("hourly", "temp_c", "24-48h")].method_id == "gbm"
+            factor=1.5,
+            min_n=24,
+            fallbacks=self.fallback(),
+            eligible_releases=frozenset({"release-a"}),
+        )
+        assert gated[("hourly", "temp_c", "24-48h")].method_id == "gbm"
+
+    def test_evidence_survives_a_nightly_dataset_rotation(self):
+        """Regression: leads >= 24h could never accumulate enough evidence.
+
+        `maintain` rebuilds the dataset nightly, rotating both the dataset
+        fingerprint and the release id, so a 24-48h forecast's truth always
+        landed after its own cohort had been retired. Neither cohort here
+        reaches min_n alone; only pooling crosses the threshold.
+        """
+        live = pl.concat(
+            [
+                self.live_frame(
+                    2.0, n=12, dataset="dataset-yesterday", release="release-yesterday"
+                ),
+                self.live_frame(2.0, n=12, dataset="dataset-a", release="release-a"),
+            ]
+        )
+        gated = apply_live_gate(
+            self.make_selection(mae=1.0),
+            live,
+            factor=1.5,
+            min_n=24,
+            fallbacks=self.fallback(),
+            eligible_releases=frozenset({"release-yesterday", "release-a"}),
+        )
+        selected = gated[("hourly", "temp_c", "24-48h")]
+        assert selected.method_id == "equal_weight"
+        assert "demoted gbm" in selected.reason
+
+    def test_pooled_live_mae_is_n_weighted(self):
+        """Pooling must weight cohorts by their row counts, not average them."""
+        live = pl.concat(
+            [
+                self.live_frame(1.1, n=100, release="release-a"),
+                self.live_frame(5.0, n=100, release="release-b"),
+            ]
+        )
+        gated = apply_live_gate(
+            self.make_selection(mae=1.0),
+            live,
+            factor=1.5,
+            min_n=24,
+            fallbacks=self.fallback(),
+            eligible_releases=frozenset({"release-a", "release-b"}),
+        )
+        assert "live MAE 3.050" in gated[("hourly", "temp_c", "24-48h")].reason
 
     def test_legacy_live_rows_cannot_drive_automatic_demotion(self):
         legacy = self.live_frame(5.0).drop("dataset_fingerprint", "release_id")
@@ -233,6 +292,17 @@ class TestLiveGate:
             apply_live_gate(self.make_selection(), legacy, factor=1.5, min_n=24)
             == self.make_selection()
         )
+
+    def test_a_rotated_dataset_fingerprint_no_longer_blocks_the_gate(self):
+        """The dataset fingerprint hashes row counts, so it is not identity."""
+        gated = apply_live_gate(
+            self.make_selection(mae=1.0),
+            self.live_frame(5.0, dataset="dataset-b"),
+            factor=1.5,
+            min_n=24,
+            fallbacks=self.fallback(),
+        )
+        assert gated[("hourly", "temp_c", "24-48h")].method_id == "equal_weight"
 
 
 class TestPValuesMonotone:

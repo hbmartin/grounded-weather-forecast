@@ -8,8 +8,9 @@ never to silence.
 
 import json
 from collections.abc import Mapping
+from contextlib import suppress
 from dataclasses import dataclass, replace
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import polars as pl
@@ -28,6 +29,13 @@ from grounded_weather_forecast.reports.leaderboard import (
 )
 
 FALLBACK_METHOD = "equal_weight"
+_LIVE_KEY = ("product", "variable", "lead_bucket", "method_id")
+# How long a served row may still testify. A module constant rather than a
+# config field on purpose: a new field changes `repr(config)`, hence
+# `config_fingerprint`, which would invalidate every score and release once.
+# The window also gives the gate hysteresis — a demoted method eventually ages
+# out of its own bad evidence and gets another hearing.
+_LIVE_EVIDENCE_WINDOW = timedelta(days=14)
 
 
 @dataclass(frozen=True, slots=True)
@@ -187,29 +195,40 @@ def _make_release(
     )
 
 
-def _release_as_of(config: Config, as_of: datetime) -> SelectionMap | None:
-    """Newest release that genuinely existed by a historical issue time."""
-    if as_of.tzinfo is None:
-        as_of = as_of.replace(tzinfo=UTC)
-    candidates: list[tuple[datetime, dict[str, object]]] = []
-    for path in (config.artifacts_dir / "releases").glob("*.json"):
-        raw = json.loads(path.read_text(encoding="utf-8"))
-        if raw.get("dataset_fingerprint") != dataset_fingerprint(config):
-            continue
-        if raw.get("config_fingerprint") != config_fingerprint(config):
-            continue
-        promoted_at = datetime.fromisoformat(str(raw["promoted_at"]))
-        if promoted_at <= as_of:
-            candidates.append((promoted_at, raw))
-    if not candidates:
-        return None
-    _, release = max(candidates, key=lambda item: item[0])
-    release_id = str(release["release_id"])
-    dataset = str(release["dataset_fingerprint"])
-    selections: dict[tuple[str, str, str], Selection] = {}
+def _compatible_releases(
+    config: Config, *, match_dataset: bool
+) -> list[dict[str, object]]:
+    """Ledger entries written under a config this system can still act on.
+
+    ``match_dataset`` additionally pins the dataset fingerprint, which is what
+    a historical replay needs. The live gate deliberately leaves it off — see
+    ``_eligible_release_ids``.
+    """
+    configuration = config_fingerprint(config)
+    dataset = dataset_fingerprint(config) if match_dataset else None
+    releases: list[dict[str, object]] = []
+    for path in sorted((config.artifacts_dir / "releases").glob("*.json")):
+        # One unreadable ledger entry must not take down nightly selection.
+        with suppress(OSError, ValueError):
+            raw = json.loads(path.read_text(encoding="utf-8"))
+            if not isinstance(raw, dict):
+                continue
+            if raw.get("config_fingerprint") != configuration:
+                continue
+            if dataset is not None and raw.get("dataset_fingerprint") != dataset:
+                continue
+            releases.append(raw)
+    return releases
+
+
+def _selections_from_release(release: Mapping[str, object]) -> SelectionMap | None:
+    """Rehydrate a ledger entry's per-slice selections."""
     raw_selections = release.get("selections", {})
     if not isinstance(raw_selections, dict):
         return None
+    release_id = str(release["release_id"])
+    dataset = str(release["dataset_fingerprint"])
+    selections: dict[tuple[str, str, str], Selection] = {}
     for raw_key, raw_selection in raw_selections.items():
         if not isinstance(raw_selection, dict):
             continue
@@ -235,6 +254,46 @@ def _release_as_of(config: Config, as_of: datetime) -> SelectionMap | None:
             release_id=release_id,
         )
     return selections
+
+
+def _eligible_release_ids(config: Config, now: datetime) -> frozenset[str]:
+    """Releases whose served rows may still testify about a method's skill.
+
+    Deliberately ignores the dataset fingerprint. That fingerprint hashes row
+    counts over every parquet artifact, so it rotates on *every ingested
+    observation* — keying live evidence to it means any slice whose truth
+    arrives after one rebuild cycle can never be scored, which is every lead
+    bucket at or beyond 24h. ``config_fingerprint`` is the identity that
+    actually pins what a method means (source set, variables, bucket edges,
+    grounding, quantile levels), so that is what compatibility rests on, and
+    the recency window bounds how long a verdict may be held against a method.
+    """
+    horizon = now - _LIVE_EVIDENCE_WINDOW
+    eligible: set[str] = set()
+    for raw in _compatible_releases(config, match_dataset=False):
+        with suppress(TypeError, ValueError):
+            promoted_at = datetime.fromisoformat(str(raw["promoted_at"]))
+            if promoted_at.tzinfo is None:
+                promoted_at = promoted_at.replace(tzinfo=UTC)
+            if promoted_at >= horizon:
+                eligible.add(str(raw["release_id"]))
+    return frozenset(eligible)
+
+
+def _release_as_of(config: Config, as_of: datetime) -> SelectionMap | None:
+    """Newest release that genuinely existed by a historical issue time."""
+    if as_of.tzinfo is None:
+        as_of = as_of.replace(tzinfo=UTC)
+    candidates: list[tuple[datetime, dict[str, object]]] = []
+    for raw in _compatible_releases(config, match_dataset=True):
+        with suppress(TypeError, ValueError):
+            promoted_at = datetime.fromisoformat(str(raw["promoted_at"]))
+            if promoted_at <= as_of:
+                candidates.append((promoted_at, raw))
+    if not candidates:
+        return None
+    _, release = max(candidates, key=lambda item: item[0])
+    return _selections_from_release(release)
 
 
 def select_methods(
@@ -288,21 +347,17 @@ def select_methods(
             )
     if not selections:
         return selections
-    prospective = _make_release(config, selections, selected_scores)
-    selections = {
-        key: replace(selected, release_id=prospective.release_id)
-        for key, selected in selections.items()
-    }
-    fallbacks = {
-        key: replace(selected, release_id=prospective.release_id)
-        for key, selected in fallbacks.items()
-    }
+    # Gate before minting the release. Stamping a prospective id first only
+    # ever orphaned it: a demotion rewrites `selections`, which the release
+    # hash covers, so the rows served under the acting release ended up
+    # attributed to an id that release does not have.
     selections = apply_live_gate(
         selections,
         _live_verification(config),
         factor=config.promotion.live_gap_factor,
         min_n=config.promotion.min_live_n,
         fallbacks=fallbacks,
+        eligible_releases=_eligible_release_ids(config, datetime.now(tz=UTC)),
     )
     release = _make_release(config, selections, selected_scores)
     release.write(config.artifacts_dir / "releases")
@@ -325,6 +380,84 @@ def _live_verification(config: Config) -> pl.DataFrame:
     return verify_history(config.predict.history_path, hourly, minute, daily)
 
 
+def _pooled_live_skill(
+    live: pl.DataFrame, eligible_releases: frozenset[str] | None
+) -> dict[tuple[str, str, str, str], tuple[int, float]]:
+    """Realized skill per (product, variable, bucket, method), pooled by identity.
+
+    ``verify_history`` scores each release cohort separately, which is right
+    for a report but fatal for a gate: a release lives about a day, so a
+    24-48h forecast's truth always arrives after its own cohort has been
+    retired. Pooling the eligible cohorts is what lets long leads accumulate
+    evidence at all. The n-weighted mean is exact for MAE.
+    """
+    required = {"product", "variable", "lead_bucket", "method_id", "release_id", "n"}
+    if live.is_empty() or not required <= set(live.columns):
+        return {}
+    scoped = live.filter(pl.col("release_id").is_not_null())
+    if eligible_releases is not None:
+        scoped = scoped.filter(pl.col("release_id").is_in(list(eligible_releases)))
+    if scoped.is_empty():
+        return {}
+    pooled = scoped.group_by(_LIVE_KEY).agg(
+        pl.col("n").sum().alias("n"),
+        ((pl.col("live_mae") * pl.col("n")).sum() / pl.col("n").sum()).alias(
+            "live_mae"
+        ),
+    )
+    return {
+        (
+            str(row["product"]),
+            str(row["variable"]),
+            str(row["lead_bucket"]),
+            str(row["method_id"]),
+        ): (int(row["n"]), float(row["live_mae"]))
+        for row in pooled.iter_rows(named=True)
+    }
+
+
+def _live_verdict(
+    pooled: Mapping[tuple[str, str, str, str], tuple[int, float]],
+    key: SliceKey,
+    selected: Selection,
+    *,
+    factor: float,
+    min_n: int,
+) -> str | None:
+    """The demotion reason for this slice, or ``None`` to leave it standing."""
+    if (
+        selected.method_id == FALLBACK_METHOD
+        or selected.reason == "pinned in config"
+        or selected.mae is None
+    ):
+        return None
+    product, variable, bucket = key
+    measured = pooled.get((product, variable, bucket, selected.method_id))
+    if measured is None:
+        return None
+    n, live_mae = measured
+    if n < min_n or live_mae <= factor * selected.mae:
+        return None
+    return (
+        f"demoted {selected.method_id}: live MAE {live_mae:.3f} vs "
+        f"backtest {selected.mae:.3f} (factor {factor}, n={n})"
+    )
+
+
+def _gate_fallback(
+    key: SliceKey,
+    selected: Selection,
+    fallbacks: Mapping[SliceKey, Selection] | None,
+) -> Selection | None:
+    if fallbacks is not None:
+        return fallbacks.get(key)
+    return Selection(
+        FALLBACK_METHOD,
+        reason="reference fallback",
+        dataset_fingerprint=selected.dataset_fingerprint,
+    )
+
+
 def apply_live_gate(
     selections: dict[tuple[str, str, str], Selection],
     live: pl.DataFrame,
@@ -332,6 +465,7 @@ def apply_live_gate(
     factor: float,
     min_n: int,
     fallbacks: Mapping[SliceKey, Selection] | None = None,
+    eligible_releases: frozenset[str] | None = None,
 ) -> dict[tuple[str, str, str], Selection]:
     """Close the self-verification loop: demote methods that underdeliver live.
 
@@ -340,67 +474,29 @@ def apply_live_gate(
     falls back to the reference method — the one failure a backtest can never
     catch by itself. The verdict travels in the selection reason, so the
     release ledger records every demotion.
+
+    Evidence is pooled across ``eligible_releases`` rather than matched to one
+    release, mirroring ``ArtifactStore.load_latest_state``: identity that
+    rotates with data volume cannot be a precondition for scoring, or the
+    slices that most need watching are the ones that never get watched.
+    ``None`` means no ledger filter — every release-tagged row is eligible.
     """
-    identity_columns = {"lead_bucket", "dataset_fingerprint", "release_id"}
-    if live.is_empty() or not identity_columns <= set(live.columns):
+    pooled = _pooled_live_skill(live, eligible_releases)
+    if not pooled:
         return selections
-    by_key = {
-        (
-            str(row["product"]),
-            str(row["variable"]),
-            str(row["lead_bucket"]),
-            str(row["method_id"]),
-            str(row["dataset_fingerprint"]),
-            str(row["release_id"]),
-        ): row
-        for row in live.iter_rows(named=True)
-        if row["dataset_fingerprint"] is not None and row["release_id"] is not None
-    }
     gated = dict(selections)
     for key, selected in selections.items():
-        product, variable, bucket = key
-        if (
-            selected.method_id == FALLBACK_METHOD
-            or selected.reason == "pinned in config"
-            or selected.mae is None
-            or selected.dataset_fingerprint is None
-            or selected.release_id is None
-        ):
+        verdict = _live_verdict(pooled, key, selected, factor=factor, min_n=min_n)
+        if verdict is None:
             continue
-        row = by_key.get(
-            (
-                product,
-                variable,
-                bucket,
-                selected.method_id,
-                selected.dataset_fingerprint,
-                selected.release_id,
-            )
+        fallback = _gate_fallback(key, selected, fallbacks)
+        if fallback is None:
+            continue
+        gated[key] = replace(
+            fallback,
+            reason=verdict,
+            dataset_fingerprint=selected.dataset_fingerprint,
         )
-        if row is None:
-            continue
-        live_mae = float(row["live_mae"])
-        if int(row["n"]) >= min_n and live_mae > factor * selected.mae:
-            fallback = (
-                fallbacks.get(key)
-                if fallbacks is not None
-                else Selection(
-                    FALLBACK_METHOD,
-                    reason="reference fallback",
-                    dataset_fingerprint=selected.dataset_fingerprint,
-                )
-            )
-            if fallback is None:
-                continue
-            gated[key] = replace(
-                fallback,
-                reason=(
-                    f"demoted {selected.method_id}: live MAE {live_mae:.3f} vs "
-                    f"backtest {selected.mae:.3f} (factor {factor})"
-                ),
-                dataset_fingerprint=selected.dataset_fingerprint,
-                release_id=selected.release_id,
-            )
     return gated
 
 
