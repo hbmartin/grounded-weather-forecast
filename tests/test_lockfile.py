@@ -38,6 +38,8 @@ def test_non_registry_sources_are_rejected(tmp_path):
         "path source",
         "github.com",
         "insecure.example.com",
+        "http scheme",
+        "ssh scheme",
     }
 
 
@@ -47,3 +49,22 @@ def test_the_projects_own_editable_entry_is_allowed(tmp_path):
         '[[package]]\nname = "self"\nsource = { editable = "." }\n', encoding="utf-8"
     )
     assert unapproved_hosts(lockfile) == set()
+
+
+def test_hostless_and_insecure_approved_sources_are_rejected(tmp_path):
+    lockfile = tmp_path / "uv.lock"
+    lockfile.write_text(
+        "\n".join(
+            (
+                'sdist = { url = "file:///tmp/evil.tar.gz" }',
+                'wheel = { url = "http://files.pythonhosted.org/evil.whl" }',
+            )
+        ),
+        encoding="utf-8",
+    )
+
+    assert unapproved_hosts(lockfile) == {
+        "file scheme",
+        "hostless file source",
+        "http scheme",
+    }

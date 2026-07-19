@@ -44,6 +44,10 @@ class DashboardContext:
     synthetic_hourly: pl.DataFrame | None = None
     score_frames: Mapping[str, pl.DataFrame] = field(default_factory=dict)
     unreadable_scores: tuple[str, ...] = ()
+    # Artifacts that exist but could not be read. A missing file is a young
+    # archive; a corrupt or permission-denied one is a fault, and collapsing
+    # both to None let a broken deployment render as merely early.
+    unreadable_artifacts: tuple[str, ...] = ()
     history: pl.DataFrame | None = None
     latest_forecast: Forecast | None = None
     releases: tuple[Mapping[str, object], ...] = ()
@@ -55,23 +59,33 @@ class DashboardContext:
     archive_location: tuple[float, float] | None = None
 
 
-def _try_parquet(path: Path) -> pl.DataFrame | None:
+def _try_parquet(path: Path, failures: list[str] | None = None) -> pl.DataFrame | None:
     if not path.exists():
         return None
     try:
         return pl.read_parquet(path)
     except (OSError, pl.exceptions.PolarsError):
+        if failures is not None:
+            failures.append(path.name)
         return None
 
 
-def _try_json(path: Path) -> Mapping[str, object] | None:
+def _try_json(
+    path: Path, failures: list[str] | None = None
+) -> Mapping[str, object] | None:
     if not path.exists():
         return None
     try:
         loaded = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError):
+        if failures is not None:
+            failures.append(path.name)
         return None
-    return loaded if isinstance(loaded, dict) else None
+    if not isinstance(loaded, dict):
+        if failures is not None:
+            failures.append(path.name)
+        return None
+    return loaded
 
 
 def _score_frames(config: Config) -> tuple[dict[str, pl.DataFrame], tuple[str, ...]]:
@@ -150,10 +164,13 @@ def _qc_summary(config: Config) -> pl.DataFrame | None:
         return None
 
 
-def _history(config: Config) -> pl.DataFrame | None:
+def _history(config: Config, failures: list[str]) -> pl.DataFrame | None:
+    if not config.predict.history_path.exists():
+        return None
     try:
         frame = load_history(config.predict.history_path)
     except (OSError, pl.exceptions.PolarsError):
+        failures.append(config.predict.history_path.name)
         return None
     return None if frame.is_empty() else frame
 
@@ -189,28 +206,34 @@ def _archive_location(config: Config) -> tuple[float, float] | None:
 def collect_context(config: Config, *, now: datetime | None = None) -> DashboardContext:
     paths = DatasetPaths.in_dir(config.dataset.dir)
     score_frames, unreadable_scores = _score_frames(config)
+    unreadable: list[str] = []
     return DashboardContext(
         config=config,
         now=now or datetime.now(tz=UTC),
-        manifest=_try_json(paths.manifest),
-        truth_minute=_try_parquet(paths.truth_minute),
-        truth_hourly=_try_parquet(paths.truth_hourly),
-        truth_daily=_try_parquet(paths.truth_daily),
+        manifest=_try_json(paths.manifest, unreadable),
+        truth_minute=_try_parquet(paths.truth_minute, unreadable),
+        truth_hourly=_try_parquet(paths.truth_hourly, unreadable),
+        truth_daily=_try_parquet(paths.truth_daily, unreadable),
         qc=_qc_summary(config),
-        hourly_matrix=_try_parquet(matrix_path(config.dataset.dir, "hourly", "live")),
-        daily_matrix=_try_parquet(matrix_path(config.dataset.dir, "daily", "live")),
+        hourly_matrix=_try_parquet(
+            matrix_path(config.dataset.dir, "hourly", "live"), unreadable
+        ),
+        daily_matrix=_try_parquet(
+            matrix_path(config.dataset.dir, "daily", "live"), unreadable
+        ),
         synthetic_hourly=_try_parquet(
-            matrix_path(config.dataset.dir, "hourly", "synthetic")
+            matrix_path(config.dataset.dir, "hourly", "synthetic"), unreadable
         ),
         score_frames=score_frames,
         unreadable_scores=unreadable_scores,
-        history=_history(config),
+        history=_history(config, unreadable),
         latest_forecast=_latest_forecast(config),
         releases=_releases(config),
-        alignment=_try_json(config.artifacts_dir / "alignment.json"),
-        drift=_try_json(config.artifacts_dir / "drift.json"),
+        alignment=_try_json(config.artifacts_dir / "alignment.json", unreadable),
+        drift=_try_json(config.artifacts_dir / "drift.json", unreadable),
         observability_states=_observability_states(config),
         observability_history=_observability_history(config),
         runs=_runs(config),
         archive_location=_archive_location(config),
+        unreadable_artifacts=tuple(sorted(unreadable)),
     )

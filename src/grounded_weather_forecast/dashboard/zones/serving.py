@@ -4,6 +4,7 @@ from datetime import timedelta
 
 import polars as pl
 
+from grounded_weather_forecast.contracts import finite_number
 from grounded_weather_forecast.dashboard.charts import bar_chart, stacked_area
 from grounded_weather_forecast.dashboard.context import DashboardContext
 from grounded_weather_forecast.dashboard.copy import PANEL_COPY, ZONE_INTROS
@@ -16,15 +17,23 @@ _DEGRADED_AMBER = 0.10
 _DEGRADED_RED = 0.50
 
 
-def _degraded_share(history: pl.DataFrame) -> float:
-    """Fraction of served rows that fell back to a degraded selection."""
-    if history.is_empty():
-        return 0.0
-    degraded = history.filter(
+def _degraded_share(history: pl.DataFrame) -> float | None:
+    """Degraded fraction of the rows that carry a selection at all.
+
+    Minutely rows are written with ``selection_reason=None`` -- they are
+    interpolated from the hourly path, not selected -- and they outnumber the
+    selected rows several to one. Counting them in the denominator turned a
+    wholly degraded forecast into a single-digit percentage. ``None`` means
+    nothing here was selectable, which is not the same as nothing degraded.
+    """
+    selected = history.filter(pl.col("selection_reason").is_not_null())
+    if selected.is_empty():
+        return None
+    degraded = selected.filter(
         pl.col("selection_reason").str.starts_with("degraded")
         | pl.col("selection_reason").str.starts_with("no backtest evidence")
     ).height
-    return degraded / history.height
+    return degraded / selected.height
 
 
 def _verification_panel(ctx: DashboardContext, derived: Derived) -> Panel:
@@ -60,16 +69,24 @@ def _verification_panel(ctx: DashboardContext, derived: Derived) -> Panel:
             f"{row['lead_bucket']}.{row['method_id']}"
         )
         labels.append(label)
-        live_maes.append(row["live_mae"])
-        backtest_maes.append(row.get("backtest_mae"))
-        gap = row.get("mae_gap")
+        # `is not None` admits NaN and every NaN comparison is False, so a
+        # broken row rendered green while its cell literally read "nan".
+        # A genuinely absent backtest_mae is different: `compare_to_backtest`
+        # left-joins, so a slice with no board row is simply not comparable
+        # and must not raise the verdict.
+        raw = (row["live_mae"], row.get("backtest_mae"), row.get("mae_gap"))
+        live_mae, backtest_mae, gap = (finite_number(value) for value in raw)
+        live_maes.append(live_mae)
+        backtest_maes.append(backtest_mae)
+        broken = any(
+            value is not None and finite_number(value) is None for value in raw
+        )
         gap_class = ""
-        if (
-            gap is not None
-            and row.get("backtest_mae") is not None
-            and row["live_mae"] is not None
-        ):
-            if row["live_mae"] > factor * row["backtest_mae"]:
+        if broken:
+            gap_class = "cell-unknown"
+            worst = "amber" if worst == "ok" else worst
+        elif live_mae is not None and backtest_mae is not None and gap is not None:
+            if live_mae > factor * backtest_mae:
                 gap_class = "cell-bad"
                 worst = "red"
             elif gap > 0:
@@ -146,9 +163,13 @@ def _reasons_panel(ctx: DashboardContext) -> Panel:
     # rows to judge, and saying so beats reporting a confident 0%; zone A owns
     # the "nothing served recently" verdict.
     recent = history.filter(
-        pl.col("issued_at") >= ctx.now - timedelta(days=_DEGRADED_WINDOW_DAYS)
+        pl.col("issued_at").is_between(
+            ctx.now - timedelta(days=_DEGRADED_WINDOW_DAYS),
+            ctx.now,
+            closed="both",
+        )
     )
-    recent_share = _degraded_share(recent) if not recent.is_empty() else None
+    recent_share = _degraded_share(recent)
     # Judge on the trailing window: a lifetime share is diluted by every
     # healthy row ever served, so a currently-100%-degraded system can read
     # green forever once enough history has accumulated.
@@ -173,7 +194,10 @@ def _reasons_panel(ctx: DashboardContext) -> Panel:
                 "—" if recent_share is None else f"{recent_share:.0%}",
                 status,
             ),
-            Stat("degraded share (lifetime)", f"{lifetime_share:.0%}"),
+            Stat(
+                "degraded share (lifetime)",
+                "—" if lifetime_share is None else f"{lifetime_share:.0%}",
+            ),
         ),
         chart=stacked_area(dates, series, y_label="served slices"),
     )

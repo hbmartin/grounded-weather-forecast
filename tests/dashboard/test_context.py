@@ -93,3 +93,22 @@ def test_qc_distinguishes_recovered_flatline_from_active_state(tmp_path):
     temp = qc.filter(pl.col("channel") == "temp").row(0, named=True)
     assert temp["flatline"] > 0
     assert temp["active_flatline"] is False
+
+
+def test_a_corrupt_artifact_is_distinguishable_from_a_missing_one(tmp_path):
+    """Absence is a young archive; a corrupt file is a fault. Not the same."""
+    from grounded_weather_forecast.dashboard.context import collect_context
+    from grounded_weather_forecast.dataset.matrix import DatasetPaths
+
+    config = write_config(tmp_path)
+    paths = DatasetPaths.in_dir(config.dataset.dir)
+    config.dataset.dir.mkdir(parents=True, exist_ok=True)
+
+    missing = collect_context(config, now=NOW)
+    assert missing.truth_hourly is None
+    assert missing.unreadable_artifacts == ()
+
+    paths.truth_hourly.write_bytes(b"not a parquet file")
+    corrupt = collect_context(config, now=NOW)
+    assert corrupt.truth_hourly is None, "still unusable"
+    assert paths.truth_hourly.name in corrupt.unreadable_artifacts

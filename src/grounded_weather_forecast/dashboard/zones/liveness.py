@@ -6,7 +6,7 @@ import polars as pl
 
 from grounded_weather_forecast.contracts import (
     age_col,
-    provider_age_hours,
+    finite_number,
     provider_age_is_fresh,
 )
 from grounded_weather_forecast.dashboard.charts import bar_chart
@@ -118,7 +118,7 @@ def _provider_ages(ctx: DashboardContext, sources: tuple[str, ...]) -> Panel:
     for index, source in enumerate(sources or _matrix_sources(matrix)):
         age = newest.get(age_col(source))
         labels.append(source)
-        ages.append(provider_age_hours(age))
+        ages.append(finite_number(age))
         fresh = provider_age_is_fresh(age, cap)
         fresh_count += int(fresh)
         colors.append(f"series-{(index % 8) + 1}" if fresh else "muted")

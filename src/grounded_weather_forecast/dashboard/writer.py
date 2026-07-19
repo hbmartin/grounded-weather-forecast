@@ -68,6 +68,7 @@ def _alert_inputs(ctx: DashboardContext, derived: Derived) -> AlertInputs:
         releases=ctx.releases,
         observability_history=ctx.observability_history,
         archive_location=ctx.archive_location,
+        unreadable_artifacts=ctx.unreadable_artifacts,
     )
 
 

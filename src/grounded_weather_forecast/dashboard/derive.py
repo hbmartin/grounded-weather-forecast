@@ -39,9 +39,11 @@ class Derived:
 def _k_eff(correlation: pl.DataFrame) -> float | None:
     """Effective independent-source count, or ``None`` when not evaluable.
 
-    A non-finite mean correlation must not be clamped: ``min(1.0, nan)``
+    Non-finite entries are dropped rather than clamped: ``min(1.0, nan)``
     returns ``1.0``, which would report "no independence" — the most alarming
-    possible answer — from an absence of evidence.
+    possible answer — from an absence of evidence. Dropping them at the source
+    is what makes the mean safe, so the clamp below only ever bounds a real
+    correlation into range.
     """
     sources = [column for column in correlation.columns if column != "source"]
     if len(sources) < 2:
@@ -55,9 +57,7 @@ def _k_eff(correlation: pl.DataFrame) -> float | None:
                 values.append(value)
     if not values:
         return None
-    if (mean := finite_number(sum(values) / len(values))) is None:
-        return None
-    mean_r = max(0.0, min(1.0, mean))
+    mean_r = max(0.0, min(1.0, sum(values) / len(values)))
     n = len(sources)
     return n / (1.0 + (n - 1) * mean_r)
 

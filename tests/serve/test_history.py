@@ -307,3 +307,40 @@ class TestReleaseProvenance:
         forecast = replace(make_forecast(), release_ids=["release-y", "release-z"])
         rows = self._rows(forecast).filter(pl.col("product") == "hourly")
         assert set(rows["release_id"].to_list()) == {None}
+
+    def test_schema_three_does_not_invent_missing_variable_provenance(self):
+        forecast = replace(
+            make_forecast(),
+            schema_version=3,
+            release_ids=["release-promoted"],
+            hourly=[
+                replace(
+                    make_forecast().hourly[0],
+                    values={"temp_c": 20.0, "humidity_pct": 50.0},
+                    methods={"temp_c": "gbm", "humidity_pct": "equal_weight"},
+                    release_ids={"temp_c": "release-promoted"},
+                )
+            ],
+        )
+
+        rows = self._rows(forecast).filter(pl.col("product") == "hourly")
+        releases = dict(zip(rows["variable"], rows["release_id"], strict=True))
+        assert releases == {
+            "temp_c": "release-promoted",
+            "humidity_pct": None,
+        }
+
+
+def test_verification_can_scope_evidence_by_served_time(tmp_path):
+    path = tmp_path / "history.parquet"
+    for _ in range(6):
+        append_history(make_forecast(), path)
+
+    live = verify_history(
+        path,
+        TestVerification().truth([20.0]),
+        issued_after=ISSUED + timedelta(minutes=1),
+        issued_before=ISSUED + timedelta(days=1),
+    )
+
+    assert live.is_empty()

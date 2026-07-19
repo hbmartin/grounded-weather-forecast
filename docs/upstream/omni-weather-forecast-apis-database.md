@@ -1,5 +1,10 @@
 # Database design and structure
 
+> Reference snapshot from
+> [`omni-weather-forecast-apis` commit `ee9e166`](https://github.com/hbmartin/omni-weather-forecast-apis/blob/ee9e166897726fdb0916a99433fa7f512c26a188/docs/database.md).
+> It documents this project's upstream SQLite contract; the upstream page is
+> authoritative if the two diverge.
+
 The CLI can persist each aggregated forecast response to a SQLite database.
 The database is designed as an append-oriented record of forecast runs: request
 metadata is stored once, provider outcomes are stored below the run, and each
@@ -110,7 +115,8 @@ historical forecast data.
 Alongside the database, the CLI writes a **raw payload archive**: a `raw/`
 directory of gzipped JSONL files (one per invocation) recording every network
 response, linked from `forecast_runs.raw_archive_path`. See
-[Data corrections](data-corrections.md) for the format and rationale.
+[Data corrections](https://github.com/hbmartin/omni-weather-forecast-apis/blob/ee9e166897726fdb0916a99433fa7f512c26a188/docs/data-corrections.md)
+for the format and rationale.
 
 SQLite uses dynamic typing, but each declaration below establishes the
 expected type affinity. Unless a column is marked `NOT NULL`, missing provider
@@ -135,7 +141,7 @@ This is the root table for a persisted aggregate response.
 | `succeeded` | `INTEGER NOT NULL` | Number of successful provider results |
 | `failed` | `INTEGER NOT NULL` | Number of failed provider results |
 | `raw_archive_path` | `TEXT` | Path to the gzipped JSONL raw payload archive for this run; `NULL` when archiving was disabled or no network traffic occurred |
-| `app_version` | `TEXT` | Package version that wrote the run; `NULL` for rows written before versions were stamped (pre correctness-sweep data — see [Data corrections](data-corrections.md)) |
+| `app_version` | `TEXT` | Package version that wrote the run; `NULL` for rows written before versions were stamped (pre correctness-sweep data — see [Data corrections](https://github.com/hbmartin/omni-weather-forecast-apis/blob/ee9e166897726fdb0916a99433fa7f512c26a188/docs/data-corrections.md)) |
 
 The summary counts are stored rather than recomputed so the database preserves
 the exact response summary emitted by the client.
@@ -568,4 +574,3 @@ upgrading across releases that change the persistence schema.
   response hook to stream the normalized response to a database designed for
   that workload. The bundled SQLite store favors a local CLI and analysis
   workflow.
-

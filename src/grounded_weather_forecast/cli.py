@@ -742,7 +742,11 @@ def _cmd_report(config: Config) -> int:
                         compare_to_backtest(live, board),
                     )
                 )
-            except (OSError, ValueError) as exc:
+            # PolarsError derives straight from Exception, so a corrupt or
+            # schema-incompatible history parquet escaped this guard and took
+            # the whole report -- and the dashboard with it -- down. Skipping
+            # self-verification is the documented contract here.
+            except (OSError, ValueError, pl.exceptions.PolarsError) as exc:
                 print(f"self-verification skipped: {exc}")
         report_name = path.stem.replace("scores_", "leaderboard_")
         written.append(

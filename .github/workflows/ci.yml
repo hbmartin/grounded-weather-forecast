@@ -9,6 +9,8 @@ on:
 jobs:
   lint-and-test:
     runs-on: ubuntu-latest
+    env:
+      CODECOV_TOKEN: ${{ secrets.CODECOV_TOKEN }}
     strategy:
       matrix:
         python-version: ["3.13", "3.14"]
@@ -80,13 +82,17 @@ jobs:
           uv run pytest tests/ --cov=src --cov-report=xml --cov-report=term-missing
 
       - name: Upload coverage to Codecov
+        # Forks and repositories without a configured token must still run
+        # the enforced local coverage gate above; external reporting is
+        # optional and must not turn a passing test suite red.
+        if: ${{ env.CODECOV_TOKEN != '' }}
         uses: codecov/codecov-action@v5
         with:
           files: coverage.xml
           disable_search: true
           fail_ci_if_error: true
           root_dir: .
-          token: ${{ secrets.CODECOV_TOKEN }}
+          token: ${{ env.CODECOV_TOKEN }}
           verbose: true
 
   windows-import-smoke:

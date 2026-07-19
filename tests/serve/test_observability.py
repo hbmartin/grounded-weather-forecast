@@ -1,6 +1,7 @@
 from datetime import UTC, datetime, timedelta
 
 import polars as pl
+import pytest
 from conftest import synthetic_hourly_matrix, write_config
 
 from grounded_weather_forecast.artifacts import ArtifactStore
@@ -125,12 +126,6 @@ class TestSnapshotsNeverAffectServing:
             raise RuntimeError("booster is unusable")
 
     def test_a_failing_blender_does_not_propagate(self, tmp_path):
-        from conftest import write_config
-
-        from grounded_weather_forecast.serve.observability import (
-            snapshot_observability,
-        )
-
         config = write_config(tmp_path)
         snapshot_observability(
             self.Exploding(),
@@ -142,13 +137,6 @@ class TestSnapshotsNeverAffectServing:
         )  # must not raise
 
     def test_keyboard_interrupt_still_propagates(self, tmp_path):
-        import pytest
-        from conftest import write_config
-
-        from grounded_weather_forecast.serve.observability import (
-            snapshot_observability,
-        )
-
         class Interrupting:
             method_id = "gbm"
 
@@ -169,8 +157,9 @@ class TestSnapshotsNeverAffectServing:
 def test_superseded_fingerprint_trees_are_reclaimed(tmp_path, monkeypatch):
     """The dataset fingerprint changes on every rebuild; old trees are dead.
 
-    Only `latest.json` is ever read back, so an unreferenced fingerprint tree
-    is pure disk leak — one per (method x product x variable) per rebuild.
+    Every state read reaches a slot through a `latest.json` pointer, so an
+    unreferenced fingerprint tree is pure disk leak — one per
+    (method x product x variable) per rebuild.
     """
     import grounded_weather_forecast.serve.observability as observability
 

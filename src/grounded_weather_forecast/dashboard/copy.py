@@ -100,14 +100,18 @@ PANEL_COPY: Mapping[str, PanelCopy] = {
         ),
         why=(
             "Flagged samples are nulled, never corrected. The chart preserves "
-            "lifetime QC counts, while the status badge follows the latest "
-            "causal flatline state."
+            "lifetime QC counts; the status badge follows the flagged share "
+            "and the latest causal flatline state, whichever is worse."
         ),
         thresholds=(
-            "Bounds and step limits come from [qc].bounds / max_step; "
-            "flatline detection from [qc].flatline_minutes. A flatline alert "
-            "clears when the latest causal state recovers. Flag bits overlap, "
-            "so clean+missing+flagged can exceed the sample count."
+            "Amber past 5% flagged, red past 25% — measured per channel as "
+            "well as pooled, so one dead sensor cannot average away, and "
+            "against reported samples only, so an uninstalled sensor's nulls "
+            "do not count as flags. Bounds and step limits come from "
+            "[qc].bounds / max_step; flatline detection from "
+            "[qc].flatline_minutes, and a flatline alert clears when the "
+            "latest causal state recovers. Flag bits overlap, so "
+            "clean+missing+flagged can exceed the sample count."
         ),
     ),
     "b2": PanelCopy(

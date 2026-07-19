@@ -170,3 +170,36 @@ def test_prune_keeps_rows_whose_started_at_is_null():
     now = datetime(2026, 7, 19, 12, 0, tzinfo=UTC)
     frame = pl.DataFrame({column: [None] for column in RUNS_SCHEMA}, schema=RUNS_SCHEMA)
     assert prune_runs(frame, now=now).height == 1
+
+
+def test_a_naive_timestamp_still_writes_a_row(tmp_path):
+    """Regression: a naive started_at silently wrote nothing at all.
+
+    `_to_frame` reinterpreted it as UTC, `prune_runs` then raised SchemaError
+    comparing the tz-aware column to a tz-naive literal, and `append_run`
+    swallowed it -- so the ledger never appeared and nothing said why.
+    """
+    from datetime import datetime
+
+    from grounded_weather_forecast.runs import RunRecord, append_run, load_runs
+
+    naive = datetime(2026, 7, 19, 12, 0)
+    path = tmp_path / "runs.parquet"
+    append_run(
+        RunRecord(
+            run_id="r1",
+            command="predict",
+            args_json="{}",
+            started_at=naive,
+            ended_at=naive,
+            exit_code=0,
+            error=None,
+            dataset_fingerprint="fp",
+            config_fingerprint="cfg",
+            code_version="0.4.0",
+        ),
+        path,
+    )
+
+    assert path.exists(), "a naive timestamp must not silently drop the row"
+    assert load_runs(path).height == 1

@@ -2,6 +2,7 @@ from datetime import timedelta
 
 import numpy as np
 import polars as pl
+import pytest
 
 from grounded_weather_forecast.reports.leaderboard import leaderboard, slice_winners
 from grounded_weather_forecast.reports.mcs import (
@@ -199,6 +200,17 @@ class TestLiveGate:
         gated = apply_live_gate(
             self.make_selection(mae=1.0),
             self.live_frame(live_mae=5.0, n=5),
+            factor=1.5,
+            min_n=24,
+            fallbacks=self.fallback(),
+        )
+        assert gated[("hourly", "temp_c", "24-48h")].method_id == "gbm"
+
+    @pytest.mark.parametrize("bad_mae", [float("nan"), float("inf")])
+    def test_non_finite_live_evidence_is_ignored(self, bad_mae):
+        gated = apply_live_gate(
+            self.make_selection(mae=1.0),
+            self.live_frame(live_mae=bad_mae),
             factor=1.5,
             min_n=24,
             fallbacks=self.fallback(),

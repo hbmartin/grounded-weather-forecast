@@ -140,8 +140,26 @@ def test_provider_freshness_classifies_invalid_and_boundary_ages(tmp_path):
     assert "fresh" not in aged.message.rsplit(": ", 1)[-1].split(", ")
 
 
+def hourly_coverage(**columns) -> pl.DataFrame:
+    """Hourly truth shaped like the real thing: coverage plus its timestamp.
+
+    `build_truth` always emits `valid_hour`, and the trailing-week alert
+    windows on it, so a fixture without it is not a truth frame.
+    """
+    length = len(next(iter(columns.values())))
+    return pl.DataFrame(
+        {
+            "valid_hour": [
+                NOW - timedelta(hours=offset) for offset in reversed(range(length))
+            ],
+            **columns,
+        },
+        schema_overrides={"valid_hour": pl.Datetime("us", "UTC")},
+    )
+
+
 def test_truth_thinning(tmp_path):
-    thin = pl.DataFrame({"temp_c_cov": [0.5] * 48, "pressure_sea_hpa_cov": [0.9] * 48})
+    thin = hourly_coverage(temp_c_cov=[0.5] * 48, pressure_sea_hpa_cov=[0.9] * 48)
     alerts = evaluate_alerts(make_inputs(tmp_path, hourly_truth=thin))
     (alert,) = by_panel(alerts, "truth-thinning")
     assert alert.severity == "amber"
@@ -156,7 +174,7 @@ def test_truth_thinning(tmp_path):
 
 def test_truth_thinning_includes_daily_temperature_and_rain(tmp_path):
     config = write_config(tmp_path, min_hour_coverage=0.8, min_day_coverage=0.75)
-    hourly = pl.DataFrame({"temp_c_cov": [0.95] * 24})
+    hourly = hourly_coverage(temp_c_cov=[0.95] * 24)
     daily = pl.DataFrame(
         {
             "date_local": [
@@ -187,8 +205,15 @@ def test_truth_thinning_includes_daily_temperature_and_rain(tmp_path):
 
 def test_truth_thinning_accepts_older_daily_schema(tmp_path):
     config = write_config(tmp_path, min_hour_coverage=0.8, min_day_coverage=0.75)
-    hourly = pl.DataFrame({"temp_c_cov": [0.95] * 24})
-    old_daily = pl.DataFrame({"coverage_frac": [0.6] * 7})
+    hourly = hourly_coverage(temp_c_cov=[0.95] * 24)
+    old_daily = pl.DataFrame(
+        {
+            "date_local": [
+                (NOW - timedelta(days=offset)).date() for offset in range(7)
+            ],
+            "coverage_frac": [0.6] * 7,
+        }
+    )
 
     alerts = by_panel(
         evaluate_alerts(
@@ -588,3 +613,174 @@ class TestDegenerateEvidenceIsNeverGreen:
         empties = by_panel(alerts, "silent-empty")
         assert any("non-finite location" in alert.message for alert in empties)
         assert all(alert.severity == "red" for alert in empties)
+
+
+def test_truth_thinning_window_is_a_week_not_a_row_count(tmp_path):
+    """Regression: `tail(24 * 7)` selected 168 ROWS, not seven days.
+
+    On a gappy archive those 168 rows spanned 49 days of healthy history and
+    reported a comfortable mean, while the actual trailing week sat far below
+    the floor and raised nothing.
+    """
+    healthy_old = pl.DataFrame(
+        {
+            "valid_hour": [NOW - timedelta(days=8 + index) for index in range(160)],
+            "temp_c_cov": [0.98] * 160,
+        },
+        schema_overrides={"valid_hour": pl.Datetime("us", "UTC")},
+    )
+    thin_recent = pl.DataFrame(
+        {
+            "valid_hour": [NOW - timedelta(hours=index) for index in range(8)],
+            "temp_c_cov": [0.10] * 8,
+        },
+        schema_overrides={"valid_hour": pl.Datetime("us", "UTC")},
+    )
+    gappy = pl.concat([healthy_old, thin_recent])
+
+    alerts = by_panel(
+        evaluate_alerts(make_inputs(tmp_path, hourly_truth=gappy)), "truth-thinning"
+    )
+
+    assert len(alerts) == 1
+    assert alerts[0].severity == "amber"
+    assert "temp_c=0.10" in alerts[0].message
+
+
+def test_truth_thinning_judges_daily_even_without_hourly(tmp_path):
+    """Regression: a missing hourly frame discarded valid daily coverage."""
+    config = write_config(tmp_path, min_hour_coverage=0.8, min_day_coverage=0.75)
+    daily = pl.DataFrame(
+        {
+            "date_local": [
+                (NOW - timedelta(days=offset)).date() for offset in range(5)
+            ],
+            "coverage_frac": [0.10] * 5,
+        }
+    )
+
+    alerts = by_panel(
+        evaluate_alerts(
+            make_inputs(
+                tmp_path,
+                config=config,
+                hourly_truth=pl.DataFrame(),
+                daily_truth=daily,
+            )
+        ),
+        "truth-thinning",
+    )
+
+    assert len(alerts) == 1
+    assert "daily.temperature=0.10" in alerts[0].message
+
+
+def test_truth_thinning_is_not_evaluable_without_recent_truth(tmp_path):
+    """An archive that stopped a month ago has nothing to say about this week."""
+    stale = pl.DataFrame(
+        {
+            "valid_hour": [NOW - timedelta(days=30 + index) for index in range(48)],
+            "temp_c_cov": [0.10] * 48,
+        },
+        schema_overrides={"valid_hour": pl.Datetime("us", "UTC")},
+    )
+
+    (alert,) = by_panel(
+        evaluate_alerts(make_inputs(tmp_path, hourly_truth=stale)), "truth-thinning"
+    )
+
+    assert alert.severity == "info"
+    assert "trailing 7 days" in alert.message
+
+
+def test_unreadable_artifacts_are_named_not_shown_as_absent(tmp_path):
+    """Every loader falls back to "absent" on failure.
+
+    That is right for a young archive and wrong for a corrupt or
+    permission-denied file: the dashboard rendered "not yet" over a broken
+    deployment. The alert names them instead.
+    """
+    alerts = by_panel(
+        evaluate_alerts(
+            make_inputs(tmp_path, unreadable_artifacts=("truth_hourly.parquet",))
+        ),
+        "unreadable-artifacts",
+    )
+
+    assert len(alerts) == 1
+    assert alerts[0].severity == "red"
+    assert "truth_hourly.parquet" in alerts[0].message
+
+
+def test_no_unreadable_alert_when_everything_loads(tmp_path):
+    assert not by_panel(evaluate_alerts(make_inputs(tmp_path)), "unreadable-artifacts")
+
+
+def _dense_trajectory(leaders):
+    """A trajectory at the documented 10-minute `predict` cadence."""
+    count = len(leaders)
+    moments = [
+        NOW - timedelta(minutes=10 * offset) for offset in reversed(range(count))
+    ]
+    return pl.DataFrame(
+        {
+            "captured_at": moments,
+            "issue_time": moments,
+            "method_id": ["boa"] * count,
+            "product": ["hourly"] * count,
+            "variable": ["temp_c"] * count,
+            "dataset_fingerprint": ["f"] * count,
+            "state_json": [_weight_state(leader) for leader in leaders],
+        }
+    )
+
+
+class TestBackendSwapIgnoresNoise:
+    """`_argmax_source` crosses whenever two experts are near-tied.
+
+    A 3-day window holds ~430 samples at the documented cadence, so counting
+    every crossing would raise an amber alert off arithmetic noise. A leader
+    has to hold `_SWAP_MIN_HOLD_DAYS` before the flip is called a swap.
+    """
+
+    def test_a_single_sample_crossing_is_not_a_swap(self, tmp_path):
+        leaders = [True] * 432
+        leaders[216] = False  # one transient crossing, 10 minutes wide
+
+        alerts = by_panel(
+            evaluate_alerts(
+                make_inputs(tmp_path, observability_history=_dense_trajectory(leaders))
+            ),
+            "backend-swap",
+        )
+
+        assert alerts == [], "a 10-minute crossing must not read as a regime change"
+
+    def test_sustained_flapping_is_reported_with_its_count(self, tmp_path):
+        # Three day-long regimes: alpha, beta, alpha. Both flips held.
+        leaders = [True] * 144 + [False] * 144 + [True] * 144
+
+        alerts = by_panel(
+            evaluate_alerts(
+                make_inputs(tmp_path, observability_history=_dense_trajectory(leaders))
+            ),
+            "backend-swap",
+        )
+
+        assert len(alerts) == 1
+        assert "beta -> alpha" in alerts[0].message, "the latest flip is the headline"
+        assert "2 times" in alerts[0].message, "flapping must be distinguishable"
+
+    def test_a_sustained_flip_still_alerts(self, tmp_path):
+        leaders = [True] * 216 + [False] * 216
+
+        alerts = by_panel(
+            evaluate_alerts(
+                make_inputs(tmp_path, observability_history=_dense_trajectory(leaders))
+            ),
+            "backend-swap",
+        )
+
+        assert len(alerts) == 1
+        assert "alpha -> beta" in alerts[0].message
+        assert "times" not in alerts[0].message, "one flip is not flapping"

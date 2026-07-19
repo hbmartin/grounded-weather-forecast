@@ -51,6 +51,7 @@ def forecast_to_rows(forecast: Forecast) -> pl.DataFrame:
     document_release = (
         forecast.release_ids[0] if len(forecast.release_ids) == 1 else None
     )
+    legacy_release = document_release if forecast.schema_version < 3 else None
     for point in forecast.minutely:
         values = {
             "temp_c": point.temp_c,
@@ -74,7 +75,7 @@ def forecast_to_rows(forecast: Forecast) -> pl.DataFrame:
                     "method_id": point.methods.get(variable, "native_or_anchored"),
                     "y_pred": value,
                     "dataset_fingerprint": forecast.dataset_fingerprint,
-                    "release_id": document_release,
+                    "release_id": legacy_release,
                     "selection_reason": None,
                     "quantiles_json": _quantiles_json(point.quantiles.get(variable)),
                 }
@@ -94,7 +95,7 @@ def forecast_to_rows(forecast: Forecast) -> pl.DataFrame:
                     "method_id": point.methods.get(variable, "unknown"),
                     "y_pred": value,
                     "dataset_fingerprint": forecast.dataset_fingerprint,
-                    "release_id": point.release_ids.get(variable, document_release),
+                    "release_id": point.release_ids.get(variable, legacy_release),
                     "selection_reason": point.selection_reasons.get(variable),
                     "quantiles_json": _quantiles_json(point.quantiles.get(variable)),
                 }
@@ -116,7 +117,7 @@ def forecast_to_rows(forecast: Forecast) -> pl.DataFrame:
                     "method_id": daily.methods.get(variable, "unknown"),
                     "y_pred": value,
                     "dataset_fingerprint": forecast.dataset_fingerprint,
-                    "release_id": daily.release_ids.get(variable, document_release),
+                    "release_id": daily.release_ids.get(variable, legacy_release),
                     "selection_reason": daily.selection_reasons.get(variable),
                     "quantiles_json": _quantiles_json(daily.quantiles.get(variable)),
                 }

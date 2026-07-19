@@ -13,6 +13,7 @@ from grounded_weather_forecast.contracts import hourly_variable
 from grounded_weather_forecast.serve.selection import (
     FALLBACK_METHOD,
     Selection,
+    _eligible_release_ids,
     method_for,
     select_methods,
     selection_report,
@@ -153,6 +154,17 @@ class TestSelectMethods:
         write_scores(challenger_only, scores_dir / "scores_hourly_live_partial.parquet")
         assert select_methods(config, scores_dir) == {}
 
+    def test_structurally_invalid_release_is_ignored(self, tmp_path):
+        config = scored_config(tmp_path)
+        releases = config.artifacts_dir / "releases"
+        releases.mkdir(parents=True, exist_ok=True)
+        (releases / "broken.json").write_text(
+            '{"config_fingerprint": "present-but-incomplete"}',
+            encoding="utf-8",
+        )
+
+        assert select_methods(config, config.dataset.dir / "scores")
+
 
 class TestMethodFor:
     def test_falls_back_explicitly(self, tmp_path):
@@ -170,6 +182,34 @@ class TestMethodFor:
             method_for(selections, "hourly", "temp_c", "0-1h", config).method_id
             == "gbm"
         )
+
+    def test_matching_pin_preserves_release_provenance(self, tmp_path):
+        config = write_config(
+            tmp_path, extra_toml='\n[predict.methods]\n"hourly.temp_c" = "gbm"\n'
+        )
+        promoted = Selection(
+            "gbm",
+            "promoted",
+            n=100,
+            mae=1.0,
+            evaluation_id="eval-r",
+            dataset_fingerprint="dataset-r",
+            release_id="release-r",
+            code_version="0.4.0+implementation",
+        )
+
+        chosen = method_for(
+            {("hourly", "temp_c", "0-1h"): promoted},
+            "hourly",
+            "temp_c",
+            "0-1h",
+            config,
+        )
+
+        assert chosen.pinned
+        assert chosen.release_id == "release-r"
+        assert chosen.evaluation_id == "eval-r"
+        assert chosen.code_version == "0.4.0+implementation"
 
     def test_unknown_bucket_falls_back(self, tmp_path):
         config = write_config(tmp_path)
@@ -209,6 +249,52 @@ class TestScoresProvenance:
             pl.DataFrame,
         )
         assert utc(2026, 1, 1)  # sanity: fixture epoch unchanged
+
+
+def test_release_eligibility_uses_implementation_not_promotion_age(tmp_path):
+    import json
+
+    from grounded_weather_forecast.evaluation import config_fingerprint
+
+    config = write_config(tmp_path)
+    releases = config.artifacts_dir / "releases"
+    releases.mkdir(parents=True)
+    release = {
+        "release_id": "release-old-but-active",
+        "promoted_at": "2020-01-01T00:00:00+00:00",
+        "dataset_fingerprint": "old-dataset",
+        "config_fingerprint": config_fingerprint(config),
+        "evaluation_contexts": [],
+        "selections": {
+            "hourly.temp_c.0-1h": {
+                "method_id": "gbm",
+                "evaluation_id": "eval-v1",
+                "code_version": "0.4.0+implementation-v1",
+            }
+        },
+    }
+    (releases / "release-old-but-active.json").write_text(
+        json.dumps(release), encoding="utf-8"
+    )
+    key = ("hourly", "temp_c", "0-1h")
+    matching = {key: Selection("gbm", "won", code_version="0.4.0+implementation-v1")}
+    changed = {key: Selection("gbm", "won", code_version="0.4.0+implementation-v2")}
+
+    assert _eligible_release_ids(config, matching)[(*key, "gbm")] == frozenset(
+        {"release-old-but-active"}
+    )
+    assert not _eligible_release_ids(config, changed)[(*key, "gbm")]
+
+
+def test_selection_positional_fields_keep_their_original_meaning():
+    chosen = Selection("gbm", "won", 100, 1.25, "eval", "dataset", "release")
+
+    assert chosen.n == 100
+    assert chosen.mae == 1.25
+    assert chosen.evaluation_id == "eval"
+    assert chosen.dataset_fingerprint == "dataset"
+    assert chosen.release_id == "release"
+    assert not chosen.pinned
 
 
 class TestNoEvidenceReason:
@@ -277,6 +363,22 @@ class TestNoEvidenceReason:
         stale = self._live_scores_row(dataset_fingerprint(config), "oldconfig0000000")
         stale.write_parquet(scores_dir / "scores_hourly_live_expanding.parquet")
         assert "config changed" in no_evidence_reason(config, scores_dir)
+
+    def test_implementation_changed(self, tmp_path):
+        from grounded_weather_forecast.evaluation import (
+            config_fingerprint,
+            dataset_fingerprint,
+        )
+        from grounded_weather_forecast.serve.selection import no_evidence_reason
+
+        config = write_config(tmp_path)
+        scores_dir = tmp_path / "scores"
+        scores_dir.mkdir()
+        stale = self._live_scores_row(
+            dataset_fingerprint(config), config_fingerprint(config)
+        )
+        stale.write_parquet(scores_dir / "scores_hourly_live_expanding.parquet")
+        assert "implementation changed" in no_evidence_reason(config, scores_dir)
 
     def test_synthetic_only_evidence(self, tmp_path):
         from grounded_weather_forecast.serve.selection import no_evidence_reason

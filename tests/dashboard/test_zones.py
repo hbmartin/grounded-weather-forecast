@@ -89,8 +89,11 @@ def test_zone_a_freshness_uses_finite_strict_boundary(tmp_path):
     assert colors == ["series-1", "muted", "muted", "muted", "muted", "muted"]
 
 
-def test_baseline_panel_only_flags_climatology_at_shortest_lead():
-    board = pl.DataFrame(
+def _baseline_board(
+    shortest_mae: tuple[float, float], longest_mae: tuple[float, float]
+):
+    """A two-bucket board: (climatology, best_provider) MAE at each lead."""
+    return pl.DataFrame(
         {
             "product": ["hourly"] * 4,
             "variable": ["temp_c"] * 4,
@@ -101,14 +104,36 @@ def test_baseline_panel_only_flags_climatology_at_shortest_lead():
                 "best_provider",
             ],
             "lead_bucket": ["0-1h", "0-1h", "240h+", "240h+"],
-            "mae": [2.0, 1.0, 1.0, 3.0],
+            "mae": [*shortest_mae, *longest_mae],
         }
     )
+
+
+def test_baseline_panel_only_flags_climatology_at_shortest_lead():
+    """Climatology winning at 240h+ is legitimate; at 0-1h it is leakage.
+
+    The MAE values matter: with climatology at 1.0 in the long bucket the
+    old cross-bucket `min()` comparison also returned "ok", so this test
+    passed against the very bug it is named for. 0.5 discriminates.
+    """
+    board = _baseline_board(shortest_mae=(2.0, 1.0), longest_mae=(0.5, 3.0))
 
     panel = evaluation._baseline_panel("scores_hourly", board)
 
     assert panel is not None
-    assert panel.status == "ok"
+    assert panel.status == "ok", (
+        "climatology beating best_provider at a long lead is not leakage"
+    )
+
+
+def test_baseline_panel_flags_climatology_winning_at_the_shortest_lead():
+    """The condition the panel exists to catch must actually fire."""
+    board = _baseline_board(shortest_mae=(1.0, 2.0), longest_mae=(3.0, 1.0))
+
+    panel = evaluation._baseline_panel("scores_hourly", board)
+
+    assert panel is not None
+    assert panel.status == "amber"
 
 
 def test_zone_c_states_fold_arithmetic(tmp_path):
@@ -326,3 +351,99 @@ def test_zone_b_still_flags_a_channel_that_is_wholly_out_of_bounds(tmp_path):
     bad = ("humidity_pct", 360, 0, 360, 0, 0, 0)
     panel = _station_qc_panel(tmp_path, _qc_frame([clean_channel, bad]))
     assert panel.status == "red"
+
+
+def _history_with_minutely(hourly_degraded: int, minutely: int) -> pl.DataFrame:
+    """Served history where minutely rows carry no selection_reason.
+
+    `forecast_to_rows` writes `selection_reason=None` for minutely points --
+    they are interpolated from the hourly path, not selected.
+    """
+    rows = hourly_degraded + minutely
+    return pl.DataFrame(
+        {
+            "issued_at": [NOW] * rows,
+            "product": ["hourly"] * hourly_degraded + ["minutely"] * minutely,
+            "variable": ["temp_c"] * rows,
+            "valid_time": [NOW + timedelta(hours=1)] * rows,
+            "valid_date": [None] * rows,
+            "lead_hours": [1.0] * rows,
+            "method_id": ["equal_weight"] * rows,
+            "y_pred": [10.0] * rows,
+            "dataset_fingerprint": ["f"] * rows,
+            "release_id": [None] * rows,
+            "selection_reason": ["degraded: no evidence"] * hourly_degraded
+            + [None] * minutely,
+            "quantiles_json": [None] * rows,
+        },
+        schema=HISTORY_SCHEMA,
+    )
+
+
+def test_zone_f_degraded_share_ignores_rows_that_carry_no_selection(tmp_path):
+    """Regression: minutely rows diluted a total serving outage to single digits.
+
+    A realistic document is ~72% minutely rows. Counting them made a wholly
+    degraded forecast read 27.6% -- amber instead of red -- and flipped an
+    11% outage all the way to green.
+    """
+    config = write_config(tmp_path)
+    ctx = DashboardContext(
+        config=config,
+        now=NOW,
+        history=_history_with_minutely(hourly_degraded=8, minutely=140),
+    )
+
+    panel = next(p for p in serving.build(ctx, Derived()).panels if p.panel_id == "f2")
+
+    shares = {stat.label: stat.value for stat in panel.stats}
+    assert shares["degraded share (last 1d)"] == "100%"
+    assert panel.status == "red"
+
+
+def test_zone_f_trailing_window_excludes_future_rows(tmp_path):
+    config = write_config(tmp_path)
+    history = _degraded_history(healthy=1, degraded=0).with_columns(
+        pl.lit(NOW + timedelta(days=2)).alias("issued_at"),
+        pl.lit("degraded: clock skew").alias("selection_reason"),
+    )
+    ctx = DashboardContext(config=config, now=NOW, history=history)
+
+    panel = next(p for p in serving.build(ctx, Derived()).panels if p.panel_id == "f2")
+
+    shares = {stat.label: stat.value for stat in panel.stats}
+    assert shares["degraded share (last 1d)"] == "—"
+    assert panel.status == "ok"
+
+
+def test_zone_b_worst_channel_drives_the_qc_verdict(tmp_path):
+    """One dead sensor among many clean ones must not average away.
+
+    24 clean channels plus one wholly out-of-bounds channel moves the pooled
+    share to 3.8% -- under the 5% floor -- and rendered the panel green.
+    """
+    clean = [(f"c{index}", 360, 0, 0, 0, 0, 360) for index in range(24)]
+    dead = ("humidity_pct", 360, 0, 360, 0, 0, 0)
+    panel = _station_qc_panel(tmp_path, _qc_frame([*clean, dead]))
+    assert panel.status == "red"
+
+
+def test_zone_b_non_finite_coverage_is_not_healthy(tmp_path):
+    """`isinstance` admits NaN and `min([nan]) < floor` is False."""
+    from dataclasses import replace
+
+    from grounded_weather_forecast.dashboard.zones import data_trust
+
+    truth = pl.DataFrame(
+        {
+            "valid_hour": [NOW - timedelta(hours=index) for index in range(4)],
+            "temp_c_cov": [float("nan")] * 4,
+        },
+        schema_overrides={"valid_hour": pl.Datetime("us", "UTC")},
+    )
+    ctx = replace(cold_context(tmp_path), truth_hourly=truth)
+
+    zone = data_trust.build(ctx, derive(ctx))
+    panel = next(p for p in zone.panels if p.panel_id == "b2")
+
+    assert panel.status == "amber", "all-NaN coverage must not render ok"

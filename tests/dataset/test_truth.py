@@ -225,8 +225,11 @@ class TestTruthDaily:
         start = utc(2026, 7, 13, 18, 0)
         ts = minute_series(start, 120)
         counter = [0.0] * 30 + [1.0] * 30 + [2.5] * 60
+        # The two coverage columns count different channels, so the fixture
+        # gives them different denominators: equal counts would let the test
+        # pass even if `rain_coverage` were aliased to `coverage_frac`.
         minute = canonical_minute_frame(
-            ts, rain_counter_mm=counter, temp_c=[20.0] * 120
+            ts, rain_counter_mm=counter, temp_c=[20.0] * 90 + [None] * 30
         )
         daily = truth_daily(minute, config)
         row = daily.filter(pl.col("date_local") == pl.date(2026, 7, 13)).row(
@@ -234,5 +237,5 @@ class TestTruthDaily:
         )
         assert row["t__precip_sum_mm"] == pytest.approx(2.5)
         assert row["t__pop"] == 1.0
-        assert row["coverage_frac"] == pytest.approx(120 / 1440)
+        assert row["coverage_frac"] == pytest.approx(90 / 1440)
         assert row["rain_coverage"] == pytest.approx(120 / 1440)

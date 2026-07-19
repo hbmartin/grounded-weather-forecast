@@ -19,13 +19,17 @@ APPROVED_SOURCE_KINDS = frozenset({"registry", "editable"})
 
 
 def unapproved_hosts(lockfile: Path) -> set[str]:
-    """Hosts and non-registry source kinds absent from the allowlist."""
+    """Hosts, schemes, and non-registry source kinds absent from the allowlist."""
     text = lockfile.read_text(encoding="utf-8")
-    findings = {
-        host
-        for match in URL_PATTERN.finditer(text)
-        if (host := urlparse(match.group()).hostname) and host not in APPROVED_HOSTS
-    }
+    findings: set[str] = set()
+    for match in URL_PATTERN.finditer(text):
+        parsed = urlparse(match.group())
+        if parsed.scheme != "https":
+            findings.add(f"{parsed.scheme or 'missing'} scheme")
+        if parsed.hostname is None:
+            findings.add(f"hostless {parsed.scheme or 'URL'} source")
+        elif parsed.hostname not in APPROVED_HOSTS:
+            findings.add(parsed.hostname)
     findings |= {
         f"{kind} source"
         for match in LOCAL_SOURCE_PATTERN.finditer(text)

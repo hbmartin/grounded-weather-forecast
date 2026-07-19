@@ -705,6 +705,35 @@ class TestCoherenceLeavesValidDistributionsAlone:
         )
         assert np.all(dew <= temp + 1e-9), "dew point must not exceed temperature"
 
+    @pytest.mark.parametrize("depression", [0.5, 1.0])
+    def test_coherent_conformal_and_emos_grids_are_untouched(self, depression):
+        """Real serving grids must not enter the lossy neighbour projection."""
+        from scipy.stats import norm
+
+        from grounded_weather_forecast.serve.predict import _cohere_pair
+
+        conformal = (0.05, 0.1, 0.25, 0.75, 0.9, 0.95)
+        emos = tuple(index / 20 for index in range(1, 20))
+        temperature = 21.0
+        dew_point = temperature - depression
+        dew_q = {
+            str(level): float(norm.ppf(level, dew_point, 2.0)) for level in conformal
+        }
+        temp_q = {
+            str(level): float(norm.ppf(level, temperature, 2.0)) for level in emos
+        }
+        before = dict(dew_q)
+
+        _cohere_pair(
+            {"dew_point_c": dew_point, "temp_c": temperature},
+            {"dew_point_c": dew_q, "temp_c": temp_q},
+            "dew_point_c",
+            "temp_c",
+            adjust="lower",
+        )
+
+        assert dew_q == pytest.approx(before)
+
 
 class TestServingPathFitting:
     """`_fit_methods` past its early returns: the warm-start path serving uses.

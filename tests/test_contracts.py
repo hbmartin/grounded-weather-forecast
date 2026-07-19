@@ -12,13 +12,13 @@ from grounded_weather_forecast.contracts import (
     TruthSemantics,
     age_col,
     daily_variable,
+    finite_number,
     fx_col,
     fxd_col,
     hourly_variable,
     is_truth_col,
     obs_col,
     parse_fx_col,
-    provider_age_hours,
     provider_age_is_fresh,
     truth_col,
 )
@@ -83,27 +83,18 @@ class TestVariableLookup:
 
 
 class TestProviderAge:
-    @pytest.mark.parametrize(
-        ("value", "expected"),
-        [
-            (0, 0.0),
-            (1.5, 1.5),
-            (True, None),
-            (None, None),
-            (float("nan"), None),
-            (float("inf"), None),
-            (float("-inf"), None),
-        ],
-    )
-    def test_normalizes_only_finite_numbers(self, value, expected):
-        assert provider_age_hours(value) == expected
+    """Normalization itself is `TestFiniteNumber`'s; this is the cap policy."""
 
     @pytest.mark.parametrize(
         ("value", "expected"),
         [
+            (0.0, True),
             (11.999, True),
             (12.0, False),
             (12.001, False),
+            # Negative: the fetch is stamped after the snapshot that selected
+            # it, a clock fault that must not read as fresher-than-fresh.
+            (-0.001, False),
             (None, False),
             (True, False),
             (float("nan"), False),
@@ -235,12 +226,23 @@ class TestFiniteNumber:
         "value", [float("nan"), float("inf"), float("-inf"), None, "1.0", True, False]
     )
     def test_unusable_values_become_none(self, value):
-        from grounded_weather_forecast.contracts import finite_number
-
         assert finite_number(value) is None
 
     @pytest.mark.parametrize(("value", "expected"), [(1, 1.0), (0, 0.0), (-2.5, -2.5)])
     def test_real_numbers_pass_through(self, value, expected):
-        from grounded_weather_forecast.contracts import finite_number
-
         assert finite_number(value) == expected
+
+
+def test_a_negative_provider_age_is_not_fresh():
+    """An age is a gap between a fetch and the snapshot that selected it.
+
+    A negative one means the fetch is stamped in the future -- a clock or
+    provenance fault -- and reporting it as fresh hides exactly that.
+    """
+    from grounded_weather_forecast.contracts import provider_age_is_fresh
+
+    assert provider_age_is_fresh(0.0, 12.0)
+    assert provider_age_is_fresh(11.9, 12.0)
+    assert not provider_age_is_fresh(12.0, 12.0)
+    assert not provider_age_is_fresh(-1.0, 12.0)
+    assert not provider_age_is_fresh(-1e6, 12.0)

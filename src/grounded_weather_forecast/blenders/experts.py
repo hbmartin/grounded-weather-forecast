@@ -25,6 +25,7 @@ import hashlib
 import json
 from collections import Counter
 from collections.abc import Mapping
+from copy import deepcopy
 from dataclasses import dataclass, field
 from typing import Literal, Self
 
@@ -115,6 +116,7 @@ class OnlineExperts:
     _kind: TargetKind = TargetKind.CONTINUOUS
     _variable: VariableSpec | None = None
     _grounding: AffineGrounding = field(default_factory=AffineGrounding)
+    _grounding_state: dict[str, object] | None = None
     _states: dict[str, _BucketState] = field(default_factory=dict)
     _progress: dict[str, _BucketProgress] = field(default_factory=dict)
     _sources: tuple[str, ...] = ()
@@ -179,7 +181,8 @@ class OnlineExperts:
         self._variable = train.variable
         self._states = {}
         self._progress = {}
-        self._replay(train, AffineGrounding().fit(train))
+        grounding = AffineGrounding().fit(train)
+        self._replay(train, grounding)
         return self
 
     def advance(self, train: SupervisedSlice) -> Self:
@@ -202,7 +205,22 @@ class OnlineExperts:
         ):
             msg = "expert state extends beyond the causal training history"
             raise ValueError(msg)
-        self._replay(train, AffineGrounding().fit(train))
+        grounding = AffineGrounding().fit(train)
+        grounding_state = grounding.to_state()
+        # EWA's known-horizon learning rate changes when the queue grows, and
+        # every expert scheme's historic losses change when grounding refits.
+        # Validate against the persisted prefix on a detached object, then
+        # replay the complete queue so one state never mixes incompatible loss
+        # definitions or learning-rate horizons.
+        requires_replay = bool(self._progress) and (
+            self.scheme == "ewa" or self._grounding_state != grounding_state
+        )
+        if requires_replay:
+            probe = deepcopy(self)
+            probe._replay(train, grounding)  # noqa: SLF001 - detached self-check
+            self._states = {}
+            self._progress = {}
+        self._replay(train, grounding)
         self._kind = train.variable.kind
         self._variable = train.variable
         return self
@@ -354,7 +372,7 @@ class OnlineExperts:
                     states[bucket].horizon = max(
                         states[bucket].horizon, horizons[bucket]
                     )
-                awake = train.x.availability[row]
+                awake = train.x.availability[row] & np.isfinite(corrected[row])
                 losses = np.where(awake, (corrected[row] - train.y[row]) ** 2, 0.0)
                 self._step(states[bucket], losses, awake)
             last = int(rows[-1])
@@ -369,6 +387,7 @@ class OnlineExperts:
         self._states = states
         self._progress = progress
         self._grounding = active
+        self._grounding_state = active.to_state()
 
     def _state_for(self, product: Product, lead: float, n_experts: int) -> _BucketState:
         """Fitted state for a lead, or a uniform default for unseen buckets."""
@@ -424,7 +443,7 @@ class OnlineExperts:
                 }
                 for label, progress in self._progress.items()
             },
-            "grounding": self._grounding.to_state(),
+            "grounding": self._grounding_state or self._grounding.to_state(),
         }
 
     def observability_state(self) -> dict[str, object]:
@@ -440,9 +459,13 @@ class OnlineExperts:
             msg = "legacy or unknown expert state schema; full replay required"
             raise ValueError(msg)
         experts = cls(method_id=method_id, scheme=_state_scheme(state))
-        share = state.get("share")
-        if isinstance(share, (int, float)):
-            experts.share = float(share)
+        if experts.scheme != method_id:
+            msg = (
+                f"expert state scheme {experts.scheme!r} does not match "
+                f"requested method {method_id!r}"
+            )
+            raise ValueError(msg)
+        experts.share = _state_share(state)
         experts._sources = _state_sources(state)
         n_experts = len(experts._sources)
         buckets = state.get("buckets")
@@ -462,6 +485,11 @@ class OnlineExperts:
         if set(experts._states) != set(experts._progress):
             msg = "expert state buckets and progress do not match"
             raise ValueError(msg)
+        grounding = state.get("grounding")
+        if not isinstance(grounding, dict):
+            msg = "expert state has no grounding metadata"
+            raise ValueError(msg)
+        experts._grounding_state = {str(key): value for key, value in grounding.items()}
         return experts
 
 
@@ -481,7 +509,29 @@ def _state_sources(state: Mapping[str, object]) -> tuple[str, ...]:
     if not isinstance(sources, list) or not sources:
         msg = "expert state names no sources; full replay required"
         raise ValueError(msg)
-    return tuple(str(source) for source in sources)
+    normalized: list[str] = []
+    for source in sources:
+        if not isinstance(source, str) or not source:
+            msg = "expert state carries an invalid source name"
+            raise ValueError(msg)
+        normalized.append(source)
+    if len(set(normalized)) != len(normalized):
+        msg = "expert state carries duplicate source names"
+        raise ValueError(msg)
+    return tuple(normalized)
+
+
+def _state_share(state: Mapping[str, object]) -> float:
+    share = state.get("share")
+    if (
+        isinstance(share, bool)
+        or not isinstance(share, (int, float))
+        or not np.isfinite(share)
+        or not 0.0 <= float(share) <= 1.0
+    ):
+        msg = f"invalid expert fixed-share value: {share!r}"
+        raise ValueError(msg)
+    return float(share)
 
 
 def _bucket_state(label: str, raw: object, n_experts: int) -> _BucketState:
@@ -495,19 +545,50 @@ def _bucket_state(label: str, raw: object, n_experts: int) -> _BucketState:
         raise ValueError(msg)
     weights = np.asarray(raw.get("weights", []), dtype=np.float64)
     regret_variance = np.asarray(raw.get("regret_variance", []), dtype=np.float64)
-    if weights.shape[0] != n_experts or regret_variance.shape[0] != n_experts:
+    expected = (n_experts,)
+    if weights.shape != expected or regret_variance.shape != expected:
         msg = (
-            f"expert bucket {label!r} carries {weights.shape[0]} weights for "
-            f"{n_experts} sources; full replay required"
+            f"expert bucket {label!r} carries weights/regret shapes "
+            f"{weights.shape} and {regret_variance.shape}; expected {expected}; "
+            "full replay required"
         )
+        raise ValueError(msg)
+    if (
+        not np.isfinite(weights).all()
+        or (weights < 0.0).any()
+        or not np.isfinite(weights.sum())
+        or float(weights.sum()) <= 0.0
+    ):
+        msg = f"expert bucket {label!r} carries invalid weights"
+        raise ValueError(msg)
+    if not np.isfinite(regret_variance).all() or (regret_variance < 0.0).any():
+        msg = f"expert bucket {label!r} carries invalid regret variance"
         raise ValueError(msg)
     horizon = raw.get("horizon", 1)
     steps = raw.get("steps", 0)
+    if (
+        isinstance(horizon, bool)
+        or not isinstance(horizon, (int, float))
+        or not np.isfinite(horizon)
+        or int(horizon) != horizon
+        or int(horizon) <= 0
+    ):
+        msg = f"expert bucket {label!r} carries invalid horizon {horizon!r}"
+        raise ValueError(msg)
+    if (
+        isinstance(steps, bool)
+        or not isinstance(steps, (int, float))
+        or not np.isfinite(steps)
+        or int(steps) != steps
+        or int(steps) < 0
+    ):
+        msg = f"expert bucket {label!r} carries invalid steps {steps!r}"
+        raise ValueError(msg)
     return _BucketState(
         weights=weights,
         regret_variance=regret_variance,
-        horizon=int(horizon) if isinstance(horizon, (int, float)) else 1,
-        steps=int(steps) if isinstance(steps, (int, float)) else 0,
+        horizon=int(horizon),
+        steps=int(steps),
     )
 
 
@@ -522,11 +603,21 @@ def _bucket_progress(label: str, raw: object) -> _BucketProgress:
     prefix_digest = raw.get("prefix_digest")
     numeric = (int, float)
     if (
-        not isinstance(resolution_us, numeric)
+        isinstance(resolution_us, bool)
+        or isinstance(issue_us, bool)
+        or isinstance(lead_hours, bool)
+        or isinstance(rows, bool)
+        or not isinstance(resolution_us, numeric)
         or not isinstance(issue_us, numeric)
         or not isinstance(lead_hours, numeric)
         or not isinstance(rows, numeric)
         or not isinstance(prefix_digest, str)
+        or not prefix_digest
+        or not all(
+            np.isfinite(value) for value in (resolution_us, issue_us, lead_hours, rows)
+        )
+        or int(rows) != rows
+        or int(rows) < 0
     ):
         msg = f"corrupt expert progress for bucket {label!r}"
         raise ValueError(msg)

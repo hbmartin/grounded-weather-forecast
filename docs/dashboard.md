@@ -99,7 +99,7 @@ constant — the alerting invents no policy:
 | provider drifting | `artifacts/drift.json` (consensus/residual tiers) |
 | grounding bias | `reports/leaderboard.py::CONSUMER_TOLERANCES` |
 | baseline implausible | structural heuristic (labeled as such — no knob) |
-| backend swap | leading-expert flip within the 3-day drift window |
+| backend swap | leading-expert flip held 0.5d+ within the 3-day drift window |
 | serving diverged | `[promotion].live_gap_factor`, `min_live_n` |
 | artifacts stale | manifest vs release fingerprints |
 | silent-empty states | manifest sources/snapshots/rows; `LOCATION_TOLERANCE` |
@@ -115,6 +115,15 @@ column, or a corrupt archive location as passing. `k_eff` likewise reports
 *not evaluable* rather than clamping a `NaN` mean to `1.0`, which would
 claim "no independence" — the most alarming possible reading — from an
 absence of evidence.
+
+The converse also holds: evidence that is *present but noisy* must not read
+as a failure. The backend-swap detector compares the leading expert across
+consecutive trajectory samples, and at the 10-minute `predict` cadence a
+3-day window holds several hundred of them — so a near-tie between two
+experts crosses back and forth on arithmetic alone. A new leader has to hold
+half a day before the flip counts as a regime change, and an alert that did
+fire reports how many flips held, so genuine flapping stays distinguishable
+from a single swap.
 
 ## What a young deployment looks like
 
@@ -144,8 +153,11 @@ nothing is actually flowing.
   `[backtest].rolling_window_days`. Write-only: serving output is identical
   whether snapshots land or not. The dataset fingerprint changes on every
   `build-dataset`, so snapshot trees no longer referenced by `latest.json`
-  are deleted after each successful write; only `latest.json` is ever read
-  back, so nothing reachable is removed.
+  are deleted after each successful write. Every state read reaches a slot
+  through a `latest.json` pointer, so an unreferenced tree is unreachable
+  rather than merely old. Reclamation runs inside the same lock as the write
+  that triggers it, so it cannot delete a tree a concurrent `predict` is
+  still writing into.
 
 ## Updating the vendored Chart.js
 

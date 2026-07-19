@@ -131,9 +131,9 @@ class TestOnlineAdvance:
                 incremental._states[label].weights, state.weights, atol=1e-12
             )
 
-    def test_public_advance_tracks_batch_closely(self):
-        """The public path re-fits the grounding per serve, so weights may
-        wiggle slightly — but must stay within a tight band of batch replay."""
+    @pytest.mark.parametrize("scheme", SCHEMES)
+    def test_public_advance_equals_batch_replay(self, scheme):
+        """A refitted grounder must replay every historical expert loss."""
         matrix = synthetic_hourly_matrix(days=30, noise_sd=0.4, seed=61)
         full = to_supervised_slice(matrix, TEMP)
         midpoint = (
@@ -143,18 +143,13 @@ class TestOnlineAdvance:
         first_half = to_supervised_slice(
             matrix.filter(pl.col("valid_time") <= midpoint), TEMP
         )
-        batch = OnlineExperts(method_id="boa", scheme="boa").fit(full)
-        incremental = OnlineExperts(method_id="boa", scheme="boa").fit(first_half)
-        restored = OnlineExperts.from_state(incremental.to_state(), "boa")
+        batch = OnlineExperts(method_id=scheme, scheme=scheme).fit(full)
+        incremental = OnlineExperts(method_id=scheme, scheme=scheme).fit(first_half)
+        restored = OnlineExperts.from_state(incremental.to_state(), scheme)
         restored.advance(full)
         for label, state in batch._states.items():
             weights = restored._states[label].weights
-            # per-serve grounding refits perturb BOA's regret-variance path;
-            # weights stay in a band and the expert ordering never flips
-            np.testing.assert_allclose(weights, state.weights, atol=0.1)
-            np.testing.assert_array_equal(
-                np.argsort(weights), np.argsort(state.weights)
-            )
+            np.testing.assert_allclose(weights, state.weights, atol=1e-12)
 
     def test_advance_is_idempotent(self):
         matrix = synthetic_hourly_matrix(days=20, noise_sd=0.4, seed=62)
@@ -321,6 +316,68 @@ class TestStateIntegrity:
 
         with pytest.raises(ValueError, match="no sources"):
             OnlineExperts.from_state(state, "ewa")
+
+    @pytest.mark.parametrize(
+        ("field", "value", "message"),
+        [
+            ("weights", [[100.0, -99.0], [100.0, -100.0]], "shapes"),
+            ("weights", [2.0, -1.0], "invalid weights"),
+            ("regret_variance", [float("nan"), 1.0], "regret variance"),
+        ],
+    )
+    def test_from_state_rejects_invalid_bucket_arrays(self, field, value, message):
+        _, experts = self._fitted()
+        state = experts.to_state()
+        label = next(iter(state["buckets"]))
+        state["buckets"][label][field] = value
+
+        with pytest.raises(ValueError, match=message):
+            OnlineExperts.from_state(state, "ewa")
+
+    @pytest.mark.parametrize("share", [-0.1, 1.1, float("nan"), True])
+    def test_from_state_rejects_invalid_share(self, share):
+        _, experts = self._fitted()
+        state = experts.to_state()
+        state["share"] = share
+
+        with pytest.raises(ValueError, match="fixed-share"):
+            OnlineExperts.from_state(state, "ewa")
+
+    def test_from_state_rejects_scheme_mismatch(self):
+        _, experts = self._fitted()
+
+        with pytest.raises(ValueError, match="does not match"):
+            OnlineExperts.from_state(experts.to_state(), "boa")
+
+
+def test_non_finite_truth_is_rejected_and_filtered():
+    from grounded_weather_forecast.contracts import (
+        ContractViolationError,
+        SupervisedSlice,
+        TruthSemantics,
+        truth_col,
+    )
+
+    matrix = synthetic_hourly_matrix(days=4)
+    train = to_supervised_slice(matrix, TEMP)
+    with pytest.raises(ContractViolationError, match="NaN or infinite"):
+        SupervisedSlice(
+            x=train.x,
+            y=np.where(np.arange(train.y.size) == 0, np.inf, train.y),
+            variable=train.variable,
+            source_kind=train.source_kind,
+        )
+
+    truth = truth_col("temp_c", TruthSemantics.INSTANTANEOUS)
+    poisoned = matrix.with_columns(
+        pl.when(pl.int_range(pl.len()) == 0)
+        .then(float("inf"))
+        .otherwise(pl.col(truth))
+        .alias(truth)
+    )
+    filtered = to_supervised_slice(poisoned, TEMP)
+    assert filtered.x.n_rows == train.x.n_rows - 1
+    assert np.isfinite(filtered.y).all()
 
     def test_observability_state_still_drops_only_the_cursors(self):
         """The dashboard view must survive the atomicity rework."""

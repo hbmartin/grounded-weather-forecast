@@ -842,7 +842,7 @@ def to_supervised_slice(
         if daily
         else pl.col("lead_hours").cast(pl.Float64)
     )
-    usable = frame.filter(pl.col(truth_column).is_not_null()).with_columns(
+    usable = frame.filter(pl.col(truth_column).is_finite()).with_columns(
         lead_expr.alias("__lead")
     )
     values = np.column_stack(

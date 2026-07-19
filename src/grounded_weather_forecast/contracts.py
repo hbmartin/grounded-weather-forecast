@@ -179,14 +179,16 @@ def finite_number(value: object) -> float | None:
             return None
 
 
-def provider_age_hours(value: object) -> float | None:
-    """Normalize a finite provider age; missing and invalid values become ``None``."""
-    return finite_number(value)
-
-
 def provider_age_is_fresh(value: object, cap_hours: float) -> bool:
-    """Whether a provider age is finite and strictly inside the serving cap."""
-    return (hours := provider_age_hours(value)) is not None and hours < cap_hours
+    """Whether a provider age is a real age inside the serving cap.
+
+    Bounded below as well as above. An age is the gap between a fetch and the
+    snapshot that selected it, so a negative one is not fresher-than-fresh —
+    it means the fetch is stamped in the future, which is a clock or
+    provenance fault, and reporting it as healthy hides exactly that.
+    """
+    hours = finite_number(value)
+    return hours is not None and 0.0 <= hours < cap_hours
 
 
 def obs_col(variable: str) -> str:
@@ -298,8 +300,10 @@ class SupervisedSlice:
         if self.y.shape != (self.x.n_rows,):
             msg = f"y shape {self.y.shape} != ({self.x.n_rows},)"
             raise ContractViolationError(msg)
-        if np.isnan(self.y).any():
-            msg = "y contains NaN; null-truth rows must be excluded upstream"
+        if not np.isfinite(self.y).all():
+            msg = (
+                "y contains NaN or infinite values; invalid truth rows must be excluded"
+            )
             raise ContractViolationError(msg)
 
 

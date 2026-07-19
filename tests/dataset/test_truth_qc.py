@@ -104,6 +104,24 @@ class TestNeighbors:
         assert checks.overlap_hours == 0
         assert "no overlapping" in checks.drift_reason
 
+    def test_constant_series_reports_undefined_correlation(self):
+        hours = [START + timedelta(hours=index) for index in range(48)]
+        truth = pl.DataFrame(
+            {"valid_hour": hours, "t__temp_c__inst": [20.0] * 48},
+            schema_overrides={"valid_hour": pl.Datetime("us", "UTC")},
+        )
+        consensus = pl.DataFrame(
+            {"valid_hour": hours, "consensus_c": [20.0] * 48},
+            schema_overrides={"valid_hour": pl.Datetime("us", "UTC")},
+        )
+
+        checks = cross_check(truth, consensus)
+
+        assert checks.correlation_alert is None
+        assert "undefined" in checks.correlation_reason
+        assert "zero variance" in checks.correlation_reason
+        assert "got 48" not in checks.correlation_reason
+
     def test_comparison_exposes_independent_residual_and_wind(self):
         neighbors = parse_neighbors(payload(), SITE_ELEVATION, 300.0, 6.5)
         truth = station_truth().with_columns(

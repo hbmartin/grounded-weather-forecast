@@ -25,6 +25,24 @@ def config_fingerprint(config: Config) -> str:
     return hashlib.sha256(repr(config).encode()).hexdigest()[:16]
 
 
+def code_identity() -> str:
+    """Version plus a digest of the implementation that produced evidence.
+
+    Package versions are release labels, not implementation identities: a
+    checkout can change serving or blender code several times before the next
+    release. Live evidence must not cross that boundary, so backtests record a
+    deterministic digest of the installed first-party Python sources.
+    """
+    package = Path(__file__).parent
+    digest = hashlib.sha256()
+    for path in sorted(package.rglob("*.py")):
+        digest.update(path.relative_to(package).as_posix().encode())
+        digest.update(b"\0")
+        digest.update(path.read_bytes())
+        digest.update(b"\0")
+    return f"{__version__}+{digest.hexdigest()[:12]}"
+
+
 def _identity(payload: object) -> str:
     encoded = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()
     return hashlib.sha256(encoded).hexdigest()[:16]
@@ -66,7 +84,7 @@ class EvaluationRun:
             "window": window,
             "semantics": {key: value.value for key, value in sorted(semantics.items())},
             "methods": list(methods),
-            "code_version": __version__,
+            "code_version": code_identity(),
             "config_fingerprint": config_fingerprint(config),
         }
         created_at = datetime.now(tz=UTC).isoformat()
@@ -80,7 +98,7 @@ class EvaluationRun:
             window=window,
             semantics={key: value.value for key, value in semantics.items()},
             methods=methods,
-            code_version=__version__,
+            code_version=str(stable["code_version"]),
             config_fingerprint=config_fingerprint(config),
         )
 

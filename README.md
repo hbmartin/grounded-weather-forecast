@@ -119,8 +119,8 @@ grounded-weather-forecast truth-qc                      # --days 30
 grounded-weather-forecast report
 
 # 8. Emit the current blended forecast (minutely + hourly + daily) as JSON.
-#    Every emitted forecast carries ready/degraded status and release identity,
-#    and is appended atomically to a history so it can later be scored
+#    Schema version 3 carries ready/degraded status plus per-variable release
+#    identity, and is appended atomically to a history so it can later be scored
 #    against the truth that arrives — backtest skill is an estimate, this is the
 #    measurement.
 grounded-weather-forecast predict                      # to stdout
@@ -140,6 +140,11 @@ expert weights, GBM importances, anchoring decay) into
 `[artifacts].dir/observability/` for the dashboard's glass-box zone, reclaiming
 snapshot trees superseded by a newer dataset fingerprint; snapshot failures
 never affect serving.
+
+Backtest evidence records the package version plus a digest of the installed
+first-party Python sources. The live demotion gate pools recent served rows only
+when configuration, method, and that implementation identity all match; a code
+change cannot inherit a previous implementation's verdict.
 
 ## Status
 
