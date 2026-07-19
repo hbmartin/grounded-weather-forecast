@@ -1,5 +1,7 @@
 """Zone F: serving and self-verification."""
 
+from datetime import timedelta
+
 import polars as pl
 
 from grounded_weather_forecast.dashboard.charts import bar_chart, stacked_area
@@ -9,10 +11,34 @@ from grounded_weather_forecast.dashboard.derive import Derived
 from grounded_weather_forecast.dashboard.model import Panel, Stat, TableSpec, Zone
 from grounded_weather_forecast.dashboard.zones.common import empty_panel, fmt
 
+_DEGRADED_WINDOW_DAYS = 1.0
+_DEGRADED_AMBER = 0.10
+_DEGRADED_RED = 0.50
+
+
+def _degraded_share(history: pl.DataFrame) -> float:
+    """Fraction of served rows that fell back to a degraded selection."""
+    if history.is_empty():
+        return 0.0
+    degraded = history.filter(
+        pl.col("selection_reason").str.starts_with("degraded")
+        | pl.col("selection_reason").str.starts_with("no backtest evidence")
+    ).height
+    return degraded / history.height
+
 
 def _verification_panel(ctx: DashboardContext, derived: Derived) -> Panel:
     live = derived.verification
     if live.is_empty():
+        if derived.live_scores_unusable:
+            return empty_panel(
+                "f1",
+                "f1",
+                "Served vs realized (mae_gap)",
+                "red",
+                "live scores exist but could not be read or scored — this is a "
+                "damaged artifact, not a young archive; check scores_*_live.parquet",
+            )
         return empty_panel(
             "f1",
             "f1",
@@ -113,23 +139,35 @@ def _reasons_panel(ctx: DashboardContext) -> Panel:
             )
         }
         series.append((reason, [float(counts_by_date.get(date, 0)) for date in dates]))
-    degraded = history.filter(
-        pl.col("selection_reason").str.starts_with("degraded")
-        | pl.col("selection_reason").str.starts_with("no backtest evidence")
-    ).height
-    share = degraded / history.height if history.height else 0.0
+    lifetime_share = _degraded_share(history)
+    recent = history.filter(
+        pl.col("issued_at")
+        >= pl.col("issued_at").max() - timedelta(days=_DEGRADED_WINDOW_DAYS)
+    )
+    recent_share = _degraded_share(recent)
+    # Judge on the trailing window: a lifetime share is diluted by every
+    # healthy row ever served, so a currently-100%-degraded system can read
+    # green forever once enough history has accumulated.
+    status = (
+        "red"
+        if recent_share >= _DEGRADED_RED
+        else "amber"
+        if recent_share >= _DEGRADED_AMBER
+        else "ok"
+    )
     return Panel(
         panel_id="f2",
         title="Selection reasons over time",
-        status="amber" if share >= 1.0 else "ok",
+        status=status,
         copy=PANEL_COPY["f2"],
         stats=(
             Stat("served rows", f"{history.height:,}"),
             Stat(
-                "degraded share",
-                f"{share:.0%}",
-                "amber" if share >= 1.0 else "ok",
+                f"degraded share (last {_DEGRADED_WINDOW_DAYS:.0f}d)",
+                f"{recent_share:.0%}",
+                status,
             ),
+            Stat("degraded share (lifetime)", f"{lifetime_share:.0%}"),
         ),
         chart=stacked_area(dates, series, y_label="served slices"),
     )

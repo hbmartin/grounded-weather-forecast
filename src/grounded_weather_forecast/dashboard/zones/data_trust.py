@@ -13,6 +13,8 @@ from grounded_weather_forecast.dashboard.model import Panel, Stat, TableSpec, Zo
 from grounded_weather_forecast.dashboard.zones.common import empty_panel
 
 _CALENDAR_DAYS = 45
+_FLAGGED_AMBER = 0.05
+_FLAGGED_RED = 0.25
 
 
 def _station_qc(ctx: DashboardContext) -> Panel:
@@ -37,7 +39,18 @@ def _station_qc(ctx: DashboardContext) -> Panel:
         if "active_flatline" in qc.columns
         else []
     )
-    status = "amber" if flat_channels else "ok"
+    # A stuck sensor is current state; a high flagged share is a calibration
+    # problem. Both belong in the verdict — counting only the first renders a
+    # channel that is 100% out-of-bounds as green.
+    flagged_share = 1.0 - (clean / samples) if samples else 0.0
+    flagged_status = (
+        "red"
+        if flagged_share >= _FLAGGED_RED
+        else "amber"
+        if flagged_share >= _FLAGGED_AMBER
+        else "ok"
+    )
+    status = "amber" if flat_channels and flagged_status == "ok" else flagged_status
     return Panel(
         panel_id="b1",
         title="Station QC flags",
@@ -45,11 +58,15 @@ def _station_qc(ctx: DashboardContext) -> Panel:
         copy=PANEL_COPY["b1"],
         stats=(
             Stat("samples", f"{samples:,}"),
-            Stat("clean", f"{clean / samples:.1%}" if samples else "—"),
+            Stat(
+                "clean",
+                f"{clean / samples:.1%}" if samples else "—",
+                flagged_status,
+            ),
             Stat(
                 "flatline channels",
                 ", ".join(flat_channels) if flat_channels else "none",
-                status,
+                "amber" if flat_channels else "ok",
             ),
         ),
         chart=bar_chart(channels, series, y_label="flagged samples"),

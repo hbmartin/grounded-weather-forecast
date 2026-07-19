@@ -226,3 +226,21 @@ class TestBlendResult:
                 quantiles=np.zeros((3, 2)),
                 quantile_levels=(0.1, 0.1),
             )
+
+
+class TestFiniteNumber:
+    """The single numeric guard for operator-facing evidence."""
+
+    @pytest.mark.parametrize(
+        "value", [float("nan"), float("inf"), float("-inf"), None, "1.0", True, False]
+    )
+    def test_unusable_values_become_none(self, value):
+        from grounded_weather_forecast.contracts import finite_number
+
+        assert finite_number(value) is None
+
+    @pytest.mark.parametrize(("value", "expected"), [(1, 1.0), (0, 0.0), (-2.5, -2.5)])
+    def test_real_numbers_pass_through(self, value, expected):
+        from grounded_weather_forecast.contracts import finite_number
+
+        assert finite_number(value) == expected
