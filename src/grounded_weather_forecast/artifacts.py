@@ -46,6 +46,7 @@ class ArtifactStore:
         state: dict[str, Any],
         meta: dict[str, Any] | None = None,
         reclaim_unreferenced: bool = False,
+        lock_timeout: float = -1,
     ) -> Path:
         slot = self._slot(fingerprint, method_id, product, variable)
         if overlap := _RESERVED_MANIFEST_KEYS.intersection(meta or {}):
@@ -63,11 +64,17 @@ class ArtifactStore:
         # the pointer's read-modify-write cannot interleave with another serve.
         # `predict` runs every 10 minutes over several variables, so concurrent
         # saves into one store are the normal case, not an edge case.
-        with locked_path(self._latest_path()):
+        with locked_path(self._latest_path(), timeout=lock_timeout):
+            # Validate the pointer map before touching a possibly existing slot.
+            # A corrupt pointer must not let a failed save overwrite recoverable
+            # state even when the caller reuses the same fingerprint.
+            latest = self.read_latest()
             slot.mkdir(parents=True, exist_ok=True)
             atomic_write_text(json.dumps(state), slot / "state.json")
             atomic_write_text(json.dumps(manifest, indent=2), slot / "manifest.json")
-            latest = self._update_latest(fingerprint, method_id, product, variable)
+            latest = self._update_latest(
+                latest, fingerprint, method_id, product, variable
+            )
             if reclaim_unreferenced:
                 self._reclaim_unreferenced(latest)
         return slot
@@ -130,29 +137,49 @@ class ArtifactStore:
         advancing, so a new dataset fingerprint does not by itself force a
         replay. The pointer identity is checked before it is trusted.
         """
-        key = f"{product}.{variable}.{method_id}"
-        pointer = self.read_latest().get(key)
-        if not isinstance(pointer, dict):
-            msg = f"no latest artifact for {key}"
-            raise ArtifactError(msg)
-        expected = {
-            "method_id": method_id,
-            "product": product,
-            "variable": variable,
-        }
-        if any(pointer.get(name) != value for name, value in expected.items()):
-            msg = f"inconsistent latest artifact pointer for {key}"
-            raise ArtifactError(msg)
-        fingerprint = pointer.get("fingerprint")
-        if not isinstance(fingerprint, str) or not fingerprint:
-            msg = f"latest artifact pointer for {key} has no fingerprint"
-            raise ArtifactError(msg)
-        return fingerprint, self.load_state(
-            fingerprint=fingerprint,
-            method_id=method_id,
-            product=product,
-            variable=variable,
+        fingerprint, state, _manifest = self.load_latest_bundle(
+            method_id=method_id, product=product, variable=variable
         )
+        return fingerprint, state
+
+    def load_latest_bundle(
+        self,
+        *,
+        method_id: str,
+        product: str,
+        variable: str,
+        lock_timeout: float = -1,
+    ) -> tuple[str, dict[str, Any], dict[str, Any]]:
+        """Load one current state and manifest while reclamation is excluded."""
+        key = f"{product}.{variable}.{method_id}"
+        with locked_path(self._latest_path(), timeout=lock_timeout):
+            pointer = self.read_latest().get(key)
+            if not isinstance(pointer, dict):
+                msg = f"no latest artifact for {key}"
+                raise ArtifactError(msg)
+            expected = {
+                "method_id": method_id,
+                "product": product,
+                "variable": variable,
+            }
+            if any(pointer.get(name) != value for name, value in expected.items()):
+                msg = f"inconsistent latest artifact pointer for {key}"
+                raise ArtifactError(msg)
+            fingerprint = pointer.get("fingerprint")
+            if not isinstance(fingerprint, str) or not fingerprint:
+                msg = f"latest artifact pointer for {key} has no fingerprint"
+                raise ArtifactError(msg)
+            identity = {
+                "fingerprint": fingerprint,
+                "method_id": method_id,
+                "product": product,
+                "variable": variable,
+            }
+            return (
+                fingerprint,
+                self.load_state(**identity),
+                self.load_manifest(**identity),
+            )
 
     def _latest_path(self) -> Path:
         return self.root / "latest.json"
@@ -175,16 +202,23 @@ class ArtifactStore:
         except OSError as exc:
             msg = f"unreadable artifact pointer at {path}"
             raise ArtifactError(msg) from exc
-        return loaded if isinstance(loaded, dict) else {}
+        if not isinstance(loaded, dict):
+            msg = f"corrupt artifact pointer at {path}"
+            raise ArtifactError(msg)
+        return loaded
 
     def _update_latest(
-        self, fingerprint: str, method_id: str, product: str, variable: str
+        self,
+        latest: dict[str, dict[str, str]],
+        fingerprint: str,
+        method_id: str,
+        product: str,
+        variable: str,
     ) -> dict[str, dict[str, str]]:
         """Merge one pointer entry, returning the map written.
 
         Callers hold the lock on ``latest.json``.
         """
-        latest = self.read_latest()
         latest[f"{product}.{variable}.{method_id}"] = {
             "fingerprint": fingerprint,
             "method_id": method_id,

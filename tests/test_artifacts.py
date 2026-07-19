@@ -1,6 +1,6 @@
 import json
-from concurrent.futures import ThreadPoolExecutor
-from threading import Barrier
+from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeoutError
+from threading import Barrier, Event
 
 import pytest
 
@@ -177,6 +177,36 @@ class TestConcurrentSaves:
         with pytest.raises(ArtifactError, match="corrupt artifact pointer"):
             store.read_latest()
 
+    @pytest.mark.parametrize("payload", ["[]", "null", '"wrong"', "7"])
+    def test_a_non_object_pointer_cannot_overwrite_or_reclaim_state(
+        self, tmp_path, payload
+    ):
+        store = ArtifactStore(tmp_path / "state")
+        slot = store.save(
+            fingerprint="existing",
+            method_id="ewa",
+            product="hourly",
+            variable="temp_c",
+            state={"generation": "recoverable"},
+        )
+        pointer = store._latest_path()
+        pointer.write_text(payload, encoding="utf-8")
+
+        with pytest.raises(ArtifactError, match="corrupt artifact pointer"):
+            store.save(
+                fingerprint="existing",
+                method_id="ewa",
+                product="hourly",
+                variable="temp_c",
+                state={"generation": "overwritten"},
+                reclaim_unreferenced=True,
+            )
+
+        assert json.loads((slot / "state.json").read_text()) == {
+            "generation": "recoverable"
+        }
+        assert pointer.read_text(encoding="utf-8") == payload
+
 
 class TestReclamationIsSafeUnderConcurrency:
     """Reclamation runs inside `save`'s lock, so it cannot delete a live tree.
@@ -235,3 +265,54 @@ class TestReclamationIsSafeUnderConcurrency:
 
         trees = sorted(c.name for c in (tmp_path / "artifacts").iterdir() if c.is_dir())
         assert trees == ["new"]
+
+    def test_reader_holds_pointer_lock_until_its_slot_is_loaded(
+        self, tmp_path, monkeypatch
+    ):
+        store = ArtifactStore(root=tmp_path / "artifacts")
+        store.save(
+            fingerprint="old",
+            method_id="gbm",
+            product="hourly",
+            variable="temp_c",
+            state={"generation": "old"},
+        )
+        reader_started = Event()
+        allow_reader = Event()
+        original = ArtifactStore._read_slot_json
+
+        def pause_old_state(path, kind):
+            if path.parts[-4:] == ("old", "gbm", "hourly.temp_c", "state.json"):
+                reader_started.set()
+                assert allow_reader.wait(timeout=10)
+            return original(path, kind)
+
+        monkeypatch.setattr(
+            ArtifactStore, "_read_slot_json", staticmethod(pause_old_state)
+        )
+
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            reader = pool.submit(
+                store.load_latest_bundle,
+                method_id="gbm",
+                product="hourly",
+                variable="temp_c",
+            )
+            assert reader_started.wait(timeout=10)
+            writer = pool.submit(
+                store.save,
+                fingerprint="new",
+                method_id="gbm",
+                product="hourly",
+                variable="temp_c",
+                state={"generation": "new"},
+                reclaim_unreferenced=True,
+            )
+            with pytest.raises(FutureTimeoutError):
+                writer.result(timeout=0.05)
+            allow_reader.set()
+            fingerprint, state, _manifest = reader.result(timeout=10)
+            writer.result(timeout=10)
+
+        assert fingerprint == "old"
+        assert state == {"generation": "old"}

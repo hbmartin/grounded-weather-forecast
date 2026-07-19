@@ -122,6 +122,54 @@ class TestNeighbors:
         assert "zero variance" in checks.correlation_reason
         assert "got 48" not in checks.correlation_reason
 
+    def test_missing_pairs_are_not_misreported_as_zero_variance(self):
+        hours = [START + timedelta(hours=index) for index in range(48)]
+        truth = pl.DataFrame(
+            {
+                "valid_hour": hours,
+                "t__temp_c__inst": [float(index) for index in range(48)],
+            },
+            schema_overrides={"valid_hour": pl.Datetime("us", "UTC")},
+        )
+        consensus = pl.DataFrame(
+            {
+                "valid_hour": hours,
+                "consensus_c": [None] * 13
+                + [float(index) * 1.1 for index in range(13, 48)],
+            },
+            schema_overrides={"valid_hour": pl.Datetime("us", "UTC")},
+        )
+
+        checks = cross_check(truth, consensus)
+
+        assert checks.correlation_alert is None
+        assert "got 35" in checks.correlation_reason
+        assert "finite paired" in checks.correlation_reason
+        assert "zero variance" not in checks.correlation_reason
+
+    def test_old_correlation_is_not_reused_after_current_window_thins(self):
+        hours = [START + timedelta(hours=index) for index in range(100)]
+        truth = pl.DataFrame(
+            {
+                "valid_hour": hours,
+                "t__temp_c__inst": [float(index) for index in range(100)],
+            },
+            schema_overrides={"valid_hour": pl.Datetime("us", "UTC")},
+        )
+        consensus = pl.DataFrame(
+            {
+                "valid_hour": hours,
+                "consensus_c": [float(index) * 1.1 for index in range(60)]
+                + [None] * 40,
+            },
+            schema_overrides={"valid_hour": pl.Datetime("us", "UTC")},
+        )
+
+        checks = cross_check(truth, consensus)
+
+        assert checks.correlation_alert is None
+        assert "got 32" in checks.correlation_reason
+
     def test_comparison_exposes_independent_residual_and_wind(self):
         neighbors = parse_neighbors(payload(), SITE_ELEVATION, 300.0, 6.5)
         truth = station_truth().with_columns(

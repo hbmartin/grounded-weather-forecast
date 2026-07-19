@@ -14,7 +14,7 @@ from grounded_weather_forecast.serve.predict import (
     predict,
 )
 from grounded_weather_forecast.serve.schema import SCHEMA_VERSION
-from grounded_weather_forecast.serve.selection import Selection
+from grounded_weather_forecast.serve.selection import Selection, select_methods
 
 NOW = utc(2026, 3, 22, 17, 0)
 FETCH = "2026-03-22T16:30:00+00:00"
@@ -227,6 +227,44 @@ class TestPredict:
         methods = {m for p in document.hourly for m in p.methods.values()}
         assert methods == {"equal_weight"}
         assert document.status == "degraded"
+
+    def test_incompatible_historical_release_degrades_without_provenance(self, config):
+        from grounded_weather_forecast.evaluation import (
+            config_fingerprint,
+            dataset_fingerprint,
+        )
+
+        release = {
+            "release_id": "old-code-release",
+            "promoted_at": (NOW - timedelta(days=1)).isoformat(),
+            "dataset_fingerprint": dataset_fingerprint(config),
+            "config_fingerprint": config_fingerprint(config),
+            "evaluation_ids": ["old-evaluation"],
+            "evaluation_contexts": [],
+            "training_cutoff": None,
+            "selections": {
+                "hourly.temp_c.0-1h": {
+                    "method_id": "gbm",
+                    "reason": "historical winner",
+                    "evaluation_id": "old-evaluation",
+                    "code_version": "0.4.0+retired-implementation",
+                    "n": 100,
+                    "mae": 1.0,
+                }
+            },
+        }
+        release_dir = config.artifacts_dir / "releases"
+        release_dir.mkdir(parents=True)
+        (release_dir / "old-code-release.json").write_text(
+            json.dumps(release), encoding="utf-8"
+        )
+
+        selections = select_methods(config, config.dataset.dir / "scores", as_of=NOW)
+        document = predict(config, selections, now=NOW)
+
+        assert selections == {}
+        assert document.status == "degraded"
+        assert document.release_ids == []
 
 
 class TestPredictCli:

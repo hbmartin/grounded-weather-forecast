@@ -12,6 +12,8 @@ from grounded_weather_forecast.runs import (
     run_id_for,
 )
 
+TEST_NOW = datetime(2026, 7, 19, tzinfo=UTC)
+
 
 def _record(command="qc", exit_code=0, error=None, offset_s=0):
     started = datetime(2026, 7, 18, 12, 0, tzinfo=UTC) + timedelta(seconds=offset_s)
@@ -32,7 +34,7 @@ def _record(command="qc", exit_code=0, error=None, offset_s=0):
 
 def test_append_and_load_round_trip(tmp_path):
     path = tmp_path / "runs.parquet"
-    append_run(_record(), path)
+    append_run(_record(), path, now=TEST_NOW)
     frame = load_runs(path)
     assert frame.height == 1
     row = frame.row(0, named=True)
@@ -44,8 +46,8 @@ def test_append_and_load_round_trip(tmp_path):
 
 def test_append_is_additive_and_ordered(tmp_path):
     path = tmp_path / "runs.parquet"
-    append_run(_record(command="qc"), path)
-    append_run(_record(command="report", offset_s=60), path)
+    append_run(_record(command="qc"), path, now=TEST_NOW)
+    append_run(_record(command="report", offset_s=60), path, now=TEST_NOW)
     assert load_runs(path)["command"].to_list() == ["qc", "report"]
 
 
@@ -96,7 +98,7 @@ def test_write_failure_is_swallowed(tmp_path, monkeypatch):
         raise OSError("disk full")
 
     monkeypatch.setattr(runs_module, "atomic_write_parquet", boom)
-    append_run(_record(), tmp_path / "runs.parquet")
+    append_run(_record(), tmp_path / "runs.parquet", now=TEST_NOW)
     assert not (tmp_path / "runs.parquet").exists()
 
 
@@ -104,7 +106,7 @@ def test_lock_timeout_is_swallowed(tmp_path, monkeypatch):
     monkeypatch.setattr(runs_module, "_LOCK_TIMEOUT_SECONDS", 0.05)
     path = tmp_path / "runs.parquet"
     with FileLock(path.with_suffix(".parquet.lock")):
-        append_run(_record(), path)
+        append_run(_record(), path, now=TEST_NOW)
     assert not path.exists()
 
 
@@ -154,6 +156,7 @@ class TestRetention:
                     code_version="0.4.0",
                 ),
                 path,
+                now=base,
             )
         # The three year-old rows are pruned; only the two recent ones survive.
         assert runs.load_runs(path)["run_id"].to_list() == ["r3", "r4"]
@@ -199,7 +202,30 @@ def test_a_naive_timestamp_still_writes_a_row(tmp_path):
             code_version="0.4.0",
         ),
         path,
+        now=datetime(2026, 7, 19, 12, 0, tzinfo=UTC),
     )
 
     assert path.exists(), "a naive timestamp must not silently drop the row"
     assert load_runs(path).height == 1
+
+
+def test_future_timestamp_does_not_move_the_retention_horizon(tmp_path):
+    path = tmp_path / "runs.parquet"
+    recent = _record(command="recent")
+    future = RunRecord(
+        run_id="future",
+        command="predict",
+        args_json="{}",
+        started_at=TEST_NOW + timedelta(days=365),
+        ended_at=TEST_NOW + timedelta(days=365),
+        exit_code=0,
+        error=None,
+        dataset_fingerprint="f",
+        config_fingerprint="c",
+        code_version="0.4.0",
+    )
+
+    append_run(recent, path, now=TEST_NOW)
+    append_run(future, path, now=TEST_NOW)
+
+    assert load_runs(path)["run_id"].to_list() == [recent.run_id, "future"]

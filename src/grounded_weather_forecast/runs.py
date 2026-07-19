@@ -90,7 +90,7 @@ def prune_runs(frame: pl.DataFrame, *, now: datetime) -> pl.DataFrame:
     ).tail(_MAX_ROWS)
 
 
-def append_run(record: RunRecord, path: Path) -> None:
+def append_run(record: RunRecord, path: Path, *, now: datetime | None = None) -> None:
     """Append one ledger row; telemetry failures never reach the command."""
     try:
         fresh = _to_frame(record)
@@ -104,11 +104,28 @@ def append_run(record: RunRecord, path: Path) -> None:
             # future timestamp would otherwise set a horizon in the future and
             # delete every genuinely recent row along with it.
             atomic_write_parquet(
-                prune_runs(combined, now=datetime.now(tz=UTC)),
+                prune_runs(combined, now=now or datetime.now(tz=UTC)),
                 path,
             )
     except (OSError, ValueError, Timeout, pl.exceptions.PolarsError):
         return
+
+
+def read_runs(path: Path) -> pl.DataFrame:
+    """Read and normalize the ledger, raising when an existing file is unusable."""
+    if not path.exists():
+        return pl.DataFrame(schema=RUNS_SCHEMA)
+    frame = pl.read_parquet(path)
+    missing = [
+        pl.lit(None, dtype=dtype).alias(column)
+        for column, dtype in RUNS_SCHEMA.items()
+        if column not in frame.columns
+    ]
+    return (
+        frame.with_columns(*missing)
+        .select(RUNS_SCHEMA.names())
+        .cast(RUNS_SCHEMA, strict=False)
+    )
 
 
 def load_runs(path: Path) -> pl.DataFrame:
@@ -119,20 +136,8 @@ def load_runs(path: Path) -> pl.DataFrame:
     intended trade for telemetry — a corrupt ledger must not fail a command —
     but it does discard whatever the file held.
     """
-    if not path.exists():
-        return pl.DataFrame(schema=RUNS_SCHEMA)
     try:
-        frame = pl.read_parquet(path)
-        missing = [
-            pl.lit(None, dtype=dtype).alias(column)
-            for column, dtype in RUNS_SCHEMA.items()
-            if column not in frame.columns
-        ]
-        return (
-            frame.with_columns(*missing)
-            .select(RUNS_SCHEMA.names())
-            .cast(RUNS_SCHEMA, strict=False)
-        )
+        return read_runs(path)
     except (OSError, pl.exceptions.PolarsError):
         return pl.DataFrame(schema=RUNS_SCHEMA)
 

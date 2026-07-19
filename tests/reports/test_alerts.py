@@ -18,7 +18,8 @@ MANIFEST = {
 
 def make_inputs(tmp_path, **overrides):
     config = overrides.pop("config", write_config(tmp_path))
-    return AlertInputs(config=config, now=NOW, **overrides)
+    now = overrides.pop("now", NOW)
+    return AlertInputs(config=config, now=now, **overrides)
 
 
 def by_panel(alerts, panel_id):
@@ -344,15 +345,20 @@ def _weight_state(leader_first):
 
 @pytest.mark.parametrize("age_days", [2, 3])
 def test_backend_swap_detects_leader_flip_inside_window(tmp_path, age_days):
+    moments = [NOW - timedelta(days=age_days), NOW - timedelta(days=1), NOW]
     history = pl.DataFrame(
         {
-            "captured_at": [NOW - timedelta(days=age_days), NOW],
-            "issue_time": [NOW - timedelta(days=age_days), NOW],
-            "method_id": ["boa", "boa"],
-            "product": ["hourly", "hourly"],
-            "variable": ["temp_c", "temp_c"],
-            "dataset_fingerprint": ["f", "f"],
-            "state_json": [_weight_state(True), _weight_state(False)],
+            "captured_at": moments,
+            "issue_time": moments,
+            "method_id": ["boa"] * 3,
+            "product": ["hourly"] * 3,
+            "variable": ["temp_c"] * 3,
+            "dataset_fingerprint": ["f"] * 3,
+            "state_json": [
+                _weight_state(True),
+                _weight_state(False),
+                _weight_state(False),
+            ],
         }
     )
     alerts = by_panel(
@@ -385,25 +391,24 @@ def test_backend_swap_ignores_pre_window_state(tmp_path):
 
 
 def test_backend_swap_reports_latest_flip_back(tmp_path):
+    moments = [
+        NOW - timedelta(days=2),
+        NOW - timedelta(hours=36),
+        NOW - timedelta(hours=18),
+        NOW,
+    ]
     history = pl.DataFrame(
         {
-            "captured_at": [
-                NOW - timedelta(days=2),
-                NOW - timedelta(days=1),
-                NOW,
-            ],
-            "issue_time": [
-                NOW - timedelta(days=2),
-                NOW - timedelta(days=1),
-                NOW,
-            ],
-            "method_id": ["boa"] * 3,
-            "product": ["hourly"] * 3,
-            "variable": ["temp_c"] * 3,
-            "dataset_fingerprint": ["f"] * 3,
+            "captured_at": moments,
+            "issue_time": moments,
+            "method_id": ["boa"] * 4,
+            "product": ["hourly"] * 4,
+            "variable": ["temp_c"] * 4,
+            "dataset_fingerprint": ["f"] * 4,
             "state_json": [
                 _weight_state(True),
                 _weight_state(False),
+                _weight_state(True),
                 _weight_state(True),
             ],
         }
@@ -647,6 +652,61 @@ def test_truth_thinning_window_is_a_week_not_a_row_count(tmp_path):
     assert "temp_c=0.10" in alerts[0].message
 
 
+def test_future_truth_cannot_hide_current_thinning(tmp_path):
+    recent = pl.DataFrame(
+        {
+            "valid_hour": [NOW - timedelta(hours=index) for index in range(10)],
+            "temp_c_cov": [0.10] * 10,
+        },
+        schema_overrides={"valid_hour": pl.Datetime("us", "UTC")},
+    )
+    future = pl.DataFrame(
+        {
+            "valid_hour": [NOW + timedelta(hours=index + 1) for index in range(100)],
+            "temp_c_cov": [1.0] * 100,
+        },
+        schema_overrides={"valid_hour": pl.Datetime("us", "UTC")},
+    )
+
+    alerts = by_panel(
+        evaluate_alerts(
+            make_inputs(tmp_path, hourly_truth=pl.concat([recent, future]))
+        ),
+        "truth-thinning",
+    )
+
+    assert len(alerts) == 1
+    assert "temp_c=0.10" in alerts[0].message
+
+
+def test_daily_truth_window_uses_station_local_date(tmp_path):
+    now = datetime(2026, 7, 18, 1, 0, tzinfo=UTC)
+    config = write_config(tmp_path, min_day_coverage=0.75)
+    daily = pl.DataFrame(
+        {
+            "date_local": [datetime(2026, 7, 10).date()],
+            "coverage_frac": [0.10],
+        }
+    )
+
+    alerts = by_panel(
+        evaluate_alerts(
+            make_inputs(
+                tmp_path,
+                config=config,
+                now=now,
+                hourly_truth=pl.DataFrame(),
+                daily_truth=daily,
+            )
+        ),
+        "truth-thinning",
+    )
+
+    assert len(alerts) == 1
+    assert alerts[0].severity == "amber"
+    assert "daily.temperature=0.10" in alerts[0].message
+
+
 def test_truth_thinning_judges_daily_even_without_hourly(tmp_path):
     """Regression: a missing hourly frame discarded valid daily coverage."""
     config = write_config(tmp_path, min_hour_coverage=0.8, min_day_coverage=0.75)
@@ -755,6 +815,26 @@ class TestBackendSwapIgnoresNoise:
         )
 
         assert alerts == [], "a 10-minute crossing must not read as a regime change"
+
+    def test_a_newest_single_sample_regime_is_still_pending(self, tmp_path):
+        history = pl.DataFrame(
+            {
+                "captured_at": [NOW - timedelta(days=2), NOW],
+                "issue_time": [NOW - timedelta(days=2), NOW],
+                "method_id": ["boa", "boa"],
+                "product": ["hourly", "hourly"],
+                "variable": ["temp_c", "temp_c"],
+                "dataset_fingerprint": ["f", "f"],
+                "state_json": [_weight_state(True), _weight_state(False)],
+            }
+        )
+
+        alerts = by_panel(
+            evaluate_alerts(make_inputs(tmp_path, observability_history=history)),
+            "backend-swap",
+        )
+
+        assert alerts == []
 
     def test_sustained_flapping_is_reported_with_its_count(self, tmp_path):
         # Three day-long regimes: alpha, beta, alpha. Both flips held.

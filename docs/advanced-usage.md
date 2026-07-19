@@ -188,7 +188,7 @@ grounded-weather-forecast predict --out forecast.json
 | flag | effect |
 |---|---|
 | `--method <id>` | Force one method for every slice, ignoring the leaderboard. Useful for A/B'ing. |
-| `--now <iso>` | Return the exact archived document if that instant was served; otherwise reconstruct causally using only evidence available then. |
+| `--now <iso>` | Return the exact archived document if that instant was served; otherwise reconstruct causally using only evidence available then. If that release's implementation is unavailable, emit an explicit degraded equal-weight forecast. |
 | `--no-history` | Do not append to the self-verification history. |
 | `--semantics` | As for `backtest`. |
 | `--out -` | stdout (default). |
@@ -199,10 +199,11 @@ Method selection resolves in this order:
 [predict.methods] config pin   ->   per-slice backtest winner   ->   named fallback
 ```
 
-Only live scores matching the current dataset, source set, and requested issue time
-are promotable. The cold-start fallback is fit-free `equal_weight`; the document is
-marked `status = "degraded"` and records the reason. **It never presents an
-unfitted grounded method as trained.**
+Only live scores matching the current dataset, source set, truth semantics, code
+identity, and requested issue time are promotable. Recent live verdicts are pooled
+only across releases with the same serving-relevant identity. The cold-start fallback
+is fit-free `equal_weight`; the document is marked `status = "degraded"` and records
+the reason. **It never presents an unfitted grounded method as trained.**
 
 Pin a method when you have a reason to override the leaderboard:
 

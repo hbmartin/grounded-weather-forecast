@@ -15,6 +15,7 @@ from pathlib import Path
 from typing import Any, Protocol, runtime_checkable
 
 import polars as pl
+from filelock import Timeout
 
 from grounded_weather_forecast import __version__
 from grounded_weather_forecast.artifacts import ArtifactError, ArtifactStore
@@ -110,6 +111,7 @@ def snapshot_observability(
             # It runs inside `save`'s lock so it cannot delete a tree another
             # `predict` is mid-way through writing.
             reclaim_unreferenced=True,
+            lock_timeout=_LOCK_TIMEOUT_SECONDS,
         )
         if method_id in _TRAJECTORY_METHODS:
             _append_history(
@@ -192,23 +194,46 @@ def load_observability_history(artifacts_dir: Path) -> pl.DataFrame:
 
 def load_observability_states(artifacts_dir: Path) -> tuple[ObservabilitySnapshot, ...]:
     """Latest snapshot per (product, variable, method); unreadable slots skipped."""
+    snapshots, _failures = load_observability_states_with_failures(artifacts_dir)
+    return snapshots
+
+
+def load_observability_states_with_failures(
+    artifacts_dir: Path,
+) -> tuple[tuple[ObservabilitySnapshot, ...], tuple[Path, ...]]:
+    """Latest snapshots plus paths for current entries that could not be read."""
     store = ArtifactStore(artifacts_dir / "observability")
+    failures: list[Path] = []
     try:
         latest = store.read_latest()
-    except (OSError, json.JSONDecodeError):
-        return ()
+    except (ArtifactError, OSError, json.JSONDecodeError):
+        pointer_path = artifacts_dir / "observability" / "latest.json"
+        return (), (pointer_path,)
     snapshots: list[ObservabilitySnapshot] = []
     for _key, pointer in sorted(latest.items()):
         try:
             identity = {
-                "fingerprint": str(pointer["fingerprint"]),
                 "method_id": str(pointer["method_id"]),
                 "product": str(pointer["product"]),
                 "variable": str(pointer["variable"]),
             }
-            state = store.load_state(**identity)
-            manifest = store.load_manifest(**identity)
-        except (ArtifactError, KeyError, OSError, TypeError, ValueError):
+            fingerprint, state, manifest = store.load_latest_bundle(
+                **identity, lock_timeout=_LOCK_TIMEOUT_SECONDS
+            )
+        except (ArtifactError, KeyError, OSError, Timeout, TypeError, ValueError):
+            if isinstance(pointer, dict) and all(
+                isinstance(pointer.get(field), str)
+                for field in ("fingerprint", "method_id", "product", "variable")
+            ):
+                failures.append(
+                    artifacts_dir
+                    / "observability"
+                    / str(pointer["fingerprint"])
+                    / str(pointer["method_id"])
+                    / f"{pointer['product']}.{pointer['variable']}"
+                )
+            else:
+                failures.append(artifacts_dir / "observability" / "latest.json")
             continue
         issue = manifest.get("issue_time")
         snapshots.append(
@@ -216,10 +241,10 @@ def load_observability_states(artifacts_dir: Path) -> tuple[ObservabilitySnapsho
                 method_id=identity["method_id"],
                 product=identity["product"],
                 variable=identity["variable"],
-                dataset_fingerprint=identity["fingerprint"],
+                dataset_fingerprint=fingerprint,
                 created_at=str(manifest.get("created_at", "")),
                 issue_time=str(issue) if issue is not None else None,
                 state=state,
             )
         )
-    return tuple(snapshots)
+    return tuple(snapshots), tuple(failures)
