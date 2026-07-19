@@ -67,7 +67,11 @@ class ArtifactStore:
         if not path.exists():
             msg = f"no artifact {kind} at {path.parent}"
             raise ArtifactError(msg)
-        loaded = json.loads(path.read_text(encoding="utf-8"))
+        try:
+            loaded = json.loads(path.read_text(encoding="utf-8"))
+        except (json.JSONDecodeError, UnicodeDecodeError) as exc:
+            msg = f"corrupt artifact {kind} at {path}"
+            raise ArtifactError(msg) from exc
         if not isinstance(loaded, dict):
             msg = f"corrupt artifact {kind} at {path}"
             raise ArtifactError(msg)

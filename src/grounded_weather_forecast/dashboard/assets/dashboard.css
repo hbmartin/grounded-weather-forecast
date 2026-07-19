@@ -104,7 +104,7 @@ nav.pills { display: flex; flex-wrap: wrap; gap: 8px; padding-bottom: 20px; }
 
 .panel-grid {
   display: grid;
-  grid-template-columns: repeat(auto-fit, minmax(340px, 1fr));
+  grid-template-columns: repeat(auto-fit, minmax(min(340px, 100%), 1fr));
   gap: 16px;
 }
 .panel {

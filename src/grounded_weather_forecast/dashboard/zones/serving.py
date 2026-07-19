@@ -1,5 +1,7 @@
 """Zone F: serving and self-verification."""
 
+from datetime import timedelta
+
 import polars as pl
 
 from grounded_weather_forecast.dashboard.charts import bar_chart, stacked_area
@@ -9,10 +11,34 @@ from grounded_weather_forecast.dashboard.derive import Derived
 from grounded_weather_forecast.dashboard.model import Panel, Stat, TableSpec, Zone
 from grounded_weather_forecast.dashboard.zones.common import empty_panel, fmt
 
+_DEGRADED_WINDOW_DAYS = 1.0
+_DEGRADED_AMBER = 0.10
+_DEGRADED_RED = 0.50
+
+
+def _degraded_share(history: pl.DataFrame) -> float:
+    """Fraction of served rows that fell back to a degraded selection."""
+    if history.is_empty():
+        return 0.0
+    degraded = history.filter(
+        pl.col("selection_reason").str.starts_with("degraded")
+        | pl.col("selection_reason").str.starts_with("no backtest evidence")
+    ).height
+    return degraded / history.height
+
 
 def _verification_panel(ctx: DashboardContext, derived: Derived) -> Panel:
     live = derived.verification
     if live.is_empty():
+        if derived.live_scores_unusable:
+            return empty_panel(
+                "f1",
+                "f1",
+                "Served vs realized (mae_gap)",
+                "red",
+                "live scores exist but could not be read or scored — this is a "
+                "damaged artifact, not a young archive; check scores_*_live.parquet",
+            )
         return empty_panel(
             "f1",
             "f1",
@@ -29,7 +55,10 @@ def _verification_panel(ctx: DashboardContext, derived: Derived) -> Panel:
     classes: list[tuple[str, ...]] = []
     worst = "ok"
     for row in live.iter_rows(named=True):
-        label = f"{row['product']}.{row['variable']}.{row['method_id']}"
+        label = (
+            f"{row['product']}.{row['variable']}."
+            f"{row['lead_bucket']}.{row['method_id']}"
+        )
         labels.append(label)
         live_maes.append(row["live_mae"])
         backtest_maes.append(row.get("backtest_mae"))
@@ -93,9 +122,14 @@ def _reasons_panel(ctx: DashboardContext) -> Panel:
         .sort("date")
     )
     dates = sorted({str(value) for value in daily["date"].to_list()})
-    reasons = sorted(
-        {str(value) for value in daily["selection_reason"].drop_nulls().to_list()}
-    )[:8]
+    reason_totals = (
+        daily.filter(pl.col("selection_reason").is_not_null())
+        .group_by("selection_reason")
+        .agg(pl.col("len").sum().alias("total"))
+        .sort(["total", "selection_reason"], descending=[True, False])
+        .head(8)
+    )
+    reasons = [str(value) for value in reason_totals["selection_reason"].to_list()]
     series = []
     for reason in reasons:
         counts_by_date = {
@@ -105,23 +139,35 @@ def _reasons_panel(ctx: DashboardContext) -> Panel:
             )
         }
         series.append((reason, [float(counts_by_date.get(date, 0)) for date in dates]))
-    degraded = history.filter(
-        pl.col("selection_reason").str.starts_with("degraded")
-        | pl.col("selection_reason").str.starts_with("no backtest evidence")
-    ).height
-    share = degraded / history.height if history.height else 0.0
+    lifetime_share = _degraded_share(history)
+    recent = history.filter(
+        pl.col("issued_at")
+        >= pl.col("issued_at").max() - timedelta(days=_DEGRADED_WINDOW_DAYS)
+    )
+    recent_share = _degraded_share(recent)
+    # Judge on the trailing window: a lifetime share is diluted by every
+    # healthy row ever served, so a currently-100%-degraded system can read
+    # green forever once enough history has accumulated.
+    status = (
+        "red"
+        if recent_share >= _DEGRADED_RED
+        else "amber"
+        if recent_share >= _DEGRADED_AMBER
+        else "ok"
+    )
     return Panel(
         panel_id="f2",
         title="Selection reasons over time",
-        status="amber" if share >= 1.0 else "ok",
+        status=status,
         copy=PANEL_COPY["f2"],
         stats=(
             Stat("served rows", f"{history.height:,}"),
             Stat(
-                "degraded share",
-                f"{share:.0%}",
-                "amber" if share >= 1.0 else "ok",
+                f"degraded share (last {_DEGRADED_WINDOW_DAYS:.0f}d)",
+                f"{recent_share:.0%}",
+                status,
             ),
+            Stat("degraded share (lifetime)", f"{lifetime_share:.0%}"),
         ),
         chart=stacked_area(dates, series, y_label="served slices"),
     )

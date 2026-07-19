@@ -6,6 +6,7 @@ import polars as pl
 import pytest
 from conftest import make_station_db, write_config
 
+from grounded_weather_forecast import cli as cli_module
 from grounded_weather_forecast import __version__
 from grounded_weather_forecast.cli import build_parser, main
 from grounded_weather_forecast.dataset.neighbors import NeighborChecks
@@ -163,6 +164,88 @@ def test_ensemble_store_failure_is_an_actionable_cli_error(
 
     assert code == 1
     assert "ensemble ingest failed: disk full" in capsys.readouterr().out
+
+
+@pytest.mark.parametrize(
+    ("failing_stage", "exception"),
+    [
+        ("build_truth", OSError("truth unavailable")),
+        ("verify_history", ValueError("history invalid")),
+        ("compare_to_backtest", ValueError("comparison invalid")),
+    ],
+)
+def test_report_skips_any_self_verification_failure(
+    tmp_path, capsys, monkeypatch, failing_stage, exception
+):
+    config = write_config(tmp_path)
+    scores_dir = config.dataset.dir / "scores"
+    scores_dir.mkdir(parents=True)
+    (scores_dir / "scores_hourly_live.parquet").touch()
+    config.predict.history_path.parent.mkdir(parents=True, exist_ok=True)
+    config.predict.history_path.touch()
+    scores = pl.DataFrame({"source_kind": ["live"]})
+    empty = pl.DataFrame()
+    written_sections = []
+
+    monkeypatch.setattr(
+        "grounded_weather_forecast.backtest.scores.load_scores",
+        lambda _path: scores,
+    )
+    monkeypatch.setattr(
+        "grounded_weather_forecast.reports.leaderboard.leaderboard",
+        lambda _scores: empty,
+    )
+    monkeypatch.setattr(
+        "grounded_weather_forecast.reports.leaderboard.aggregate_leaderboard",
+        lambda _board: empty,
+    )
+    monkeypatch.setattr(
+        "grounded_weather_forecast.reports.leaderboard.slice_winners",
+        lambda *_args, **_kwargs: empty,
+    )
+    monkeypatch.setattr(
+        "grounded_weather_forecast.reports.render.print_summary",
+        lambda *_args, **_kwargs: None,
+    )
+
+    def write_report(_directory, name, _title, sections):
+        written_sections.append(sections)
+        return tmp_path / f"{name}.md"
+
+    monkeypatch.setattr(
+        "grounded_weather_forecast.reports.render.write_markdown_report",
+        write_report,
+    )
+    monkeypatch.setattr(
+        "grounded_weather_forecast.dashboard.write_dashboard",
+        lambda _config: tmp_path / "dashboard.html",
+    )
+
+    def maybe_fail(stage, result):
+        if failing_stage == stage:
+            raise exception
+        return result
+
+    monkeypatch.setattr(
+        "grounded_weather_forecast.dataset.matrix.build_truth",
+        lambda _config: maybe_fail("build_truth", (empty, empty, empty)),
+    )
+    monkeypatch.setattr(
+        "grounded_weather_forecast.reports.verification.verify_history",
+        lambda *_args, **_kwargs: maybe_fail("verify_history", empty),
+    )
+    monkeypatch.setattr(
+        "grounded_weather_forecast.reports.verification.compare_to_backtest",
+        lambda *_args, **_kwargs: maybe_fail("compare_to_backtest", empty),
+    )
+
+    assert cli_module._cmd_report(config) == 0
+    assert "self-verification skipped" in capsys.readouterr().out
+    assert all(
+        title != "Self-verification (served vs realized)"
+        for sections in written_sections
+        for title, _frame in sections
+    )
 
 
 class TestRunLedger:

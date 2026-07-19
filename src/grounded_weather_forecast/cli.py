@@ -722,9 +722,6 @@ def _cmd_report(config: Config) -> int:
         if is_live and config.predict.history_path.exists():
             try:
                 minute_truth, hourly_truth, daily_truth = build_truth(config)
-            except (OSError, ValueError) as exc:
-                print(f"self-verification skipped: {exc}")
-            else:
                 live = verify_history(
                     config.predict.history_path,
                     hourly_truth,
@@ -737,6 +734,8 @@ def _cmd_report(config: Config) -> int:
                         compare_to_backtest(live, board),
                     )
                 )
+            except (OSError, ValueError) as exc:
+                print(f"self-verification skipped: {exc}")
         report_name = path.stem.replace("scores_", "leaderboard_")
         written.append(
             write_markdown_report(
@@ -838,13 +837,15 @@ def _record_run(
     exit_code: int | None,
 ) -> None:
     """Append this invocation to the run ledger; never raises."""
-    from grounded_weather_forecast import runs  # noqa: PLC0415
-    from grounded_weather_forecast.evaluation import (  # noqa: PLC0415
-        config_fingerprint,
-        dataset_fingerprint,
-    )
-
     try:
+        # Inside the try: this runs from a `finally`, so an import failure
+        # escaping here would replace the real command's result or exception.
+        from grounded_weather_forecast import runs  # noqa: PLC0415
+        from grounded_weather_forecast.evaluation import (  # noqa: PLC0415
+            config_fingerprint,
+            dataset_fingerprint,
+        )
+
         error = sys.exc_info()[1]
         try:
             dataset_print = dataset_fingerprint(config)

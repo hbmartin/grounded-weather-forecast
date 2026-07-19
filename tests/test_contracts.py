@@ -18,6 +18,8 @@ from grounded_weather_forecast.contracts import (
     is_truth_col,
     obs_col,
     parse_fx_col,
+    provider_age_hours,
+    provider_age_is_fresh,
     truth_col,
 )
 
@@ -78,6 +80,38 @@ class TestVariableLookup:
             hourly_variable("nope")
         with pytest.raises(KeyError):
             daily_variable("temp_c" + "x")
+
+
+class TestProviderAge:
+    @pytest.mark.parametrize(
+        ("value", "expected"),
+        [
+            (0, 0.0),
+            (1.5, 1.5),
+            (True, None),
+            (None, None),
+            (float("nan"), None),
+            (float("inf"), None),
+            (float("-inf"), None),
+        ],
+    )
+    def test_normalizes_only_finite_numbers(self, value, expected):
+        assert provider_age_hours(value) == expected
+
+    @pytest.mark.parametrize(
+        ("value", "expected"),
+        [
+            (11.999, True),
+            (12.0, False),
+            (12.001, False),
+            (None, False),
+            (True, False),
+            (float("nan"), False),
+            (float("inf"), False),
+        ],
+    )
+    def test_freshness_is_strict_and_finite(self, value, expected):
+        assert provider_age_is_fresh(value, 12.0) is expected
 
 
 class TestForecastMatrix:
@@ -192,3 +226,21 @@ class TestBlendResult:
                 quantiles=np.zeros((3, 2)),
                 quantile_levels=(0.1, 0.1),
             )
+
+
+class TestFiniteNumber:
+    """The single numeric guard for operator-facing evidence."""
+
+    @pytest.mark.parametrize(
+        "value", [float("nan"), float("inf"), float("-inf"), None, "1.0", True, False]
+    )
+    def test_unusable_values_become_none(self, value):
+        from grounded_weather_forecast.contracts import finite_number
+
+        assert finite_number(value) is None
+
+    @pytest.mark.parametrize(("value", "expected"), [(1, 1.0), (0, 0.0), (-2.5, -2.5)])
+    def test_real_numbers_pass_through(self, value, expected):
+        from grounded_weather_forecast.contracts import finite_number
+
+        assert finite_number(value) == expected

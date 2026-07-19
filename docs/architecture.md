@@ -184,7 +184,7 @@ Everything under `[dataset].dir` (git-ignored), all parquet:
 |---|---|
 | `truth_minute.parquet` | one row per station sample; values null when QC-flagged, plus `{var}_qc` bitmask |
 | `truth_hourly.parquet` | one row per hour; **both** truth semantics for state vars, plus coverage counters |
-| `truth_daily.parquet` | one row per local day; extremes and sums with DST-aware coverage |
+| `truth_daily.parquet` | one row per local day; extremes and sums with DST-aware `coverage_frac` and `rain_coverage` |
 | `forecasts_long.parquet` | one row per (source, fetched_at, valid_time) |
 | `daily_long.parquet`, `minutely_long.parquet` | as above, daily / minutely grain |
 | `hourly_matrix_live.parquet` | **one row per (snapshot, valid hour)** — the supervised matrix |

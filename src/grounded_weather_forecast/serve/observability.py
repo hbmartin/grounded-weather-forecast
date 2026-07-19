@@ -9,13 +9,14 @@ serving output is identical whether they land or not.
 """
 
 import json
+import shutil
+from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any, Protocol, runtime_checkable
 
 import polars as pl
-from filelock import Timeout
 
 from grounded_weather_forecast import __version__
 from grounded_weather_forecast.artifacts import ArtifactError, ArtifactStore
@@ -78,6 +79,26 @@ def observability_state(blender: object) -> dict[str, Any] | None:
             return None
 
 
+def _prune_snapshot_trees(store: ArtifactStore) -> None:
+    """Delete fingerprint trees nothing in ``latest.json`` points at.
+
+    The dataset fingerprint changes on every ``build-dataset``, so without
+    this every rebuild mints a permanent new tree of state/manifest files
+    per (method x product x variable) and the directory grows without bound.
+    Only ``latest.json`` is ever read back, so unreferenced trees are dead.
+    """
+    referenced = {
+        entry["fingerprint"]
+        for entry in store.read_latest().values()
+        if isinstance(entry, Mapping) and isinstance(entry.get("fingerprint"), str)
+    }
+    if not referenced or not store.root.is_dir():
+        return
+    for child in store.root.iterdir():
+        if child.is_dir() and child.name not in referenced:
+            shutil.rmtree(child, ignore_errors=True)
+
+
 def snapshot_observability(
     blender: object,
     *,
@@ -93,7 +114,8 @@ def snapshot_observability(
         if state is None:
             return
         fingerprint = dataset_fingerprint(config)
-        ArtifactStore(observability_root(config)).save(
+        store = ArtifactStore(observability_root(config))
+        store.save(
             fingerprint=fingerprint,
             method_id=method_id,
             product=product,
@@ -115,14 +137,14 @@ def snapshot_observability(
                 issue_time=issue_time,
                 state=state,
             )
-    except (
-        ArtifactError,
-        OSError,
-        TypeError,
-        ValueError,
-        Timeout,
-        pl.exceptions.PolarsError,
-    ):
+        _prune_snapshot_trees(store)
+    except (Exception,):  # noqa: B013 - project style requires tuple clauses
+        # Deliberately broad: this is write-only telemetry and the docstring
+        # promises it never raises. ``observability_state`` runs arbitrary
+        # blender code (e.g. LightGBM's own error type, which subclasses
+        # Exception directly), and no snapshot failure may ever fail a
+        # `predict`. KeyboardInterrupt/SystemExit are BaseException and still
+        # propagate.
         return
 
 

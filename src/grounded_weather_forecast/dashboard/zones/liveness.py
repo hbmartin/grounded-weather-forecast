@@ -4,7 +4,11 @@ from datetime import datetime, timedelta
 
 import polars as pl
 
-from grounded_weather_forecast.contracts import age_col
+from grounded_weather_forecast.contracts import (
+    age_col,
+    provider_age_hours,
+    provider_age_is_fresh,
+)
 from grounded_weather_forecast.dashboard.charts import bar_chart
 from grounded_weather_forecast.dashboard.context import DashboardContext
 from grounded_weather_forecast.dashboard.copy import PANEL_COPY, ZONE_INTROS
@@ -110,13 +114,15 @@ def _provider_ages(ctx: DashboardContext, sources: tuple[str, ...]) -> Panel:
     labels: list[str] = []
     ages: list[float | None] = []
     colors: list[str] = []
+    fresh_count = 0
     for index, source in enumerate(sources or _matrix_sources(matrix)):
         age = newest.get(age_col(source))
         labels.append(source)
-        ages.append(float(age) if isinstance(age, (int, float)) else None)
-        aged_out = not isinstance(age, (int, float)) or age > cap
-        colors.append("muted" if aged_out else f"series-{(index % 8) + 1}")
-    stale = sum(1 for age in ages if age is None or age > cap)
+        ages.append(provider_age_hours(age))
+        fresh = provider_age_is_fresh(age, cap)
+        fresh_count += int(fresh)
+        colors.append(f"series-{(index % 8) + 1}" if fresh else "muted")
+    stale = len(ages) - fresh_count
     status = "red" if stale == len(ages) else "amber" if stale else "ok"
     return Panel(
         panel_id="a3",
@@ -124,7 +130,7 @@ def _provider_ages(ctx: DashboardContext, sources: tuple[str, ...]) -> Panel:
         status=status,
         copy=PANEL_COPY["a3"],
         stats=(
-            Stat("providers fresh", f"{len(ages) - stale}/{len(ages)}", status),
+            Stat("providers fresh", f"{fresh_count}/{len(ages)}", status),
             Stat("freshness cap", f"{fmt(cap)} h"),
             Stat("snapshot", str(newest.get("issue_time", "—"))),
         ),

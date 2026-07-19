@@ -43,6 +43,7 @@ class DashboardContext:
     daily_matrix: pl.DataFrame | None = None
     synthetic_hourly: pl.DataFrame | None = None
     score_frames: Mapping[str, pl.DataFrame] = field(default_factory=dict)
+    unreadable_scores: tuple[str, ...] = ()
     history: pl.DataFrame | None = None
     latest_forecast: Forecast | None = None
     releases: tuple[Mapping[str, object], ...] = ()
@@ -73,15 +74,22 @@ def _try_json(path: Path) -> Mapping[str, object] | None:
     return loaded if isinstance(loaded, dict) else None
 
 
-def _score_frames(config: Config) -> dict[str, pl.DataFrame]:
+def _score_frames(config: Config) -> tuple[dict[str, pl.DataFrame], tuple[str, ...]]:
+    """Readable score frames, plus the stems that exist but cannot be read.
+
+    A file that is present but corrupt is *not* the same as a young archive
+    with no file at all; the second return value keeps them distinguishable
+    so zones can say "unreadable" instead of "not enough data yet".
+    """
     frames: dict[str, pl.DataFrame] = {}
+    unreadable: list[str] = []
     scores_dir = config.dataset.dir / "scores"
     for path in sorted(scores_dir.glob("scores_*.parquet")):
         try:
             frames[path.stem] = load_scores(path)
         except (OSError, MixedProvenanceError, pl.exceptions.PolarsError):
-            continue
-    return frames
+            unreadable.append(path.stem)
+    return frames, tuple(unreadable)
 
 
 def _latest_forecast(config: Config) -> Forecast | None:
@@ -180,6 +188,7 @@ def _archive_location(config: Config) -> tuple[float, float] | None:
 
 def collect_context(config: Config, *, now: datetime | None = None) -> DashboardContext:
     paths = DatasetPaths.in_dir(config.dataset.dir)
+    score_frames, unreadable_scores = _score_frames(config)
     return DashboardContext(
         config=config,
         now=now or datetime.now(tz=UTC),
@@ -193,7 +202,8 @@ def collect_context(config: Config, *, now: datetime | None = None) -> Dashboard
         synthetic_hourly=_try_parquet(
             matrix_path(config.dataset.dir, "hourly", "synthetic")
         ),
-        score_frames=_score_frames(config),
+        score_frames=score_frames,
+        unreadable_scores=unreadable_scores,
         history=_history(config),
         latest_forecast=_latest_forecast(config),
         releases=_releases(config),

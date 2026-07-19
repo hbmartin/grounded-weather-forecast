@@ -10,7 +10,11 @@ from dataclasses import dataclass, field
 
 import polars as pl
 
-from grounded_weather_forecast.contracts import TruthSemantics, hourly_variable
+from grounded_weather_forecast.contracts import (
+    TruthSemantics,
+    finite_number,
+    hourly_variable,
+)
 from grounded_weather_forecast.dashboard.context import DashboardContext
 from grounded_weather_forecast.reports.correlation import error_correlation
 from grounded_weather_forecast.reports.leaderboard import leaderboard, slice_winners
@@ -28,9 +32,17 @@ class Derived:
     verification: pl.DataFrame = field(default_factory=pl.DataFrame)
     correlation: pl.DataFrame | None = None
     k_eff: float | None = None
+    live_scores_unusable: bool = False
+    """A live score file exists but could not be read or scored."""
 
 
 def _k_eff(correlation: pl.DataFrame) -> float | None:
+    """Effective independent-source count, or ``None`` when not evaluable.
+
+    A non-finite mean correlation must not be clamped: ``min(1.0, nan)``
+    returns ``1.0``, which would report "no independence" — the most alarming
+    possible answer — from an absence of evidence.
+    """
     sources = [column for column in correlation.columns if column != "source"]
     if len(sources) < 2:
         return None
@@ -39,12 +51,13 @@ def _k_eff(correlation: pl.DataFrame) -> float | None:
         for column_index, source in enumerate(sources):
             if column_index <= row_index:
                 continue
-            value = row[source]
-            if isinstance(value, (int, float)):
-                values.append(float(value))
+            if (value := finite_number(row[source])) is not None:
+                values.append(value)
     if not values:
         return None
-    mean_r = max(0.0, min(1.0, sum(values) / len(values)))
+    if (mean := finite_number(sum(values) / len(values))) is None:
+        return None
+    mean_r = max(0.0, min(1.0, mean))
     n = len(sources)
     return n / (1.0 + (n - 1) * mean_r)
 
@@ -53,21 +66,26 @@ def derive(ctx: DashboardContext) -> Derived:
     boards: dict[str, pl.DataFrame] = {}
     winners: dict[str, pl.DataFrame] = {}
     live_stem: str | None = None
+    # A live stem that fails to score is "unusable", not "absent" — record it
+    # before any early exit so zone F cannot mistake it for a young archive.
+    live_unusable = any("_live" in stem for stem in ctx.unreadable_scores)
     for stem, scores in ctx.score_frames.items():
+        is_live = "_live" in stem
         if scores.is_empty():
             continue
         try:
             board = leaderboard(scores)
-            boards[stem] = board
             winners[stem] = slice_winners(
                 board,
                 scores=scores,
                 rule=ctx.config.promotion.rule,
                 alpha=ctx.config.promotion.alpha,
             )
+            boards[stem] = board
         except (ValueError, pl.exceptions.PolarsError):
+            live_unusable = live_unusable or is_live
             continue
-        if "_live" in stem and live_stem is None:
+        if is_live and live_stem is None:
             live_stem = stem
 
     verification = pl.DataFrame()
@@ -87,6 +105,7 @@ def derive(ctx: DashboardContext) -> Derived:
                 verification = compare_to_backtest(live, boards[live_stem])
         except (OSError, ValueError, pl.exceptions.PolarsError):
             verification = pl.DataFrame()
+            live_unusable = True
 
     correlation: pl.DataFrame | None = None
     k_eff: float | None = None
@@ -109,4 +128,5 @@ def derive(ctx: DashboardContext) -> Derived:
         verification=verification,
         correlation=correlation,
         k_eff=k_eff,
+        live_scores_unusable=live_unusable,
     )

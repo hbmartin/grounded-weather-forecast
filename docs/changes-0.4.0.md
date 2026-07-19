@@ -28,6 +28,26 @@ renders), public `OBS_STALENESS` / `LOCATION_TOLERANCE` constants (renamed
 from private), an optional `timeout` on `storage.locked_path`, and
 `ArtifactStore.load_manifest`.
 
+Both new on-disk signals are bounded: the run ledger is pruned to the last 90
+days and 50,000 rows on each append, and observability snapshot trees left
+behind by a superseded dataset fingerprint are reclaimed after each write.
+
+Two serving-visible corrections landed alongside the dashboard:
+
+- **Ensemble features are resolved identically in training and serving.**
+  `build-dataset` filters `ensembles.parquet` to the configured
+  `[ensembles].models`/`variables`; `predict` now applies the same filter. It
+  previously loaded every stored row, so EMOS could fit its spread
+  coefficient against one predictor and apply it to another — silently
+  miscalibrating every interval when a model was retired from config.
+- **The minutely nowcast no longer steps between anchoring regimes.** When
+  the two bracketing hourly rows came from different method families the path
+  fell back to nearest-neighbour, producing a flat line with one large jump
+  and flipping the anchoring decision halfway — so the live station
+  observation was ignored for the minutes on the anchored side. The regime of
+  the row owning lead zero now governs the whole range and the path stays
+  interpolated.
+
 No existing artifact schemas changed and no migration is required: the new
 files are additive, the dashboard renders honest "not yet" states wherever
 history hasn't accumulated, and CI's lizard step now excludes the vendored

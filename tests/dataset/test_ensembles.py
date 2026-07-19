@@ -1,5 +1,6 @@
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
+from types import SimpleNamespace
 from datetime import datetime, timedelta
 from threading import Barrier
 
@@ -24,7 +25,7 @@ from grounded_weather_forecast.dataset.ensembles import (
     parse_ensemble,
 )
 from grounded_weather_forecast.dataset.matrix import (
-    _active_ensembles,
+    active_ensembles,
     build_hourly_matrix,
     to_supervised_slice,
 )
@@ -235,13 +236,13 @@ class TestEnsembleFeatures:
         stale = parse_ensemble(payload(), "retired", FETCHED, VARIABLES)
         append_ensembles(store, pl.concat([active, stale]))
 
-        assert _active_ensembles(config) is None
+        assert active_ensembles(config) is None
 
         configured = replace(
             config,
             ensembles=EnsemblesConfig(models=("gefs",), variables=("temp_c",)),
         )
-        selected = _active_ensembles(configured)
+        selected = active_ensembles(configured)
         assert selected is not None
         assert set(selected["model"]) == {"gefs"}
         assert set(selected["variable"]) == {"temp_c"}
@@ -284,3 +285,65 @@ class TestMatrixIntegration:
         assert "ens__gefs__temp_c__mean" in matrix.columns
         slice_ = to_supervised_slice(matrix, hourly_variable("temp_c"))
         assert "ens__gefs__temp_c__mean" in slice_.x.features.columns
+
+
+class TestTrainServeSymmetry:
+    """Serving must resolve the same ensemble rows the dataset build does.
+
+    EMOS resolves its spread predictor by scanning `ens__*__sd` columns at
+    call time, so if training filters retired models and serving does not,
+    the coefficient is fitted against one predictor and applied to another.
+    """
+
+    def test_build_snapshot_uses_the_configured_rows(self, tmp_path, monkeypatch):
+        import grounded_weather_forecast.serve.predict as predict
+
+        config = replace(
+            write_config(tmp_path),
+            ensembles=EnsemblesConfig(models=("gefs",), variables=("temp_c",)),
+        )
+        store = tmp_path / "data" / "ensembles.parquet"
+        append_ensembles(
+            store,
+            pl.concat(
+                [
+                    parse_ensemble(payload(), "gefs", FETCHED, VARIABLES),
+                    parse_ensemble(payload(), "retired", FETCHED, VARIABLES),
+                ]
+            ),
+        )
+
+        class Reached(Exception):
+            """Short-circuit once the argument under test has been captured."""
+
+        seen: list[pl.DataFrame | None] = []
+        empty = pl.DataFrame()
+
+        # Stub only what build_snapshot needs to reach the ensembles seam.
+        monkeypatch.setattr(
+            predict, "build_truth", lambda _config: (empty, empty, empty)
+        )
+        monkeypatch.setattr(predict, "build_observation_features", lambda _config: empty)
+        monkeypatch.setattr(
+            predict,
+            "read_forecast_archive",
+            lambda _forecasts: SimpleNamespace(
+                hourly=empty, daily=empty, minutely=empty, completions=empty
+            ),
+        )
+
+        def spy(*_args, ensembles=None, **_kwargs):
+            seen.append(ensembles)
+            raise Reached
+
+        monkeypatch.setattr(predict, "build_hourly_matrix", spy)
+        with pytest.raises(Reached):
+            predict.build_snapshot(config, issue_time=ISSUE)
+
+        assert seen, "build_hourly_matrix was never reached"
+        used = seen[0]
+        assert used is not None
+        assert set(used["model"].unique()) == {"gefs"}, (
+            "serving must apply the same [ensembles].models filter as the "
+            "dataset build, or EMOS is fitted and served on different spreads"
+        )

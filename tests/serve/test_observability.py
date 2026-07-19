@@ -107,3 +107,82 @@ def test_store_failure_is_swallowed(tmp_path, monkeypatch):
     monkeypatch.setattr(ArtifactStore, "save", boom)
     snap(config, fitted(), "grounded_equal_weight")
     assert load_observability_states(config.artifacts_dir) == ()
+
+
+class TestSnapshotsNeverAffectServing:
+    """The module docstring promises snapshots never raise. Hold it to that."""
+
+    class Exploding:
+        """A fitted blender whose state extraction fails at snapshot time.
+
+        Models e.g. LightGBM's own error type, which subclasses Exception
+        directly and so escapes any narrow tuple of exception classes.
+        """
+
+        method_id = "gbm"
+
+        def observability_state(self):
+            raise RuntimeError("booster is unusable")
+
+    def test_a_failing_blender_does_not_propagate(self, tmp_path):
+        from grounded_weather_forecast.serve.observability import (
+            snapshot_observability,
+        )
+        from conftest import write_config
+
+        config = write_config(tmp_path)
+        snapshot_observability(
+            self.Exploding(),
+            method_id="gbm",
+            product="hourly",
+            variable="temp_c",
+            config=config,
+            issue_time=datetime(2026, 7, 19, tzinfo=UTC),
+        )  # must not raise
+
+    def test_keyboard_interrupt_still_propagates(self, tmp_path):
+        import pytest
+
+        from grounded_weather_forecast.serve.observability import (
+            snapshot_observability,
+        )
+        from conftest import write_config
+
+        class Interrupting:
+            method_id = "gbm"
+
+            def observability_state(self):
+                raise KeyboardInterrupt
+
+        with pytest.raises(KeyboardInterrupt):
+            snapshot_observability(
+                Interrupting(),
+                method_id="gbm",
+                product="hourly",
+                variable="temp_c",
+                config=write_config(tmp_path),
+                issue_time=datetime(2026, 7, 19, tzinfo=UTC),
+            )
+
+
+def test_superseded_fingerprint_trees_are_reclaimed(tmp_path, monkeypatch):
+    """The dataset fingerprint changes on every rebuild; old trees are dead.
+
+    Only `latest.json` is ever read back, so an unreferenced fingerprint tree
+    is pure disk leak — one per (method x product x variable) per rebuild.
+    """
+    import grounded_weather_forecast.serve.observability as observability
+
+    config = write_config(tmp_path)
+    blender = fitted()
+    for fingerprint in ("aaaa1111", "bbbb2222", "cccc3333"):
+        monkeypatch.setattr(
+            observability, "dataset_fingerprint", lambda _config, f=fingerprint: f
+        )
+        snap(config, blender, "grounded_equal_weight")
+
+    root = observability_root(config)
+    trees = sorted(child.name for child in root.iterdir() if child.is_dir())
+    assert trees == ["cccc3333"], "superseded fingerprint trees must be removed"
+    # The surviving snapshot is still readable.
+    assert len(load_observability_states(config.artifacts_dir)) == 1

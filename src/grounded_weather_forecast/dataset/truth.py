@@ -284,5 +284,6 @@ def truth_daily(minute: pl.DataFrame, config: Config) -> pl.DataFrame:
             "t__precip_sum_mm",
             "t__pop",
             "coverage_frac",
+            "rain_coverage",
         )
     )

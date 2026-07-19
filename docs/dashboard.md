@@ -33,7 +33,10 @@ cap silently drops out of snapshots — it is drawn grey, not omitted.
 (out-of-bounds / spike / flatline; flagged samples are nulled, never
 corrected), a daily truth-coverage calendar against
 `[dataset].min_hour_coverage`, per-provider forecast null shares, and the
-live/synthetic provenance wall asserted as a badge.
+live/synthetic provenance wall asserted as a badge. The panel verdict reads
+both the *current* flatline state and the overall flagged share (amber past
+5%, red past 25%), so a channel that is wholly out-of-bounds cannot render
+green on the strength of having no stuck sensor.
 
 **C — Learning readiness.** Archive issue-time span versus the
 `initial_train_days + step_days` a first rolling-origin fold needs (a
@@ -61,9 +64,14 @@ its weight curve, and best_provider's per-bucket source rankings.
 **F — Serving & self-verification.** Served-vs-realized MAE per slice with
 the `mae_gap` against the backtest's promise (red past
 `[promotion].live_gap_factor`), served slices per day stacked by selection
-reason with the degraded share, and the release lineage table — dataset
-fingerprint → evaluations → release → served documents — with stale
-fingerprints flagged.
+reason, and the release lineage table — dataset fingerprint → evaluations →
+release → served documents — with stale fingerprints flagged. The degraded
+share is judged on the trailing day (amber past 10%, red past 50%) with the
+lifetime share shown beside it: a lifetime figure alone is diluted by every
+healthy row ever served, so a currently-degraded system would read green once
+enough history accumulated. When a live score file exists but cannot be read
+or scored, the verification panel says so in red rather than reporting the
+young-archive "not enough realized forecasts" message.
 
 **G — Explainability.** Pick any point/variable of the latest served
 document and see the method that produced it, its selection reason, release
@@ -86,6 +94,7 @@ constant — the alerting invents no policy:
 | serving refused | `NoForecastDataError` via the runs ledger |
 | serving degraded | `Forecast.status_reason` (`no_evidence_reason`) |
 | truth thinning | `[dataset].min_hour_coverage` / `min_day_coverage` |
+| truth coverage unusable | coverage columns present but wholly null/NaN (red) |
 | stuck sensor | `QC_FLATLINE` bit; `[qc].flatline_minutes` |
 | provider drifting | `artifacts/drift.json` (consensus/residual tiers) |
 | grounding bias | `reports/leaderboard.py::CONSUMER_TOLERANCES` |
@@ -97,6 +106,15 @@ constant — the alerting invents no policy:
 
 Families that cannot be evaluated yet return a single *not evaluable yet*
 info chip instead of silence or a false alarm.
+
+Evidence that is *present but degenerate* is treated as a failure, never as
+health. Every numeric guard goes through `contracts.finite_number`, because
+`isinstance(x, (int, float))` admits `NaN` and every `NaN` comparison is
+`False` — so a raw check silently renders a dead provider, an empty coverage
+column, or a corrupt archive location as passing. `k_eff` likewise reports
+*not evaluable* rather than clamping a `NaN` mean to `1.0`, which would
+claim "no independence" — the most alarming possible reading — from an
+absence of evidence.
 
 ## What a young deployment looks like
 
@@ -111,17 +129,23 @@ nothing is actually flowing.
 
 ## New on-disk signals
 
-- `[dataset].dir/runs.parquet` — append-only ledger of every command whose
+- `[dataset].dir/runs.parquet` — rolling ledger of every command whose
   configuration loads successfully: command, args, start/end, duration, exit
   code or exception name, dataset/config fingerprints, code version. Parser
   and configuration-loading failures cannot be recorded because that
   configuration supplies the ledger destination. Telemetry writes never fail
-  a command (5-second lock timeout, errors swallowed).
+  a command (5-second lock timeout, errors swallowed). The file is rewritten
+  in full under that lock, so it is pruned on every append to the last 90 days
+  and 50,000 rows — without a bound it would grow forever at the 10-minute
+  `predict` cadence in [Scheduling](scheduling.md).
 - `[artifacts].dir/observability/` — per-(method, product, variable)
   latest-state snapshots (`ArtifactStore` layout) plus
   `history.parquet`, an ewa/boa-only weight trajectory pruned to
   `[backtest].rolling_window_days`. Write-only: serving output is identical
-  whether snapshots land or not.
+  whether snapshots land or not. The dataset fingerprint changes on every
+  `build-dataset`, so snapshot trees no longer referenced by `latest.json`
+  are deleted after each successful write; only `latest.json` is ever read
+  back, so nothing reachable is removed.
 
 ## Updating the vendored Chart.js
 

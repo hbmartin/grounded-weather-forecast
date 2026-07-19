@@ -4,6 +4,7 @@ This module and ``leads`` are the only modules other packages may deep-import fr
 Blenders import contracts only, never the dataset layer.
 """
 
+import math
 from dataclasses import dataclass
 from enum import StrEnum
 from itertools import pairwise
@@ -159,6 +160,33 @@ def fxd_col(source: str, variable: str) -> str:
 def age_col(source: str) -> str:
     """Hours-since-fetch column for one source."""
     return f"age{COLUMN_SEPARATOR}{source}"
+
+
+def finite_number(value: object) -> float | None:
+    """A real, finite number, or ``None`` for missing/non-numeric/NaN/inf.
+
+    The single numeric guard for operator-facing evidence. ``isinstance``
+    admits ``NaN`` (and ``bool``), and every ``NaN`` comparison is ``False``,
+    so a raw ``isinstance`` check silently renders a broken signal as healthy.
+    """
+    match value:
+        case bool():
+            return None
+        case int() | float():
+            number = float(value)
+            return number if math.isfinite(number) else None
+        case _:
+            return None
+
+
+def provider_age_hours(value: object) -> float | None:
+    """Normalize a finite provider age; missing and invalid values become ``None``."""
+    return finite_number(value)
+
+
+def provider_age_is_fresh(value: object, cap_hours: float) -> bool:
+    """Whether a provider age is finite and strictly inside the serving cap."""
+    return (hours := provider_age_hours(value)) is not None and hours < cap_hours
 
 
 def obs_col(variable: str) -> str:

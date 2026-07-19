@@ -113,7 +113,7 @@ grounded-weather-forecast truth-qc                      # --days 30
 #    absolute error, consumer %-within-3F), the provider error-correlation
 #    matrix, and self-verification of forecasts this system actually served.
 #    Also writes reports/dashboard.html — a fully offline, self-contained
-#    operator console (seven zones: freshness, data trust, learning
+#    operator console (seven zones: liveness, data trust, learning
 #    readiness, evaluation, model internals, serving, explainability) with
 #    threshold alerts sourced from the existing config knobs.
 grounded-weather-forecast report
@@ -130,13 +130,16 @@ grounded-weather-forecast predict --out forecast.json
 
 Every command takes `--config <path>` (default `config.toml`). Once that
 configuration loads successfully, the invocation appends one row to
-`[dataset].dir/runs.parquet` — an append-only ledger (command, timing, exit
+`[dataset].dir/runs.parquet` — a rolling ledger (command, timing, exit
 status, dataset/config fingerprints) that the dashboard renders as the pipeline
-heartbeat. Parser and configuration-loading failures cannot be recorded because
-the ledger destination comes from that configuration. Each `predict` run additionally
-snapshots the fitted models' internals (grounding coefficients, expert
-weights, GBM importances, anchoring decay) into `[artifacts].dir/observability/`
-for the dashboard's glass-box zone; snapshot failures never affect serving.
+heartbeat, kept to the last 90 days and 50,000 rows so it stays bounded under a
+scheduled cadence. Parser and configuration-loading failures cannot be recorded
+because the ledger destination comes from that configuration. Each `predict` run
+additionally snapshots the fitted models' internals (grounding coefficients,
+expert weights, GBM importances, anchoring decay) into
+`[artifacts].dir/observability/` for the dashboard's glass-box zone, reclaiming
+snapshot trees superseded by a newer dataset fingerprint; snapshot failures
+never affect serving.
 
 ## Status
 
@@ -174,7 +177,7 @@ uv run ruff check src --fix && uv run ruff format src tests
 uvx --from semgrep==1.170.0 semgrep scan --test --config semgrep/provider-qc.yml semgrep/tests/provider_qc_grouping.py
 uvx --from semgrep==1.170.0 semgrep scan --metrics=off --error --config semgrep/provider-qc.yml src/grounded_weather_forecast/dataset/matrix.py
 uv run pyrefly check src && uv run ty check src
-uv run lizard -Eduplicate -C 27 src
+uv run lizard -Eduplicate -C 27 -x "*/dashboard/assets/*" src
 uv run pytest tests/ --cov=src --cov-report=term-missing
 ```
 

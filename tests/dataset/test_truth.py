@@ -234,3 +234,5 @@ class TestTruthDaily:
         )
         assert row["t__precip_sum_mm"] == pytest.approx(2.5)
         assert row["t__pop"] == 1.0
+        assert row["coverage_frac"] == pytest.approx(120 / 1440)
+        assert row["rain_coverage"] == pytest.approx(120 / 1440)

@@ -78,6 +78,36 @@ class TestArtifactStore:
                 variable="temp_c",
             )
 
+    @pytest.mark.parametrize(
+        ("filename", "loader_name", "kind"),
+        [
+            ("state.json", "load_state", "state"),
+            ("manifest.json", "load_manifest", "manifest"),
+        ],
+    )
+    @pytest.mark.parametrize("payload", [b"{", b"\xff"])
+    def test_corrupt_json_is_wrapped(
+        self, tmp_path, filename, loader_name, kind, payload
+    ):
+        store = ArtifactStore(root=tmp_path / "artifacts")
+        slot = store.save(
+            fingerprint="abc123",
+            method_id="gbm",
+            product="hourly",
+            variable="temp_c",
+            state={},
+        )
+        (slot / filename).write_bytes(payload)
+
+        loader = getattr(store, loader_name)
+        with pytest.raises(ArtifactError, match=f"corrupt artifact {kind}"):
+            loader(
+                fingerprint="abc123",
+                method_id="gbm",
+                product="hourly",
+                variable="temp_c",
+            )
+
     def test_empty_latest(self, tmp_path):
         assert ArtifactStore(root=tmp_path / "nothing").read_latest() == {}
 
