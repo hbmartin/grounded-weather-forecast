@@ -165,6 +165,32 @@ class TestLeaderboard:
         mature = leaderboard(probabilistic_scores(50)).row(0, named=True)
         assert mature["pit_chi2_p"] is not None
 
+    def test_nominal_coverage_requires_exact_probability_levels(self):
+        start = utc(2026, 3, 1)
+        n = 8
+        scores = pl.DataFrame(
+            {
+                "product": ["hourly"] * n,
+                "variable": ["temp_c"] * n,
+                "lead_bucket": ["1-3h"] * n,
+                "method_id": ["distribution"] * n,
+                "issue_time": [start + timedelta(hours=i) for i in range(n)],
+                "valid_time": [start + timedelta(hours=i + 1) for i in range(n)],
+                "lead_hours": [1.0] * n,
+                "y_pred": [0.0] * n,
+                "y_true": [0.0] * n,
+                "quantile_levels_json": [json.dumps((0.2, 0.5, 0.8))] * n,
+                "quantiles_json": [json.dumps((-1.0, 0.0, 1.0))] * n,
+            }
+        )
+
+        row = leaderboard(scores).row(0, named=True)
+
+        assert row["crps"] is not None
+        assert row["coverage80"] is None
+        assert row["coverage90"] is None
+        assert row["sharpness"] is None
+
 
 class TestDmCollapsesPseudoReplication:
     """Dozens of snapshots forecasting the same valid hour must not

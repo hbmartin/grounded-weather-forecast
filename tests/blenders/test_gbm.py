@@ -71,3 +71,14 @@ class TestGbmStacker:
         assert "lead_hours" in names
         assert "source_spread" in names
         assert "n_available" in names
+
+
+def test_observability_state_is_compact():
+    matrix = hour_dependent_bias_matrix()
+    train = to_supervised_slice(matrix, TEMP)
+    state = get_factory("gbm")().fit(train).observability_state()
+    assert "model" not in state
+    assert state["num_trees"] > 0
+    assert set(state["importance_gain"]) == set(state["feature_names"])
+    assert set(state["importance_split"]) == set(state["feature_names"])
+    assert "src__alpha" in state["feature_names"]

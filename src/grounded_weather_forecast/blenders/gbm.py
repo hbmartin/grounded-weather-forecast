@@ -125,6 +125,25 @@ class GbmStacker:
             "variable": self._variable.name if self._variable else None,
         }
 
+    def observability_state(self) -> dict[str, Any]:
+        """Compact glass-box state: importances only, never the booster."""
+        gain = self._booster.feature_importance(importance_type="gain")
+        split = self._booster.feature_importance(importance_type="split")
+        return {
+            "variable": self._variable.name if self._variable else None,
+            "kind": self._kind.value,
+            "num_trees": int(self._booster.num_trees()),
+            "feature_names": list(self._feature_names),
+            "importance_gain": {
+                name: float(value)
+                for name, value in zip(self._feature_names, gain, strict=True)
+            },
+            "importance_split": {
+                name: int(value)
+                for name, value in zip(self._feature_names, split, strict=True)
+            },
+        }
+
     @classmethod
     def from_state(cls, state: dict[str, Any]) -> "GbmStacker":
         lightgbm = import_module("lightgbm")

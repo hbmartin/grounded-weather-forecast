@@ -96,9 +96,10 @@ migration step 3.
    keys. Consumers reading `artifacts/alignment.json` should ignore unknown
    keys (additive change).
 
-10. **Nothing about serving changed.** `predict` output schema, degraded-mode
-   behavior, history append, and release identity hashing are untouched.
-   Python API: if you imported `InverseMseWeights` from
+10. **The serving JSON schema remains compatible.** The document shape and
+   existing field meanings are unchanged. Selection now includes release-scoped
+   live-MAE demotion, and fitted/minutely anchoring behavior changed as described
+   below. Python API: if you imported `InverseMseWeights` from
    `grounded_weather_forecast.blenders.combine`, it is now
    `InverseErrorWeights` (registry ids unchanged).
 
@@ -293,7 +294,7 @@ section and `ingest-ensembles` command, additive matrix feature columns
 scoring-semantics changes that alter reported numbers; one Python-API rename
 (`InverseMseWeights` → `InverseErrorWeights`). No serve JSON schema breaks.
 
-### 12. The remaining program (M6–M12), briefly
+### 12. Implementation summary (M6–M12)
 
 - **M6** `backfill --provider dynamical`: free keyless Zarr archives of FULL
   GEFS/AIFS-ENS cycles at native 3–6 h steps populate the 0–24 h lead buckets

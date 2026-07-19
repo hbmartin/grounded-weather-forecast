@@ -1,0 +1,1 @@
+src/grounded_weather_forecast/dashboard/assets/chart.umd.min.js:(anonymous)  # vendored Chart.js bundle

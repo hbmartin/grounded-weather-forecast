@@ -23,31 +23,40 @@ backtesting or serving methods that consume ensemble features.
 
 ## Installing
 
-1. Copy a template into `~/Library/LaunchAgents/` and fill the
-   `__PLACEHOLDERS__` (repo path, log directory, coordinates, output path,
-   Synoptic token). Keep the label matching the filename.
+1. Copy all four templates into `~/Library/LaunchAgents/` and fill their
+   `__PLACEHOLDERS__` (repository paths, log directory, coordinates, output
+   path, forecast database, and Synoptic token). Keep each label matching its
+   filename.
 
    ```bash
    mkdir -p ~/Library/LaunchAgents ~/.local/state/grounded-weather-forecast
-   cp docs/launchd/com.grounded-weather-forecast.predict.plist ~/Library/LaunchAgents/
-   $EDITOR ~/Library/LaunchAgents/com.grounded-weather-forecast.predict.plist
+   for job in poll ingest-ensembles predict maintain; do
+     cp "docs/launchd/com.grounded-weather-forecast.${job}.plist" ~/Library/LaunchAgents/
+     "$EDITOR" "$HOME/Library/LaunchAgents/com.grounded-weather-forecast.${job}.plist"
+   done
    ```
 
-2. Load it (modern launchctl syntax):
+2. Load and start every job (modern launchctl syntax):
 
    ```bash
-   launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.grounded-weather-forecast.predict.plist
-   launchctl kickstart -k gui/$(id -u)/com.grounded-weather-forecast.predict   # run once now
+   for job in poll ingest-ensembles predict maintain; do
+     launchctl bootstrap "gui/$(id -u)" "$HOME/Library/LaunchAgents/com.grounded-weather-forecast.${job}.plist"
+     launchctl kickstart -k "gui/$(id -u)/com.grounded-weather-forecast.${job}"
+   done
    ```
 
 3. Verify and watch:
 
    ```bash
-   launchctl print gui/$(id -u)/com.grounded-weather-forecast.predict | head
+   for job in poll ingest-ensembles predict maintain; do
+     launchctl print "gui/$(id -u)/com.grounded-weather-forecast.${job}" | head
+   done
    tail -f __LOG_DIR__/predict.log
    ```
 
-   To unload: `launchctl bootout gui/$(id -u)/com.grounded-weather-forecast.predict`.
+   To unload one job, run
+   `launchctl bootout "gui/$(id -u)/com.grounded-weather-forecast.predict"`;
+   substitute any of the other three labels as needed.
 
 ## Notes
 

@@ -65,6 +65,10 @@ class GroundedEqualWeight:
         point = masked_average(corrected, x.availability)
         return BlendResult(point=finalize_point(point, self._kind, self._variable))
 
+    def to_state(self) -> dict[str, object]:
+        """Compact observability state: the fitted grounding coefficients."""
+        return {"method_id": self.method_id, "grounding": self._grounding.to_state()}
+
 
 @dataclass
 class InverseErrorWeights:
@@ -122,6 +126,20 @@ class InverseErrorWeights:
 
         self._fitted.apply(x.lead_hours, use)
         return BlendResult(point=finalize_point(point, self._kind, self._variable))
+
+    def to_state(self) -> dict[str, object]:
+        """Compact observability state: grounding plus per-bucket weights."""
+        return {
+            "method_id": self.method_id,
+            "grounding": self._grounding.to_state(),
+            "weights": {
+                "global": self._fitted.global_state.tolist(),
+                "buckets": {
+                    label: weights.tolist()
+                    for label, weights in self._fitted.states.items()
+                },
+            },
+        }
 
 
 def _affine_equal_weight() -> GroundedEqualWeight:

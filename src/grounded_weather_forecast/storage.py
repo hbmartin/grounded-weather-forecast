@@ -10,11 +10,15 @@ from filelock import FileLock
 
 
 @contextmanager
-def locked_path(path: Path) -> Iterator[None]:
-    """Hold the sidecar lock for ``path`` across a read-modify-write cycle."""
+def locked_path(path: Path, timeout: float = -1) -> Iterator[None]:
+    """Hold the sidecar lock for ``path`` across a read-modify-write cycle.
+
+    A negative ``timeout`` blocks forever; telemetry writers pass a finite
+    timeout so they can drop a row instead of stalling the command.
+    """
     lock_path = path.with_suffix(f"{path.suffix}.lock")
     lock_path.parent.mkdir(parents=True, exist_ok=True)
-    with FileLock(lock_path):
+    with FileLock(lock_path, timeout=timeout):
         yield
 
 

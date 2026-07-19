@@ -3,10 +3,13 @@ import sqlite3
 from datetime import date
 
 import polars as pl
+import pytest
 from conftest import make_station_db, write_config
 
+from grounded_weather_forecast import __version__
 from grounded_weather_forecast.cli import build_parser, main
 from grounded_weather_forecast.dataset.neighbors import NeighborChecks
+from grounded_weather_forecast.runs import load_runs
 from grounded_weather_forecast.serve.predict import UnsupportedMethodError
 
 
@@ -137,3 +140,105 @@ def test_predict_reports_unsupported_method_without_traceback(
 
     assert code == 1
     assert "cannot predict: method 'persistence'" in capsys.readouterr().out
+
+
+def test_ensemble_store_failure_is_an_actionable_cli_error(
+    tmp_path, capsys, monkeypatch
+):
+    write_config(tmp_path)
+    monkeypatch.setattr(
+        "grounded_weather_forecast.dataset.ensembles.ingest_ensembles",
+        lambda _config: pl.DataFrame({"model": ["gefs"]}),
+    )
+
+    def fail_append(_path, _fresh):
+        raise OSError("disk full")
+
+    monkeypatch.setattr(
+        "grounded_weather_forecast.dataset.ensembles.append_ensembles",
+        fail_append,
+    )
+
+    code = main(["--config", str(tmp_path / "config.toml"), "ingest-ensembles"])
+
+    assert code == 1
+    assert "ensemble ingest failed: disk full" in capsys.readouterr().out
+
+
+class TestRunLedger:
+    def test_successful_run_is_recorded(self, tmp_path):
+        config = write_config(tmp_path)
+        make_station_db(
+            tmp_path / "station.db",
+            [
+                ("2026-07-13 19:21:03", {"outTemp": 70.0, "outHumi": 50.0}),
+                ("2026-07-13 19:22:03", {"outTemp": 71.0, "outHumi": 51.0}),
+            ],
+        )
+        code = main(["--config", str(tmp_path / "config.toml"), "qc"])
+        assert code == 0
+        frame = load_runs(config.dataset.dir / "runs.parquet")
+        assert frame.height == 1
+        row = frame.row(0, named=True)
+        assert row["command"] == "qc"
+        assert row["exit_code"] == 0
+        assert row["error"] is None
+        assert row["dataset_fingerprint"] == "unknown"
+        assert row["code_version"] == __version__
+        assert row["duration_ms"] >= 0
+
+    def test_config_error_has_no_configured_ledger_destination(self, tmp_path):
+        (tmp_path / "config.toml").write_text("[station]\n", encoding="utf-8")
+        code = main(["--config", str(tmp_path / "config.toml"), "qc"])
+        assert code == 2
+        assert not (tmp_path / "data" / "runs.parquet").exists()
+
+    def test_raised_command_is_recorded_and_propagates(self, tmp_path, monkeypatch):
+        config = write_config(tmp_path)
+
+        def interrupt(_config):
+            raise KeyboardInterrupt
+
+        monkeypatch.setattr("grounded_weather_forecast.cli._cmd_qc", interrupt)
+        with pytest.raises(KeyboardInterrupt):
+            main(["--config", str(tmp_path / "config.toml"), "qc"])
+        row = load_runs(config.dataset.dir / "runs.parquet").row(0, named=True)
+        assert row["error"] == "KeyboardInterrupt"
+        assert row["exit_code"] is None
+
+    def test_fingerprint_captured_from_manifest(self, tmp_path):
+        config = write_config(tmp_path)
+        make_station_db(
+            tmp_path / "station.db",
+            [("2026-07-13 19:21:03", {"outTemp": 70.0, "outHumi": 50.0})],
+        )
+        config.dataset.dir.mkdir(parents=True, exist_ok=True)
+        (config.dataset.dir / "manifest.json").write_text(
+            json.dumps({"fingerprint": "feedface00000000"}), encoding="utf-8"
+        )
+        main(["--config", str(tmp_path / "config.toml"), "qc"])
+        row = load_runs(config.dataset.dir / "runs.parquet").row(0, named=True)
+        assert row["dataset_fingerprint"] == "feedface00000000"
+        assert row["config_fingerprint"] not in ("", "unknown")
+
+    def test_unexpected_telemetry_error_does_not_break_command(
+        self, tmp_path, monkeypatch
+    ):
+        write_config(tmp_path)
+        make_station_db(
+            tmp_path / "station.db",
+            [
+                ("2026-07-13 19:21:03", {"outTemp": 70.0, "outHumi": 50.0}),
+                ("2026-07-13 19:22:03", {"outTemp": 71.0, "outHumi": 51.0}),
+            ],
+        )
+
+        def fail_run_id(_command, _started_at):
+            raise RuntimeError("unexpected telemetry bug")
+
+        monkeypatch.setattr(
+            "grounded_weather_forecast.runs.run_id_for",
+            fail_run_id,
+        )
+
+        assert main(["--config", str(tmp_path / "config.toml"), "qc"]) == 0

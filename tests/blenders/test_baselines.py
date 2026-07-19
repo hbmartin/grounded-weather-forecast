@@ -135,6 +135,18 @@ class TestBestProvider:
         result = get_factory("best_provider")().fit(s).predict(s.x)
         np.testing.assert_allclose(result.point, good)
 
+    def test_to_state_ranks_sources_by_name(self):
+        rng = np.random.default_rng(0)
+        y = rng.normal(size=200)
+        good = y + rng.normal(0, 0.1, 200)
+        bad = y + 5.0
+        s = make_slice(np.column_stack([bad, good]), y)
+        state = get_factory("best_provider")().fit(s).to_state()
+        assert state["sources"] == ["s0", "s1"]
+        assert state["global"] == ["s1", "s0"]
+        for names in state["buckets"].values():
+            assert sorted(names) == ["s0", "s1"]
+
     def test_falls_back_when_best_unavailable(self):
         y = np.zeros(50)
         good = y.copy()

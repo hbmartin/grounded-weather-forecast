@@ -180,6 +180,17 @@ class OnlineExperts:
         corrections or retention changes; callers then discard the state and
         replay rather than silently combining incompatible histories.
         """
+        if self._sources and self._sources != train.x.sources:
+            msg = "expert source order changed; full replay required"
+            raise ValueError(msg)
+        resolution, _ = self._row_times(train.x)
+        if self._progress and (
+            not resolution.size
+            or max(progress.resolution_us for progress in self._progress.values())
+            > int(resolution.max())
+        ):
+            msg = "expert state extends beyond the causal training history"
+            raise ValueError(msg)
         self._kind = train.variable.kind
         self._variable = train.variable
         self._grounding = AffineGrounding().fit(train)
@@ -204,7 +215,9 @@ class OnlineExperts:
         issue = cls._time_us(x, "issue_time")
         if issue is None:
             issue = np.arange(x.n_rows, dtype=np.int64)
-        resolution = cls._time_us(x, "valid_time")
+        resolution = cls._time_us(x, "truth_known_at")
+        if resolution is None:
+            resolution = cls._time_us(x, "valid_time")
         if resolution is None:
             resolution = cls._time_us(x, "forecast_date")
         if resolution is None:
@@ -380,6 +393,12 @@ class OnlineExperts:
             },
             "grounding": self._grounding.to_state(),
         }
+
+    def observability_state(self) -> dict[str, object]:
+        """``to_state`` without replay cursors: the dashboard-facing view."""
+        state = self.to_state()
+        state.pop("progress", None)
+        return state
 
     @classmethod
     def from_state(cls, state: dict[str, object], method_id: str) -> "OnlineExperts":

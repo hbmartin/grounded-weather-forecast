@@ -41,24 +41,27 @@ _RIDGE = 1.0
 _MIN_FIT_ROWS = 48
 
 
-def _phase_design(x: ForecastMatrix) -> FloatArray:
-    """Design matrix from whichever deterministic phase features exist.
+def _phase_design(x: ForecastMatrix) -> tuple[FloatArray, tuple[str, ...]]:
+    """Design matrix and its semantic column identity.
 
     Degrades gracefully: without any context columns it is a lone intercept,
     i.e. exactly the scalar bias-only correction.
     """
     columns: list[FloatArray] = [np.ones(x.n_rows)]
+    names = ["intercept"]
     features = x.features
     if "solar_elevation_deg" in features.columns:
         sin_elevation = np.sin(
             np.deg2rad(features["solar_elevation_deg"].cast(float).to_numpy())
         )
         columns += [sin_elevation, sin_elevation**2]
+        names += ["sin_solar_elevation", "sin_solar_elevation_squared"]
     elif {"hour_sin", "hour_cos"} <= set(features.columns):
         columns += [
             features["hour_sin"].cast(float).to_numpy(),
             features["hour_cos"].cast(float).to_numpy(),
         ]
+        names += ["hour_sin", "hour_cos"]
     if {"doy_sin", "doy_cos"} <= set(features.columns):
         doy_sin = features["doy_sin"].cast(float).to_numpy()
         doy_cos = features["doy_cos"].cast(float).to_numpy()
@@ -68,7 +71,8 @@ def _phase_design(x: ForecastMatrix) -> FloatArray:
             2.0 * doy_sin * doy_cos,  # semiannual sin
             doy_cos**2 - doy_sin**2,  # semiannual cos
         ]
-    return np.column_stack(columns)
+        names += ["doy_sin", "doy_cos", "semiannual_sin", "semiannual_cos"]
+    return np.column_stack(columns), tuple(names)
 
 
 def _ridge_fit(design: FloatArray, residual: FloatArray) -> FloatArray:
@@ -86,11 +90,10 @@ class HarmonicGrounding:
     """Per-(source, lead bucket) phase-dependent bias curves."""
 
     _by_source: dict[str, FittedBuckets[FloatArray]] = field(default_factory=dict)
-    _n_columns: int = 1
+    _feature_names: tuple[str, ...] = ("intercept",)
 
     def fit(self, train: SupervisedSlice) -> Self:
-        design = _phase_design(train.x)
-        self._n_columns = design.shape[1]
+        design, self._feature_names = _phase_design(train.x)
         buckets = buckets_for_product(train.x.product)
         residuals = train.y[:, np.newaxis] - train.x.values
         for index, source in enumerate(train.x.sources):
@@ -109,7 +112,9 @@ class HarmonicGrounding:
 
     def transform(self, x: ForecastMatrix) -> FloatArray:
         corrected = x.values.copy()
-        design = _phase_design(x)
+        design, feature_names = _phase_design(x)
+        if feature_names != self._feature_names:
+            return corrected
         for index, source in enumerate(x.sources):
             fitted = self._by_source.get(source)
             if fitted is None:

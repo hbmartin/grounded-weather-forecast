@@ -7,6 +7,7 @@ from grounded_weather_forecast.dataset.providers import (
     read_forecast_archive,
     read_daily_long,
     read_hourly_long,
+    read_latest_archive_location,
     read_minutely_long,
     read_run_completions,
     source_slug,
@@ -251,3 +252,19 @@ class TestRunCompletions:
         completions = read_run_completions(la_config.forecasts)
         assert completions.height == 1
         assert completions["completed_at"][0] == utc(2026, 3, 22, 12, 0, 30)
+
+
+def test_latest_archive_location_is_not_station_filtered(tmp_path, la_config):
+    make_forecast_db(
+        tmp_path / "fx.sqlite",
+        [
+            {
+                "completed_at": "2026-03-22T12:00:30+00:00",
+                "latitude": 35.0,
+                "longitude": -118.0,
+                "results": [],
+            }
+        ],
+    )
+
+    assert read_latest_archive_location(la_config.forecasts) == (35.0, -118.0)

@@ -295,6 +295,18 @@ compatible evidence uses the fit-free `equal_weight` fallback, marks the documen
 Every emitted value carries the `method_id` that produced it. When someone asks
 "why is the 6 a.m. temperature 12 °C", the answer is in the document.
 
+Serving is also instrumented without being observable-in-band: every command
+that successfully loads its configuration appends to the `runs.parquet` ledger,
+and each fitted blender's
+compact internals are snapshotted to `artifacts/observability/`
+(write-only, failures swallowed). The `dashboard/` package renders both —
+plus every other on-disk artifact — into the self-contained
+`reports/dashboard.html` operator console on each `report` run; see
+[Operator Dashboard](dashboard.md).
+
+Parser and configuration-loading failures cannot be recorded because that
+configuration supplies the ledger destination.
+
 ---
 
 ## 8. Library choices

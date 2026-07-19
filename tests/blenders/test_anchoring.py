@@ -4,6 +4,7 @@ import pytest
 from conftest import synthetic_hourly_matrix
 
 from grounded_weather_forecast.blenders import get_factory
+from grounded_weather_forecast.blenders.anchoring import TAU_GRID_HOURS
 from grounded_weather_forecast.contracts import ForecastMatrix, hourly_variable
 from grounded_weather_forecast.dataset.matrix import to_supervised_slice
 from grounded_weather_forecast.metrics.deterministic import mae
@@ -155,3 +156,33 @@ class TestAnchoredEmpirical:
         fitted_mae = mae(fitted.predict(train.x).point, train.y)
         trend_mae = mae(trend.predict(train.x).point, train.y)
         assert trend_mae <= 1.1 * fitted_mae
+
+    def test_trend_fit_uses_finite_subset(self):
+        anchored = get_factory("anchored_trend_grounded")()
+        lead = np.full(30, 0.5)
+        residuals = np.ones(30)
+        trend = np.linspace(-1.0, 1.0, 30)
+        errors = residuals + 2.0 * trend
+        trend[:5] = np.nan
+
+        anchored._fit_bins(lead, residuals, errors, trend)
+
+        assert anchored._trend_weights is not None
+        assert anchored._trend_weights[0] == pytest.approx(2.0)
+
+
+def test_anchored_to_state_reports_fitted_tau():
+    matrix = matrix_with_persistent_residual()
+    train = to_supervised_slice(matrix, TEMP)
+    state = get_factory("anchored_grounded_equal_weight")().fit(train).to_state()
+    assert state["tau_hours"] is None or state["tau_hours"] in TAU_GRID_HOURS
+    assert state["base_method_id"] == "grounded_equal_weight"
+    assert state["tau_grid_hours"] == list(TAU_GRID_HOURS)
+
+
+def test_anchored_empirical_to_state_reports_weight_curve():
+    train = to_supervised_slice(matrix_with_persistent_residual(), TEMP)
+    state = get_factory("anchored_fitted_grounded")().fit(train).to_state()
+    assert state["use_trend"] is False
+    assert state["base_method_id"] == "grounded_equal_weight"
+    assert len(state["residual_weights"]) == len(state["bin_edges"]) - 1

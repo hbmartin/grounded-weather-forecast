@@ -36,7 +36,7 @@ DAILY_COLUMN_MAP: Mapping[str, str] = {
 }
 
 _SECONDS_PER_HOUR = 3600.0
-_LOCATION_TOLERANCE = 1e-4
+LOCATION_TOLERANCE = 1e-4
 
 
 @dataclass(frozen=True, slots=True)
@@ -101,9 +101,9 @@ def _fetch_points(
         query,
         (
             forecasts.latitude,
-            _LOCATION_TOLERANCE,
+            LOCATION_TOLERANCE,
             forecasts.longitude,
-            _LOCATION_TOLERANCE,
+            LOCATION_TOLERANCE,
         ),
     ).fetchall()
 
@@ -300,9 +300,9 @@ def _read_run_completions(
         "AND ABS(latitude - ?) <= ? AND ABS(longitude - ?) <= ?",
         (
             forecasts.latitude,
-            _LOCATION_TOLERANCE,
+            LOCATION_TOLERANCE,
             forecasts.longitude,
-            _LOCATION_TOLERANCE,
+            LOCATION_TOLERANCE,
         ),
     ).fetchall()
     raw = pl.DataFrame(rows, schema={"completed_at_raw": pl.String()}, orient="row")
@@ -323,6 +323,38 @@ def read_run_completions(forecasts: ForecastsConfig) -> pl.DataFrame:
         return _read_run_completions(connection, forecasts)
     finally:
         connection.close()
+
+
+def read_latest_archive_location(
+    forecasts: ForecastsConfig,
+) -> tuple[float, float] | None:
+    """Coordinates recorded by the newest forecast run, without filtering."""
+    try:
+        connection = _open(forecasts)
+        try:
+            if not _table_exists(connection, "forecast_runs"):
+                return None
+            if not {"latitude", "longitude"} <= _table_columns(
+                connection, "forecast_runs"
+            ):
+                return None
+            row = connection.execute(
+                "SELECT latitude, longitude FROM forecast_runs ORDER BY id DESC LIMIT 1"
+            ).fetchone()
+        finally:
+            connection.close()
+    except (  # noqa: B013 - project style requires tuple clauses
+        sqlite3.Error,
+    ) as exc:
+        msg = f"cannot read forecast archive location {forecasts.db_path}: {exc}"
+        raise OSError(msg) from exc
+    if (
+        row is None
+        or len(row) != 2
+        or not all(isinstance(value, (int, float)) for value in row)
+    ):
+        return None
+    return float(row[0]), float(row[1])
 
 
 def read_forecast_archive(forecasts: ForecastsConfig) -> ForecastArchive:

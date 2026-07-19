@@ -8,7 +8,7 @@ from conftest import synthetic_hourly_matrix
 from grounded_weather_forecast.blenders import get_factory
 from grounded_weather_forecast.blenders.ewma_grounding import EwmaBiasGrounding
 from grounded_weather_forecast.blenders.harmonic_grounding import HarmonicGrounding
-from grounded_weather_forecast.contracts import hourly_variable
+from grounded_weather_forecast.contracts import ForecastMatrix, hourly_variable
 from grounded_weather_forecast.dataset.matrix import to_supervised_slice
 from grounded_weather_forecast.metrics.deterministic import mae
 
@@ -120,3 +120,19 @@ class TestHarmonicGrounding:
         assert float(np.nanmean(corrected[:, 0] - train.y)) == pytest.approx(
             0.0, abs=0.2
         )
+
+    def test_same_width_different_phase_schema_is_not_applied(self):
+        train = to_supervised_slice(diurnal_bias_matrix(), TEMP)
+        harmonic = HarmonicGrounding().fit(train)
+        alternate_features = train.x.features.drop("hour_sin", "hour_cos").with_columns(
+            pl.lit(30.0).alias("solar_elevation_deg")
+        )
+        alternate = ForecastMatrix.build(
+            sources=train.x.sources,
+            values=train.x.values,
+            lead_hours=train.x.lead_hours,
+            features=alternate_features,
+            product=train.x.product,
+        )
+
+        np.testing.assert_array_equal(harmonic.transform(alternate), alternate.values)

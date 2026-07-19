@@ -101,6 +101,10 @@ class TestEndToEnd:
         assert "Per-slice winners" in text
         # the unbiased provider should be discoverable by best_provider
         assert "best_provider" in text
+        dashboard = (e2e_config / "reports" / "dashboard.html").read_text()
+        assert 'id="zone-A"' in dashboard
+        assert 'id="zone-G"' in dashboard
+        assert "equal_weight" in dashboard
 
     def test_backtest_without_dataset(self, tmp_path, capsys):
         write_config(tmp_path)
@@ -113,3 +117,6 @@ class TestEndToEnd:
         code = main(["--config", str(tmp_path / "config.toml"), "report"])
         assert code == 1
         assert "run backtest first" in capsys.readouterr().out
+        dashboard = (tmp_path / "reports" / "dashboard.html").read_text()
+        assert 'id="zone-A"' in dashboard
+        assert "no backtest scores yet" in dashboard

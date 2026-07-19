@@ -87,8 +87,12 @@ grounded-weather-forecast backfill --end 2026-07-12   # --models, --chunk-days
 #    A second backfill provider reads dynamical.org's free Zarr archives of
 #    FULL forecast cycles (GEFS since 2020, AIFS-ENS since 2025-07) at native
 #    3-6h steps — populating the sub-24h lead buckets Previous Runs cannot.
-#    Requires the optional dependencies: uv sync --extra backfill
+#    For an installed CLI, put the extra in that same tool environment:
+uv tool install --force 'grounded-weather-forecast[backfill]'
 grounded-weather-forecast backfill --provider dynamical --start 2026-06-01
+#    From a checkout instead:
+#    uv sync --extra backfill
+#    uv run grounded-weather-forecast backfill --provider dynamical --start 2026-06-01
 
 # 5. Study whether each hourly variable should use instantaneous or interval-mean
 #    truth. Misalignment masquerades as provider bias; this measures it.
@@ -108,6 +112,10 @@ grounded-weather-forecast truth-qc                      # --days 30
 # 7. Leaderboards (per-slice skill with Diebold-Mariano, aggregate, winners,
 #    absolute error, consumer %-within-3F), the provider error-correlation
 #    matrix, and self-verification of forecasts this system actually served.
+#    Also writes reports/dashboard.html — a fully offline, self-contained
+#    operator console (seven zones: freshness, data trust, learning
+#    readiness, evaluation, model internals, serving, explainability) with
+#    threshold alerts sourced from the existing config knobs.
 grounded-weather-forecast report
 
 # 8. Emit the current blended forecast (minutely + hourly + daily) as JSON.
@@ -120,7 +128,15 @@ grounded-weather-forecast predict --out forecast.json
 #   --method auto|<id>   --now <iso>   --no-history   --semantics ...
 ```
 
-Every command takes `--config <path>` (default `config.toml`).
+Every command takes `--config <path>` (default `config.toml`). Once that
+configuration loads successfully, the invocation appends one row to
+`[dataset].dir/runs.parquet` — an append-only ledger (command, timing, exit
+status, dataset/config fingerprints) that the dashboard renders as the pipeline
+heartbeat. Parser and configuration-loading failures cannot be recorded because
+the ledger destination comes from that configuration. Each `predict` run additionally
+snapshots the fitted models' internals (grounding coefficients, expert
+weights, GBM importances, anchoring decay) into `[artifacts].dir/observability/`
+for the dashboard's glass-box zone; snapshot failures never affect serving.
 
 ## Status
 
@@ -141,6 +157,7 @@ to serve from stale provider data rather than guessing.
   bugs the evaluation harness caught. **Read before trusting any number.**
 - **[Scheduling](https://hbmartin.github.io/grounded-weather-forecast/scheduling/)** — launchd templates and cadence rationale for the
   polling, ensemble-ingest, predict, and nightly-retrain crons
+- [`docs/changes-0.4.0.md`](https://github.com/hbmartin/grounded-weather-forecast/blob/main/docs/changes-0.4.0.md) — 0.4.0 dashboard + instrumentation changes
 - [`docs/changes-0.3.0.md`](https://github.com/hbmartin/grounded-weather-forecast/blob/main/docs/changes-0.3.0.md) — 0.3.0 migration instructions and change
   rationale (scoring semantics changed; re-run backtest before comparing)
 - [`CONTEXT.md`](https://github.com/hbmartin/grounded-weather-forecast/blob/main/CONTEXT.md) — project glossary (issue time, valid time, lead,

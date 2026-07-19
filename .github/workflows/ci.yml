@@ -73,7 +73,7 @@ jobs:
 
       - name: Check complexity and duplication with Lizard
         run: |
-          uv run lizard -Eduplicate -C 27 src
+          uv run lizard -Eduplicate -C 27 -x "*/dashboard/assets/*" src
 
       - name: Run tests
         run: |

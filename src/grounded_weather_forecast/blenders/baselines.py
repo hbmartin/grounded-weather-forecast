@@ -133,10 +133,12 @@ class BestProvider:
     method_id: str = "best_provider"
     _kind: TargetKind = TargetKind.CONTINUOUS
     _variable: VariableSpec | None = None
+    _sources: tuple[str, ...] = ()
 
     def fit(self, train: SupervisedSlice) -> Self:
         self._kind = train.variable.kind
         self._variable = train.variable
+        self._sources = train.x.sources
         values, y = train.x.values, train.y
 
         def rank_sources(rows: np.ndarray) -> np.ndarray:
@@ -164,6 +166,20 @@ class BestProvider:
 
         self._fitted.apply(x.lead_hours, use)
         return BlendResult(point=finalize_point(point, self._kind, self._variable))
+
+    def to_state(self) -> dict[str, object]:
+        """Per-bucket source rankings by ascending training MAE, as names."""
+
+        def names(ranking: np.ndarray) -> list[str]:
+            return [self._sources[int(index)] for index in ranking]
+
+        return {
+            "sources": list(self._sources),
+            "global": names(self._fitted.global_state),
+            "buckets": {
+                label: names(ranking) for label, ranking in self._fitted.states.items()
+            },
+        }
 
 
 @dataclass

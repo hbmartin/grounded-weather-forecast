@@ -62,19 +62,28 @@ class ArtifactStore:
         self._update_latest(fingerprint, method_id, product, variable)
         return slot
 
+    @staticmethod
+    def _read_slot_json(path: Path, kind: str) -> dict[str, Any]:
+        if not path.exists():
+            msg = f"no artifact {kind} at {path.parent}"
+            raise ArtifactError(msg)
+        loaded = json.loads(path.read_text(encoding="utf-8"))
+        if not isinstance(loaded, dict):
+            msg = f"corrupt artifact {kind} at {path}"
+            raise ArtifactError(msg)
+        return loaded
+
     def load_state(
         self, *, fingerprint: str, method_id: str, product: str, variable: str
     ) -> dict[str, Any]:
         slot = self._slot(fingerprint, method_id, product, variable)
-        state_path = slot / "state.json"
-        if not state_path.exists():
-            msg = f"no artifact at {slot}"
-            raise ArtifactError(msg)
-        loaded = json.loads(state_path.read_text(encoding="utf-8"))
-        if not isinstance(loaded, dict):
-            msg = f"corrupt artifact state at {state_path}"
-            raise ArtifactError(msg)
-        return loaded
+        return self._read_slot_json(slot / "state.json", "state")
+
+    def load_manifest(
+        self, *, fingerprint: str, method_id: str, product: str, variable: str
+    ) -> dict[str, Any]:
+        slot = self._slot(fingerprint, method_id, product, variable)
+        return self._read_slot_json(slot / "manifest.json", "manifest")
 
     def load_latest_state(
         self, *, method_id: str, product: str, variable: str

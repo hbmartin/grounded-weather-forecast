@@ -544,6 +544,19 @@ class DatasetManifest:
         )
 
 
+def _active_ensembles(config: Config) -> pl.DataFrame | None:
+    """Persisted ensemble rows still enabled by the active configuration."""
+    if not config.ensembles.enabled:
+        return None
+    stored = load_ensembles(ensembles_path(config))
+    if stored.is_empty():
+        return stored
+    return stored.filter(
+        pl.col("model").is_in(config.ensembles.models),
+        pl.col("variable").is_in(config.ensembles.variables),
+    )
+
+
 def write_dataset(config: Config) -> DatasetManifest:
     """Run the full dataset build and persist parquet artifacts + manifest."""
     paths = DatasetPaths.in_dir(config.dataset.dir)
@@ -564,7 +577,7 @@ def write_dataset(config: Config) -> DatasetManifest:
     minutely_long = archive.minutely
     snapshots = snapshot_times(archive.completions)
 
-    ensembles = load_ensembles(ensembles_path(config))
+    ensembles = _active_ensembles(config)
     hourly_matrix = build_hourly_matrix(
         hourly_long,
         snapshots,

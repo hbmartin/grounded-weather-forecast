@@ -502,11 +502,11 @@ def _cmd_ingest_ensembles(config: Config, args: argparse.Namespace) -> int:
         config = replace(config, ensembles=replace(config.ensembles, models=models))
     try:
         fresh = ingest_ensembles(config)
+        path = ensembles_path(config)
+        new_rows, total_rows = append_ensembles(path, fresh)
     except (EnsembleError, OSError, ValueError) as exc:
         print(f"ensemble ingest failed: {exc}")
         return 1
-    path = ensembles_path(config)
-    new_rows, total_rows = append_ensembles(path, fresh)
     models_seen = ", ".join(sorted(fresh["model"].unique().to_list()))
     print(f"ingested {fresh.height} statistic rows from {models_seen}")
     print(f"ensembles store: +{new_rows} new rows, {total_rows} total -> {path}")
@@ -666,6 +666,7 @@ def _explain_no_folds(config: Config, matrix: pl.DataFrame, product: str) -> Non
 def _cmd_report(config: Config) -> int:
     from grounded_weather_forecast.backtest.scores import load_scores  # noqa: PLC0415
     from grounded_weather_forecast.contracts import hourly_variable  # noqa: PLC0415
+    from grounded_weather_forecast.dashboard import write_dashboard  # noqa: PLC0415
     from grounded_weather_forecast.dataset.matrix import build_truth  # noqa: PLC0415
     from grounded_weather_forecast.reports.correlation import (  # noqa: PLC0415
         error_correlation,
@@ -688,6 +689,7 @@ def _cmd_report(config: Config) -> int:
     score_files = sorted(scores_dir.glob("scores_*.parquet"))
     if not score_files:
         print(f"no scores found in {scores_dir}; run backtest first")
+        print(f"wrote {write_dashboard(config)}")
         return 1
     written: list[Path] = []
     for path in score_files:
@@ -718,19 +720,23 @@ def _cmd_report(config: Config) -> int:
             else set(scores["source_kind"].unique()) == {"live"}
         )
         if is_live and config.predict.history_path.exists():
-            minute_truth, hourly_truth, daily_truth = build_truth(config)
-            live = verify_history(
-                config.predict.history_path,
-                hourly_truth,
-                minute_truth,
-                daily_truth,
-            )
-            sections.append(
-                (
-                    "Self-verification (served vs realized)",
-                    compare_to_backtest(live, board),
+            try:
+                minute_truth, hourly_truth, daily_truth = build_truth(config)
+            except (OSError, ValueError) as exc:
+                print(f"self-verification skipped: {exc}")
+            else:
+                live = verify_history(
+                    config.predict.history_path,
+                    hourly_truth,
+                    minute_truth,
+                    daily_truth,
                 )
-            )
+                sections.append(
+                    (
+                        "Self-verification (served vs realized)",
+                        compare_to_backtest(live, board),
+                    )
+                )
         report_name = path.stem.replace("scores_", "leaderboard_")
         written.append(
             write_markdown_report(
@@ -780,19 +786,15 @@ def _cmd_report(config: Config) -> int:
                     [("Pearson correlation of forecast errors", correlation)],
                 )
             )
+    written.append(write_dashboard(config))
     for path in written:
         print(f"wrote {path}")
     return 0
 
 
-def main(argv: Sequence[str] | None = None) -> int:
-    parser = build_parser()
-    args = parser.parse_args(argv)
-    try:
-        config = load_config(args.config)
-    except ConfigError as exc:
-        print(f"config error: {exc}")
-        return 2
+def _dispatch(
+    config: Config, args: argparse.Namespace, parser: argparse.ArgumentParser
+) -> int:
     match args.command:
         case "qc":
             return _cmd_qc(config)
@@ -815,6 +817,75 @@ def main(argv: Sequence[str] | None = None) -> int:
         case _:  # pragma: no cover - argparse enforces the choices
             parser.print_help()
             return 2
+
+
+def _args_summary(args: argparse.Namespace) -> str:
+    import json  # noqa: PLC0415
+
+    summary = {
+        key: str(value) if isinstance(value, (Path, date, datetime)) else value
+        for key, value in vars(args).items()
+        if key not in {"command", "config"} and value is not None
+    }
+    return json.dumps(summary, sort_keys=True)
+
+
+def _record_run(
+    config: Config,
+    args: argparse.Namespace,
+    *,
+    started_at: datetime,
+    exit_code: int | None,
+) -> None:
+    """Append this invocation to the run ledger; never raises."""
+    from grounded_weather_forecast import runs  # noqa: PLC0415
+    from grounded_weather_forecast.evaluation import (  # noqa: PLC0415
+        config_fingerprint,
+        dataset_fingerprint,
+    )
+
+    try:
+        error = sys.exc_info()[1]
+        try:
+            dataset_print = dataset_fingerprint(config)
+        except (OSError, ValueError):
+            dataset_print = "unknown"
+        try:
+            config_print = config_fingerprint(config)
+        except (OSError, ValueError):
+            config_print = "unknown"
+        record = runs.RunRecord(
+            run_id=runs.run_id_for(args.command, started_at),
+            command=args.command,
+            args_json=_args_summary(args),
+            started_at=started_at,
+            ended_at=datetime.now(tz=UTC),
+            exit_code=exit_code,
+            error=type(error).__name__ if error is not None else None,
+            dataset_fingerprint=dataset_print,
+            config_fingerprint=config_print,
+            code_version=__version__,
+        )
+        runs.append_run(record, runs.runs_path(config))
+    except (Exception,):  # noqa: B013 - project style requires tuple clauses
+        return
+
+
+def main(argv: Sequence[str] | None = None) -> int:
+    started_at = datetime.now(tz=UTC)
+    parser = build_parser()
+    args = parser.parse_args(argv)
+    try:
+        config = load_config(args.config)
+    except ConfigError as exc:
+        print(f"config error: {exc}")
+        return 2
+    exit_code: int | None = None
+    try:
+        exit_code = _dispatch(config, args, parser)
+        return exit_code  # noqa: RET504 - the finally block reads exit_code
+    finally:
+        _record_run(config, args, started_at=started_at, exit_code=exit_code)
 
 
 if __name__ == "__main__":  # pragma: no cover

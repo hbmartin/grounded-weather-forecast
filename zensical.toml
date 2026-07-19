@@ -13,6 +13,7 @@ nav = [
   { "Architecture" = "architecture.md" },
   { "Limitations" = "limitations.md" },
   { "Scheduling" = "scheduling.md" },
+  { "Operator Dashboard" = "dashboard.md" },
   { "Improvement Plan" = "improvement-plan.md" },
   { "Releasing" = "releasing.md" },
   { "Decisions" = [

@@ -138,6 +138,14 @@ class Anchored:
         point = base_point + weight * correction
         return BlendResult(point=finalize_point(point, self._kind, self._variable))
 
+    def to_state(self) -> dict[str, object]:
+        """Compact observability state: the fitted decay and its base."""
+        return {
+            "tau_hours": self._tau_hours,
+            "base_method_id": getattr(getattr(self, "_base", None), "method_id", None),
+            "tau_grid_hours": list(TAU_GRID_HOURS),
+        }
+
 
 _FIT_BIN_EDGES: tuple[float, ...] = (0.0, 1.0, 2.0, 3.0, 6.0, 12.0, 24.0)
 _MIN_BIN_ROWS = 24
@@ -226,9 +234,12 @@ class AnchoredEmpirical:
             if denominator <= 0.0:
                 continue
             raw_weights[index] = np.clip(float(r0 @ e) / denominator, 0.0, 1.0)
-            trend_bin = trend[in_bin]
-            if self.use_trend and np.isfinite(trend_bin).all():
-                centered = e - raw_weights[index] * r0
+            trend_usable = in_bin & np.isfinite(trend)
+            if self.use_trend and int(trend_usable.sum()) >= _MIN_BIN_ROWS:
+                trend_bin = trend[trend_usable]
+                centered = (
+                    errors[trend_usable] - raw_weights[index] * residuals[trend_usable]
+                )
                 trend_denominator = float(trend_bin @ trend_bin)
                 if trend_denominator > 0.0:
                     trend_weights[index] = np.clip(
@@ -270,6 +281,18 @@ class AnchoredEmpirical:
             trend = np.nan_to_num(self._trends(x), nan=0.0)
             point = point + self._weights_at(x.lead_hours, self._trend_weights) * trend
         return BlendResult(point=finalize_point(point, self._kind, self._variable))
+
+    def to_state(self) -> dict[str, object]:
+        """Compact observability state: the fitted per-lead anchor weights."""
+        residual = self._residual_weights
+        trend = self._trend_weights
+        return {
+            "residual_weights": residual.tolist() if residual is not None else None,
+            "trend_weights": trend.tolist() if trend is not None else None,
+            "bin_edges": list(_FIT_BIN_EDGES),
+            "use_trend": self.use_trend,
+            "base_method_id": getattr(getattr(self, "_base", None), "method_id", None),
+        }
 
 
 def _anchored_gew() -> Blender:
