@@ -188,9 +188,7 @@ def test_zone_f_degraded_share_is_judged_on_the_trailing_window(tmp_path):
     ctx = DashboardContext(
         config=config, now=NOW, history=_degraded_history(healthy=5000, degraded=400)
     )
-    panel = next(
-        p for p in serving.build(ctx, Derived()).panels if p.panel_id == "f2"
-    )
+    panel = next(p for p in serving.build(ctx, Derived()).panels if p.panel_id == "f2")
     shares = {stat.label: stat.value for stat in panel.stats}
     assert shares["degraded share (last 1d)"] == "100%"
     assert shares["degraded share (lifetime)"] == "7%"
@@ -203,9 +201,7 @@ def test_zone_f_near_total_degradation_is_not_green(tmp_path):
     ctx = DashboardContext(
         config=config, now=NOW, history=_degraded_history(healthy=0, degraded=999)
     )
-    panel = next(
-        p for p in serving.build(ctx, Derived()).panels if p.panel_id == "f2"
-    )
+    panel = next(p for p in serving.build(ctx, Derived()).panels if p.panel_id == "f2")
     assert panel.status == "red"
 
 
@@ -213,11 +209,7 @@ def test_zone_f_unusable_live_scores_are_not_reported_as_a_young_archive(tmp_pat
     """A damaged artifact and an empty one must not render the same."""
     config = write_config(tmp_path)
     ctx = DashboardContext(config=config, now=NOW)
-    young = next(
-        p
-        for p in serving.build(ctx, Derived()).panels
-        if p.panel_id == "f1"
-    )
+    young = next(p for p in serving.build(ctx, Derived()).panels if p.panel_id == "f1")
     damaged = next(
         p
         for p in serving.build(ctx, Derived(live_scores_unusable=True)).panels

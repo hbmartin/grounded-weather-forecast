@@ -323,7 +323,9 @@ class TestTrainServeSymmetry:
         monkeypatch.setattr(
             predict, "build_truth", lambda _config: (empty, empty, empty)
         )
-        monkeypatch.setattr(predict, "build_observation_features", lambda _config: empty)
+        monkeypatch.setattr(
+            predict, "build_observation_features", lambda _config: empty
+        )
         monkeypatch.setattr(
             predict,
             "read_forecast_archive",

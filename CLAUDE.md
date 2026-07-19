@@ -1,4 +1,4 @@
-- Always run `uv run ruff check src --fix; uv run pyrefly check src; uv run ty check src` after making changes.
+- Always run `uv run ruff check src --fix; uv run ruff format src tests; uv run pyrefly check src; uv run ty check src` after making changes (CI enforces `ruff format --check src tests`, so the format step covers tests too).
 - Run `uv run lizard -Eduplicate -x "*/dashboard/assets/*" src; uv run pytest tests/` after finishing implementation (the exclusion skips the vendored Chart.js asset).
 - Any user facing changes (e.g. new CLI flags) should be documented in the `README.md`.
 - Use `uv` not `python` for running scripts.
