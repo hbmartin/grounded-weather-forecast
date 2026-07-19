@@ -140,16 +140,22 @@ def _reasons_panel(ctx: DashboardContext) -> Panel:
         }
         series.append((reason, [float(counts_by_date.get(date, 0)) for date in dates]))
     lifetime_share = _degraded_share(history)
+    # Anchor the window to wall-clock, not to the newest served row: anchoring
+    # to the history would report "the last day the system happened to serve"
+    # under a label promising the last day. A stale archive has no recent
+    # rows to judge, and saying so beats reporting a confident 0%; zone A owns
+    # the "nothing served recently" verdict.
     recent = history.filter(
-        pl.col("issued_at")
-        >= pl.col("issued_at").max() - timedelta(days=_DEGRADED_WINDOW_DAYS)
+        pl.col("issued_at") >= ctx.now - timedelta(days=_DEGRADED_WINDOW_DAYS)
     )
-    recent_share = _degraded_share(recent)
+    recent_share = _degraded_share(recent) if not recent.is_empty() else None
     # Judge on the trailing window: a lifetime share is diluted by every
     # healthy row ever served, so a currently-100%-degraded system can read
     # green forever once enough history has accumulated.
     status = (
-        "red"
+        "ok"
+        if recent_share is None
+        else "red"
         if recent_share >= _DEGRADED_RED
         else "amber"
         if recent_share >= _DEGRADED_AMBER
@@ -164,7 +170,7 @@ def _reasons_panel(ctx: DashboardContext) -> Panel:
             Stat("served rows", f"{history.height:,}"),
             Stat(
                 f"degraded share (last {_DEGRADED_WINDOW_DAYS:.0f}d)",
-                f"{recent_share:.0%}",
+                "—" if recent_share is None else f"{recent_share:.0%}",
                 status,
             ),
             Stat("degraded share (lifetime)", f"{lifetime_share:.0%}"),

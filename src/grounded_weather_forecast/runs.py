@@ -59,11 +59,18 @@ def runs_path(config: Config) -> Path:
 
 
 def prune_runs(frame: pl.DataFrame, *, now: datetime) -> pl.DataFrame:
-    """Bound the ledger by age, then by row count as a burst backstop."""
+    """Bound the ledger by age, then by row count as a burst backstop.
+
+    A null ``started_at`` has no age to judge, so it is kept and left to the
+    row-count backstop rather than silently dropped — ``load_runs`` promises
+    that older schemas load null-filled, and pruning must honour that.
+    """
     if frame.is_empty():
         return frame
     horizon = now - timedelta(days=_RETENTION_DAYS)
-    return frame.filter(pl.col("started_at") >= horizon).tail(_MAX_ROWS)
+    return frame.filter(
+        pl.col("started_at").is_null() | (pl.col("started_at") >= horizon)
+    ).tail(_MAX_ROWS)
 
 
 def append_run(record: RunRecord, path: Path) -> None:

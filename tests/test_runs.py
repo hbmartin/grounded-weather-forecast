@@ -157,3 +157,16 @@ class TestRetention:
             )
         # The three year-old rows are pruned; only the two recent ones survive.
         assert runs.load_runs(path)["run_id"].to_list() == ["r3", "r4"]
+
+
+def test_prune_keeps_rows_whose_started_at_is_null():
+    """`load_runs` promises older schemas load null-filled; pruning must agree."""
+    from datetime import UTC, datetime
+
+    import polars as pl
+
+    from grounded_weather_forecast.runs import RUNS_SCHEMA, prune_runs
+
+    now = datetime(2026, 7, 19, 12, 0, tzinfo=UTC)
+    frame = pl.DataFrame({column: [None] for column in RUNS_SCHEMA}, schema=RUNS_SCHEMA)
+    assert prune_runs(frame, now=now).height == 1
