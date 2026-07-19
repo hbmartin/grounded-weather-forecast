@@ -36,6 +36,7 @@ from grounded_weather_forecast.contracts import (
     HOURLY_VARIABLES,
     Blender,
     BlendResult,
+    FloatArray,
     ForecastMatrix,
     Product,
     SupervisedSlice,
@@ -330,6 +331,62 @@ def _validated_selection(
     )
 
 
+def _row_selections(
+    predict_frame: pl.DataFrame,
+    variable: VariableSpec,
+    selections: SelectionMap,
+    config: Config,
+    *,
+    daily: bool,
+    force_method: str | None,
+) -> list[Selection]:
+    """The validated method choice for every row, by its lead bucket."""
+    product = "daily" if daily else "hourly"
+    product_kind = Product.DAILY if daily else Product.HOURLY
+    leads = (
+        predict_frame["lead_days"] if daily else predict_frame["lead_hours"]
+    ).to_list()
+    buckets: list[str | None] = [
+        daily_bucket(lead) if daily else hourly_bucket(lead) for lead in leads
+    ]
+    return [
+        _validated_selection(
+            selection,
+            product_kind,
+            variable,
+            explicit=force_method is not None or selection.reason == "pinned in config",
+        )
+        for selection in (
+            Selection(force_method, reason="forced by --method")
+            if force_method
+            else method_for(selections, product, variable.name, bucket, config)
+            for bucket in buckets
+        )
+    ]
+
+
+def _blended_rows(
+    results: dict[str, BlendResult],
+    chosen: list[Selection],
+    height: int,
+) -> tuple[FloatArray, list[dict[str, float]]]:
+    """Gather each row's point and quantiles from the method that owns it."""
+    point = np.full(height, np.nan)
+    quantiles: list[dict[str, float]] = []
+    for row, selection in enumerate(chosen):
+        result = results[selection.method_id]
+        point[row] = result.point[row]
+        quantiles.append(
+            {
+                str(level): float(result.quantiles[row, index])
+                for index, level in enumerate(result.quantile_levels)
+            }
+            if result.quantiles is not None
+            else {}
+        )
+    return point, quantiles
+
+
 def _blend_variable(
     train: pl.DataFrame,
     predict_frame: pl.DataFrame,
@@ -343,29 +400,14 @@ def _blend_variable(
     issue_time: datetime | None = None,
 ) -> VariableBlend | None:
     """Per row: the prediction of the method selected for that row's bucket."""
-    product = "daily" if daily else "hourly"
-    buckets: list[str | None] = [
-        daily_bucket(lead) if daily else hourly_bucket(lead)
-        for lead in (
-            predict_frame["lead_days"] if daily else predict_frame["lead_hours"]
-        ).to_list()
-    ]
-    chosen: list[Selection] = [
-        Selection(force_method, reason="forced by --method")
-        if force_method
-        else method_for(selections, product, variable.name, bucket, config)
-        for bucket in buckets
-    ]
-    product_kind = Product.DAILY if daily else Product.HOURLY
-    chosen = [
-        _validated_selection(
-            selection,
-            product_kind,
-            variable,
-            explicit=force_method is not None or selection.reason == "pinned in config",
-        )
-        for selection in chosen
-    ]
+    chosen = _row_selections(
+        predict_frame,
+        variable,
+        selections,
+        config,
+        daily=daily,
+        force_method=force_method,
+    )
     fitted = _fit_methods(
         train,
         predict_frame,
@@ -393,19 +435,7 @@ def _blend_variable(
             quantiles=[{} for _ in range(predict_frame.height)],
         )
     results, _ = fitted
-    point = np.full(predict_frame.height, np.nan)
-    quantiles: list[dict[str, float]] = []
-    for row, selection in enumerate(chosen):
-        result = results[selection.method_id]
-        point[row] = result.point[row]
-        quantiles.append(
-            {
-                str(level): float(result.quantiles[row, index])
-                for index, level in enumerate(result.quantile_levels)
-            }
-            if result.quantiles is not None
-            else {}
-        )
+    point, quantiles = _blended_rows(results, chosen, predict_frame.height)
     return VariableBlend(
         point=point,
         methods=[selection.method_id for selection in chosen],

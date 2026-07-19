@@ -266,3 +266,27 @@ class TestEmosFitStatus:
         emos = get_factory("emos")().fit(make_wind_slice())
         assert emos._fit_family == "truncated_normal"
         assert emos._fit_status == "converged"
+
+    def test_state_reports_the_family_it_fitted_and_the_one_it_serves(self):
+        """A Gaussian fallback on a bounded variable must not read as gaussian.
+
+        The loss that was optimized and the family the quantiles come from can
+        legitimately differ; reporting one number for both is the original bug
+        in miniature.
+        """
+        import json
+
+        emos = get_factory("emos")().fit(self._wind_slice_with_out_of_bound_truth())
+        state = emos.to_state()
+
+        assert json.loads(json.dumps(state)) == state, "state must be JSON-safe"
+        assert state["fit_family"] == "gaussian"
+        assert state["serving_family"] == "truncated_normal"
+        assert state["fit_status"] == "gaussian_fallback"
+        assert state["fitted"] is True
+        assert set(state["coefficients"]) == {
+            "mean_intercept",
+            "mean_slope",
+            "log_sigma_intercept",
+            "log_sigma_slope",
+        }

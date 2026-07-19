@@ -252,6 +252,37 @@ class Emos:
             quantile_levels=QUANTILE_LEVELS,
         )
 
+    def to_state(self) -> dict[str, object]:
+        """Glass-box view of the fitted head.
+
+        ``fit_family`` and ``serving_family`` are reported separately on
+        purpose: after a Gaussian fallback the loss that was optimized and the
+        family the quantiles come from genuinely differ, and collapsing them
+        is the reporting failure this fit-status work exists to end.
+        """
+        minimum = self._variable.minimum if self._variable else None
+        maximum = self._variable.maximum if self._variable else None
+        bounded = minimum is not None or maximum is not None
+        parameters = self._parameters
+        return {
+            "schema_version": 1,
+            "method_id": self.method_id,
+            "variable": self._variable.name if self._variable else None,
+            "kind": self._kind.value,
+            "fit_family": self._fit_family,
+            "serving_family": "truncated_normal" if bounded else "gaussian",
+            "fit_status": self._fit_status,
+            "fitted": parameters is not None,
+            "coefficients": None
+            if parameters is None
+            else {
+                "mean_intercept": float(parameters[0]),
+                "mean_slope": float(parameters[1]),
+                "log_sigma_intercept": float(parameters[2]),
+                "log_sigma_slope": float(parameters[3]),
+            },
+        }
+
 
 def _emos() -> Blender:
     return Emos(GroundedEqualWeight, "emos")
