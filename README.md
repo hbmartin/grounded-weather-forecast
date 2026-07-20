@@ -126,6 +126,8 @@ grounded-weather-forecast report
 grounded-weather-forecast predict                      # to stdout
 grounded-weather-forecast predict --out forecast.json
 #   --method auto|<id>   --now <iso>   --no-history   --semantics ...
+#   Unarchived --now reconstructions degrade to equal_weight when the historical
+#   release's implementation is unavailable; archived documents replay exactly.
 ```
 
 Every command takes `--config <path>` (default `config.toml`). Once that
@@ -143,8 +145,9 @@ never affect serving.
 
 Backtest evidence records the package version plus a digest of the installed
 first-party Python sources. The live demotion gate pools recent served rows only
-when configuration, method, and that implementation identity all match; a code
-change cannot inherit a previous implementation's verdict.
+when configuration, method, implementation identity, provider source set, and
+per-variable truth semantics all match; a changed ensemble or implementation
+cannot inherit an incompatible verdict.
 
 ## Status
 

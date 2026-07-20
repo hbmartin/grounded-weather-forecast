@@ -68,6 +68,7 @@ type SelectionMap = Mapping[tuple[str, str, str], Selection]
 type SliceKey = tuple[str, str, str]
 type LiveKey = tuple[str, str, str, str]
 type EligibleReleases = Mapping[LiveKey, frozenset[str]]
+type EvaluationCompatibility = tuple[str, frozenset[str], str]
 
 
 def _pins(config: Config) -> dict[tuple[str, str], str]:
@@ -186,6 +187,49 @@ def _evaluation_contexts(
             }
         )
     return tuple(sorted(contexts, key=lambda context: str(context["evaluation_id"])))
+
+
+def _contexts_by_evaluation_id(
+    raw_contexts: object,
+) -> dict[str, Mapping[str, object]]:
+    """Well-formed release contexts keyed by their evaluation id."""
+    if not isinstance(raw_contexts, (list, tuple)):
+        return {}
+    contexts: dict[str, Mapping[str, object]] = {}
+    for raw_context in raw_contexts:
+        if not isinstance(raw_context, dict):
+            continue
+        context = cast(Mapping[str, object], raw_context)
+        evaluation_id = context.get("evaluation_id")
+        if isinstance(evaluation_id, str) and evaluation_id:
+            contexts[evaluation_id] = context
+    return contexts
+
+
+def _evaluation_compatibility(
+    context: Mapping[str, object] | None, variable: str
+) -> EvaluationCompatibility | None:
+    """The serving-relevant identity shared by live release cohorts."""
+    if context is None or context.get("source_kind") != "live":
+        return None
+    raw_source_set = context.get("source_set_json")
+    semantics = context.get("semantics")
+    if not isinstance(raw_source_set, str) or not isinstance(semantics, Mapping):
+        return None
+    try:
+        sources = json.loads(raw_source_set)
+    except (json.JSONDecodeError, TypeError):
+        return None
+    semantic = semantics.get(variable)
+    if (
+        not isinstance(sources, list)
+        or not sources
+        or not all(isinstance(source, str) and source for source in sources)
+        or not isinstance(semantic, str)
+        or not semantic
+    ):
+        return None
+    return ("live", frozenset(cast(str, source) for source in sources), semantic)
 
 
 def _make_release(
@@ -315,38 +359,56 @@ def _release_selection_code_version(
 
 
 def _eligible_release_ids(
-    config: Config, selections: Mapping[SliceKey, Selection]
+    config: Config,
+    selections: Mapping[SliceKey, Selection],
+    evaluation_contexts: tuple[dict[str, object], ...] = (),
 ) -> EligibleReleases:
-    """Release cohorts matching each selected method and implementation.
+    """Release cohorts matching each selected method and evaluation context.
 
     Deliberately ignores the dataset fingerprint. That fingerprint hashes row
     counts over every parquet artifact, so it rotates on *every ingested
     observation* — keying live evidence to it means any slice whose truth
     arrives after one rebuild cycle can never be scored, which is every lead
     bucket at or beyond 24h. ``config_fingerprint`` pins settings while
-    ``code_version`` includes a source digest, so evidence cannot cross an
-    implementation change. Recency is applied to served rows rather than to
-    immutable release creation times.
+    ``code_version`` includes a source digest. Source set and per-variable
+    truth semantics are matched from the release contexts because
+    auto-discovered providers can change without either identity changing.
+    Recency is applied to served rows rather than to immutable release creation
+    times.
     """
     eligible: dict[LiveKey, set[str]] = {
         (*key, selected.method_id): set() for key, selected in selections.items()
     }
+    current_contexts = _contexts_by_evaluation_id(evaluation_contexts)
     for raw in _compatible_releases(config, match_dataset=False):
         release_id = raw.get("release_id")
         raw_selections = raw.get("selections")
         if not isinstance(release_id, str) or not isinstance(raw_selections, dict):
             continue
+        release_contexts = _contexts_by_evaluation_id(raw.get("evaluation_contexts"))
         for key, selected in selections.items():
             raw_selected = raw_selections.get(".".join(key))
             if not isinstance(raw_selected, dict):
                 continue
             selection_mapping = cast(Mapping[str, object], raw_selected)
             live_key = (*key, selected.method_id)
+            current_context = current_contexts.get(selected.evaluation_id or "")
+            release_context = release_contexts.get(
+                str(selection_mapping.get("evaluation_id") or "")
+            )
             if (
                 selection_mapping.get("method_id") == selected.method_id
                 and selected.code_version is not None
                 and _release_selection_code_version(raw, selection_mapping)
                 == selected.code_version
+                and (
+                    current_compatibility := _evaluation_compatibility(
+                        current_context, key[1]
+                    )
+                )
+                is not None
+                and _evaluation_compatibility(release_context, key[1])
+                == current_compatibility
             ):
                 eligible[live_key].add(release_id)
     return {key: frozenset(releases) for key, releases in eligible.items()}
@@ -356,16 +418,29 @@ def _release_as_of(config: Config, as_of: datetime) -> SelectionMap | None:
     """Newest release that genuinely existed by a historical issue time."""
     if as_of.tzinfo is None:
         as_of = as_of.replace(tzinfo=UTC)
-    candidates: list[tuple[datetime, dict[str, object]]] = []
+    current_code = code_identity()
+    candidates: list[tuple[datetime, SelectionMap]] = []
     for raw in _compatible_releases(config, match_dataset=True):
+        selections = _selections_from_release(raw)
+        raw_selections = raw.get("selections")
+        if (
+            not selections
+            or not isinstance(raw_selections, dict)
+            or len(selections) != len(raw_selections)
+            or any(
+                selected.code_version != current_code
+                for selected in selections.values()
+            )
+        ):
+            continue
         with suppress(TypeError, ValueError):
             promoted_at = datetime.fromisoformat(str(raw["promoted_at"]))
             if promoted_at <= as_of:
-                candidates.append((promoted_at, raw))
+                candidates.append((promoted_at, selections))
     if not candidates:
         return None
-    _, release = max(candidates, key=lambda item: item[0])
-    return _selections_from_release(release)
+    _, selections = max(candidates, key=lambda item: item[0])
+    return selections
 
 
 def select_methods(
@@ -424,6 +499,7 @@ def select_methods(
             )
     if not selections:
         return selections
+    evaluation_contexts = _evaluation_contexts(selected_scores)
     # Gate before minting the release. Stamping a prospective id first only
     # ever orphaned it: a demotion rewrites `selections`, which the release
     # hash covers, so the rows served under the acting release ended up
@@ -435,7 +511,9 @@ def select_methods(
         factor=config.promotion.live_gap_factor,
         min_n=config.promotion.min_live_n,
         fallbacks=fallbacks,
-        eligible_releases=_eligible_release_ids(config, selections),
+        eligible_releases=_eligible_release_ids(
+            config, selections, evaluation_contexts
+        ),
     )
     release = _make_release(config, selections, selected_scores)
     release.write(config.artifacts_dir / "releases")

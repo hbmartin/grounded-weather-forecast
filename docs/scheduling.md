@@ -71,6 +71,11 @@ backtesting or serving methods that consume ensemble features.
 - launchd `StartCalendarInterval` fires in **local time**; the 6-hourly
   ensemble job uses `StartInterval` (elapsed seconds) precisely so daylight
   saving cannot skip a model cycle.
+- The scheduled `predict` run appends to the self-verification history by
+  default; the `--no-history`
+  ([advanced usage](advanced-usage.md)) flag opts a one-off manual serve out of
+  that append, and the cron should not pass it — that history feeds the
+  live-MAE demotion gate.
 - Keep the Synoptic token out of the plist if you prefer: set
   `synoptic_token = "$SYNOPTIC_TOKEN"` in `config.toml` and provide the
   variable via `launchctl setenv SYNOPTIC_TOKEN ...` instead of the

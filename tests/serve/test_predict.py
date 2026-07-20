@@ -14,7 +14,7 @@ from grounded_weather_forecast.serve.predict import (
     predict,
 )
 from grounded_weather_forecast.serve.schema import SCHEMA_VERSION
-from grounded_weather_forecast.serve.selection import Selection
+from grounded_weather_forecast.serve.selection import Selection, select_methods
 
 NOW = utc(2026, 3, 22, 17, 0)
 FETCH = "2026-03-22T16:30:00+00:00"
@@ -227,6 +227,44 @@ class TestPredict:
         methods = {m for p in document.hourly for m in p.methods.values()}
         assert methods == {"equal_weight"}
         assert document.status == "degraded"
+
+    def test_incompatible_historical_release_degrades_without_provenance(self, config):
+        from grounded_weather_forecast.evaluation import (
+            config_fingerprint,
+            dataset_fingerprint,
+        )
+
+        release = {
+            "release_id": "old-code-release",
+            "promoted_at": (NOW - timedelta(days=1)).isoformat(),
+            "dataset_fingerprint": dataset_fingerprint(config),
+            "config_fingerprint": config_fingerprint(config),
+            "evaluation_ids": ["old-evaluation"],
+            "evaluation_contexts": [],
+            "training_cutoff": None,
+            "selections": {
+                "hourly.temp_c.0-1h": {
+                    "method_id": "gbm",
+                    "reason": "historical winner",
+                    "evaluation_id": "old-evaluation",
+                    "code_version": "0.4.0+retired-implementation",
+                    "n": 100,
+                    "mae": 1.0,
+                }
+            },
+        }
+        release_dir = config.artifacts_dir / "releases"
+        release_dir.mkdir(parents=True)
+        (release_dir / "old-code-release.json").write_text(
+            json.dumps(release), encoding="utf-8"
+        )
+
+        selections = select_methods(config, config.dataset.dir / "scores", as_of=NOW)
+        document = predict(config, selections, now=NOW)
+
+        assert selections == {}
+        assert document.status == "degraded"
+        assert document.release_ids == []
 
 
 class TestPredictCli:
@@ -778,37 +816,77 @@ class TestServingPathFitting:
         for result in results.values():
             assert result.point.shape[0] == x.n_rows
 
-    def test_a_stateful_method_persists_and_warm_starts(self, tmp_path):
-        """Second serve must load the artifact and advance it, not refit."""
+    def test_a_stateful_method_persists_and_warm_starts(self, tmp_path, monkeypatch):
+        """Second serve must load the artifact and advance it, not refit.
+
+        Output equality alone cannot prove this: a from-scratch refit over the
+        same replayed evidence lands in the same place. So spy on the two
+        mutually exclusive entry points -- ``from_state`` (rehydrate) versus
+        ``fit`` (full refit) -- and require the second serve to take the former.
+        """
         config = write_config(tmp_path)
 
         import numpy as np
+
+        from grounded_weather_forecast.blenders import experts as experts_mod
 
         first = self._fit(config, {"ewa"})
         assert first is not None
         state_dir = config.artifacts_dir / "state"
         assert list(state_dir.rglob("*.json")), "the serve path must persist state"
 
+        calls = {"from_state": 0, "fit": 0}
+        real_from_state = experts_mod.OnlineExperts.from_state.__func__
+        real_fit = experts_mod.OnlineExperts.fit
+
+        def spy_from_state(cls, state, method_id):
+            calls["from_state"] += 1
+            return real_from_state(cls, state, method_id)
+
+        def spy_fit(self, train):
+            calls["fit"] += 1
+            return real_fit(self, train)
+
+        monkeypatch.setattr(
+            experts_mod.OnlineExperts, "from_state", classmethod(spy_from_state)
+        )
+        monkeypatch.setattr(experts_mod.OnlineExperts, "fit", spy_fit)
+
         second = self._fit(config, {"ewa"}, issue_time=NOW + timedelta(minutes=10))
         assert second is not None
-        # Same evidence replayed: the warm start must land where the first did.
+        assert calls["from_state"] == 1, "warm start must rehydrate the artifact"
+        assert calls["fit"] == 0, "a warm start must not refit from scratch"
+        # Same evidence replayed: the warm start must still land where the first did.
         np.testing.assert_allclose(
             second[0]["ewa"].point, first[0]["ewa"].point, atol=1e-9
         )
 
     def test_a_corrupt_artifact_falls_back_to_a_full_refit(self, tmp_path):
         """The digest guard's whole point: never silently combine histories."""
-        config = write_config(tmp_path)
-        assert self._fit(config, {"ewa"}) is not None
-        for path in (config.artifacts_dir / "state").rglob("*.json"):
-            path.write_text('{"schema_version": 1}', encoding="utf-8")
-
         import numpy as np
 
-        refitted = self._fit(config, {"ewa"})
+        config = write_config(tmp_path)
+        assert self._fit(config, {"ewa"}) is not None
+        corrupted = list((config.artifacts_dir / "state").rglob("*.json"))
+        assert corrupted, "the first serve must have persisted state to corrupt"
+        for path in corrupted:
+            path.write_text('{"schema_version": 1}', encoding="utf-8")
 
+        refitted = self._fit(config, {"ewa"})
         assert refitted is not None
-        assert np.isfinite(refitted[0]["ewa"].point).any()
+
+        # An independent clean cold start over the same evidence, in a config
+        # with no persisted state at all. Discarding the corrupt artifact and
+        # replaying from scratch must reproduce it exactly; a silent warm start
+        # from the corrupt file -- or any other partial state -- would diverge.
+        clean_dir = tmp_path / "clean"
+        clean_dir.mkdir()
+        clean = write_config(clean_dir)
+        baseline = self._fit(clean, {"ewa"})
+        assert baseline is not None
+        np.testing.assert_allclose(
+            refitted[0]["ewa"].point, baseline[0]["ewa"].point, atol=1e-9
+        )
 
     def test_observability_is_snapshotted_through_the_serving_path(self, tmp_path):
         config = write_config(tmp_path)

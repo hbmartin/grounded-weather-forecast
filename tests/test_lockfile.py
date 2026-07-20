@@ -51,6 +51,16 @@ def test_the_projects_own_editable_entry_is_allowed(tmp_path):
     assert unapproved_hosts(lockfile) == set()
 
 
+def test_a_foreign_editable_path_is_rejected(tmp_path):
+    """Allowlisting the `editable` kind must not wave through arbitrary paths."""
+    lockfile = tmp_path / "uv.lock"
+    lockfile.write_text(
+        '[[package]]\nname = "self"\nsource = { editable = "../evil" }\n',
+        encoding="utf-8",
+    )
+    assert unapproved_hosts(lockfile) == {"editable ../evil"}
+
+
 def test_hostless_and_insecure_approved_sources_are_rejected(tmp_path):
     lockfile = tmp_path / "uv.lock"
     lockfile.write_text(

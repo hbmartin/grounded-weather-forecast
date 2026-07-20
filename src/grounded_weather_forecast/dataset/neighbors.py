@@ -229,10 +229,43 @@ def cross_check(truth_hourly: pl.DataFrame, consensus: pl.DataFrame) -> Neighbor
             min_samples=_MIN_CORRELATION_SAMPLES,
         ).alias("correlation")
     ).select("valid_hour", "correlation")
-    latest = correlation.drop_nulls("correlation").tail(1)
-    latest_correlation = (
-        float(latest["correlation"][0]) if latest.height else float("nan")
+    correlation_window = joined.tail(_CORRELATION_WINDOW_HOURS)
+    finite_pairs = correlation_window.filter(
+        pl.col("t__temp_c__inst").is_not_null()
+        & pl.col("consensus_c").is_not_null()
+        & pl.col("t__temp_c__inst").is_finite()
+        & pl.col("consensus_c").is_finite()
     )
+    finite_pair_count = finite_pairs.height
+    if finite_pair_count < _MIN_CORRELATION_SAMPLES:
+        latest_correlation = float("nan")
+        unavailable_correlation_reason = (
+            f"need at least {_MIN_CORRELATION_SAMPLES} finite paired hourly "
+            f"comparisons; got {finite_pair_count}"
+        )
+    elif (
+        finite_pairs["t__temp_c__inst"].n_unique() <= 1
+        or finite_pairs["consensus_c"].n_unique() <= 1
+    ):
+        latest_correlation = float("nan")
+        unavailable_correlation_reason = (
+            "rolling correlation is undefined because the station or "
+            f"neighbor consensus has zero variance across {finite_pair_count} "
+            "finite paired hourly comparisons"
+        )
+    else:
+        raw_correlation = finite_pairs.select(
+            pl.corr("t__temp_c__inst", "consensus_c")
+        ).item()
+        latest_correlation = (
+            float(raw_correlation)
+            if isinstance(raw_correlation, (int, float))
+            else float("nan")
+        )
+        unavailable_correlation_reason = (
+            "rolling correlation is undefined despite "
+            f"{finite_pair_count} finite, nonconstant paired hourly comparisons"
+        )
     correlation_evaluable = np.isfinite(latest_correlation)
     return NeighborChecks(
         daily_drift=daily,
@@ -252,16 +285,7 @@ def cross_check(truth_hourly: pl.DataFrame, consensus: pl.DataFrame) -> Neighbor
         correlation_reason=(
             f"latest rolling correlation {latest_correlation:.3f}"
             if correlation_evaluable
-            else (
-                "rolling correlation is undefined because the station or "
-                f"neighbor consensus has zero variance across {joined.height} "
-                "overlapping hourly comparisons"
-            )
-            if joined.height >= _MIN_CORRELATION_SAMPLES
-            else (
-                f"need at least {_MIN_CORRELATION_SAMPLES} overlapping hourly"
-                f" comparisons; got {joined.height}"
-            )
+            else unavailable_correlation_reason
         ),
     )
 

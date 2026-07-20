@@ -11,15 +11,18 @@ APPROVED_HOSTS = frozenset({"files.pythonhosted.org", "pypi.org"})
 URL_PATTERN = re.compile(r"\b[a-zA-Z][a-zA-Z0-9+.-]*://[^\"'\s]+")
 # uv records non-registry dependencies as a source kind rather than a URL, so
 # a `{ path = "../evil" }` or `{ workspace = true }` entry carries no scheme at
-# all and would otherwise pass silently.
-LOCAL_SOURCE_PATTERN = re.compile(r"source\s*=\s*\{\s*(?P<kind>[a-z_]+)\s*=")
-# `editable` is this project itself; anything else pointing outside the
-# registry is what we are looking for.
-APPROVED_SOURCE_KINDS = frozenset({"registry", "editable"})
+# all and would otherwise pass silently. Capture the value as well: allowlisting
+# the `editable` kind alone would wave through `editable = "../evil"`.
+LOCAL_SOURCE_PATTERN = re.compile(
+    r"source\s*=\s*\{\s*(?P<kind>[a-z_]+)\s*=\s*(?P<value>\"[^\"]*\"|[^\s},]+)"
+)
+# The project's own editable install is `editable = "."`; an editable source
+# pointing anywhere else escapes the workspace and is what we are looking for.
+APPROVED_EDITABLE_PATH = "."
 
 
 def unapproved_hosts(lockfile: Path) -> set[str]:
-    """Hosts, schemes, and non-registry source kinds absent from the allowlist."""
+    """Hosts, schemes, and non-registry or off-project sources to reject."""
     text = lockfile.read_text(encoding="utf-8")
     findings: set[str] = set()
     for match in URL_PATTERN.finditer(text):
@@ -30,11 +33,16 @@ def unapproved_hosts(lockfile: Path) -> set[str]:
             findings.add(f"hostless {parsed.scheme or 'URL'} source")
         elif parsed.hostname not in APPROVED_HOSTS:
             findings.add(parsed.hostname)
-    findings |= {
-        f"{kind} source"
-        for match in LOCAL_SOURCE_PATTERN.finditer(text)
-        if (kind := match.group("kind")) not in APPROVED_SOURCE_KINDS
-    }
+    for source in LOCAL_SOURCE_PATTERN.finditer(text):
+        match (source.group("kind"), source.group("value").strip('"')):
+            case ("registry", _):
+                pass  # the URL is validated above by URL_PATTERN
+            case ("editable", path) if path != APPROVED_EDITABLE_PATH:
+                findings.add(f"editable {path}")
+            case ("editable", _):
+                pass  # this project itself
+            case (kind, _):
+                findings.add(f"{kind} source")
     return findings
 
 

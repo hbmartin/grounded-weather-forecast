@@ -259,12 +259,21 @@ def test_release_eligibility_uses_implementation_not_promotion_age(tmp_path):
     config = write_config(tmp_path)
     releases = config.artifacts_dir / "releases"
     releases.mkdir(parents=True)
+    release_context = {
+        "evaluation_id": "eval-v1",
+        "source_kind": "live",
+        "source_set_json": json.dumps(["nws", "ecmwf"]),
+        "semantics": {"temp_c": "inst"},
+        "window": "expanding",
+        "code_version": "0.4.0+implementation-v1",
+        "config_fingerprint": config_fingerprint(config),
+    }
     release = {
         "release_id": "release-old-but-active",
         "promoted_at": "2020-01-01T00:00:00+00:00",
         "dataset_fingerprint": "old-dataset",
         "config_fingerprint": config_fingerprint(config),
-        "evaluation_contexts": [],
+        "evaluation_contexts": [release_context],
         "selections": {
             "hourly.temp_c.0-1h": {
                 "method_id": "gbm",
@@ -277,13 +286,121 @@ def test_release_eligibility_uses_implementation_not_promotion_age(tmp_path):
         json.dumps(release), encoding="utf-8"
     )
     key = ("hourly", "temp_c", "0-1h")
-    matching = {key: Selection("gbm", "won", code_version="0.4.0+implementation-v1")}
-    changed = {key: Selection("gbm", "won", code_version="0.4.0+implementation-v2")}
-
-    assert _eligible_release_ids(config, matching)[(*key, "gbm")] == frozenset(
-        {"release-old-but-active"}
+    matching = {
+        key: Selection(
+            "gbm",
+            "won",
+            evaluation_id="eval-current",
+            code_version="0.4.0+implementation-v1",
+        )
+    }
+    changed = {
+        key: Selection(
+            "gbm",
+            "won",
+            evaluation_id="eval-current",
+            code_version="0.4.0+implementation-v2",
+        )
+    }
+    current_contexts = (
+        release_context
+        | {
+            "evaluation_id": "eval-current",
+            "source_set_json": json.dumps(["ecmwf", "nws"]),
+        },
     )
-    assert not _eligible_release_ids(config, changed)[(*key, "gbm")]
+
+    assert _eligible_release_ids(config, matching, current_contexts)[
+        (*key, "gbm")
+    ] == frozenset({"release-old-but-active"})
+    assert not _eligible_release_ids(config, changed, current_contexts)[(*key, "gbm")]
+
+
+def test_release_eligibility_rejects_incompatible_evaluation_context(tmp_path):
+    import json
+
+    from grounded_weather_forecast.evaluation import config_fingerprint
+
+    config = write_config(tmp_path)
+    releases = config.artifacts_dir / "releases"
+    releases.mkdir(parents=True)
+    release = {
+        "release_id": "release-old-context",
+        "promoted_at": "2020-01-01T00:00:00+00:00",
+        "dataset_fingerprint": "old-dataset",
+        "config_fingerprint": config_fingerprint(config),
+        "evaluation_contexts": [
+            {
+                "evaluation_id": "eval-old",
+                "source_kind": "live",
+                "source_set_json": json.dumps(["nws", "ecmwf"]),
+                "semantics": {"temp_c": "inst"},
+                "code_version": "implementation",
+            }
+        ],
+        "selections": {
+            "hourly.temp_c.0-1h": {
+                "method_id": "gbm",
+                "evaluation_id": "eval-old",
+                "code_version": "implementation",
+            }
+        },
+    }
+    (releases / "release-old-context.json").write_text(
+        json.dumps(release), encoding="utf-8"
+    )
+    key = ("hourly", "temp_c", "0-1h")
+    selected = {
+        key: Selection(
+            "gbm",
+            "won",
+            evaluation_id="eval-current",
+            code_version="implementation",
+        )
+    }
+
+    def eligible(*, sources=("nws", "ecmwf"), semantic="inst", present=True):
+        contexts = (
+            {
+                "evaluation_id": "eval-current",
+                "source_kind": "live",
+                "source_set_json": json.dumps(sources),
+                "semantics": {"temp_c": semantic},
+                "code_version": "implementation",
+            },
+        )
+        return _eligible_release_ids(config, selected, contexts if present else ())[
+            (*key, "gbm")
+        ]
+
+    assert eligible() == frozenset({"release-old-context"})
+    assert not eligible(sources=("nws", "gfs"))
+    assert not eligible(semantic="mean")
+    assert not eligible(present=False)
+
+
+def test_historical_release_requires_current_implementation(tmp_path):
+    import json
+
+    config = scored_config(tmp_path)
+    promoted = select_methods(config, config.dataset.dir / "scores")
+    release_id = next(iter({choice.release_id for choice in promoted.values()}))
+    assert release_id is not None
+    release_path = config.artifacts_dir / "releases" / f"{release_id}.json"
+    release = json.loads(release_path.read_text(encoding="utf-8"))
+    for selection in release["selections"].values():
+        selection["code_version"] = "0.4.0+retired-implementation"
+    for context in release["evaluation_contexts"]:
+        context["code_version"] = "0.4.0+retired-implementation"
+    release_path.write_text(json.dumps(release), encoding="utf-8")
+
+    restored = select_methods(
+        config,
+        config.dataset.dir / "scores",
+        as_of=datetime.now(tz=UTC) + timedelta(minutes=1),
+    )
+
+    assert restored == {}
 
 
 def test_selection_positional_fields_keep_their_original_meaning():

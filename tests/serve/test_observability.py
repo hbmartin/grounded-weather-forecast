@@ -1,8 +1,10 @@
 from datetime import UTC, datetime, timedelta
+from time import monotonic
 
 import polars as pl
 import pytest
 from conftest import synthetic_hourly_matrix, write_config
+from filelock import FileLock
 
 from grounded_weather_forecast.artifacts import ArtifactStore
 from grounded_weather_forecast.blenders import get_factory
@@ -107,6 +109,25 @@ def test_store_failure_is_swallowed(tmp_path, monkeypatch):
 
     monkeypatch.setattr(ArtifactStore, "save", boom)
     snap(config, fitted(), "grounded_equal_weight")
+    assert load_observability_states(config.artifacts_dir) == ()
+
+
+def test_snapshot_lock_timeout_is_swallowed_promptly(tmp_path, monkeypatch):
+    import grounded_weather_forecast.serve.observability as observability
+
+    config = write_config(tmp_path)
+    blender = fitted()
+    monkeypatch.setattr(observability, "_LOCK_TIMEOUT_SECONDS", 0.05)
+    store = ArtifactStore(observability_root(config))
+    lock_path = store._latest_path().with_suffix(".json.lock")
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+
+    with FileLock(lock_path):
+        started = monotonic()
+        snap(config, blender, "grounded_equal_weight")
+        elapsed = monotonic() - started
+
+    assert elapsed < 1.0
     assert load_observability_states(config.artifacts_dir) == ()
 
 

@@ -14,6 +14,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from itertools import pairwise
 from typing import Literal
+from zoneinfo import ZoneInfo
 
 import polars as pl
 
@@ -254,7 +255,11 @@ def _truth_alerts(inputs: AlertInputs) -> tuple[Alert, ...]:
         # 49 days and reported healthy mean coverage while the actual trailing
         # week sat far below the floor.
         recent_hourly = hourly.filter(
-            pl.col("valid_hour") >= inputs.now - timedelta(days=_TRUTH_WINDOW_DAYS)
+            pl.col("valid_hour").is_between(
+                inputs.now - timedelta(days=_TRUTH_WINDOW_DAYS),
+                inputs.now,
+                closed="both",
+            )
         )
         if not recent_hourly.is_empty():
             evaluated = True
@@ -275,8 +280,13 @@ def _truth_alerts(inputs: AlertInputs) -> tuple[Alert, ...]:
     # Judged independently of hourly: returning early when hourly truth was
     # missing silently discarded perfectly good daily coverage.
     if not daily.is_empty() and daily_columns and "date_local" in daily.columns:
-        horizon = (inputs.now - timedelta(days=_TRUTH_WINDOW_DAYS)).date()
-        recent_daily = daily.filter(pl.col("date_local") >= horizon)
+        local_today = inputs.now.astimezone(
+            ZoneInfo(inputs.config.station.timezone)
+        ).date()
+        horizon = local_today - timedelta(days=_TRUTH_WINDOW_DAYS)
+        recent_daily = daily.filter(
+            pl.col("date_local").is_between(horizon, local_today, closed="both")
+        )
         if not recent_daily.is_empty():
             evaluated = True
             daily_labels = {
@@ -508,11 +518,9 @@ def _held_leaders(
 ) -> list[str]:
     """Leaders that actually held ``min_hold``, in order, brief crossings dropped.
 
-    Each sample stands for the interval until the next one, so the newest run
-    is credited one typical interval rather than zero. Without that a sparse
-    trajectory — where one snapshot represents hours of state — could never
-    confirm its own most recent change, while a dense one would confirm every
-    single-sample crossing.
+    A regime is measured only across actual observations. The newest sample
+    contributes no speculative future interval, so a last-sample crossing stays
+    pending until another snapshot observes that leader.
     """
     if len(samples) < 2:
         return [leader for _moment, leader in samples]
@@ -520,8 +528,7 @@ def _held_leaders(
     for moment, leader in samples:
         if not starts or starts[-1][1] != leader:
             starts.append((moment, leader))
-    gaps = sorted((b - a).total_seconds() for (a, _), (b, _) in pairwise(samples))
-    horizon = samples[-1][0] + timedelta(seconds=gaps[len(gaps) // 2])
+    horizon = samples[-1][0]
     held: list[str] = []
     for index, (start, leader) in enumerate(starts):
         end = starts[index + 1][0] if index + 1 < len(starts) else horizon
