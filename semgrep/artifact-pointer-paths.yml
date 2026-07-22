@@ -23,3 +23,4 @@ rules:
       - pattern-either:
           - pattern: $BASE / $VALUE
           - pattern: $BASE.joinpath(..., $VALUE, ...)
+          - pattern: Path($VALUE)
