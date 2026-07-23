@@ -83,14 +83,20 @@ def test_hostless_and_insecure_approved_sources_are_rejected(tmp_path):
 
 
 @pytest.mark.parametrize(
-    "entry",
+    ("entry", "finding"),
     [
-        'source = { registry = "pypi.org/simple" }',
-        'wheel = { url = "files.pythonhosted.org/evil.whl" }',
+        (
+            'source = { registry = "pypi.org/simple" }',
+            "missing scheme: pypi.org/simple",
+        ),
+        (
+            'wheel = { url = "files.pythonhosted.org/evil.whl" }',
+            "missing scheme: files.pythonhosted.org/evil.whl",
+        ),
     ],
 )
-def test_scheme_less_url_values_are_rejected(tmp_path, entry):
+def test_scheme_less_url_values_are_rejected(tmp_path, entry, finding):
     lockfile = tmp_path / "uv.lock"
     lockfile.write_text(entry, encoding="utf-8")
 
-    assert unapproved_hosts(lockfile) == {"missing scheme"}
+    assert unapproved_hosts(lockfile) == {finding}

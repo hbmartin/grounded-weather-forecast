@@ -223,9 +223,9 @@ def backfill_dynamical_long(
     start_instant = datetime(start.year, start.month, start.day, tzinfo=timezone.utc)
     end_instant = datetime(end.year, end.month, end.day, 23, 59, tzinfo=timezone.utc)
     frames: list[pl.DataFrame] = []
+    catalog_errors = _dynamical_error_types()
     for model in selected:
         spec = DYNAMICAL_DATASETS[model]
-        catalog_errors = _dynamical_error_types()
         try:
             dataset = opener(spec.catalog_id)
         except (DynamicalBackfillError,):  # noqa: B013 - project tuple convention

@@ -28,9 +28,10 @@ def unapproved_hosts(lockfile: Path) -> set[str]:
     """Hosts, schemes, and non-registry or off-project sources to reject."""
     text = lockfile.read_text(encoding="utf-8")
     findings: set[str] = set()
-    for value in URL_VALUE_PATTERN.finditer(text):
-        if URL_PATTERN.fullmatch(value.group("value")) is None:
-            findings.add("missing scheme")
+    for field in URL_VALUE_PATTERN.finditer(text):
+        value = field.group("value")
+        if URL_PATTERN.fullmatch(value) is None:
+            findings.add(f"missing scheme: {value}")
     for match in URL_PATTERN.finditer(text):
         parsed = urlparse(match.group())
         if parsed.scheme != "https":
