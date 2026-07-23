@@ -51,6 +51,23 @@ def test_catalog_base_errors_are_normalized(config, monkeypatch):
         )
 
 
+@pytest.mark.parametrize("error_type", [TypeError, ValueError, LookupError, OSError])
+def test_builtin_errors_from_open_are_normalized(config, error_type):
+    def fail_open(_catalog_id):
+        raise error_type("dataset cannot be opened")
+
+    with pytest.raises(
+        DynamicalBackfillError,
+        match=rf"'gefs'.*{error_type.__name__}: dataset cannot be opened",
+    ):
+        backfill_dynamical_long(
+            config,
+            date(2026, 6, 1),
+            date(2026, 6, 2),
+            opener=fail_open,
+        )
+
+
 @pytest.mark.parametrize(
     "error_type", [TypeError, ValueError, LookupError, RuntimeError]
 )
