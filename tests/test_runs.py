@@ -209,6 +209,34 @@ def test_a_naive_timestamp_still_writes_a_row(tmp_path):
     assert load_runs(path).height == 1
 
 
+def test_mixed_timestamp_awareness_is_normalized_before_duration(tmp_path):
+    path = tmp_path / "runs.parquet"
+    started = datetime(2026, 7, 19, 12, 0)
+    ended = datetime(2026, 7, 19, 12, 0, 1, 500_000, tzinfo=UTC)
+
+    append_run(
+        RunRecord(
+            run_id="mixed",
+            command="predict",
+            args_json="{}",
+            started_at=started,
+            ended_at=ended,
+            exit_code=0,
+            error=None,
+            dataset_fingerprint="fp",
+            config_fingerprint="cfg",
+            code_version="0.4.0",
+        ),
+        path,
+        now=ended,
+    )
+
+    row = load_runs(path).row(0, named=True)
+    assert row["started_at"] == started.replace(tzinfo=UTC)
+    assert row["ended_at"] == ended
+    assert row["duration_ms"] == 1500
+
+
 def test_future_timestamp_does_not_move_the_retention_horizon(tmp_path):
     path = tmp_path / "runs.parquet"
     recent = _record(command="recent")

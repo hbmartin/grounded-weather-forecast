@@ -85,6 +85,16 @@ class TestMcsPromotionGate:
         winners = slice_winners(board, scores=scores, rule="mcs", alpha=0.1)
         assert winners["method_id"][0] == "challenger"
 
+    def test_null_semantics_use_instantaneous_scores(self):
+        scores = scores_frame(gap=0.5).with_columns(
+            pl.lit(None, dtype=pl.String).alias("semantics")
+        )
+        board = leaderboard(scores)
+
+        assert board["truth_semantics"].unique().to_list() == ["inst"]
+        winners = slice_winners(board, scores=scores, rule="mcs", alpha=0.1)
+        assert winners["method_id"][0] == "challenger"
+
     def test_near_tie_keeps_the_reference(self):
         # seed 10: the challenger leads on sample MAE (the winner's-curse
         # configuration) yet the MCS keeps both, so the reference serves

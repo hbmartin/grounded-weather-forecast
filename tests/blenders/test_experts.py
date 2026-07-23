@@ -94,6 +94,19 @@ class TestOnlineExperts:
         assert short_weights is not None
         assert short_weights[1] > 0.6  # beta trusted where it is awake
 
+    def test_predict_ignores_a_non_finite_corrected_expert(self, monkeypatch):
+        train = to_supervised_slice(synthetic_hourly_matrix(days=4), TEMP)
+        blender = get_factory("ewa")().fit(train)
+        corrected = blender._grounding.transform(train.x)
+        assert train.x.availability[0].all()
+        corrected[0, 0] = np.inf
+        monkeypatch.setattr(blender._grounding, "transform", lambda _x: corrected)
+
+        point = blender.predict(train.x).point
+
+        assert point[0] == pytest.approx(corrected[0, 1])
+        assert np.isfinite(point).all()
+
     def test_state_serializable(self):
         matrix = synthetic_hourly_matrix(days=10)
         train = to_supervised_slice(matrix, TEMP)
@@ -349,6 +362,13 @@ class TestStateIntegrity:
         with pytest.raises(ValueError, match="does not match"):
             OnlineExperts.from_state(experts.to_state(), "boa")
 
+    def test_observability_state_still_drops_only_the_cursors(self):
+        """The dashboard view must survive the atomicity rework."""
+        _, experts = self._fitted()
+        state = experts.observability_state()
+        assert "progress" not in state
+        assert "buckets" in state
+
 
 def test_non_finite_truth_is_rejected_and_filtered():
     from grounded_weather_forecast.contracts import (
@@ -378,10 +398,3 @@ def test_non_finite_truth_is_rejected_and_filtered():
     filtered = to_supervised_slice(poisoned, TEMP)
     assert filtered.x.n_rows == train.x.n_rows - 1
     assert np.isfinite(filtered.y).all()
-
-    def test_observability_state_still_drops_only_the_cursors(self):
-        """The dashboard view must survive the atomicity rework."""
-        _, experts = self._fitted()
-        state = experts.observability_state()
-        assert "progress" not in state
-        assert "buckets" in state

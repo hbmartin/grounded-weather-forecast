@@ -14,6 +14,7 @@ import numpy as np
 import polars as pl
 from scipy import stats
 
+from grounded_weather_forecast.contracts import TruthSemantics
 from grounded_weather_forecast.metrics.deterministic import bias, mae, pct_within, rmse
 from grounded_weather_forecast.metrics.dm import diebold_mariano
 from grounded_weather_forecast.metrics.probabilistic import (
@@ -51,6 +52,17 @@ _PROBABILISTIC_EMPTY: Mapping[str, float | None] = {
     "pit_chi2_p": None,
     "sharpness": None,
 }
+
+
+def _with_default_semantics(scores: pl.DataFrame) -> pl.DataFrame:
+    """Treat missing semantic values as the legacy instantaneous target."""
+    if "semantics" not in scores.columns:
+        return scores
+    return scores.with_columns(
+        pl.col("semantics")
+        .fill_null(TruthSemantics.INSTANTANEOUS.value)
+        .alias("semantics")
+    )
 
 
 def _level_index(levels: Sequence[float], target: float) -> int | None:
@@ -194,6 +206,7 @@ def leaderboard(
     references: tuple[str, ...] = DEFAULT_REFERENCES,
 ) -> pl.DataFrame:
     """Per (product, variable, lead bucket, method): every reported view."""
+    scores = _with_default_semantics(scores)
     rows: list[dict[str, object]] = []
     # Semantics joins the slice identity so a concatenated frame cannot pool
     # two truth targets into one row; per-evaluation frames are unaffected.
@@ -227,7 +240,9 @@ def leaderboard(
             row: dict[str, object] = {
                 "product": product,
                 "variable": variable,
-                "truth_semantics": parts.get("semantics", "inst"),
+                "truth_semantics": parts.get(
+                    "semantics", TruthSemantics.INSTANTANEOUS.value
+                ),
                 "lead_bucket": lead_bucket,
                 "method_id": method_id,
                 "n": method_scores.height,
@@ -367,6 +382,7 @@ def slice_winners(
     """
     if board.is_empty():
         return board
+    normalized_scores = _with_default_semantics(scores) if scores is not None else None
     winners: list[dict[str, object]] = []
     keys = ["product", "variable", "lead_bucket"]
     if "truth_semantics" in board.columns:
@@ -396,14 +412,17 @@ def slice_winners(
                     candidate = _reference_fallback(reference_rows)
                 else:
                     continue
-            elif rule == "mcs" and scores is not None:
+            elif rule == "mcs" and normalized_scores is not None:
                 parts = dict(zip(keys, slice_key, strict=True))
-                slice_scores = scores.filter(
+                slice_scores = normalized_scores.filter(
                     (pl.col("product") == parts["product"])
                     & (pl.col("variable") == parts["variable"])
                     & (pl.col("lead_bucket") == parts["lead_bucket"])
                 )
-                if "truth_semantics" in parts and "semantics" in scores.columns:
+                if (
+                    "truth_semantics" in parts
+                    and "semantics" in normalized_scores.columns
+                ):
                     slice_scores = slice_scores.filter(
                         pl.col("semantics") == parts["truth_semantics"]
                     )

@@ -189,6 +189,16 @@ def _long_frame(
     )
 
 
+def _backfill_failure(
+    model: str, spec: DynamicalDataset, exc: Exception
+) -> DynamicalBackfillError:
+    msg = (
+        f"dynamical backfill failed for {model!r} "
+        f"({spec.catalog_id}): {type(exc).__name__}: {exc}"
+    )
+    return DynamicalBackfillError(msg)
+
+
 def backfill_dynamical_long(
     config: Config,
     start: date,
@@ -215,8 +225,17 @@ def backfill_dynamical_long(
     frames: list[pl.DataFrame] = []
     for model in selected:
         spec = DYNAMICAL_DATASETS[model]
+        catalog_errors = _dynamical_error_types()
         try:
             dataset = opener(spec.catalog_id)
+        except (DynamicalBackfillError,):  # noqa: B013 - project tuple convention
+            raise
+        # These built-ins come directly from the optional catalog boundary.
+        # Do not catch them around our extraction helpers: the same classes are
+        # also raised by ordinary programming errors there.
+        except (ValueError, LookupError, TypeError, OSError, *catalog_errors) as exc:
+            raise _backfill_failure(model, spec, exc) from exc
+        try:
             point = _point_selection(
                 dataset, config.station.latitude, config.station.longitude
             )
@@ -232,25 +251,11 @@ def backfill_dynamical_long(
             frames.append(_long_frame(_member_mean(window), spec, lag))
         except (DynamicalBackfillError,):  # noqa: B013 - project tuple convention
             raise
-        # The Zarr/xarray/icechunk stack raises a wide and version-dependent
-        # set of its own errors. Catch through Exception only to cross the lazy
-        # optional-dependency boundary, then re-raise programming failures and
-        # normalize the catalog's documented hierarchy plus data/store errors.
-        except (Exception,) as exc:  # noqa: B013 - filtered immediately below
-            expected = (
-                OSError,
-                ValueError,
-                LookupError,
-                TypeError,
-                *_dynamical_error_types(),
-            )
-            if not isinstance(exc, expected):
-                raise
-            msg = (
-                f"dynamical backfill failed for {model!r} "
-                f"({spec.catalog_id}): {type(exc).__name__}: {exc}"
-            )
-            raise DynamicalBackfillError(msg) from exc
+        # Lazy reads can raise the catalog's public error hierarchy or storage
+        # errors after open(). Normalize only those unambiguous dependency
+        # failures; built-in TypeError/ValueError/LookupError must stay visible.
+        except (OSError, *catalog_errors) as exc:
+            raise _backfill_failure(model, spec, exc) from exc
     if not frames:
         msg = "no dynamical cycles found in the requested window"
         raise DynamicalBackfillError(msg)

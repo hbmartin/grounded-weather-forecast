@@ -1,6 +1,8 @@
 import sys
 from pathlib import Path
 
+import pytest
+
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
 
 from check_lock_hosts import unapproved_hosts
@@ -78,3 +80,17 @@ def test_hostless_and_insecure_approved_sources_are_rejected(tmp_path):
         "hostless file source",
         "http scheme",
     }
+
+
+@pytest.mark.parametrize(
+    "entry",
+    [
+        'source = { registry = "pypi.org/simple" }',
+        'wheel = { url = "files.pythonhosted.org/evil.whl" }',
+    ],
+)
+def test_scheme_less_url_values_are_rejected(tmp_path, entry):
+    lockfile = tmp_path / "uv.lock"
+    lockfile.write_text(entry, encoding="utf-8")
+
+    assert unapproved_hosts(lockfile) == {"missing scheme"}

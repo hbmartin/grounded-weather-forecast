@@ -143,13 +143,15 @@ def load_runs(path: Path) -> pl.DataFrame:
 
 
 def _to_frame(record: RunRecord) -> pl.DataFrame:
-    duration_ms = int((record.ended_at - record.started_at).total_seconds() * 1000)
+    started_at = _as_utc(record.started_at)
+    ended_at = _as_utc(record.ended_at)
+    duration_ms = int((ended_at - started_at).total_seconds() * 1000)
     row = {
         "run_id": record.run_id,
         "command": record.command,
         "args_json": record.args_json,
-        "started_at": _as_utc(record.started_at),
-        "ended_at": _as_utc(record.ended_at),
+        "started_at": started_at,
+        "ended_at": ended_at,
         "duration_ms": duration_ms,
         "exit_code": record.exit_code,
         "error": record.error,

@@ -9,6 +9,9 @@ APPROVED_HOSTS = frozenset({"files.pythonhosted.org", "pypi.org"})
 # exactly what an allowlist exists to catch, and matching only https URLs made
 # the check blind to every one of them.
 URL_PATTERN = re.compile(r"\b[a-zA-Z][a-zA-Z0-9+.-]*://[^\"'\s]+")
+# Registry and distribution URL fields are URLs by schema, so a value without
+# ``scheme://`` must be rejected instead of disappearing from URL_PATTERN.
+URL_VALUE_PATTERN = re.compile(r'\b(?:registry|url)\s*=\s*"(?P<value>[^"]*)"')
 # uv records non-registry dependencies as a source kind rather than a URL, so
 # a `{ path = "../evil" }` or `{ workspace = true }` entry carries no scheme at
 # all and would otherwise pass silently. Capture the value as well: allowlisting
@@ -25,10 +28,13 @@ def unapproved_hosts(lockfile: Path) -> set[str]:
     """Hosts, schemes, and non-registry or off-project sources to reject."""
     text = lockfile.read_text(encoding="utf-8")
     findings: set[str] = set()
+    for value in URL_VALUE_PATTERN.finditer(text):
+        if URL_PATTERN.fullmatch(value.group("value")) is None:
+            findings.add("missing scheme")
     for match in URL_PATTERN.finditer(text):
         parsed = urlparse(match.group())
         if parsed.scheme != "https":
-            findings.add(f"{parsed.scheme or 'missing'} scheme")
+            findings.add(f"{parsed.scheme} scheme")
         if parsed.hostname is None:
             findings.add(f"hostless {parsed.scheme or 'URL'} source")
         elif parsed.hostname not in APPROVED_HOSTS:

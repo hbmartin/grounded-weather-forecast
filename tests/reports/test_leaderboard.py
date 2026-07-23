@@ -88,8 +88,33 @@ class TestLeaderboard:
         instantaneous = mixed.filter(pl.col("truth_semantics") == "inst")
         assert instantaneous.height == single.height
         winners = slice_winners(mixed)
-        keys = winners.select("product", "variable", "truth_semantics", "lead_bucket")
-        assert keys.unique().height == winners.height
+        winner_columns = ["product", "variable", "lead_bucket", "method_id"]
+        expected = (
+            slice_winners(single).select(winner_columns).sort(winner_columns).to_dicts()
+        )
+        assert expected
+        for semantics in ("inst", "mean"):
+            actual = (
+                winners.filter(pl.col("truth_semantics") == semantics)
+                .select(winner_columns)
+                .sort(winner_columns)
+                .to_dicts()
+            )
+            assert len(actual) == len(expected)
+            assert actual == expected
+
+    def test_null_semantics_merge_into_instantaneous_slice(
+        self, scores: pl.DataFrame
+    ) -> None:
+        nullable = scores.with_columns(
+            pl.Series(
+                "semantics",
+                [None if index % 2 else "inst" for index in range(scores.height)],
+                dtype=pl.String,
+            )
+        )
+
+        assert leaderboard(nullable).equals(leaderboard(scores))
 
     def test_empty_scores(self):
         assert leaderboard(empty_scores()).is_empty()

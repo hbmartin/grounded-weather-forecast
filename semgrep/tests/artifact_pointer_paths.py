@@ -1,19 +1,33 @@
-def invalid_division(root, raw_pointer):
+from collections.abc import Mapping
+from pathlib import Path
+
+
+def invalid_division(root: Path, raw_pointer: Mapping[str, str]) -> Path:
     fingerprint = raw_pointer["fingerprint"]
     # ruleid: artifact-pointer-fields-must-not-feed-paths-directly
     return root / fingerprint
 
 
-def invalid_joinpath(root, raw_pointer):
+def invalid_joinpath(root: Path, raw_pointer: Mapping[str, str]) -> Path:
     # ruleid: artifact-pointer-fields-must-not-feed-paths-directly
     return root.joinpath(raw_pointer.get("method_id"), "state.json")
 
 
-def valid_division(root, validated_pointer):
+def invalid_constructor(raw_pointer: Mapping[str, str]) -> Path:
+    # ruleid: artifact-pointer-fields-must-not-feed-paths-directly
+    return Path(raw_pointer["fingerprint"])
+
+
+def valid_division(root: Path, validated_pointer: Mapping[str, str]) -> Path:
     # ok: artifact-pointer-fields-must-not-feed-paths-directly
     return root / validated_pointer["fingerprint"]
 
 
-def valid_joinpath(root, fingerprint):
+def valid_joinpath(root: Path, fingerprint: str) -> Path:
     # ok: artifact-pointer-fields-must-not-feed-paths-directly
     return root.joinpath(fingerprint, "state.json")
+
+
+def valid_constructor(validated_pointer: Mapping[str, str]) -> Path:
+    # ok: artifact-pointer-fields-must-not-feed-paths-directly
+    return Path(validated_pointer["fingerprint"])

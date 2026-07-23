@@ -51,16 +51,23 @@ def test_catalog_base_errors_are_normalized(config, monkeypatch):
         )
 
 
-def test_programming_errors_are_not_normalized(config):
-    def fail_open(_catalog_id):
-        raise RuntimeError("bug")
+@pytest.mark.parametrize(
+    "error_type", [TypeError, ValueError, LookupError, RuntimeError]
+)
+def test_programming_errors_from_extraction_are_not_normalized(
+    config, monkeypatch, error_type
+):
+    def fail_selection(*_args):
+        raise error_type("bug")
 
-    with pytest.raises(RuntimeError, match="bug"):
+    monkeypatch.setattr(module, "_point_selection", fail_selection)
+
+    with pytest.raises(error_type, match="bug"):
         backfill_dynamical_long(
             config,
             date(2026, 6, 1),
             date(2026, 6, 2),
-            opener=fail_open,
+            opener=lambda _catalog_id: object(),
         )
 
 

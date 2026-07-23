@@ -401,7 +401,7 @@ class OnlineExperts:
         n_experts = len(x.sources)
         point = np.full(x.n_rows, np.nan)
         for row in range(x.n_rows):
-            awake = x.availability[row]
+            awake = x.availability[row] & np.isfinite(corrected[row])
             state = self._state_for(x.product, float(x.lead_hours[row]), n_experts)
             weights = _awake_weights(state.weights, awake)
             if weights is None:

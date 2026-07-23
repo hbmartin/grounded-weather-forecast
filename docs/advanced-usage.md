@@ -199,11 +199,13 @@ Method selection resolves in this order:
 [predict.methods] config pin   ->   per-slice backtest winner   ->   named fallback
 ```
 
-Only live scores matching the current dataset, source set, truth semantics, code
-identity, and requested issue time are promotable. Recent live verdicts are pooled
-only across releases with the same serving-relevant identity. The cold-start fallback
-is fit-free `equal_weight`; the document is marked `status = "degraded"` and records
-the reason. **It never presents an unfitted grounded method as trained.**
+Only live scores matching the current dataset, configuration, source set, truth
+semantics, code identity, and requested issue time are promotable. Recent live
+verdicts are pooled only across releases whose configuration, selected method,
+implementation identity, provider source set, exact serving feature schema, and
+per-variable truth semantics all match. The cold-start fallback is fit-free
+`equal_weight`; the document is marked `status = "degraded"` and records the reason.
+**It never presents an unfitted grounded method as trained.**
 
 Pin a method when you have a reason to override the leaderboard:
 
