@@ -85,7 +85,7 @@ class TestMcsPromotionGate:
         winners = slice_winners(board, scores=scores, rule="mcs", alpha=0.1)
         assert winners["method_id"][0] == "challenger"
 
-    def test_null_semantics_use_instantaneous_scores(self):
+    def test_null_semantics_use_instantaneous_scores(self) -> None:
         scores = scores_frame(gap=0.5).with_columns(
             pl.lit(None, dtype=pl.String).alias("semantics")
         )
