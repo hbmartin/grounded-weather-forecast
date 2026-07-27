@@ -378,6 +378,35 @@ class TestReleaseProvenance:
             "humidity_pct": None,
         }
 
+    def test_release_id_survives_a_long_null_minutely_prefix(self):
+        """A served document fronts hourly rows with ~360 null-release minutely
+        rows, past any schema-inference window; the first tagged hourly row
+        must not fail to build."""
+        base = make_forecast()
+        minutely = [
+            replace(
+                base.minutely[0],
+                valid_time=(ISSUED + timedelta(minutes=minute)).isoformat(),
+                minutes_ahead=minute,
+                temp_c=20.0,
+                pop=0.0,
+            )
+            for minute in range(1, 61)
+        ]
+        forecast = replace(
+            base,
+            schema_version=3,
+            minutely=minutely,
+            hourly=[
+                replace(base.hourly[0], release_ids={"temp_c": "release-promoted"})
+            ],
+        )
+
+        rows = self._rows(forecast)
+        hourly = rows.filter(pl.col("product") == "hourly")
+        assert hourly["release_id"].to_list() == ["release-promoted"]
+        assert rows.schema == HISTORY_SCHEMA
+
 
 def test_verification_can_scope_evidence_by_served_time(tmp_path):
     path = tmp_path / "history.parquet"
