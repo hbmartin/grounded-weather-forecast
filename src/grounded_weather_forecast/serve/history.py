@@ -138,6 +138,7 @@ def forecast_to_rows(forecast: Forecast) -> pl.DataFrame:
             rows,
             schema_overrides={
                 "valid_date": pl.String(),
+                "release_id": pl.String(),
                 "selection_reason": pl.String(),
                 "truth_semantics": pl.String(),
                 "quantiles_json": pl.String(),
