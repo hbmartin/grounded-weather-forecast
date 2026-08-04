@@ -309,6 +309,33 @@ def backfill_ensembles(
     return pl.concat(frames).sort(list(_KEY))
 
 
+def trim_backfill_to_live(frame: pl.DataFrame, existing: pl.DataFrame) -> pl.DataFrame:
+    """Drop backfilled vintages that would shadow live-polled statistics.
+
+    The as-of join keeps ONE fetched_at per (issue, model): a later-but-sparse
+    archived vintage (one valid hour per day offset) would shadow an earlier
+    live poll carrying the full horizon. Backfilled rows (``n_members`` null)
+    therefore never cross into a model's live-polled era.
+    """
+    if existing.is_empty():
+        return frame
+    live_starts = (
+        existing.filter(pl.col("n_members").is_not_null())
+        .group_by("model")
+        .agg(pl.col("fetched_at").min().alias("live_start"))
+    )
+    if live_starts.is_empty():
+        return frame
+    return (
+        frame.join(live_starts, on="model", how="left")
+        .filter(
+            pl.col("live_start").is_null()
+            | (pl.col("fetched_at") < pl.col("live_start"))
+        )
+        .drop("live_start")
+    )
+
+
 def load_ensembles(path: Path) -> pl.DataFrame:
     if not path.exists():
         return pl.DataFrame(schema=_SCHEMA)

@@ -372,6 +372,8 @@ def _cmd_backfill_ensembles(config: Config, args: argparse.Namespace, end: date)
         append_ensembles,
         backfill_ensembles,
         ensembles_path,
+        load_ensembles,
+        trim_backfill_to_live,
     )
 
     start = args.start or config.backfill.start_date
@@ -387,7 +389,9 @@ def _cmd_backfill_ensembles(config: Config, args: argparse.Namespace, end: date)
     except (EnsembleError, OSError, ValueError) as exc:
         print(f"backfill failed: {exc}")
         return 1
-    new_rows, total_rows = append_ensembles(ensembles_path(config), frame)
+    store = ensembles_path(config)
+    frame = trim_backfill_to_live(frame, load_ensembles(store))
+    new_rows, total_rows = append_ensembles(store, frame)
     print(f"backfilled {frame.height} ensemble statistics rows")
     print(f"models: {', '.join(sorted(frame['model'].unique().to_list()))}")
     print(f"ensemble store: +{new_rows} new rows -> {total_rows} total")

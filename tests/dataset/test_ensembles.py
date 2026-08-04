@@ -28,6 +28,7 @@ from grounded_weather_forecast.dataset.ensembles import (
     ingest_ensembles,
     parse_ensemble,
     parse_ensemble_mean_runs,
+    trim_backfill_to_live,
 )
 from grounded_weather_forecast.dataset.matrix import (
     active_ensembles,
@@ -240,6 +241,22 @@ class TestEnsembleMeanBackfill:
     def test_no_usable_offsets_raises(self):
         with pytest.raises(EnsembleError, match="no usable offsets"):
             parse_ensemble_mean_runs({"hourly": {"time": []}}, "m", ("temp_c",))
+
+    def test_backfill_never_shadows_the_live_polled_era(self):
+        live = parse_ensemble(payload(), "ncep_gefs025", FETCHED, VARIABLES)
+        backfill = parse_ensemble_mean_runs(
+            mean_runs_payload(
+                times=("2026-03-22T12:00", "2026-07-01T00:00"), days=(1,)
+            ),
+            "ncep_gefs025",
+            ("temp_c",),
+        )
+        trimmed = trim_backfill_to_live(backfill, live)
+        # The vintage fetched after the model's first live poll is dropped;
+        # the pre-live one survives, and unknown models pass through.
+        assert trimmed["fetched_at"].to_list() == [utc(2026, 3, 21, 12, 0)]
+        other = backfill.with_columns(pl.lit("other_model").alias("model"))
+        assert trim_backfill_to_live(other, live).height == other.height
 
     def test_backfill_appends_into_the_live_store(self, tmp_path):
         config = replace(
