@@ -156,6 +156,15 @@ cannot strand their evidence. Score files written before feature-schema
 identity are ignored by selection; re-run `backtest` after upgrading to
 restore promotions.
 
+Served slices whose winning method emits no native quantiles are dressed with
+empirical residual quantiles from that method's own live backtest errors
+(asymmetric, per lead bucket, finite-sample corrected); the document marks
+them in a per-variable `quantiles_source` map so dressed bands are never
+mistaken for a method's own distribution. The leaderboard report adds a
+"Blocked promotions" section naming every slice whose served MAE exceeds the
+slice's board minimum by more than `[promotion].report_gap_threshold`
+(default 0.15), along with which gate blocked the better method.
+
 ## Status
 
 Alpha, and honest about it: with a young forecast archive the backtest reports

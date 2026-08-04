@@ -121,6 +121,9 @@ rule = "mcs"
 alpha = 0.1
 live_gap_factor = 1.5
 min_live_n = 24
+# Relative served-vs-board-minimum MAE gap above which the leaderboard report
+# lists a slice under "Blocked promotions".
+report_gap_threshold = 0.15
 
 [backtest]
 initial_train_days = 90

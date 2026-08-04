@@ -708,6 +708,7 @@ def _cmd_report(config: Config) -> int:
     )
     from grounded_weather_forecast.reports.leaderboard import (  # noqa: PLC0415
         aggregate_leaderboard,
+        blocked_promotions,
         leaderboard,
         slice_winners,
     )
@@ -727,20 +728,24 @@ def _cmd_report(config: Config) -> int:
         print(f"wrote {write_dashboard(config)}")
         return 1
     written: list[Path] = []
+    gap_threshold = config.promotion.report_gap_threshold
     for path in score_files:
         scores = load_scores(path)
         board = leaderboard(scores)
+        winners = slice_winners(
+            board,
+            scores=scores,
+            rule=config.promotion.rule,
+            alpha=config.promotion.alpha,
+        )
         sections = [
             ("Per-slice leaderboard", board),
             ("Aggregate (n-weighted MAE)", aggregate_leaderboard(board)),
+            ("Per-slice winners", winners),
             (
-                "Per-slice winners",
-                slice_winners(
-                    board,
-                    scores=scores,
-                    rule=config.promotion.rule,
-                    alpha=config.promotion.alpha,
-                ),
+                f"Blocked promotions (served MAE above slice best "
+                f"by more than {gap_threshold:.0%})",
+                blocked_promotions(winners, gap_threshold),
             ),
         ]
         # Serving runs on the live provider set, so its realized skill may only
@@ -781,15 +786,10 @@ def _cmd_report(config: Config) -> int:
                 config.reports_dir, report_name, report_name, sections
             )
         )
-        print_summary(
-            f"winners ({path.stem})",
-            slice_winners(
-                board,
-                scores=scores,
-                rule=config.promotion.rule,
-                alpha=config.promotion.alpha,
-            ),
-        )
+        print_summary(f"winners ({path.stem})", winners)
+        blocked = blocked_promotions(winners, gap_threshold)
+        if not blocked.is_empty():
+            print_summary(f"blocked promotions ({path.stem})", blocked)
     matrix_file = _live_hourly_matrix_path(config)
     if matrix_file.exists():
         matrix = pl.read_parquet(matrix_file)

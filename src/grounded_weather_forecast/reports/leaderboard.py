@@ -343,12 +343,14 @@ def _mcs_gate(
     slice_scores: pl.DataFrame,
     eligible_methods: tuple[str, ...],
     alpha: float,
-) -> dict[str, object]:
+) -> tuple[dict[str, object], str | None]:
     """Promote only when every reference is excluded from the MCS.
 
     Sparse, ineligible methods are deliberately excluded before constructing
     the common-case matrix. Thin data never falls back to a more permissive
-    test: the best eligible reference continues serving.
+    test: the best eligible reference continues serving. The second element
+    names which outcome blocked the candidate (None when it promoted), so
+    the report can say why a slice serves above its board minimum.
     """
     from grounded_weather_forecast.reports.mcs import (  # noqa: PLC0415
         collapsed_loss_matrix,
@@ -358,18 +360,18 @@ def _mcs_gate(
     fallback = _reference_fallback(references)
     built = collapsed_loss_matrix(slice_scores, method_ids=eligible_methods)
     if built is None:
-        return fallback
+        return fallback, "mcs_no_matrix"
     matrix, methods = built
     if matrix.shape[0] < _MIN_DM_SAMPLES:
-        return fallback
+        return fallback, "mcs_thin_matrix"
     result = model_confidence_set(matrix, methods, alpha=alpha)
     candidate_id = str(candidate["method_id"])
     reference_ids = tuple(str(reference["method_id"]) for reference in references)
     if result.contains(candidate_id) and all(
         not result.contains(reference_id) for reference_id in reference_ids
     ):
-        return candidate
-    return fallback
+        return candidate, None
+    return fallback, "mcs_not_separated"
 
 
 def slice_winners(
@@ -391,8 +393,20 @@ def slice_winners(
     keys = ["product", "variable", "lead_bucket"]
     if "truth_semantics" in board.columns:
         keys.insert(2, "truth_semantics")
-    output_columns = (*keys, "method_id", "n", "mae")
+    output_columns = (
+        *keys,
+        "method_id",
+        "n",
+        "mae",
+        "best_method_id",
+        "best_mae",
+        "best_n",
+        "mae_gap",
+        "gap_ratio",
+        "gate",
+    )
     for slice_key, group in board.partition_by(keys, as_dict=True).items():
+        best = group.sort("mae").row(0, named=True)
         eligible = group.filter(
             (pl.col("coverage") >= 0.8)
             & (pl.col("n") >= 8)
@@ -402,6 +416,7 @@ def slice_winners(
             continue
         ranked = eligible.sort("mae")
         candidate = ranked.row(0, named=True)
+        gate: str | None = None
         reference_rows = tuple(
             ranked.filter(pl.col("method_id").is_in(DEFAULT_REFERENCES))
             .sort("mae")
@@ -414,6 +429,7 @@ def slice_winners(
             if not set(DEFAULT_REFERENCES) <= present_references:
                 if reference_rows:
                     candidate = _reference_fallback(reference_rows)
+                    gate = "missing_reference"
                 else:
                     continue
             elif rule == "mcs" and normalized_scores is not None:
@@ -430,7 +446,7 @@ def slice_winners(
                     slice_scores = slice_scores.filter(
                         pl.col("semantics") == parts["truth_semantics"]
                     )
-                candidate = _mcs_gate(
+                candidate, gate = _mcs_gate(
                     candidate,
                     reference_rows,
                     slice_scores,
@@ -442,7 +458,91 @@ def slice_winners(
                 for reference in reference_rows
             ):
                 candidate = _reference_fallback(reference_rows)
-        winners.append(candidate)
+                gate = "dm_not_significant"
+        winners.append(_annotate_winner(candidate, best, eligible, gate))
     if not winners:
-        return board.select(*output_columns).head(0)
-    return pl.DataFrame(winners).select(*output_columns).sort(*keys)
+        return _empty_winners(keys)
+    return (
+        pl.DataFrame(winners, infer_schema_length=None)
+        .with_columns(
+            pl.col("gate").cast(pl.String),
+            pl.col("best_mae").cast(pl.Float64),
+            pl.col("mae_gap").cast(pl.Float64),
+            pl.col("gap_ratio").cast(pl.Float64),
+        )
+        .select(*output_columns)
+        .sort(*keys)
+    )
+
+
+def _annotate_winner(
+    candidate: dict[str, object],
+    best: dict[str, object],
+    eligible: pl.DataFrame,
+    gate: str | None,
+) -> dict[str, object]:
+    """Attach the served-vs-board-minimum gap and the gate that caused it."""
+    best_id = str(best["method_id"])
+    if str(candidate["method_id"]) == best_id:
+        gate = None
+    elif not (eligible["method_id"] == best_id).any():
+        # The board minimum never even reached the statistical gates.
+        gate = "eligibility"
+    best_mae = best["mae"] if isinstance(best["mae"], (int, float)) else None
+    served_mae = (
+        candidate["mae"] if isinstance(candidate["mae"], (int, float)) else None
+    )
+    mae_gap = (
+        float(served_mae) - float(best_mae)
+        if served_mae is not None and best_mae is not None
+        else None
+    )
+    gap_ratio = (
+        float(served_mae) / float(best_mae) - 1.0
+        if served_mae is not None and best_mae is not None and best_mae > 0
+        else None
+    )
+    return {
+        **candidate,
+        "best_method_id": best_id,
+        "best_mae": best_mae,
+        "best_n": best["n"],
+        "mae_gap": mae_gap,
+        "gap_ratio": gap_ratio,
+        "gate": gate,
+    }
+
+
+def _empty_winners(keys: list[str]) -> pl.DataFrame:
+    """Typed empty frame: the winner columns no longer all exist on the board."""
+    return pl.DataFrame(
+        schema={
+            **dict.fromkeys(keys, pl.String),
+            "method_id": pl.String,
+            "n": pl.Int64,
+            "mae": pl.Float64,
+            "best_method_id": pl.String,
+            "best_mae": pl.Float64,
+            "best_n": pl.Int64,
+            "mae_gap": pl.Float64,
+            "gap_ratio": pl.Float64,
+            "gate": pl.String,
+        }
+    )
+
+
+def blocked_promotions(winners: pl.DataFrame, threshold: float = 0.15) -> pl.DataFrame:
+    """Slices serving measurably above their board minimum, worst first.
+
+    The gate may be right or wrong per slice — thin data is a legitimate
+    reason to hold a reference — but a 46 % gap should never be silent.
+    """
+    if winners.is_empty() or "gate" not in winners.columns:
+        return winners
+    return winners.filter(
+        pl.col("gate").is_not_null()
+        & (
+            (pl.col("gap_ratio") > threshold)
+            | (pl.col("gap_ratio").is_null() & (pl.col("mae_gap") > 0.0))
+        )
+    ).sort("gap_ratio", descending=True, nulls_last=True)

@@ -215,6 +215,9 @@ class PromotionConfig:
     alpha: float = 0.1
     live_gap_factor: float = 1.5
     min_live_n: int = 24
+    # Relative served-vs-board-minimum MAE gap above which the leaderboard
+    # report flags a slice as a blocked promotion.
+    report_gap_threshold: float = 0.15
 
 
 @dataclass(frozen=True, slots=True)
@@ -609,6 +612,11 @@ def _promotion(raw: Mapping[str, Any]) -> PromotionConfig:
         ),
         min_live_n=_positive_int(
             section.get("min_live_n", 24), "min_live_n", "promotion"
+        ),
+        report_gap_threshold=_positive_number(
+            section.get("report_gap_threshold", 0.15),
+            "report_gap_threshold",
+            "promotion",
         ),
     )
 

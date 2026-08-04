@@ -209,3 +209,17 @@ class TestErrors:
         text = MINIMAL + "\n[backtest]\nstep_days = 0\n"
         with pytest.raises(ConfigError, match="positive integer"):
             load_config(write(tmp_path, text))
+
+    def test_report_gap_threshold_default(self, tmp_path):
+        cfg = load_config(write(tmp_path, MINIMAL))
+        assert cfg.promotion.report_gap_threshold == 0.15
+
+    def test_report_gap_threshold_parsed(self, tmp_path):
+        text = MINIMAL + "\n[promotion]\nreport_gap_threshold = 0.3\n"
+        cfg = load_config(write(tmp_path, text))
+        assert cfg.promotion.report_gap_threshold == 0.3
+
+    def test_nonpositive_report_gap_threshold_rejected(self, tmp_path):
+        text = MINIMAL + "\n[promotion]\nreport_gap_threshold = 0\n"
+        with pytest.raises(ConfigError, match="report_gap_threshold"):
+            load_config(write(tmp_path, text))
