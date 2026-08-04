@@ -185,6 +185,7 @@ class AnchoredEmpirical:
     _variable: VariableSpec | None = None
     _residual_weights: FloatArray | None = None
     _trend_weights: FloatArray | None = None
+    _fitted_bins: int | None = None
 
     def fit(self, train: SupervisedSlice) -> Self:
         self._kind = train.variable.kind
@@ -220,6 +221,7 @@ class AnchoredEmpirical:
         n_bins = len(_FIT_BIN_EDGES) - 1
         raw_weights = np.full(n_bins, np.nan)
         trend_weights = np.zeros(n_bins)
+        bin_rows = np.zeros(n_bins, dtype=np.int64)
         usable = np.isfinite(residuals) & np.isfinite(errors)
         for index in range(n_bins):
             in_bin = (
@@ -227,7 +229,8 @@ class AnchoredEmpirical:
                 & (lead >= _FIT_BIN_EDGES[index])
                 & (lead < _FIT_BIN_EDGES[index + 1])
             )
-            if int(in_bin.sum()) < _MIN_BIN_ROWS:
+            bin_rows[index] = int(in_bin.sum())
+            if bin_rows[index] < _MIN_BIN_ROWS:
                 continue
             r0, e = residuals[in_bin], errors[in_bin]
             denominator = float(r0 @ r0)
@@ -247,6 +250,7 @@ class AnchoredEmpirical:
                         0.0,
                         _MAX_TREND_GAIN_HOURS,
                     )
+        self._fitted_bins = int(np.isfinite(raw_weights).sum())
         if np.isnan(raw_weights).all():
             self._residual_weights = np.zeros(n_bins)
             self._trend_weights = trend_weights
@@ -256,13 +260,53 @@ class AnchoredEmpirical:
         indices = np.arange(n_bins, dtype=np.float64)
         fitted = np.isfinite(raw_weights)
         filled = np.interp(indices, indices[fitted], raw_weights[fitted])
+        # A leading unfitted bin must not inherit its long-lead neighbor's
+        # weight either (np.interp left-clamps): under the AR(1) residual
+        # model the anchor weight rises toward 1 as lead -> 0, so extrapolate
+        # the earliest fitted bin's implied decay back toward zero lead —
+        # persist, then ramp. This is the measured 0-1 h regime where raw
+        # persistence beat every anchored method on the first live folds.
+        # Gated on the fitted weight clearing its own estimation noise
+        # (~2/sqrt(n)): amplifying a noise-level weight toward 1 would turn a
+        # harmless near-zero anchor into an aggressive wrong one.
+        first = int(np.flatnonzero(fitted)[0])
+        first_weight = float(raw_weights[first])
+        credible = first_weight >= max(0.2, 2.0 / np.sqrt(float(bin_rows[first])))
+        if first > 0 and credible and first_weight < 1.0:
+            centers = _bin_centers()
+            rho = first_weight ** (1.0 / centers[first])
+            filled[:first] = rho ** centers[:first]
         # observation information can only fade with lead
         self._residual_weights = np.minimum.accumulate(filled)
         self._trend_weights = trend_weights
 
-    def _weights_at(self, lead: FloatArray, weights: FloatArray) -> FloatArray:
+    @staticmethod
+    def _zero_lead_weight(weights: FloatArray) -> float:
+        """The residual weight as lead -> 0, by extrapolating the fitted decay.
+
+        At zero lead the anchor observation *is* the target up to instrument
+        noise, so a decaying curve is extended toward (0, <=1) in log space.
+        A flat fitted curve is respected as-is — the ramp is only ever
+        inferred from a measured decay, never invented.
+        """
+        centers = _bin_centers()
+        first = float(weights[0])
+        if first <= 0.0:
+            return 0.0
+        second = float(weights[1]) if len(weights) > 1 else first
+        if not 0.0 < second < first:
+            return first
+        rho = (second / first) ** (1.0 / (centers[1] - centers[0]))
+        return float(min(1.0, first * rho ** -centers[0]))
+
+    def _weights_at(
+        self, lead: FloatArray, weights: FloatArray, *, ramp_to_zero_lead: bool = False
+    ) -> FloatArray:
         centers = np.append(_bin_centers(), _FIT_BIN_EDGES[-1])
         tapered = np.append(weights, 0.0)
+        if ramp_to_zero_lead:
+            centers = np.concatenate(([0.0], centers))
+            tapered = np.concatenate(([self._zero_lead_weight(weights)], tapered))
         return np.interp(lead, centers, tapered, right=0.0)
 
     def predict(self, x: ForecastMatrix) -> BlendResult:
@@ -275,7 +319,10 @@ class AnchoredEmpirical:
         correction = np.nan_to_num(residuals, nan=0.0)
         point = (
             base_point
-            + self._weights_at(x.lead_hours, self._residual_weights) * correction
+            + self._weights_at(
+                x.lead_hours, self._residual_weights, ramp_to_zero_lead=True
+            )
+            * correction
         )
         if self.use_trend and self._trend_weights is not None:
             trend = np.nan_to_num(self._trends(x), nan=0.0)
@@ -289,6 +336,12 @@ class AnchoredEmpirical:
         return {
             "residual_weights": residual.tolist() if residual is not None else None,
             "trend_weights": trend.tolist() if trend is not None else None,
+            "zero_lead_weight": (
+                self._zero_lead_weight(residual) if residual is not None else None
+            ),
+            # 0 fitted bins means every weight came from the fallback path —
+            # the silent all-NaN degeneration is visible here, not just absent.
+            "fitted_bins": getattr(self, "_fitted_bins", None),
             "bin_edges": list(_FIT_BIN_EDGES),
             "use_trend": self.use_trend,
             "base_method_id": getattr(getattr(self, "_base", None), "method_id", None),

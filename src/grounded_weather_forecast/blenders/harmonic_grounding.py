@@ -104,6 +104,12 @@ class HarmonicGrounding:
                     return np.zeros(design.shape[1])
                 return _ridge_fit(design[available], residuals[available, index])
 
+            # Deliberately no shrinkage blend (stays on the min_rows cliff):
+            # a thin bucket's local state is the zero-vector fallback above,
+            # not a genuine curve, and interpolating Fourier/ridge coefficients
+            # against that all-or-nothing fallback design is not obviously
+            # sound. The ridge penalty already stabilises the buckets that
+            # clear the bar.
             fitter = PerBucketFitter[FloatArray](
                 buckets=buckets, fit_one=fit_one, min_rows=_MIN_FIT_ROWS
             )
