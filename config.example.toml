@@ -35,6 +35,14 @@ immutable = false
 # Empty = every source discovered in the archive; otherwise an allowlist of slugs.
 sources = []
 max_forecast_age_hours = 12.0
+# Null one variable of one source at matrix build without excluding the source
+# entirely, for providers whose signal is genuinely bad for a single field.
+# exclude = ["weatherapi:dew_point_c"]
+
+# Per-source lead cap in hours: rows beyond the cap are dropped at matrix
+# build, trimming a provider's degraded horizon tail.
+# [forecasts.max_lead_hours]
+# stormglass_sg = 120
 
 [dataset]
 dir = "data"

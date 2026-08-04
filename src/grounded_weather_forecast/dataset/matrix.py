@@ -10,7 +10,7 @@ aggregates (``ewagg__*``).
 
 import hashlib
 import json
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -64,6 +64,7 @@ from grounded_weather_forecast.solar import solar_elevation_deg, toa_irradiance_
 from grounded_weather_forecast.timeutil import local_date_expr, local_day_minutes
 
 _SECONDS_PER_HOUR = 3600.0
+_HOURS_PER_DAY = 24.0
 _OBS_TOLERANCE = timedelta(minutes=30)
 HOURLY_MATRIX_VARIABLES: tuple[str, ...] = tuple(HOURLY_COLUMN_MAP.values())
 DAILY_MATRIX_VARIABLES: tuple[str, ...] = tuple(
@@ -85,6 +86,42 @@ def assert_single_kind(frame: pl.DataFrame, *, allow_mixed: bool = False) -> str
         case _:
             msg = f"frame mixes source kinds {sorted(map(str, kinds))}; pass allow_mixed=True only if deliberate"
             raise MixedProvenanceError(msg)
+
+
+def _apply_variable_exclusions(
+    snap: pl.DataFrame,
+    exclude: tuple[tuple[str, str], ...],
+    value_columns: tuple[str, ...],
+) -> pl.DataFrame:
+    """Null configured (source, variable) values on the still-long frame.
+
+    Nulling rather than dropping keeps the column present, so downstream the
+    pair becomes an unavailable entry every blender's availability mask
+    already skips — the provider-QC contract, applied by configuration.
+    """
+    for source, variable in exclude:
+        if variable in value_columns and variable in snap.columns:
+            snap = snap.with_columns(
+                pl.when(pl.col("source") == source)
+                .then(pl.lit(None, dtype=pl.Float64))
+                .otherwise(pl.col(variable))
+                .alias(variable)
+            )
+    return snap
+
+
+def _drop_capped_leads(
+    snap: pl.DataFrame,
+    caps: Mapping[str, float],
+    lead_hours_expr: pl.Expr,
+) -> pl.DataFrame:
+    """Drop rows beyond a source's configured lead cap (horizon-edge trim)."""
+    if not caps:
+        return snap
+    keep = pl.lit(value=True)
+    for source, cap in caps.items():
+        keep = keep & ~((pl.col("source") == source) & (lead_hours_expr > cap))
+    return snap.filter(keep)
 
 
 def _pivot(
@@ -254,6 +291,12 @@ def build_hourly_matrix(
             (pl.col("valid_time") - pl.col("issue_time")).dt.total_seconds()
             / _SECONDS_PER_HOUR
         ).alias("lead_hours")
+    )
+    snap = _apply_variable_exclusions(
+        snap, config.forecasts.exclude, HOURLY_MATRIX_VARIABLES
+    )
+    snap = _drop_capped_leads(
+        snap, config.forecasts.max_lead_hours, pl.col("lead_hours")
     )
     # A stable sort fixes pivot column order, keeping parquet bytes and the
     # dataset fingerprint deterministic across rebuilds.
@@ -425,11 +468,24 @@ def build_daily_matrix(
 ) -> pl.DataFrame:
     """One row per (issue snapshot, target local date)."""
     kind = assert_single_kind(daily_long)
+    timezone_name = config.station.timezone
     snap = apply_provider_qc(
         snapshot_long(daily_long, snapshots, config.forecasts.max_forecast_age_hours),
         config,
         value_columns=DAILY_MATRIX_VARIABLES,
         group_key=["issue_time", "forecast_date"],
+    )
+    snap = _apply_variable_exclusions(
+        snap, config.forecasts.exclude, DAILY_MATRIX_VARIABLES
+    )
+    snap = _drop_capped_leads(
+        snap,
+        config.forecasts.max_lead_hours,
+        (
+            pl.col("forecast_date")
+            - local_date_expr(pl.col("issue_time"), timezone_name)
+        ).dt.total_days()
+        * _HOURS_PER_DAY,
     )
     if snap.is_empty():
         return pl.DataFrame(
@@ -442,7 +498,6 @@ def build_daily_matrix(
             }
         )
     snap = snap.sort("source", "issue_time", "forecast_date")
-    timezone_name = config.station.timezone
     index = ["issue_time", "forecast_date"]
     wide = snap.select(index).unique(maintain_order=True).sort(index)
     for variable in DAILY_MATRIX_VARIABLES:

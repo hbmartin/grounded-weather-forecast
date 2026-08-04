@@ -20,6 +20,8 @@ from grounded_weather_forecast.contracts import (
     hourly_variable,
 )
 from grounded_weather_forecast.dataset.matrix import (
+    _apply_variable_exclusions,
+    _drop_capped_leads,
     _equal_weight_daily_aggregates,
     _observation_trends,
     assert_single_kind,
@@ -386,3 +388,54 @@ class TestWriteDataset:
         first = write_dataset(config)
         second = write_dataset(config)
         assert first.fingerprint == second.fingerprint
+
+
+class TestSourceLimits:
+    """Per-variable exclusion and per-source lead caps on the long frame."""
+
+    def snap(self):
+        return pl.DataFrame(
+            {
+                "source": ["nws", "nws", "weatherapi", "weatherapi"],
+                "lead_hours": [12.0, 200.0, 12.0, 200.0],
+                "temp_c": [10.0, 11.0, 12.0, 13.0],
+                "dew_point_c": [5.0, 6.0, 7.0, 8.0],
+            }
+        )
+
+    def test_exclusion_nulls_only_the_named_pair(self):
+        out = _apply_variable_exclusions(
+            self.snap(),
+            (("weatherapi", "dew_point_c"),),
+            ("temp_c", "dew_point_c"),
+        )
+        weatherapi = out.filter(pl.col("source") == "weatherapi")
+        assert weatherapi["dew_point_c"].to_list() == [None, None]
+        assert weatherapi["temp_c"].to_list() == [12.0, 13.0]
+        assert out.filter(pl.col("source") == "nws")["dew_point_c"].to_list() == [
+            5.0,
+            6.0,
+        ]
+
+    def test_exclusion_ignores_unknown_variable(self):
+        out = _apply_variable_exclusions(
+            self.snap(), (("nws", "not_a_variable"),), ("temp_c", "dew_point_c")
+        )
+        assert out.equals(self.snap())
+
+    def test_lead_cap_drops_only_the_named_source(self):
+        out = _drop_capped_leads(
+            self.snap(), {"weatherapi": 100.0}, pl.col("lead_hours")
+        )
+        assert out.filter(pl.col("source") == "weatherapi")["lead_hours"].to_list() == [
+            12.0
+        ]
+        assert out.filter(pl.col("source") == "nws")["lead_hours"].to_list() == [
+            12.0,
+            200.0,
+        ]
+
+    def test_no_caps_is_identity(self):
+        assert _drop_capped_leads(self.snap(), {}, pl.col("lead_hours")).equals(
+            self.snap()
+        )

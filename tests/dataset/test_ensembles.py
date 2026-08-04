@@ -17,12 +17,16 @@ from conftest import (
 from grounded_weather_forecast.config import EnsemblesConfig
 from grounded_weather_forecast.contracts import hourly_variable
 from grounded_weather_forecast.dataset.ensembles import (
+    ENSEMBLE_MEAN_SUFFIX,
     EnsembleError,
     append_ensembles,
+    backfill_ensembles,
+    build_ensemble_backfill_url,
     build_ensemble_url,
     ensemble_features,
     ingest_ensembles,
     parse_ensemble,
+    parse_ensemble_mean_runs,
 )
 from grounded_weather_forecast.dataset.matrix import (
     active_ensembles,
@@ -188,6 +192,72 @@ class TestIngestAndAppend:
             append_ensembles(store, second)
 
         assert pl.read_parquet(store).equals(first)
+
+
+def mean_runs_payload(times=("2026-07-01T00:00", "2026-07-01T01:00"), days=(1, 2)):
+    n = len(times)
+    hourly = {"time": list(times)}
+    for day in days:
+        hourly[f"temperature_2m_previous_day{day}"] = [20.0 + day] * n
+        hourly[f"temperature_2m_spread_previous_day{day}"] = [0.5 * day] * n
+    return {"hourly": hourly}
+
+
+class TestEnsembleMeanBackfill:
+    def test_url_uses_pseudo_model_and_spread_fields(self, tmp_path):
+        config = replace(
+            write_config(tmp_path),
+            ensembles=EnsemblesConfig(models=("ncep_gefs025",), variables=("temp_c",)),
+        )
+        url = build_ensemble_backfill_url(
+            config, "ncep_gefs025", FETCHED.date(), FETCHED.date()
+        )
+        assert f"ncep_gefs025{ENSEMBLE_MEAN_SUFFIX}" in url
+        assert "temperature_2m_previous_day1" in url
+        assert "temperature_2m_spread_previous_day1" in url
+        assert "previous-runs-api.open-meteo.com" in url
+
+    def test_offsets_become_run_vintages(self):
+        frame = parse_ensemble_mean_runs(
+            mean_runs_payload(), "ncep_gefs025", ("temp_c",)
+        )
+        day2 = frame.filter(
+            (pl.col("fetched_at") == utc(2026, 6, 29, 0, 0))
+            & (pl.col("valid_time") == utc(2026, 7, 1, 0, 0))
+        ).row(0, named=True)
+        assert day2["model"] == "ncep_gefs025"
+        assert day2["mean"] == pytest.approx(22.0)
+        assert day2["sd"] == pytest.approx(1.0)
+        assert day2["p50"] is None  # archived stats carry no percentiles
+        assert day2["n_members"] is None
+
+    def test_no_usable_offsets_raises(self):
+        with pytest.raises(EnsembleError, match="no usable offsets"):
+            parse_ensemble_mean_runs({"hourly": {"time": []}}, "m", ("temp_c",))
+
+    def test_backfill_appends_into_the_live_store(self, tmp_path):
+        config = replace(
+            write_config(tmp_path),
+            ensembles=EnsemblesConfig(models=("ncep_gefs025",), variables=("temp_c",)),
+        )
+        frame = backfill_ensembles(
+            config,
+            FETCHED.date(),
+            FETCHED.date(),
+            fetcher=lambda _url: mean_runs_payload(),
+        )
+        store = tmp_path / "ensembles.parquet"
+        new_rows, total = append_ensembles(store, frame)
+        assert new_rows == total == frame.height == 4
+        features = ensemble_features(
+            pl.read_parquet(store),
+            _snapshots(utc(2026, 6, 30, 0, 30)),
+            max_age_hours=48.0,
+        )
+        assert any(
+            column.startswith("ens__ncep_gefs025__temp_c__")
+            for column in features.columns
+        )
 
 
 def _snapshots(*times):

@@ -7,7 +7,7 @@ station column/unit mappings) so the codebase itself stays station-agnostic.
 import math
 import tomllib
 from collections.abc import Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import date, datetime
 from pathlib import Path
 from types import MappingProxyType
@@ -127,6 +127,14 @@ class ForecastsConfig:
     immutable: bool
     latitude: float
     longitude: float
+    # Per-source lead cap in hours: rows beyond a source's cap are dropped at
+    # matrix build, trimming horizon-edge garbage without excluding the source.
+    max_lead_hours: Mapping[str, float] = field(
+        default_factory=lambda: MappingProxyType({})
+    )
+    # (source, variable) pairs whose values are nulled at matrix build — for
+    # providers whose signal is genuinely bad for one variable only.
+    exclude: tuple[tuple[str, str], ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -358,6 +366,35 @@ def _station(raw: Mapping[str, Any]) -> StationConfig:
     )
 
 
+def _forecast_exclusions(section: Mapping[str, Any]) -> tuple[tuple[str, str], ...]:
+    raw = section.get("exclude", [])
+    if not isinstance(raw, list) or not all(isinstance(e, str) for e in raw):
+        msg = "'exclude' in [forecasts] must be a list of 'source:variable' strings"
+        raise ConfigError(msg)
+    pairs: list[tuple[str, str]] = []
+    for entry in raw:
+        source, _, variable = entry.partition(":")
+        if not source or not variable:
+            msg = (
+                f"[forecasts].exclude entries must be 'source:variable', got {entry!r}"
+            )
+            raise ConfigError(msg)
+        pairs.append((source, variable))
+    return tuple(pairs)
+
+
+def _forecast_lead_caps(section: Mapping[str, Any]) -> Mapping[str, float]:
+    raw = section.get("max_lead_hours", {})
+    if not isinstance(raw, Mapping):
+        msg = "[forecasts].max_lead_hours must be a table of source = hours"
+        raise ConfigError(msg)
+    caps = {
+        str(source): _positive_number(hours, f"max_lead_hours.{source}", "forecasts")
+        for source, hours in sorted(raw.items())
+    }
+    return MappingProxyType(caps)
+
+
 def _forecasts(raw: Mapping[str, Any], station: StationConfig) -> ForecastsConfig:
     section = _section(raw, "forecasts")
     sources = section.get("sources", [])
@@ -375,6 +412,8 @@ def _forecasts(raw: Mapping[str, Any], station: StationConfig) -> ForecastsConfi
         immutable=bool(section.get("immutable", False)),
         latitude=station.latitude,
         longitude=station.longitude,
+        max_lead_hours=_forecast_lead_caps(section),
+        exclude=_forecast_exclusions(section),
     )
 
 

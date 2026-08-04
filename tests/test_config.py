@@ -223,3 +223,26 @@ class TestErrors:
         text = MINIMAL + "\n[promotion]\nreport_gap_threshold = 0\n"
         with pytest.raises(ConfigError, match="report_gap_threshold"):
             load_config(write(tmp_path, text))
+
+    def test_forecast_exclusions_parsed(self, tmp_path):
+        text = MINIMAL + 'exclude = ["weatherapi:dew_point_c", "weatherapi:pop"]\n'
+        cfg = load_config(write(tmp_path, text))
+        assert cfg.forecasts.exclude == (
+            ("weatherapi", "dew_point_c"),
+            ("weatherapi", "pop"),
+        )
+
+    def test_forecast_exclusion_without_colon_rejected(self, tmp_path):
+        text = MINIMAL + 'exclude = ["weatherapi"]\n'
+        with pytest.raises(ConfigError, match="source:variable"):
+            load_config(write(tmp_path, text))
+
+    def test_forecast_lead_caps_parsed(self, tmp_path):
+        text = MINIMAL + "\n[forecasts.max_lead_hours]\nvisual_crossing = 336\n"
+        cfg = load_config(write(tmp_path, text))
+        assert cfg.forecasts.max_lead_hours["visual_crossing"] == 336.0
+
+    def test_nonpositive_lead_cap_rejected(self, tmp_path):
+        text = MINIMAL + "\n[forecasts.max_lead_hours]\nnws = -1\n"
+        with pytest.raises(ConfigError, match="max_lead_hours.nws"):
+            load_config(write(tmp_path, text))

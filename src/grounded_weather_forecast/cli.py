@@ -101,11 +101,12 @@ def build_parser() -> argparse.ArgumentParser:
     )
     backfill.add_argument(
         "--provider",
-        choices=("open_meteo", "dynamical"),
+        choices=("open_meteo", "dynamical", "open_meteo_ensemble"),
         default="open_meteo",
         help="open_meteo: Previous Runs (24h-multiple leads); dynamical:"
         " dynamical.org full cycles at native steps (sub-24h leads; needs"
-        " the 'backfill' optional extra)",
+        " the 'backfill' optional extra); open_meteo_ensemble: archived"
+        " ensemble mean/spread into the ens__ feature store",
     )
     backfill.add_argument(
         "--models",
@@ -365,6 +366,34 @@ def _dynamical_long(
     return backfill_dynamical_long(config, start, end, models=models or None)
 
 
+def _cmd_backfill_ensembles(config: Config, args: argparse.Namespace, end: date) -> int:
+    from grounded_weather_forecast.dataset.ensembles import (  # noqa: PLC0415
+        EnsembleError,
+        append_ensembles,
+        backfill_ensembles,
+        ensembles_path,
+    )
+
+    start = args.start or config.backfill.start_date
+    if start is None:
+        msg = "set [backfill.open_meteo].start_date or pass --start"
+        print(f"backfill failed: {msg}")
+        return 1
+    models = tuple(_split_csv(args.models)) or None
+    try:
+        frame = backfill_ensembles(
+            config, start, end, chunk_days=args.chunk_days, models=models
+        )
+    except (EnsembleError, OSError, ValueError) as exc:
+        print(f"backfill failed: {exc}")
+        return 1
+    new_rows, total_rows = append_ensembles(ensembles_path(config), frame)
+    print(f"backfilled {frame.height} ensemble statistics rows")
+    print(f"models: {', '.join(sorted(frame['model'].unique().to_list()))}")
+    print(f"ensemble store: +{new_rows} new rows -> {total_rows} total")
+    return 0
+
+
 def _cmd_backfill(config: Config, args: argparse.Namespace) -> int:
     from grounded_weather_forecast.dataset.backfill import (  # noqa: PLC0415
         BackfillError,
@@ -378,6 +407,8 @@ def _cmd_backfill(config: Config, args: argparse.Namespace) -> int:
     )
 
     end = args.end or (datetime.now(tz=UTC).date() - timedelta(days=1))
+    if args.provider == "open_meteo_ensemble":
+        return _cmd_backfill_ensembles(config, args, end)
     try:
         match args.provider:
             case "dynamical":

@@ -94,6 +94,11 @@ grounded-weather-forecast backfill --provider dynamical --start 2026-06-01
 #    uv sync --extra backfill
 #    uv run grounded-weather-forecast backfill --provider dynamical --start 2026-06-01
 
+#    A third provider backfills archived ENSEMBLE mean/spread (Open-Meteo keeps
+#    them from ~March 2026) into the ens__ feature store with true run
+#    vintages, months before live polling accumulates the same history.
+grounded-weather-forecast backfill --provider open_meteo_ensemble --start 2026-03-01
+
 # 5. Study whether each hourly variable should use instantaneous or interval-mean
 #    truth. Misalignment masquerades as provider bias; this measures it.
 grounded-weather-forecast alignment
