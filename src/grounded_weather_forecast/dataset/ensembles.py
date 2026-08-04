@@ -188,6 +188,16 @@ def ingest_ensembles(
     return pl.concat(frames).sort(list(_KEY))
 
 
+def ensemble_mean_model(model: str) -> str:
+    """The archived-statistics pseudo-model for an ensemble model slug.
+
+    Slugs that already end in ``_ensemble`` (e.g. ``ecmwf_aifs025_ensemble``)
+    replace that suffix rather than doubling it: the API knows
+    ``ecmwf_aifs025_ensemble_mean``, not ``…_ensemble_ensemble_mean``.
+    """
+    return model.removesuffix("_ensemble") + ENSEMBLE_MEAN_SUFFIX
+
+
 def build_ensemble_backfill_url(
     config: Config,
     model: str,
@@ -209,7 +219,7 @@ def build_ensemble_backfill_url(
             "start_date": start.isoformat(),
             "end_date": end.isoformat(),
             "hourly": ",".join(fields),
-            "models": f"{model}{ENSEMBLE_MEAN_SUFFIX}",
+            "models": ensemble_mean_model(model),
             "timezone": "UTC",
             "wind_speed_unit": "ms",
         }

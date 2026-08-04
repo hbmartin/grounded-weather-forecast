@@ -23,6 +23,7 @@ from grounded_weather_forecast.dataset.ensembles import (
     backfill_ensembles,
     build_ensemble_backfill_url,
     build_ensemble_url,
+    ensemble_mean_model,
     ensemble_features,
     ingest_ensembles,
     parse_ensemble,
@@ -213,6 +214,11 @@ class TestEnsembleMeanBackfill:
             config, "ncep_gefs025", FETCHED.date(), FETCHED.date()
         )
         assert f"ncep_gefs025{ENSEMBLE_MEAN_SUFFIX}" in url
+        # A slug already ending in _ensemble must not double the suffix.
+        assert (
+            ensemble_mean_model("ecmwf_aifs025_ensemble")
+            == "ecmwf_aifs025_ensemble_mean"
+        )
         assert "temperature_2m_previous_day1" in url
         assert "temperature_2m_spread_previous_day1" in url
         assert "previous-runs-api.open-meteo.com" in url
