@@ -7,7 +7,11 @@ import pytest
 from conftest import synthetic_hourly_matrix
 
 from grounded_weather_forecast.blenders import get_factory
-from grounded_weather_forecast.blenders.experts import OnlineExperts
+from grounded_weather_forecast.blenders.experts import (
+    OnlineExperts,
+    _awake_weights,
+    _uniform,
+)
 from grounded_weather_forecast.blenders.grounding import AffineGrounding
 from grounded_weather_forecast.contracts import (
     ForecastMatrix,
@@ -28,6 +32,25 @@ def grounded_expert_mae(train, expert_index):
     return mae(column[usable], train.y[usable])
 
 
+def replayed_outlier_weight(scheme, power):
+    """Final weight of an outlier-heavy expert after replaying |e|**power.
+
+    Both experts miss by 1 on ordinary rounds (a tie under any loss power),
+    so the loss powers differ only in how hard the outlier rounds punish the
+    blowing-up expert relative to the steady one.
+    """
+    errors = np.asarray([[1.0, 3.0 if i % 3 == 2 else 1.0] for i in range(60)])
+    experts = OnlineExperts(method_id=scheme, scheme=scheme)
+    state = _uniform(2)
+    state.horizon = errors.shape[0]
+    awake = np.ones(2, dtype=bool)
+    for row in errors:
+        experts._step(state, row**power, awake)
+    weights = _awake_weights(state.weights, awake)
+    assert weights is not None
+    return float(weights[1])
+
+
 class TestOnlineExperts:
     @pytest.mark.parametrize("scheme", SCHEMES)
     def test_weights_concentrate_on_better_expert(self, scheme):
@@ -40,6 +63,37 @@ class TestOnlineExperts:
         weights = blender.bucket_weights("6-12h")
         assert weights is not None
         assert weights[1] > 0.75  # beta (index 1) is clearly better
+
+    def test_l1_down_weights_an_outlier_source_less_aggressively_than_squared(self):
+        """The absolute loss is the point of improvement-plan section 2a.
+
+        Squaring inflates the outlier rounds' loss gap, so the same error
+        sequence strips more weight from the outlier-heavy expert. BOA is
+        excluded: its second-order rate divides by accumulated regret
+        variance, which self-normalizes the loss power away.
+        """
+        l1_weight = replayed_outlier_weight("ewa", power=1)
+        squared_weight = replayed_outlier_weight("ewa", power=2)
+        assert l1_weight > squared_weight * 1.2
+
+    @pytest.mark.parametrize("scheme", SCHEMES)
+    def test_outlier_heavy_low_mae_source_keeps_the_weight(self, scheme):
+        """MAE-consistent ranking: rare big misses cost what MAE says they
+        cost. beta blows up every tenth row (MSE 3.6 vs alpha's 1.0) yet has
+        the lower MAE (0.6 vs 1.0), and the aggregator must still back it."""
+        matrix = synthetic_hourly_matrix(days=40, noise_sd=0.0, seed=21)
+        truth = matrix["t__temp_c__inst"].to_numpy()
+        sign = np.where(np.arange(matrix.height) % 2 == 0, 1.0, -1.0)
+        outlier = np.arange(matrix.height) % 10 == 9
+        shaped = matrix.with_columns(
+            pl.Series("fx__alpha__temp_c", truth + sign),
+            pl.Series("fx__beta__temp_c", truth + np.where(outlier, sign * 6.0, 0.0)),
+        )
+        train = to_supervised_slice(shaped, TEMP)
+        blender = get_factory(scheme)().fit(train)
+        weights = blender.bucket_weights("6-12h")
+        assert weights is not None
+        assert weights[1] > 0.75
 
     @pytest.mark.parametrize("scheme", SCHEMES)
     def test_regret_close_to_best_expert(self, scheme):
@@ -225,6 +279,18 @@ class TestOnlineAdvance:
             OnlineExperts.from_state(
                 {"scheme": "ewa", "sources": ["alpha"], "buckets": {}}, "ewa"
             )
+
+    def test_squared_loss_era_state_requires_full_replay(self):
+        """Version 2 weights were accumulated under the squared loss. Their
+        prefix digests hash the raw history, so without the version gate
+        they would revalidate and silently mix loss scales."""
+        train = to_supervised_slice(synthetic_hourly_matrix(days=4), TEMP)
+        state = OnlineExperts(method_id="boa", scheme="boa").fit(train).to_state()
+        assert state["schema_version"] == 3
+        state["schema_version"] = 2
+
+        with pytest.raises(ValueError, match="legacy"):
+            OnlineExperts.from_state(state, "boa")
 
     def test_reordered_sources_require_full_replay(self):
         train = to_supervised_slice(synthetic_hourly_matrix(days=4), TEMP)
