@@ -9,7 +9,6 @@ from conftest import synthetic_hourly_matrix, write_config
 from grounded_weather_forecast.backtest.engine import BacktestRequest, run_backtest
 from grounded_weather_forecast.backtest.scores import empty_scores
 from grounded_weather_forecast.contracts import hourly_variable
-from grounded_weather_forecast.metrics.probabilistic import crps_from_quantiles
 from grounded_weather_forecast.reports.leaderboard import (
     aggregate_leaderboard,
     leaderboard,
@@ -176,7 +175,7 @@ class TestLeaderboard:
         )
         assert slice_winners(board).is_empty()
 
-    def test_quantile_crps_uses_probability_levels_and_pit_needs_50_rows(self):
+    def test_quantile_crps_is_ensemble_crps_and_pit_needs_50_rows(self):
         start = utc(2026, 3, 1)
         levels = (0.1, 0.5, 0.9)
 
@@ -198,12 +197,43 @@ class TestLeaderboard:
             )
 
         thin = leaderboard(probabilistic_scores(8)).row(0, named=True)
-        grids = np.tile(np.asarray([-1.0, 0.0, 2.0]), (8, 1))
-        expected = crps_from_quantiles(np.full(8, 0.4), grids, levels)
-        assert thin["crps"] == pytest.approx(expected)
+        # Energy-form ensemble CRPS with members (-1, 0, 2) against y = 0.4:
+        #   mean|X - y| = (1.4 + 0.4 + 1.6) / 3 = 3.4 / 3
+        #   mean|X - X'| over all 9 pairs = 2 * (1 + 3 + 2) / 9 = 4 / 3
+        #   CRPS = 3.4 / 3 - (4 / 3) / 2 = 1.4 / 3
+        assert thin["crps"] == pytest.approx(1.4 / 3)
         assert thin["pit_chi2_p"] is None
         mature = leaderboard(probabilistic_scores(50)).row(0, named=True)
         assert mature["pit_chi2_p"] is not None
+
+    def test_rows_without_usable_quantiles_yield_null_crps(self):
+        """Null grids and null grid members drop out; too few survivors
+        leave the CRPS column null instead of crashing the estimator."""
+        start = utc(2026, 3, 1)
+        n = 10
+        grids = [None, None, json.dumps([None, 0.0, 2.0])] + [
+            json.dumps([-1.0, 0.0, 2.0])
+        ] * (n - 3)
+        scores = pl.DataFrame(
+            {
+                "product": ["hourly"] * n,
+                "variable": ["temp_c"] * n,
+                "lead_bucket": ["1-3h"] * n,
+                "method_id": ["distribution"] * n,
+                "issue_time": [start + timedelta(hours=i) for i in range(n)],
+                "valid_time": [start + timedelta(hours=i + 1) for i in range(n)],
+                "lead_hours": [1.0] * n,
+                "y_pred": [0.0] * n,
+                "y_true": [0.4] * n,
+                "quantile_levels_json": [json.dumps((0.1, 0.5, 0.9))] * n,
+                "quantiles_json": grids,
+            }
+        )
+
+        row = leaderboard(scores).row(0, named=True)
+
+        assert row["crps"] is None
+        assert row["pinball"] is None
 
     def test_nominal_coverage_requires_exact_probability_levels(self):
         start = utc(2026, 3, 1)

@@ -19,7 +19,7 @@ from grounded_weather_forecast.metrics.deterministic import bias, mae, pct_withi
 from grounded_weather_forecast.metrics.dm import diebold_mariano
 from grounded_weather_forecast.metrics.probabilistic import (
     brier,
-    crps_from_quantiles,
+    crps_ensemble,
     empirical_coverage,
     pinball_loss,
     pit_from_quantiles,
@@ -127,7 +127,11 @@ def _probabilistic_columns(method_scores: pl.DataFrame) -> dict[str, float | Non
     coverage80, sharpness = _interval_metrics(y, grids, levels, 0.1, 0.9)
     coverage90, _ = _interval_metrics(y, grids, levels, 0.05, 0.95)
     return {
-        "crps": crps_from_quantiles(y, grids, levels),
+        # Energy-form ensemble CRPS with the sorted quantile grid as the
+        # members: mean|X - y| - mean|X - X'| / 2. Unlike the weighted-pinball
+        # rectangle rule it needs no level spacing assumptions; rows already
+        # dropped above (no quantiles, non-finite grid) stay null.
+        "crps": crps_ensemble(y, np.sort(grids, axis=1)),
         "pinball": pinball,
         "coverage80": coverage80,
         "coverage90": coverage90,
