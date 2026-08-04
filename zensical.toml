@@ -19,6 +19,8 @@ nav = [
     { "omni-weather-forecast-apis" = "upstream/omni-weather-forecast-apis-database.md" },
   ] },
   { "Improvement Plan" = "improvement-plan.md" },
+  { "Papers Research (2026-07)" = "research-papers-2026-07.md" },
+  { "Future Work" = "future-work.md" },
   { "Releasing" = "releasing.md" },
   { "Decisions" = [
     { "SQLite files are the only upstream contract" = "adr/0001-sqlite-files-are-the-only-upstream-contract.md" },
