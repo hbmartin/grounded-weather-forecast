@@ -37,15 +37,24 @@ def board_row(
         "dm_p_vs_best_provider": p,
         "skill_vs_equal_weight": skill,
         "dm_p_vs_equal_weight": p,
+        "skill_vs_damped_grounded_equal_weight": skill,
+        "dm_p_vs_damped_grounded_equal_weight": p,
     }
+
+
+_SKILL_COLUMNS = (
+    "skill_vs_best_provider",
+    "dm_p_vs_best_provider",
+    "skill_vs_equal_weight",
+    "dm_p_vs_equal_weight",
+    "skill_vs_damped_grounded_equal_weight",
+    "dm_p_vs_damped_grounded_equal_weight",
+)
 
 
 def make_board(rows):
     return pl.DataFrame(rows, infer_schema_length=None).with_columns(
-        pl.col("skill_vs_best_provider").cast(pl.Float64),
-        pl.col("dm_p_vs_best_provider").cast(pl.Float64),
-        pl.col("skill_vs_equal_weight").cast(pl.Float64),
-        pl.col("dm_p_vs_equal_weight").cast(pl.Float64),
+        *(pl.col(column).cast(pl.Float64) for column in _SKILL_COLUMNS)
     )
 
 
@@ -56,6 +65,7 @@ class TestWinnerAnnotations:
                 board_row("persistence", 12.35, skill=0.3, p=0.01),
                 board_row("equal_weight", 18.09),
                 board_row("best_provider", 19.0),
+                board_row("damped_grounded_equal_weight", 17.0),
             ]
         )
         row = slice_winners(board, rule="legacy").row(0, named=True)
@@ -64,19 +74,21 @@ class TestWinnerAnnotations:
         assert row["mae_gap"] == 0.0
         assert row["best_method_id"] == "persistence"
 
-    def test_dm_gate_blocks_and_reports_the_gap(self):
+    def test_dm_gate_blocks_and_falls_back_to_the_best_reference(self):
         board = make_board(
             [
                 board_row("persistence", 12.35, skill=0.3, p=0.4),
                 board_row("equal_weight", 18.09),
                 board_row("best_provider", 19.0),
+                board_row("damped_grounded_equal_weight", 17.0),
             ]
         )
         row = slice_winners(board, rule="legacy").row(0, named=True)
-        assert row["method_id"] == "equal_weight"
+        # The fallback is the best reference by MAE, not equal_weight by name.
+        assert row["method_id"] == "damped_grounded_equal_weight"
         assert row["gate"] == "dm_not_significant"
         assert row["best_method_id"] == "persistence"
-        assert row["gap_ratio"] == (18.09 / 12.35) - 1.0
+        assert row["gap_ratio"] == (17.0 / 12.35) - 1.0
 
     def test_missing_reference_gate(self):
         board = make_board(
@@ -95,10 +107,12 @@ class TestWinnerAnnotations:
                 board_row("persistence", 12.35, coverage=0.5),
                 board_row("equal_weight", 18.09),
                 board_row("best_provider", 19.0),
+                board_row("damped_grounded_equal_weight", 17.0),
             ]
         )
         row = slice_winners(board, rule="legacy").row(0, named=True)
-        assert row["method_id"] == "equal_weight"
+        # damped is the eligible minimum AND a reference: it serves outright.
+        assert row["method_id"] == "damped_grounded_equal_weight"
         assert row["gate"] == "eligibility"
         assert row["best_method_id"] == "persistence"
         assert row["best_mae"] == 12.35
@@ -118,6 +132,7 @@ class TestBlockedPromotions:
                 board_row("persistence", 12.35, skill=0.3, p=0.4),
                 board_row("equal_weight", 18.09),
                 board_row("best_provider", 19.0),
+                board_row("damped_grounded_equal_weight", 17.0),
             ]
         )
         return slice_winners(board, rule="legacy")
@@ -134,19 +149,36 @@ class TestBlockedPromotions:
 
 def mcs_scores(n_times, candidate_offset=0.0, reference_offset=0.0, seed=1):
     rng = np.random.default_rng(seed)
+    references = (
+        "equal_weight",
+        "best_provider",
+        "damped_grounded_equal_weight",
+    )
     rows = []
     issue = utc(2026, 7, 31)
     for index in range(n_times):
         valid = utc(2026, 8, 1) + timedelta(hours=index)
         truth = 20.0 + rng.normal(0.0, 0.1)
-        noise = rng.normal(0.0, 0.05, 2)
         rows.append(
-            ("candidate", issue, valid, truth + candidate_offset + noise[0], truth)
+            (
+                "candidate",
+                issue,
+                valid,
+                truth + candidate_offset + rng.normal(0.0, 0.05),
+                truth,
+            )
         )
-        rows.append(
-            ("equal_weight", issue, valid, truth + reference_offset + noise[1], truth)
+        rows.extend(
+            (
+                reference,
+                issue,
+                valid,
+                truth + reference_offset + rng.normal(0.0, 0.05),
+                truth,
+            )
+            for reference in references
         )
-    return pl.DataFrame(
+    frame = pl.DataFrame(
         rows,
         schema={
             "method_id": pl.String,
@@ -157,6 +189,40 @@ def mcs_scores(n_times, candidate_offset=0.0, reference_offset=0.0, seed=1):
         },
         orient="row",
     )
+    return frame.with_columns(
+        pl.lit("hourly").alias("product"),
+        pl.lit("humidity_pct").alias("variable"),
+        pl.lit("168-240h").alias("lead_bucket"),
+        pl.lit(200.0).alias("lead_hours"),
+    )
+
+
+class TestDecisionScopedMatrix:
+    def test_sparse_bystander_cannot_thin_the_gate(self):
+        scores = mcs_scores(40, candidate_offset=0.05, reference_offset=5.0)
+        sparse = (
+            scores.filter(pl.col("method_id") == "candidate")
+            .head(3)
+            .with_columns(pl.lit("sparse").alias("method_id"))
+        )
+        board = make_board(
+            [
+                board_row("candidate", 1.0),
+                board_row("sparse", 1.5),
+                board_row("equal_weight", 5.0),
+                board_row("best_provider", 5.1),
+                board_row("damped_grounded_equal_weight", 5.2),
+            ]
+        )
+        winners = slice_winners(
+            board, scores=pl.concat([scores, sparse]), rule="mcs", alpha=0.1
+        )
+        row = winners.row(0, named=True)
+        # Before the decision-scoped matrix, the sparse bystander's 3 common
+        # cases collapsed the all-method intersection below the 8-row floor
+        # and the gate returned "mcs_thin_matrix" instead of promoting.
+        assert row["method_id"] == "candidate"
+        assert row["gate"] is None
 
 
 class TestMcsGateReasons:

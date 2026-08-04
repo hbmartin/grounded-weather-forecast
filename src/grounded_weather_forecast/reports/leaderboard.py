@@ -25,7 +25,17 @@ from grounded_weather_forecast.metrics.probabilistic import (
     pit_from_quantiles,
 )
 
-DEFAULT_REFERENCES: tuple[str, ...] = ("best_provider", "equal_weight")
+# The safety class: a candidate serves only by excluding every reference
+# from the confidence set, and gate failures fall back to the best reference.
+# damped_grounded_equal_weight joined 2026-08-04 after one clean promoted
+# cycle — it contains equal_weight as its alpha -> 1 boundary and stays safe
+# at long leads where the raw mean provably is not (the week-2 bias episode,
+# research/week2-provider-diagnostic-2026-08-04.md).
+DEFAULT_REFERENCES: tuple[str, ...] = (
+    "best_provider",
+    "equal_weight",
+    "damped_grounded_equal_weight",
+)
 
 # Consumer-legible "close enough" tolerances, in each variable's metric unit.
 CONSUMER_TOLERANCES: Mapping[str, float] = {
@@ -325,16 +335,20 @@ def _legacy_gate(
 def _reference_fallback(
     references: tuple[dict[str, object], ...],
 ) -> dict[str, object]:
-    """The named serving incumbent, or the best remaining reference."""
-    for reference in references:
-        if reference["method_id"] == "equal_weight":
-            return reference
+    """The best reference by MAE; equal_weight only breaks exact ties.
 
-    def row_mae(row: dict[str, object]) -> float:
+    Preferring the incumbent by name defeated the point of a multi-member
+    safety class: with damped_grounded_equal_weight as a reference, a gate
+    failure at long leads should serve the damped blend, not the raw mean
+    whose shared provider bias motivated it.
+    """
+
+    def rank(row: dict[str, object]) -> tuple[float, int]:
         value = row["mae"]
-        return float(value) if isinstance(value, (int, float)) else float("inf")
+        mae = float(value) if isinstance(value, (int, float)) else float("inf")
+        return (mae, 0 if row["method_id"] == "equal_weight" else 1)
 
-    return min(references, key=row_mae)
+    return min(references, key=rank)
 
 
 def _mcs_gate(
@@ -446,11 +460,20 @@ def slice_winners(
                     slice_scores = slice_scores.filter(
                         pl.col("semantics") == parts["truth_semantics"]
                     )
+                # Decision-scoped matrix: the gate decides "candidate vs the
+                # references", so only those methods enter the common-case
+                # loss matrix. Intersecting cases over the full pool let every
+                # newly registered (and sometimes abstaining) method shrink
+                # the sample and mechanically widen the max-statistic null —
+                # the 2026-08-04 cycle demoted four standing winners that way.
                 candidate, gate = _mcs_gate(
                     candidate,
                     reference_rows,
                     slice_scores,
-                    tuple(str(method) for method in ranked["method_id"].to_list()),
+                    (
+                        str(candidate["method_id"]),
+                        *(str(row["method_id"]) for row in reference_rows),
+                    ),
                     alpha,
                 )
             elif any(

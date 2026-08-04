@@ -30,7 +30,12 @@ def scored_config(tmp_path, extra=""):
         matrix,
         BacktestRequest(
             variables=(hourly_variable("temp_c"),),
-            methods=("equal_weight", "grounded_equal_weight", "best_provider"),
+            methods=(
+                "equal_weight",
+                "grounded_equal_weight",
+                "best_provider",
+                "damped_grounded_equal_weight",
+            ),
         ),
         config,
     )
@@ -397,7 +402,12 @@ def test_selection_and_historical_replay_bind_requested_truth_semantics(tmp_path
         matrix,
         BacktestRequest(
             variables=(hourly_variable("temp_c"),),
-            methods=("equal_weight", "grounded_equal_weight", "best_provider"),
+            methods=(
+                "equal_weight",
+                "grounded_equal_weight",
+                "best_provider",
+                "damped_grounded_equal_weight",
+            ),
             semantics=TruthSemantics.INTERVAL_MEAN,
         ),
         config,

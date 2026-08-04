@@ -63,6 +63,15 @@ def scores_frame(gap: float, n_times=80, seed=9):
         rows.append(("challenger", issue, valid, truth + challenger_noise, truth))
         rows.append(("equal_weight", issue, valid, truth + reference_noise, truth))
         rows.append(("best_provider", issue, valid, truth + reference_noise, truth))
+        rows.append(
+            (
+                "damped_grounded_equal_weight",
+                issue,
+                valid,
+                truth + reference_noise,
+                truth,
+            )
+        )
     return pl.DataFrame(
         {
             "method_id": [r[0] for r in rows],
@@ -110,8 +119,13 @@ class TestMcsPromotionGate:
         built = collapsed_loss_matrix(scores)
         assert built is not None
         matrix, methods = built
-        assert matrix.shape == (20, 3)
-        assert methods == ("best_provider", "challenger", "equal_weight")
+        assert matrix.shape == (20, 4)
+        assert methods == (
+            "best_provider",
+            "challenger",
+            "damped_grounded_equal_weight",
+            "equal_weight",
+        )
 
     def test_ineligible_sparse_method_does_not_shrink_common_cases(self):
         scores = scores_frame(gap=0.1, n_times=20)
