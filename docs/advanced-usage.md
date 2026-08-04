@@ -133,6 +133,9 @@ anchored_trend_grounded                                      <- + short-lead anc
 gbm                                                          <- the nonlinear ceiling
 ewa  boa                                                     <- online experts
 emos  idr  conformal_gew  conformal_ewma                     <- distributional heads
+damped_grounded_equal_weight                                 <- climatology-damped long leads
+analog_ensemble                                              <- analog distributions (AnEn)
+cluster_equal_weight                                         <- de-duplicated provider mean
 ```
 
 `available_methods()` is the authority; this list is a reading aid, not a

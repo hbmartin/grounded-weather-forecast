@@ -1,10 +1,13 @@
 """Blenders: one module per method family, all implementing the Blender
 protocol and self-registering with the registry on import."""
 
+from grounded_weather_forecast.blenders import analog as _analog  # noqa: F401
 from grounded_weather_forecast.blenders import anchoring as _anchoring  # noqa: F401
 from grounded_weather_forecast.blenders import baselines as _baselines  # noqa: F401
+from grounded_weather_forecast.blenders import cluster as _cluster  # noqa: F401
 from grounded_weather_forecast.blenders import combine as _combine  # noqa: F401
 from grounded_weather_forecast.blenders import conformal as _conformal  # noqa: F401
+from grounded_weather_forecast.blenders import damped as _damped  # noqa: F401
 from grounded_weather_forecast.blenders import emos as _emos  # noqa: F401
 from grounded_weather_forecast.blenders import (  # noqa: F401
     ewma_grounding as _ewma_grounding,

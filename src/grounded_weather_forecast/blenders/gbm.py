@@ -90,22 +90,37 @@ def _variable_spec(name: str | None) -> VariableSpec | None:
 @dataclass
 class GbmStacker:
     method_id: str = "gbm"
+    # A 300-round booster on a few hundred rows memorizes noise yet can still
+    # sneak through the promotion gate on a lucky fold; below the floor the
+    # method abstains entirely (NaN = "no opinion"), so its slice coverage
+    # falls under the leaderboard's 0.8 eligibility bar.
+    min_fit_rows: int = 500
     _kind: TargetKind = TargetKind.CONTINUOUS
     _variable: VariableSpec | None = None
     _feature_names: list[str] = field(default_factory=list)
+    _training_rows: int = 0
+    _fit_status: str = "unfitted"
 
     def fit(self, train: SupervisedSlice) -> Self:
-        lightgbm = import_module("lightgbm")
         self._kind = train.variable.kind
         self._variable = train.variable
+        self._training_rows = train.x.n_rows
+        if train.x.n_rows < self.min_fit_rows:
+            self._fit_status = "insufficient_rows"
+            return self
+        lightgbm = import_module("lightgbm")
         features, self._feature_names = build_features(train.x)
         dataset = lightgbm.Dataset(
             features, label=train.y, feature_name=self._feature_names
         )
         self._booster = lightgbm.train(_PARAMS, dataset, num_boost_round=_NUM_ROUNDS)
+        self._fit_status = "fit"
         return self
 
     def predict(self, x: ForecastMatrix) -> BlendResult:
+        if self._fit_status != "fit":
+            point = np.full(x.n_rows, np.nan)
+            return BlendResult(point=finalize_point(point, self._kind, self._variable))
         features, names = build_features(x)
         if names != self._feature_names:
             aligned = np.full((features.shape[0], len(self._feature_names)), np.nan)
@@ -118,6 +133,14 @@ class GbmStacker:
         return BlendResult(point=finalize_point(point, self._kind, self._variable))
 
     def to_state(self) -> dict[str, Any]:
+        if self._fit_status != "fit":
+            return {
+                "fit_status": self._fit_status,
+                "training_rows": self._training_rows,
+                "min_fit_rows": self.min_fit_rows,
+                "kind": self._kind.value,
+                "variable": self._variable.name if self._variable else None,
+            }
         return {
             "model": self._booster.model_to_string(),
             "feature_names": self._feature_names,
@@ -127,11 +150,21 @@ class GbmStacker:
 
     def observability_state(self) -> dict[str, Any]:
         """Compact glass-box state: importances only, never the booster."""
+        if self._fit_status != "fit":
+            return {
+                "variable": self._variable.name if self._variable else None,
+                "kind": self._kind.value,
+                "fit_status": self._fit_status,
+                "training_rows": self._training_rows,
+                "min_fit_rows": self.min_fit_rows,
+            }
         gain = self._booster.feature_importance(importance_type="gain")
         split = self._booster.feature_importance(importance_type="split")
         return {
             "variable": self._variable.name if self._variable else None,
             "kind": self._kind.value,
+            "fit_status": self._fit_status,
+            "training_rows": self._training_rows,
             "num_trees": int(self._booster.num_trees()),
             "feature_names": list(self._feature_names),
             "importance_gain": {
@@ -152,6 +185,7 @@ class GbmStacker:
         stacker._variable = _variable_spec(state.get("variable"))
         stacker._feature_names = list(state["feature_names"])
         stacker._booster = lightgbm.Booster(model_str=state["model"])
+        stacker._fit_status = "fit"
         return stacker
 
 
