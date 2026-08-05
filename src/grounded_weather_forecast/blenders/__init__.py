@@ -22,9 +22,12 @@ from grounded_weather_forecast.blenders import (  # noqa: F401
     harmonic_grounding as _harmonic_grounding,
 )
 from grounded_weather_forecast.blenders import idr as _idr  # noqa: F401
+from grounded_weather_forecast.blenders import invcov as _invcov  # noqa: F401
 from grounded_weather_forecast.blenders import (  # noqa: F401
     pop_calibration as _pop_calibration,
 )
+from grounded_weather_forecast.blenders import raft as _raft  # noqa: F401
+from grounded_weather_forecast.blenders import seamless as _seamless  # noqa: F401
 from grounded_weather_forecast.blenders import trimmed as _trimmed  # noqa: F401
 from grounded_weather_forecast.blenders.registry import (
     BlenderFactory,

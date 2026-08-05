@@ -185,6 +185,16 @@ eligibility floor are gated on pooled D3-10 evidence instead — a promotion
 through that path is labeled `pooled_D3-10` in the winners table while
 scoring and selection stay per fine bucket.
 
+Three structure challengers round out the method pool, pure leaderboard
+candidates: `raft_grounded` (a freely fitted per-bucket response to the
+issue-time residual, replacing the assumed exponential anchor decay — RAFT,
+Schuhen et al. 2020), `seamless_regression` (one per-bucket ridge over
+forward-filled source columns plus the issue-time observation — Dabernig &
+Atencia's single-model architecture, the honest test of the
+grounding→blending→anchoring decomposition), and `inverse_covariance`
+(Ledoit–Wolf-shrunk GLS weights with capped deviations — the honest test of
+diagonal-only weighting).
+
 Promotion offers two mutually exclusive statistical gates, compared side by
 side in every live report's "Promotion rule comparison" section:
 `[promotion].rule = "mcs"` (bootstrap Model Confidence Set, re-run from
