@@ -1,7 +1,11 @@
 from datetime import UTC, datetime, timedelta
 
+import numpy as np
 import polars as pl
 from conftest import synthetic_hourly_matrix, utc, write_config
+
+import grounded_weather_forecast.serve.selection as selection_module
+from grounded_weather_forecast.backtest.scores import SCORES_SCHEMA
 
 from grounded_weather_forecast.backtest.engine import BacktestRequest, run_backtest
 from grounded_weather_forecast.backtest.scores import (
@@ -599,3 +603,72 @@ class TestForecastStatusReason:
             '"status_reason": "cold start: no backtest scores exist yet",', ""
         )
         assert Forecast.from_json(legacy).status_reason is None
+
+
+def daily_pool_scores(created):
+    """Far daily buckets with 5 valid times each: only the pool can promote."""
+    rng = np.random.default_rng(31)
+    methods = (
+        "inverse_mse",
+        "equal_weight",
+        "best_provider",
+        "damped_grounded_equal_weight",
+    )
+    rows = []
+    for bucket_index, bucket in enumerate(("D3-4", "D5-7", "D8-10")):
+        for step in range(5):
+            valid = utc(2026, 7, 3) + timedelta(days=bucket_index * 5 + step)
+            truth = 30.0 + rng.normal(0.0, 0.1)
+            for method in methods:
+                offset = 0.05 if method == "inverse_mse" else 5.0
+                rows.append(
+                    {
+                        "method_id": method,
+                        "variable": "temp_max_c",
+                        "product": "daily",
+                        "source_kind": "live",
+                        "evaluation_id": "evalpool",
+                        "evaluation_created_at": created,
+                        "dataset_fingerprint": "ds1",
+                        "source_set_json": "[]",
+                        "feature_set_json": "[]",
+                        "semantics": "inst",
+                        "code_version": "code1",
+                        "config_fingerprint": "cfg1",
+                        "window": "expanding",
+                        "fold_origin": created,
+                        "issue_time": utc(2026, 7, 1),
+                        "valid_time": valid,
+                        "lead_hours": 24.0 * (4 + bucket_index * 3),
+                        "lead_bucket": bucket,
+                        "y_pred": truth + offset + rng.normal(0.0, 0.05),
+                        "y_true": truth,
+                        "quantile_levels_json": "[]",
+                        "quantiles_json": None,
+                    }
+                )
+    return pl.DataFrame(rows).cast(SCORES_SCHEMA)
+
+
+class TestPooledDailySelection:
+    def test_far_buckets_serve_through_the_pool(self, tmp_path, monkeypatch):
+        config = write_config(tmp_path)
+        scores_dir = tmp_path / "scores"
+        scores_dir.mkdir()
+        monkeypatch.setattr(
+            selection_module, "dataset_fingerprint", lambda _config: "ds1"
+        )
+        monkeypatch.setattr(
+            selection_module, "config_fingerprint", lambda _config: "cfg1"
+        )
+        monkeypatch.setattr(selection_module, "code_identity", lambda: "code1")
+        write_scores(
+            daily_pool_scores(utc(2026, 8, 1)),
+            scores_path(scores_dir, "daily", "live"),
+        )
+        selections = select_methods(config, scores_dir)
+        for bucket in ("D3-4", "D5-7", "D8-10"):
+            chosen = selections[("daily", "temp_max_c", bucket)]
+            assert chosen.method_id == "inverse_mse"
+            assert "pooled D3-10" in chosen.reason
+            assert chosen.n == 15  # pooled evidence, not the fine bucket's 5

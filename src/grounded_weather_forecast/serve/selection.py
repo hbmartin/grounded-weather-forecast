@@ -28,6 +28,7 @@ from grounded_weather_forecast.evaluation import (
 )
 from grounded_weather_forecast.reports.eprocess import EProcessStore
 from grounded_weather_forecast.reports.leaderboard import (
+    _DAILY_GATE_POOL,
     gate_references,
     leaderboard,
     slice_winners,
@@ -128,6 +129,32 @@ def _compatible_scores(
         if not scores.is_empty():
             candidates.append(scores)
     return candidates
+
+
+def _pool_sibling_scores(
+    key: SliceKey,
+    frame: pl.DataFrame,
+    slices: Mapping[SliceKey, pl.DataFrame],
+) -> pl.DataFrame:
+    """Widen a far daily slice's scores to its D3-10 pool siblings.
+
+    ``_newest_complete_slices`` partitions evidence per fine bucket, but the
+    pooled far-bucket gate can only pool what it can see — without the
+    siblings of the same evaluation, serving would never reach the pooled
+    promotions the report shows.
+    """
+    product, variable, bucket = key
+    pool = _DAILY_GATE_POOL.get(bucket) if product == "daily" else None
+    if not pool:
+        return frame
+    evaluation_id = str(frame["evaluation_id"][0])
+    siblings = [
+        sibling
+        for sibling_bucket in pool
+        if (sibling := slices.get((product, variable, sibling_bucket))) is not None
+        and str(sibling["evaluation_id"][0]) == evaluation_id
+    ]
+    return pl.concat(siblings, how="diagonal_relaxed") if siblings else frame
 
 
 def _eprocess_store_for(
@@ -559,7 +586,7 @@ def select_methods(
         board = leaderboard(frame, references=references)
         winners = slice_winners(
             board,
-            scores=frame,
+            scores=_pool_sibling_scores(key, frame, slices),
             rule=config.promotion.rule,
             alpha=config.promotion.alpha,
             promotion=config.promotion,
@@ -570,9 +597,12 @@ def select_methods(
         selected_scores.append(frame)
         evaluation_id = str(frame["evaluation_id"][0])
         row = winners.row(0, named=True)
+        reason = "lowest backtest MAE among promotable common-case methods"
+        if row.get("gate") == "pooled_D3-10":
+            reason += " (gated on pooled D3-10 evidence)"
         selections[key] = Selection(
             method_id=str(row["method_id"]),
-            reason="lowest backtest MAE among promotable common-case methods",
+            reason=reason,
             n=int(row["n"]),
             mae=float(row["mae"]),
             evaluation_id=evaluation_id,
