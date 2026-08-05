@@ -61,6 +61,10 @@ from grounded_weather_forecast.leads import daily_bucket, hourly_bucket
 from grounded_weather_forecast.serve.dressing import ResidualDresser, dress_variable
 from grounded_weather_forecast.serve.history import load_archived_forecast
 from grounded_weather_forecast.serve.observability import snapshot_observability
+from grounded_weather_forecast.serve.recalibration import (
+    QuantileRecalibrator,
+    recalibrate_variable,
+)
 from grounded_weather_forecast.serve.schema import (
     SCHEMA_VERSION,
     DailyPoint,
@@ -372,6 +376,13 @@ def _lead_buckets(predict_frame: pl.DataFrame, *, daily: bool) -> list[str | Non
     return [daily_bucket(lead) if daily else hourly_bucket(lead) for lead in leads]
 
 
+def _recalibrator(config: Config, product: str) -> QuantileRecalibrator | None:
+    mode = config.predict.quantile_recalibration
+    if mode == "none":
+        return None
+    return QuantileRecalibrator(config.dataset.dir / "scores", product, config, mode)
+
+
 def _blended_rows(
     results: dict[str, BlendResult],
     chosen: list[Selection],
@@ -406,6 +417,7 @@ def _blend_variable(
     force_method: str | None = None,
     issue_time: datetime | None = None,
     dresser: ResidualDresser | None = None,
+    recalibrator: QuantileRecalibrator | None = None,
 ) -> VariableBlend | None:
     """Per row: the prediction of the method selected for that row's bucket."""
     chosen = _row_selections(
@@ -453,6 +465,7 @@ def _blend_variable(
         )
     results, _ = fitted
     point, quantiles = _blended_rows(results, chosen, predict_frame.height)
+    lead_buckets = _lead_buckets(predict_frame, daily=daily)
     quantile_sources: tuple[str | None, ...] | None = None
     if dresser is not None:
         # Dressing is strictly additive; any failure leaves the bare points.
@@ -462,12 +475,25 @@ def _blend_variable(
                 variable,
                 semantics,
                 chosen,
-                _lead_buckets(predict_frame, daily=daily),
+                lead_buckets,
                 point,
                 quantiles,
             )
         except (OSError, ValueError, pl.exceptions.PolarsError):
             quantile_sources = None
+    if recalibrator is not None:
+        # Recalibration touches only rows with native quantiles; dressed rows
+        # are already split-conformal and keep their label and values.
+        with suppress(OSError, ValueError, pl.exceptions.PolarsError):
+            quantile_sources = recalibrate_variable(
+                recalibrator,
+                variable,
+                semantics,
+                chosen,
+                lead_buckets,
+                quantiles,
+                quantile_sources,
+            )
     return VariableBlend(
         point=point,
         methods=[selection.method_id for selection in chosen],
@@ -774,6 +800,7 @@ def hourly_product(
     frame = snapshot.hourly.sort("valid_time")
     blended: dict[str, VariableBlend] = {}
     dresser = ResidualDresser(config.dataset.dir / "scores", "hourly", config)
+    recalibrator = _recalibrator(config, "hourly")
     for variable in HOURLY_VARIABLES:
         variable_semantics = (
             semantics.get(variable.name, TruthSemantics.INSTANTANEOUS)
@@ -791,6 +818,7 @@ def hourly_product(
             force_method=force_method,
             issue_time=snapshot.issue_time,
             dresser=dresser,
+            recalibrator=recalibrator,
         )
         if result is None:
             continue
@@ -827,6 +855,7 @@ def daily_product(
         return []
     blended: dict[str, VariableBlend] = {}
     dresser = ResidualDresser(config.dataset.dir / "scores", "daily", config)
+    recalibrator = _recalibrator(config, "daily")
     for variable in DAILY_VARIABLES:
         result = _blend_variable(
             train,
@@ -839,6 +868,7 @@ def daily_product(
             force_method=force_method,
             issue_time=snapshot.issue_time,
             dresser=dresser,
+            recalibrator=recalibrator,
         )
         if result is None:
             continue

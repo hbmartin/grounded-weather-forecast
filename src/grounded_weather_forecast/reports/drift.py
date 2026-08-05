@@ -54,6 +54,7 @@ _DEGENERATE_NEAR_SHARE = 0.9  # residual share at the median that disables PH
 _MIN_ROWS = 48
 
 RESIDUAL_SKIPPED_TIER = "residual_skipped"
+CONSENSUS_SKIPPED_TIER = "consensus_skipped"
 
 
 @dataclass(frozen=True, slots=True)
@@ -211,9 +212,24 @@ def consensus_alarms(matrix: pl.DataFrame, variable: VariableSpec) -> list[Drift
             )
             if recent.size < 4 or baseline.size < 24:
                 continue
-            center = float(np.median(baseline))
-            scale = float(np.median(np.abs(baseline - center))) * _MAD_TO_SIGMA
-            scale = max(scale, 1e-6)
+            # The floored robust scale the residual tier already uses: a raw
+            # MAD on a near-constant deviation series (zero-inflated precip)
+            # produced z-statistics in the tens of thousands for +0.01 mm
+            # shifts (future-work #22a).
+            robust = _residual_scale(baseline)
+            if robust.degenerate:
+                alarms.append(
+                    _skipped_degenerate_row(
+                        source,
+                        lead_bucket,
+                        baseline,
+                        robust,
+                        tier=CONSENSUS_SKIPPED_TIER,
+                    )
+                )
+                continue
+            center = robust.center
+            scale = robust.scale
             z = (float(np.mean(recent)) - center) / (scale / np.sqrt(recent.size))
             if abs(z) > _FAST_Z:
                 alarms.append(
@@ -234,17 +250,22 @@ def consensus_alarms(matrix: pl.DataFrame, variable: VariableSpec) -> list[Drift
 
 
 def _skipped_degenerate_row(
-    source: str, lead_bucket: str, residuals: FloatArray, robust: _ResidualScale
+    source: str,
+    lead_bucket: str,
+    residuals: FloatArray,
+    robust: _ResidualScale,
+    tier: str = RESIDUAL_SKIPPED_TIER,
 ) -> DriftAlarm:
+    test_name = "Page-Hinkley" if tier == RESIDUAL_SKIPPED_TIER else "consensus z-test"
     return DriftAlarm(
         source=source,
         lead_bucket=lead_bucket,
-        tier=RESIDUAL_SKIPPED_TIER,
+        tier=tier,
         statistic=round(robust.near_median_share, 3),
         detail=(
             f"skipped_degenerate: {robust.near_median_share:.0%} of "
             f"{residuals.shape[0]} residuals within {_SCALE_ABS_EPSILON:g} of "
-            f"the median (MAD-sigma {robust.mad_sigma:.3g}); Page-Hinkley "
+            f"the median (MAD-sigma {robust.mad_sigma:.3g}); {test_name} "
             "not run on a near-constant series"
         ),
     )
@@ -380,7 +401,7 @@ def write_drift_artifact(alarms: pl.DataFrame, path: Path) -> None:
     (every ``alarms`` entry becomes a pageable alert) while the dashboard —
     which treats absence as failure — still sees that the tier was checked.
     """
-    is_note = pl.col("tier") == RESIDUAL_SKIPPED_TIER
+    is_note = pl.col("tier").is_in([RESIDUAL_SKIPPED_TIER, CONSENSUS_SKIPPED_TIER])
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(
         json.dumps(

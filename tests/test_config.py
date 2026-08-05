@@ -99,6 +99,7 @@ class TestMinimalConfig:
         assert cfg.predict.selection == "skill_per_slice"
         assert cfg.predict.history_path == Path("data/predict_history.parquet")
         assert cfg.predict.minutely_tau_hours == 3.0
+        assert cfg.predict.quantile_recalibration == "none"
         assert cfg.reports_dir == Path("reports")
         assert cfg.artifacts_dir == Path("artifacts")
 
@@ -208,6 +209,16 @@ class TestErrors:
     def test_nonpositive_backtest_step_rejected(self, tmp_path):
         text = MINIMAL + "\n[backtest]\nstep_days = 0\n"
         with pytest.raises(ConfigError, match="positive integer"):
+            load_config(write(tmp_path, text))
+
+    def test_quantile_recalibration_mode_parsed(self, tmp_path):
+        text = MINIMAL + '\n[predict]\nquantile_recalibration = "cqr"\n'
+        cfg = load_config(write(tmp_path, text))
+        assert cfg.predict.quantile_recalibration == "cqr"
+
+    def test_unknown_quantile_recalibration_rejected(self, tmp_path):
+        text = MINIMAL + '\n[predict]\nquantile_recalibration = "isotonic"\n'
+        with pytest.raises(ConfigError, match="must be one of"):
             load_config(write(tmp_path, text))
 
     def test_report_gap_threshold_default(self, tmp_path):

@@ -170,6 +170,16 @@ mistaken for a method's own distribution. The leaderboard report adds a
 slice's board minimum by more than `[promotion].report_gap_threshold`
 (default 0.15), along with which gate blocked the better method.
 
+Natively-emitted quantiles can additionally be recalibrated at serve time:
+live leaderboard reports carry a "Quantile recalibration (offline holdout)"
+section that fits two mutually exclusive post-hoc repairs — PIT level
+remapping and per-level CQR margins — on the stored scores and compares
+their holdout coverage against the raw bands, and
+`[predict].quantile_recalibration = "none" | "pit" | "cqr"` (default
+`"none"`) applies the winning transform to native quantile rows in the
+served document. Recalibrated rows are labeled `recalibrated_{mode}_*` in
+`quantiles_source`; dressed rows are never transformed twice.
+
 ## Status
 
 Alpha, and honest about it: with a young forecast archive the backtest reports

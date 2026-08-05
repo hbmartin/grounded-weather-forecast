@@ -747,6 +747,9 @@ def _cmd_report(config: Config) -> int:
         leaderboard,
         slice_winners,
     )
+    from grounded_weather_forecast.reports.recalibration import (  # noqa: PLC0415
+        recalibration_report,
+    )
     from grounded_weather_forecast.reports.render import (  # noqa: PLC0415
         print_summary,
         write_markdown_report,
@@ -794,6 +797,15 @@ def _cmd_report(config: Config) -> int:
             if scores.is_empty()
             else set(scores["source_kind"].unique()) == {"live"}
         )
+        if is_live:
+            # Offline A/B of the two mutually exclusive post-hoc quantile
+            # repairs; [predict].quantile_recalibration serves the winner.
+            sections.append(
+                (
+                    "Quantile recalibration (offline holdout: raw vs pit vs cqr)",
+                    recalibration_report(scores),
+                )
+            )
         if is_live and config.predict.history_path.exists():
             try:
                 minute_truth, hourly_truth, daily_truth = build_truth(config)

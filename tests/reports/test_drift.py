@@ -7,6 +7,7 @@ from conftest import synthetic_hourly_matrix, utc
 
 from grounded_weather_forecast.contracts import hourly_variable
 from grounded_weather_forecast.reports.drift import (
+    CONSENSUS_SKIPPED_TIER,
     RESIDUAL_SKIPPED_TIER,
     consensus_alarms,
     drift_report,
@@ -100,6 +101,33 @@ class TestConsensusTier:
     def test_needs_a_crowd(self):
         matrix = synthetic_hourly_matrix(days=40, noise_sd=0.4, seed=53)  # 2 sources
         assert consensus_alarms(matrix, TEMP) == []
+
+    def test_zero_variance_baseline_notes_instead_of_alarming(self):
+        """A +0.01 mm drift over an all-zero baseline used to produce z-scores
+        in the tens of thousands (future-work #22a); it must skip, not page."""
+        issues = [utc(2026, 6, 1) + timedelta(hours=i) for i in range(40 * 24)]
+        cutover = issues[-1] - timedelta(days=2)
+        columns: dict[str, object] = {
+            "issue_time": issues,
+            "valid_time": [issue + timedelta(hours=1) for issue in issues],
+            "lead_hours": [1.0] * len(issues),
+            "t__precip_mm": [0.0] * len(issues),
+            "fx__a__precip_mm": [0.01 if issue > cutover else 0.0 for issue in issues],
+        }
+        for source in ("b", "c", "d", "e"):
+            columns[f"fx__{source}__precip_mm"] = [0.0] * len(issues)
+        matrix = pl.DataFrame(
+            columns,
+            schema_overrides={
+                name: pl.Float64
+                for name in columns
+                if name.endswith("precip_mm") or name == "lead_hours"
+            },
+        )
+        alarms = consensus_alarms(matrix, PRECIP)
+        assert alarms
+        assert all(a.tier == CONSENSUS_SKIPPED_TIER for a in alarms)
+        assert all(abs(a.statistic) <= 1.0 for a in alarms)
 
 
 class TestResidualTier:

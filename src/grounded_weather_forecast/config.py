@@ -234,6 +234,9 @@ class PredictConfig:
     history_path: Path
     methods: Mapping[str, str]
     minutely_tau_hours: float
+    # Post-hoc transform applied to natively-emitted quantiles at serve time;
+    # the offline report section arbitrates which mode earns this switch.
+    quantile_recalibration: str
 
 
 @dataclass(frozen=True, slots=True)
@@ -293,6 +296,15 @@ def _positive_number(value: Any, key: str, context: str) -> float:
         msg = f"{key!r} in [{context}] must be > 0"
         raise ConfigError(msg)
     return number
+
+
+def _choice(value: Any, allowed: tuple[str, ...], key: str, context: str) -> str:
+    text = str(value)
+    if text not in allowed:
+        options = ", ".join(repr(option) for option in allowed)
+        msg = f"{key!r} in [{context}] must be one of {options}, got {text!r}"
+        raise ConfigError(msg)
+    return text
 
 
 def _positive_int(value: Any, key: str, context: str) -> int:
@@ -673,6 +685,12 @@ def _predict(raw: Mapping[str, Any], dataset_dir: Path) -> PredictConfig:
         minutely_tau_hours=_positive_number(
             section.get("minutely_tau_hours", 3.0),
             "minutely_tau_hours",
+            "predict",
+        ),
+        quantile_recalibration=_choice(
+            section.get("quantile_recalibration", "none"),
+            ("none", "pit", "cqr"),
+            "quantile_recalibration",
             "predict",
         ),
     )
