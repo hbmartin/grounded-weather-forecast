@@ -50,12 +50,14 @@ def model_confidence_set(
     method_ids: tuple[str, ...],
     alpha: float = 0.1,
     n_bootstrap: int = _DEFAULT_BOOTSTRAP,
+    block_length: int | None = None,
 ) -> McsResult:
     """MCS over a (n_times, n_methods) loss matrix (one row per valid time).
 
     Returns every method the data cannot distinguish from the best at level
     ``alpha``. With fewer than ``_MIN_TIMES`` rows nothing can be eliminated
-    and all methods survive — thinness is never evidence.
+    and all methods survive — thinness is never evidence. ``block_length``
+    None or non-positive selects the ``n_times ** (1/3)`` default.
     """
     n_times, n_methods = losses.shape
     if n_methods != len(method_ids):
@@ -64,7 +66,8 @@ def model_confidence_set(
     if n_times < _MIN_TIMES or n_methods < 2:
         return McsResult(survivors=tuple(method_ids), p_values={})
     rng = np.random.default_rng(_SEED)
-    block_length = max(1, round(n_times ** (1.0 / 3.0)))
+    if block_length is None or block_length <= 0:
+        block_length = max(1, round(n_times ** (1.0 / 3.0)))
     indices = _block_indices(rng, n_times, block_length, n_bootstrap)
     active = list(range(n_methods))
     p_values: dict[str, float] = {}
@@ -106,15 +109,17 @@ def model_confidence_set(
     return McsResult(survivors=survivors, p_values=p_values)
 
 
-def collapsed_loss_matrix(
+def collapsed_loss_frame(
     slice_scores: pl.DataFrame,
     *,
     method_ids: tuple[str, ...] | None = None,
-) -> tuple[FloatArray, tuple[str, ...]] | None:
-    """Common-case losses collapsed per valid_time, methods as columns.
+) -> tuple[pl.DataFrame, tuple[str, ...]] | None:
+    """Common-case losses collapsed per valid_time, one column per method.
 
     Only cases every method scored enter (MCS compares the set, so its inputs
-    must be common) — the leaderboard's own-case scoring is unaffected.
+    must be common) — the leaderboard's own-case scoring is unaffected. The
+    ``valid_time`` column is kept so sequential consumers can dedupe against
+    a cursor.
     """
     frame = slice_scores.drop_nulls("y_pred")
     if method_ids is not None:
@@ -141,5 +146,18 @@ def collapsed_loss_matrix(
     )
     if collapsed.is_empty():
         return None
+    return collapsed, methods
+
+
+def collapsed_loss_matrix(
+    slice_scores: pl.DataFrame,
+    *,
+    method_ids: tuple[str, ...] | None = None,
+) -> tuple[FloatArray, tuple[str, ...]] | None:
+    """The collapsed common-case losses as a (n_times, n_methods) array."""
+    built = collapsed_loss_frame(slice_scores, method_ids=method_ids)
+    if built is None:
+        return None
+    collapsed, methods = built
     matrix = collapsed.select(list(methods)).to_numpy().astype(np.float64)
     return matrix, methods

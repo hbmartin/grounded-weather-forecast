@@ -85,7 +85,9 @@ def _spread(x: ForecastMatrix, variable_name: str) -> FloatArray:
 
 
 def _minimize(
-    loss: Callable[[FloatArray], float], initial: FloatArray
+    loss: Callable[[FloatArray], float],
+    initial: FloatArray,
+    max_iterations: int = 400,
 ) -> FloatArray | None:
     """Fitted parameters, or ``None`` when the optimizer produced no usable fit.
 
@@ -104,7 +106,7 @@ def _minimize(
         loss,
         initial,
         method="Nelder-Mead",
-        options={"maxiter": 400, "xatol": 1e-4, "fatol": 1e-6},
+        options={"maxiter": max_iterations, "xatol": 1e-4, "fatol": 1e-6},
     )
     fitted = np.asarray(result.x, dtype=np.float64)
     if (

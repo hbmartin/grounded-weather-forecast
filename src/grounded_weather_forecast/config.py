@@ -7,7 +7,7 @@ station column/unit mappings) so the codebase itself stays station-agnostic.
 import math
 import tomllib
 from collections.abc import Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import date, datetime
 from pathlib import Path
 from types import MappingProxyType
@@ -127,6 +127,14 @@ class ForecastsConfig:
     immutable: bool
     latitude: float
     longitude: float
+    # Per-source lead cap in hours: rows beyond a source's cap are dropped at
+    # matrix build, trimming horizon-edge garbage without excluding the source.
+    max_lead_hours: Mapping[str, float] = field(
+        default_factory=lambda: MappingProxyType({})
+    )
+    # (source, variable) pairs whose values are nulled at matrix build — for
+    # providers whose signal is genuinely bad for one variable only.
+    exclude: tuple[tuple[str, str], ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -215,6 +223,19 @@ class PromotionConfig:
     alpha: float = 0.1
     live_gap_factor: float = 1.5
     min_live_n: int = 24
+    # Relative served-vs-board-minimum MAE gap above which the leaderboard
+    # report flags a slice as a blocked promotion.
+    report_gap_threshold: float = 0.15
+    # Bootstrap replicates and moving-block length for the MCS gate;
+    # block length 0 selects the n^(1/3) default.
+    mcs_bootstrap: int = 500
+    mcs_block_length: int = 0
+    # Per-variable gate-reference overrides ([promotion.references]): where
+    # the default provider-space references are bias-dominated against
+    # station truth, grounded variants keep the gate and fallback meaningful.
+    references: Mapping[str, tuple[str, ...]] = field(
+        default_factory=lambda: MappingProxyType({})
+    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -223,6 +244,9 @@ class PredictConfig:
     history_path: Path
     methods: Mapping[str, str]
     minutely_tau_hours: float
+    # Post-hoc transform applied to natively-emitted quantiles at serve time;
+    # the offline report section arbitrates which mode earns this switch.
+    quantile_recalibration: str
 
 
 @dataclass(frozen=True, slots=True)
@@ -284,10 +308,27 @@ def _positive_number(value: Any, key: str, context: str) -> float:
     return number
 
 
+def _choice(value: Any, allowed: tuple[str, ...], key: str, context: str) -> str:
+    text = str(value)
+    if text not in allowed:
+        options = ", ".join(repr(option) for option in allowed)
+        msg = f"{key!r} in [{context}] must be one of {options}, got {text!r}"
+        raise ConfigError(msg)
+    return text
+
+
 def _positive_int(value: Any, key: str, context: str) -> int:
     number = _finite_number(value, key, context)
     if not number.is_integer() or number <= 0.0:
         msg = f"{key!r} in [{context}] must be a positive integer"
+        raise ConfigError(msg)
+    return int(number)
+
+
+def _nonnegative_int(value: Any, key: str, context: str) -> int:
+    number = _finite_number(value, key, context)
+    if not number.is_integer() or number < 0.0:
+        msg = f"{key!r} in [{context}] must be a non-negative integer"
         raise ConfigError(msg)
     return int(number)
 
@@ -355,6 +396,35 @@ def _station(raw: Mapping[str, Any]) -> StationConfig:
     )
 
 
+def _forecast_exclusions(section: Mapping[str, Any]) -> tuple[tuple[str, str], ...]:
+    raw = section.get("exclude", [])
+    if not isinstance(raw, list) or not all(isinstance(e, str) for e in raw):
+        msg = "'exclude' in [forecasts] must be a list of 'source:variable' strings"
+        raise ConfigError(msg)
+    pairs: list[tuple[str, str]] = []
+    for entry in raw:
+        source, _, variable = entry.partition(":")
+        if not source or not variable:
+            msg = (
+                f"[forecasts].exclude entries must be 'source:variable', got {entry!r}"
+            )
+            raise ConfigError(msg)
+        pairs.append((source, variable))
+    return tuple(pairs)
+
+
+def _forecast_lead_caps(section: Mapping[str, Any]) -> Mapping[str, float]:
+    raw = section.get("max_lead_hours", {})
+    if not isinstance(raw, Mapping):
+        msg = "[forecasts].max_lead_hours must be a table of source = hours"
+        raise ConfigError(msg)
+    caps = {
+        str(source): _positive_number(hours, f"max_lead_hours.{source}", "forecasts")
+        for source, hours in sorted(raw.items())
+    }
+    return MappingProxyType(caps)
+
+
 def _forecasts(raw: Mapping[str, Any], station: StationConfig) -> ForecastsConfig:
     section = _section(raw, "forecasts")
     sources = section.get("sources", [])
@@ -372,6 +442,8 @@ def _forecasts(raw: Mapping[str, Any], station: StationConfig) -> ForecastsConfi
         immutable=bool(section.get("immutable", False)),
         latitude=station.latitude,
         longitude=station.longitude,
+        max_lead_hours=_forecast_lead_caps(section),
+        exclude=_forecast_exclusions(section),
     )
 
 
@@ -595,12 +667,27 @@ def _truth_qc(raw: Mapping[str, Any]) -> TruthQcConfig:
     )
 
 
+def _promotion_references(
+    value: Any,
+) -> Mapping[str, tuple[str, ...]]:
+    if not isinstance(value, Mapping):
+        msg = "[promotion.references] must be a table of string lists"
+        raise ConfigError(msg)
+    references: dict[str, tuple[str, ...]] = {}
+    for variable, methods in value.items():
+        parsed = _string_tuple(methods, str(variable), "promotion.references")
+        if not parsed:
+            msg = f"[promotion.references].{variable} must list at least one method id"
+            raise ConfigError(msg)
+        references[str(variable)] = parsed
+    return MappingProxyType(references)
+
+
 def _promotion(raw: Mapping[str, Any]) -> PromotionConfig:
     section = _section(raw, "promotion") if "promotion" in raw else {}
-    rule = str(section.get("rule", "mcs"))
-    if rule not in ("mcs", "legacy"):
-        msg = f"[promotion].rule must be 'mcs' or 'legacy', got {rule!r}"
-        raise ConfigError(msg)
+    rule = _choice(
+        section.get("rule", "mcs"), ("mcs", "legacy", "seq_mcs"), "rule", "promotion"
+    )
     return PromotionConfig(
         rule=rule,
         alpha=_fraction(section.get("alpha", 0.1), "alpha", "promotion"),
@@ -610,6 +697,18 @@ def _promotion(raw: Mapping[str, Any]) -> PromotionConfig:
         min_live_n=_positive_int(
             section.get("min_live_n", 24), "min_live_n", "promotion"
         ),
+        report_gap_threshold=_positive_number(
+            section.get("report_gap_threshold", 0.15),
+            "report_gap_threshold",
+            "promotion",
+        ),
+        mcs_bootstrap=_positive_int(
+            section.get("mcs_bootstrap", 500), "mcs_bootstrap", "promotion"
+        ),
+        mcs_block_length=_nonnegative_int(
+            section.get("mcs_block_length", 0), "mcs_block_length", "promotion"
+        ),
+        references=_promotion_references(section.get("references", {})),
     )
 
 
@@ -626,6 +725,12 @@ def _predict(raw: Mapping[str, Any], dataset_dir: Path) -> PredictConfig:
         minutely_tau_hours=_positive_number(
             section.get("minutely_tau_hours", 3.0),
             "minutely_tau_hours",
+            "predict",
+        ),
+        quantile_recalibration=_choice(
+            section.get("quantile_recalibration", "none"),
+            ("none", "pit", "cqr"),
+            "quantile_recalibration",
             "predict",
         ),
     )

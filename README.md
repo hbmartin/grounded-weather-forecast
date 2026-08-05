@@ -94,6 +94,11 @@ grounded-weather-forecast backfill --provider dynamical --start 2026-06-01
 #    uv sync --extra backfill
 #    uv run grounded-weather-forecast backfill --provider dynamical --start 2026-06-01
 
+#    A third provider backfills archived ENSEMBLE mean/spread (Open-Meteo keeps
+#    them from ~March 2026) into the ens__ feature store with true run
+#    vintages, months before live polling accumulates the same history.
+grounded-weather-forecast backfill --provider open_meteo_ensemble --start 2026-03-01
+
 # 5. Study whether each hourly variable should use instantaneous or interval-mean
 #    truth. Misalignment masquerades as provider bias; this measures it.
 grounded-weather-forecast alignment
@@ -155,6 +160,66 @@ variables with dual truth semantics — single-truth variables (`wind_gust_ms`,
 cannot strand their evidence. Score files written before feature-schema
 identity are ignored by selection; re-run `backtest` after upgrading to
 restore promotions.
+
+Served slices whose winning method emits no native quantiles are dressed with
+empirical residual quantiles from that method's own live backtest errors
+(asymmetric, per lead bucket, finite-sample corrected); the document marks
+them in a per-variable `quantiles_source` map so dressed bands are never
+mistaken for a method's own distribution. The leaderboard report adds a
+"Blocked promotions" section naming every slice whose served MAE exceeds the
+slice's board minimum by more than `[promotion].report_gap_threshold`
+(default 0.15), along with which gate blocked the better method.
+
+Methods can be registered with a variable scope (`register(...,
+variables=frozenset({"pop"}))`), so specialist heads are simply never fitted
+off-scope: `pop_platt` vs `pop_beta` recalibrate the provider PoP mean (the
+wet-season A/B, arbitrated by the Brier column, identity-guarded on dry
+archives), `csgd_emos` fits a censored shifted-gamma to precipitation (the
+first quantile emitter whose censored mass IS the dry probability), and the
+daily temperature product gets its own A/B — `daily_marginal_emos` (direct
+Meng–Taylor marginal on daily values + hourly-path extremes) vs
+`daily_path_extreme` (grounded ensemble of per-source path extremes). The
+daily matrix carries `path__{source}__max/min` features (coverage-gated) to
+power them. Far daily buckets whose per-bucket evidence sits under the
+eligibility floor are gated on pooled D3-10 evidence instead — a promotion
+through that path is labeled `pooled_D3-10` in the winners table while
+scoring and selection stay per fine bucket.
+
+Three structure challengers round out the method pool, pure leaderboard
+candidates: `raft_grounded` (a freely fitted per-bucket response to the
+issue-time residual, replacing the assumed exponential anchor decay — RAFT,
+Schuhen et al. 2020), `seamless_regression` (one per-bucket ridge over
+forward-filled source columns plus the issue-time observation — Dabernig &
+Atencia's single-model architecture, the honest test of the
+grounding→blending→anchoring decomposition), and `inverse_covariance`
+(Ledoit–Wolf-shrunk GLS weights with capped deviations — the honest test of
+diagonal-only weighting).
+
+Promotion offers two mutually exclusive statistical gates, compared side by
+side in every live report's "Promotion rule comparison" section:
+`[promotion].rule = "mcs"` (bootstrap Model Confidence Set, re-run from
+scratch nightly; replicates and block length tunable via
+`[promotion].mcs_bootstrap` / `mcs_block_length`) and `"seq_mcs"` — an
+anytime-valid betting e-process per (slice, candidate, reference) whose
+wealth accumulates across nightly re-runs (state under
+`artifacts/eprocess/`, reset whenever config or code identity changes) and
+promotes when every reference's e-process exceeds `1/alpha`. The leaderboard
+also carries `dm_q_vs_*` Benjamini–Hochberg FDR-adjusted q-values beside
+every DM p-value. Where the default references are bias-dominated against
+station truth, `[promotion.references]` overrides the gate's reference class
+per variable (e.g. `pressure_sea_hpa = ["grounded_equal_weight",
+"damped_grounded_equal_weight"]`); skill columns keep their default meaning
+and extend with the configured references.
+
+Natively-emitted quantiles can additionally be recalibrated at serve time:
+live leaderboard reports carry a "Quantile recalibration (offline holdout)"
+section that fits two mutually exclusive post-hoc repairs — PIT level
+remapping and per-level CQR margins — on the stored scores and compares
+their holdout coverage against the raw bands, and
+`[predict].quantile_recalibration = "none" | "pit" | "cqr"` (default
+`"none"`) applies the winning transform to native quantile rows in the
+served document. Recalibrated rows are labeled `recalibrated_{mode}_*` in
+`quantiles_source`; dressed rows are never transformed twice.
 
 ## Status
 

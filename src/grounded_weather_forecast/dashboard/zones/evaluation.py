@@ -25,7 +25,10 @@ from grounded_weather_forecast.metrics.probabilistic import (
     pit_from_quantiles,
     reliability_bins,
 )
-from grounded_weather_forecast.reports.leaderboard import CONSUMER_TOLERANCES
+from grounded_weather_forecast.reports.leaderboard import (
+    CONSUMER_TOLERANCES,
+    DEFAULT_REFERENCES,
+)
 
 _MAX_BOARD_ROWS = 250
 _BOARD_COLUMNS = (
@@ -86,7 +89,7 @@ def _winners_panel(stem: str, winners: pl.DataFrame, rule: str, alpha: float) ->
         for row in winners.iter_rows(named=True)
     )
     reference_wins = winners.filter(
-        pl.col("method_id").is_in(["best_provider", "equal_weight"])
+        pl.col("method_id").is_in(list(DEFAULT_REFERENCES))
     ).height
     return Panel(
         panel_id=f"d2-{stem}",

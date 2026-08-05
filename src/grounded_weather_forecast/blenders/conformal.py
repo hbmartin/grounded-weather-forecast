@@ -2,23 +2,29 @@
 
 A compact conformal-PID-style tracker (Angelopoulos, Candès & Tibshirani
 2023; SAOCP-adjacent): per (lead bucket x day/night) cell, an online quantile
-tracker follows the absolute-residual quantile of the base blend (the P term)
-and a slow integrator nudges the radius whenever realized coverage drifts
-from target (the I term, which is what recovers coverage through regime
-shifts and archive gaps). The base model is retained from a chronological
-proper-training split; only predictions for the later calibration split update
-the interval tracker. This avoids the optimistic in-sample residuals that would
-result from evaluating a flexible base model on rows it already fitted.
-
-This supersedes plain ACI from the original improvement plan: ACI's single
-learning rate either oscillates or lags; tracking the score quantile at a
-residual-scaled step plus an explicit coverage integrator removes the knob.
+tracker follows the absolute-residual quantile of the base blend at a step of
+0.1x the trailing-window score maximum (the paper's scale heuristic — the P
+term), seeded at readiness with the conservative empirical quantile of the
+buffered scores so a large systematic offset is covered immediately. A
+saturating tangent integrator adds at most ~2.6x the score scale on top when
+realized coverage drifts from target, with authority that decays as log t / t
+(the I term — recovers coverage through regime shifts without the unbounded
+windup a linear integral accumulates during a persistent-miss run). Every
+calibration score also feeds a global cell per day/night flag, so buckets
+whose calibration split is empty (long leads under an expanding archive) fall
+back to pooled radii instead of emitting nothing. The base model is retained
+from a chronological proper-training split; only predictions for the later
+calibration split update the interval tracker. This avoids the optimistic
+in-sample residuals that would result from evaluating a flexible base model
+on rows it already fitted.
 
 Intervals are symmetric around the base point — the honest first cut; the
 EMOS/IDR heads carry asymmetry where the data supports it, and the
 leaderboard arbitrates.
 """
 
+import math
+from collections import deque
 from dataclasses import dataclass, field
 from typing import Self
 
@@ -46,10 +52,11 @@ from grounded_weather_forecast.leads import LeadBucket, buckets_for_product
 # target central coverages and the quantile levels they imply
 COVERAGES: tuple[float, ...] = (0.5, 0.8, 0.9)
 QUANTILE_LEVELS: tuple[float, ...] = (0.05, 0.1, 0.25, 0.75, 0.9, 0.95)
-_STEP = 0.05  # quantile-tracker step, in units of the running score scale
-_INTEGRATOR_GAIN = 0.02
-_INTEGRATOR_SATURATION = 25.0
-_SCALE_DECAY = 0.02
+_STEP = 0.1  # quantile-tracker step, in units of the trailing score maximum
+_SCALE_WINDOW = 50  # trailing scores kept for the scale anchor and warm start
+_CSAT = 0.5  # integrator threshold scale (sublinear h(t) = t * _CSAT / log t)
+_ARG_CLIP = 1.2  # tan argument bound: integrator authority tops out ~2.6x scale
+_GLOBAL_LABEL = "__global__"
 _MIN_UPDATES = 20
 _MIN_PROPER_ROWS = 60
 _MIN_CALIBRATION_ROWS = 20
@@ -60,33 +67,57 @@ _DAILY_RESOLUTION_DELAY_US = 25 * 3_600_000_000
 
 @dataclass
 class _CellState:
-    """Radii for each coverage target plus the shared score scale."""
+    """Radii for each coverage target plus the trailing score buffer."""
 
     radii: FloatArray
-    integrals: FloatArray
-    scale: float = 1.0
+    error_sums: FloatArray
+    recent: deque[float] = field(default_factory=lambda: deque(maxlen=_SCALE_WINDOW))
     updates: int = 0
 
     def update(self, score: float) -> None:
         self.updates += 1
-        self.scale = (1.0 - _SCALE_DECAY) * self.scale + _SCALE_DECAY * score
-        step = _STEP * max(self.scale, 1e-6)
+        self.recent.append(score)
+        if self.updates < _MIN_UPDATES:
+            return
+        if self.updates == _MIN_UPDATES:
+            self._warm_start()
+            return
+        step = _STEP * self.scale_anchor()
         for index, coverage in enumerate(COVERAGES):
             covered = score <= self.effective_radius(index)
             # P: pinball-gradient quantile tracking of the score distribution
             self.radii[index] += step * (coverage if not covered else coverage - 1.0)
             self.radii[index] = max(self.radii[index], 0.0)
-            # I: realized-coverage error accumulates and nudges the radius
-            self.integrals[index] = float(
-                np.clip(
-                    self.integrals[index] + (coverage - float(covered)),
-                    -_INTEGRATOR_SATURATION,
-                    _INTEGRATOR_SATURATION,
-                )
-            )
+            # I: realized-coverage error accumulates without clipping; the
+            # saturating tangent in effective_radius bounds its authority
+            self.error_sums[index] += coverage - float(covered)
+
+    def _warm_start(self) -> None:
+        # Conservative split-conformal quantile of the buffered scores, so a
+        # systematic offset is covered at readiness instead of after hundreds
+        # of tracker steps.
+        ordered = np.sort(np.asarray(self.recent, dtype=float))
+        count = ordered.shape[0]
+        for index, coverage in enumerate(COVERAGES):
+            rank = min(count, math.ceil((count + 1) * coverage))
+            self.radii[index] = float(ordered[rank - 1])
+        self.error_sums[:] = 0.0
+
+    def scale_anchor(self) -> float:
+        if not self.recent:
+            return 1e-6
+        return max(*self.recent, 1e-6)
 
     def effective_radius(self, index: int) -> float:
-        integrator = _INTEGRATOR_GAIN * self.integrals[index] * max(self.scale, 1e-6)
+        t = max(self.updates, 2)
+        argument = float(
+            np.clip(
+                float(self.error_sums[index]) * math.log(t) / (t * _CSAT),
+                -_ARG_CLIP,
+                _ARG_CLIP,
+            )
+        )
+        integrator = self.scale_anchor() * math.tan(argument)
         return max(float(self.radii[index]) + integrator, 0.0)
 
     def ready(self) -> bool:
@@ -95,7 +126,7 @@ class _CellState:
 
 def _fresh_cell() -> _CellState:
     return _CellState(
-        radii=np.zeros(len(COVERAGES)), integrals=np.zeros(len(COVERAGES))
+        radii=np.zeros(len(COVERAGES)), error_sums=np.zeros(len(COVERAGES))
     )
 
 
@@ -235,9 +266,12 @@ class Conformal:
         for row in calibration_rows[order]:
             if not np.isfinite(scores[row]):
                 continue
-            key = (labels[row], bool(day[row]))
-            cell = self._cells.setdefault(key, _fresh_cell())
-            cell.update(float(scores[row]))
+            is_day = bool(day[row])
+            # every score also feeds the pooled cell, so buckets with an empty
+            # calibration split fall back to global radii instead of emitting
+            # nothing
+            for key in ((labels[row], is_day), (_GLOBAL_LABEL, is_day)):
+                self._cells.setdefault(key, _fresh_cell()).update(float(scores[row]))
         self._split_metadata = {
             "strategy": "chronological_70_30",
             "proper_rows": int(proper_rows.shape[0]),
@@ -249,8 +283,13 @@ class Conformal:
         return self
 
     def _cell_for(self, label: str, *, is_day: bool) -> _CellState | None:
-        # fall back across day/night before giving up on the bucket
-        for key in ((label, is_day), (label, not is_day)):
+        # ladder: bucket day/night, bucket other-phase, then the pooled cells
+        for key in (
+            (label, is_day),
+            (label, not is_day),
+            (_GLOBAL_LABEL, is_day),
+            (_GLOBAL_LABEL, not is_day),
+        ):
             cell = self._cells.get(key)
             if cell is not None and cell.ready():
                 return cell
@@ -292,12 +331,13 @@ class Conformal:
 
     def to_state(self) -> dict[str, object]:
         return {
-            "schema_version": 2,
+            "schema_version": 3,
             "cells": {
                 f"{label}|{'day' if is_day else 'night'}": {
                     "radii": cell.radii.tolist(),
-                    "integrals": cell.integrals.tolist(),
-                    "scale": cell.scale,
+                    "error_sums": cell.error_sums.tolist(),
+                    "scale_anchor": cell.scale_anchor(),
+                    "recent": list(cell.recent),
                     "updates": cell.updates,
                 }
                 for (label, is_day), cell in sorted(self._cells.items())

@@ -99,6 +99,7 @@ class TestMinimalConfig:
         assert cfg.predict.selection == "skill_per_slice"
         assert cfg.predict.history_path == Path("data/predict_history.parquet")
         assert cfg.predict.minutely_tau_hours == 3.0
+        assert cfg.predict.quantile_recalibration == "none"
         assert cfg.reports_dir == Path("reports")
         assert cfg.artifacts_dir == Path("artifacts")
 
@@ -208,4 +209,91 @@ class TestErrors:
     def test_nonpositive_backtest_step_rejected(self, tmp_path):
         text = MINIMAL + "\n[backtest]\nstep_days = 0\n"
         with pytest.raises(ConfigError, match="positive integer"):
+            load_config(write(tmp_path, text))
+
+    def test_quantile_recalibration_mode_parsed(self, tmp_path):
+        text = MINIMAL + '\n[predict]\nquantile_recalibration = "cqr"\n'
+        cfg = load_config(write(tmp_path, text))
+        assert cfg.predict.quantile_recalibration == "cqr"
+
+    def test_unknown_quantile_recalibration_rejected(self, tmp_path):
+        text = MINIMAL + '\n[predict]\nquantile_recalibration = "isotonic"\n'
+        with pytest.raises(ConfigError, match="must be one of"):
+            load_config(write(tmp_path, text))
+
+    def test_report_gap_threshold_default(self, tmp_path):
+        cfg = load_config(write(tmp_path, MINIMAL))
+        assert cfg.promotion.report_gap_threshold == 0.15
+
+    def test_report_gap_threshold_parsed(self, tmp_path):
+        text = MINIMAL + "\n[promotion]\nreport_gap_threshold = 0.3\n"
+        cfg = load_config(write(tmp_path, text))
+        assert cfg.promotion.report_gap_threshold == 0.3
+
+    def test_nonpositive_report_gap_threshold_rejected(self, tmp_path):
+        text = MINIMAL + "\n[promotion]\nreport_gap_threshold = 0\n"
+        with pytest.raises(ConfigError, match="report_gap_threshold"):
+            load_config(write(tmp_path, text))
+
+    def test_promotion_gate_defaults(self, tmp_path):
+        cfg = load_config(write(tmp_path, MINIMAL))
+        assert cfg.promotion.mcs_bootstrap == 500
+        assert cfg.promotion.mcs_block_length == 0
+        assert dict(cfg.promotion.references) == {}
+
+    def test_seq_mcs_rule_accepted(self, tmp_path):
+        text = MINIMAL + '\n[promotion]\nrule = "seq_mcs"\n'
+        cfg = load_config(write(tmp_path, text))
+        assert cfg.promotion.rule == "seq_mcs"
+
+    def test_unknown_promotion_rule_rejected(self, tmp_path):
+        text = MINIMAL + '\n[promotion]\nrule = "argmin"\n'
+        with pytest.raises(ConfigError, match="must be one of"):
+            load_config(write(tmp_path, text))
+
+    def test_promotion_references_parsed(self, tmp_path):
+        text = (
+            MINIMAL
+            + "\n[promotion.references]\n"
+            + 'pressure_sea_hpa = ["grounded_equal_weight", '
+            + '"damped_grounded_equal_weight"]\n'
+        )
+        cfg = load_config(write(tmp_path, text))
+        assert cfg.promotion.references["pressure_sea_hpa"] == (
+            "grounded_equal_weight",
+            "damped_grounded_equal_weight",
+        )
+
+    def test_empty_promotion_reference_list_rejected(self, tmp_path):
+        text = MINIMAL + "\n[promotion.references]\npressure_sea_hpa = []\n"
+        with pytest.raises(ConfigError, match="at least one"):
+            load_config(write(tmp_path, text))
+
+    def test_promotion_bootstrap_parsed(self, tmp_path):
+        text = MINIMAL + "\n[promotion]\nmcs_bootstrap = 999\nmcs_block_length = 6\n"
+        cfg = load_config(write(tmp_path, text))
+        assert cfg.promotion.mcs_bootstrap == 999
+        assert cfg.promotion.mcs_block_length == 6
+
+    def test_forecast_exclusions_parsed(self, tmp_path):
+        text = MINIMAL + 'exclude = ["weatherapi:dew_point_c", "weatherapi:pop"]\n'
+        cfg = load_config(write(tmp_path, text))
+        assert cfg.forecasts.exclude == (
+            ("weatherapi", "dew_point_c"),
+            ("weatherapi", "pop"),
+        )
+
+    def test_forecast_exclusion_without_colon_rejected(self, tmp_path):
+        text = MINIMAL + 'exclude = ["weatherapi"]\n'
+        with pytest.raises(ConfigError, match="source:variable"):
+            load_config(write(tmp_path, text))
+
+    def test_forecast_lead_caps_parsed(self, tmp_path):
+        text = MINIMAL + "\n[forecasts.max_lead_hours]\nvisual_crossing = 336\n"
+        cfg = load_config(write(tmp_path, text))
+        assert cfg.forecasts.max_lead_hours["visual_crossing"] == 336.0
+
+    def test_nonpositive_lead_cap_rejected(self, tmp_path):
+        text = MINIMAL + "\n[forecasts.max_lead_hours]\nnws = -1\n"
+        with pytest.raises(ConfigError, match="max_lead_hours.nws"):
             load_config(write(tmp_path, text))

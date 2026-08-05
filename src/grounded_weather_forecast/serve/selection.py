@@ -18,7 +18,7 @@ from typing import cast
 import polars as pl
 
 from grounded_weather_forecast.backtest.scores import load_scores
-from grounded_weather_forecast.config import Config
+from grounded_weather_forecast.config import Config, PromotionConfig
 from grounded_weather_forecast.contracts import TruthSemantics
 from grounded_weather_forecast.evaluation import (
     ModelRelease,
@@ -26,10 +26,13 @@ from grounded_weather_forecast.evaluation import (
     config_fingerprint,
     dataset_fingerprint,
 )
+from grounded_weather_forecast.reports.eprocess import EProcessStore
 from grounded_weather_forecast.reports.leaderboard import (
-    DEFAULT_REFERENCES,
+    _DAILY_GATE_POOL,
+    gate_references,
     leaderboard,
     slice_winners,
+    union_references,
 )
 
 FALLBACK_METHOD = "equal_weight"
@@ -128,10 +131,57 @@ def _compatible_scores(
     return candidates
 
 
+def _pool_sibling_scores(
+    key: SliceKey,
+    frame: pl.DataFrame,
+    slices: Mapping[SliceKey, pl.DataFrame],
+) -> pl.DataFrame:
+    """Widen a far daily slice's scores to its D3-10 pool siblings.
+
+    ``_newest_complete_slices`` partitions evidence per fine bucket, but the
+    pooled far-bucket gate can only pool what it can see — without the
+    siblings of the same evaluation, serving would never reach the pooled
+    promotions the report shows.
+    """
+    product, variable, bucket = key
+    pool = _DAILY_GATE_POOL.get(bucket) if product == "daily" else None
+    if not pool:
+        return frame
+    evaluation_id = str(frame["evaluation_id"][0])
+    siblings = [
+        sibling
+        for sibling_bucket in pool
+        if (sibling := slices.get((product, variable, sibling_bucket))) is not None
+        and str(sibling["evaluation_id"][0]) == evaluation_id
+    ]
+    return pl.concat(siblings, how="diagonal_relaxed") if siblings else frame
+
+
+def _eprocess_store_for(
+    config: Config, product: str, cache: dict[str, EProcessStore]
+) -> EProcessStore | None:
+    """Read-only e-process wealth for the ``seq_mcs`` rule.
+
+    Only ``report`` persists the store; selection's in-memory updates are
+    cursor-deduped and deterministic, so a reader that runs before the
+    nightly writer reaches the same wealth the writer will record.
+    """
+    if config.promotion.rule != "seq_mcs":
+        return None
+    if product not in cache:
+        cache[product] = EProcessStore.load(
+            config.artifacts_dir / "eprocess" / f"{product}_live.json",
+            config_fingerprint(config),
+            code_identity(),
+        )
+    return cache[product]
+
+
 def _newest_complete_slices(
     candidates: list[pl.DataFrame],
+    promotion: PromotionConfig | None = None,
 ) -> dict[SliceKey, pl.DataFrame]:
-    """Newest atomic evaluation per slice containing both reference methods."""
+    """Newest atomic evaluation per slice containing every reference method."""
     if not candidates:
         return {}
     combined = pl.concat(candidates, how="diagonal_relaxed")
@@ -147,7 +197,7 @@ def _newest_complete_slices(
             ["product", "variable", "lead_bucket"], as_dict=True
         ).items():
             methods = {str(method) for method in frame["method_id"].unique().to_list()}
-            if not set(DEFAULT_REFERENCES) <= methods:
+            if not set(gate_references(str(slice_key[1]), promotion)) <= methods:
                 continue
             product, variable, lead_bucket = (str(part) for part in slice_key)
             key: SliceKey = (product, variable, lead_bucket)
@@ -527,25 +577,32 @@ def select_methods(
     pinned = _pins(config)
     selections: dict[tuple[str, str, str], Selection] = {}
     compatible = _compatible_scores(config, scores_dir, as_of, semantics)
-    slices = _newest_complete_slices(compatible)
+    slices = _newest_complete_slices(compatible, config.promotion)
     selected_scores: list[pl.DataFrame] = []
     fallbacks: dict[SliceKey, Selection] = {}
+    references = union_references(config.promotion)
+    eprocess_stores: dict[str, EProcessStore] = {}
     for key, frame in slices.items():
-        board = leaderboard(frame)
+        board = leaderboard(frame, references=references)
         winners = slice_winners(
             board,
-            scores=frame,
+            scores=_pool_sibling_scores(key, frame, slices),
             rule=config.promotion.rule,
             alpha=config.promotion.alpha,
+            promotion=config.promotion,
+            eprocess_store=_eprocess_store_for(config, key[0], eprocess_stores),
         )
         if winners.is_empty():
             continue
         selected_scores.append(frame)
         evaluation_id = str(frame["evaluation_id"][0])
         row = winners.row(0, named=True)
+        reason = "lowest backtest MAE among promotable common-case methods"
+        if row.get("gate") == "pooled_D3-10":
+            reason += " (gated on pooled D3-10 evidence)"
         selections[key] = Selection(
             method_id=str(row["method_id"]),
-            reason="lowest backtest MAE among promotable common-case methods",
+            reason=reason,
             n=int(row["n"]),
             mae=float(row["mae"]),
             evaluation_id=evaluation_id,

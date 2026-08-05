@@ -101,11 +101,12 @@ def build_parser() -> argparse.ArgumentParser:
     )
     backfill.add_argument(
         "--provider",
-        choices=("open_meteo", "dynamical"),
+        choices=("open_meteo", "dynamical", "open_meteo_ensemble"),
         default="open_meteo",
         help="open_meteo: Previous Runs (24h-multiple leads); dynamical:"
         " dynamical.org full cycles at native steps (sub-24h leads; needs"
-        " the 'backfill' optional extra)",
+        " the 'backfill' optional extra); open_meteo_ensemble: archived"
+        " ensemble mean/spread into the ens__ feature store",
     )
     backfill.add_argument(
         "--models",
@@ -365,6 +366,38 @@ def _dynamical_long(
     return backfill_dynamical_long(config, start, end, models=models or None)
 
 
+def _cmd_backfill_ensembles(config: Config, args: argparse.Namespace, end: date) -> int:
+    from grounded_weather_forecast.dataset.ensembles import (  # noqa: PLC0415
+        EnsembleError,
+        append_ensembles,
+        backfill_ensembles,
+        ensembles_path,
+        load_ensembles,
+        trim_backfill_to_live,
+    )
+
+    start = args.start or config.backfill.start_date
+    if start is None:
+        msg = "set [backfill.open_meteo].start_date or pass --start"
+        print(f"backfill failed: {msg}")
+        return 1
+    models = tuple(_split_csv(args.models)) or None
+    try:
+        frame = backfill_ensembles(
+            config, start, end, chunk_days=args.chunk_days, models=models
+        )
+    except (EnsembleError, OSError, ValueError) as exc:
+        print(f"backfill failed: {exc}")
+        return 1
+    store = ensembles_path(config)
+    frame = trim_backfill_to_live(frame, load_ensembles(store))
+    new_rows, total_rows = append_ensembles(store, frame)
+    print(f"backfilled {frame.height} ensemble statistics rows")
+    print(f"models: {', '.join(sorted(frame['model'].unique().to_list()))}")
+    print(f"ensemble store: +{new_rows} new rows -> {total_rows} total")
+    return 0
+
+
 def _cmd_backfill(config: Config, args: argparse.Namespace) -> int:
     from grounded_weather_forecast.dataset.backfill import (  # noqa: PLC0415
         BackfillError,
@@ -378,6 +411,8 @@ def _cmd_backfill(config: Config, args: argparse.Namespace) -> int:
     )
 
     end = args.end or (datetime.now(tz=UTC).date() - timedelta(days=1))
+    if args.provider == "open_meteo_ensemble":
+        return _cmd_backfill_ensembles(config, args, end)
     try:
         match args.provider:
             case "dynamical":
@@ -703,13 +738,27 @@ def _cmd_report(config: Config) -> int:
     from grounded_weather_forecast.contracts import hourly_variable  # noqa: PLC0415
     from grounded_weather_forecast.dashboard import write_dashboard  # noqa: PLC0415
     from grounded_weather_forecast.dataset.matrix import build_truth  # noqa: PLC0415
+    from grounded_weather_forecast.evaluation import (  # noqa: PLC0415
+        code_identity,
+        config_fingerprint,
+    )
     from grounded_weather_forecast.reports.correlation import (  # noqa: PLC0415
         error_correlation,
     )
+    from grounded_weather_forecast.reports.eprocess import (  # noqa: PLC0415
+        EProcessStore,
+        promotion_comparison,
+    )
     from grounded_weather_forecast.reports.leaderboard import (  # noqa: PLC0415
         aggregate_leaderboard,
+        bh_adjusted,
+        blocked_promotions,
         leaderboard,
         slice_winners,
+        union_references,
+    )
+    from grounded_weather_forecast.reports.recalibration import (  # noqa: PLC0415
+        recalibration_report,
     )
     from grounded_weather_forecast.reports.render import (  # noqa: PLC0415
         print_summary,
@@ -727,22 +776,12 @@ def _cmd_report(config: Config) -> int:
         print(f"wrote {write_dashboard(config)}")
         return 1
     written: list[Path] = []
+    gap_threshold = config.promotion.report_gap_threshold
+    references = union_references(config.promotion)
+    eprocess_stores: dict[str, EProcessStore] = {}
     for path in score_files:
         scores = load_scores(path)
-        board = leaderboard(scores)
-        sections = [
-            ("Per-slice leaderboard", board),
-            ("Aggregate (n-weighted MAE)", aggregate_leaderboard(board)),
-            (
-                "Per-slice winners",
-                slice_winners(
-                    board,
-                    scores=scores,
-                    rule=config.promotion.rule,
-                    alpha=config.promotion.alpha,
-                ),
-            ),
-        ]
+        board = bh_adjusted(leaderboard(scores, references=references))
         # Serving runs on the live provider set, so its realized skill may only
         # be compared with a leaderboard built from the same provenance — a
         # synthetic board describes different sources entirely. The provenance
@@ -754,6 +793,59 @@ def _cmd_report(config: Config) -> int:
             if scores.is_empty()
             else set(scores["source_kind"].unique()) == {"live"}
         )
+        eprocess_store: EProcessStore | None = None
+        if is_live:
+            product = path.stem.split("_")[1]
+            if product not in eprocess_stores:
+                eprocess_stores[product] = EProcessStore.load(
+                    config.artifacts_dir / "eprocess" / f"{product}_live.json",
+                    config_fingerprint(config),
+                    code_identity(),
+                )
+            eprocess_store = eprocess_stores[product]
+        winners = slice_winners(
+            board,
+            scores=scores,
+            rule=config.promotion.rule,
+            alpha=config.promotion.alpha,
+            promotion=config.promotion,
+            eprocess_store=eprocess_store,
+        )
+        sections = [
+            ("Per-slice leaderboard", board),
+            ("Aggregate (n-weighted MAE)", aggregate_leaderboard(board)),
+            ("Per-slice winners", winners),
+            (
+                f"Blocked promotions (served MAE above slice best "
+                f"by more than {gap_threshold:.0%})",
+                blocked_promotions(winners, gap_threshold),
+            ),
+        ]
+        if is_live and eprocess_store is not None:
+            # Both promotion rules run every report so the operator can watch
+            # them disagree before switching [promotion].rule; this is also
+            # the single writer that persists the e-process wealth.
+            sections.append(
+                (
+                    "Promotion rule comparison (mcs vs seq_mcs)",
+                    promotion_comparison(
+                        board,
+                        scores,
+                        alpha=config.promotion.alpha,
+                        promotion=config.promotion,
+                        store=eprocess_store,
+                    ),
+                )
+            )
+            eprocess_store.save()
+            # Offline A/B of the two mutually exclusive post-hoc quantile
+            # repairs; [predict].quantile_recalibration serves the winner.
+            sections.append(
+                (
+                    "Quantile recalibration (offline holdout: raw vs pit vs cqr)",
+                    recalibration_report(scores),
+                )
+            )
         if is_live and config.predict.history_path.exists():
             try:
                 minute_truth, hourly_truth, daily_truth = build_truth(config)
@@ -781,15 +873,10 @@ def _cmd_report(config: Config) -> int:
                 config.reports_dir, report_name, report_name, sections
             )
         )
-        print_summary(
-            f"winners ({path.stem})",
-            slice_winners(
-                board,
-                scores=scores,
-                rule=config.promotion.rule,
-                alpha=config.promotion.alpha,
-            ),
-        )
+        print_summary(f"winners ({path.stem})", winners)
+        blocked = blocked_promotions(winners, gap_threshold)
+        if not blocked.is_empty():
+            print_summary(f"blocked promotions ({path.stem})", blocked)
     matrix_file = _live_hourly_matrix_path(config)
     if matrix_file.exists():
         matrix = pl.read_parquet(matrix_file)

@@ -76,6 +76,26 @@ class TestGbmStacker:
         assert "n_available" in names
 
 
+class TestMinFitRowsFloor:
+    def test_abstains_below_floor(self):
+        matrix = synthetic_hourly_matrix(days=10, seed=2)
+        train = to_supervised_slice(matrix, TEMP)
+        stacker = GbmStacker(min_fit_rows=10_000).fit(train)
+        result = stacker.predict(train.x)
+        assert np.isnan(result.point).all()
+        state = stacker.observability_state()
+        assert state["fit_status"] == "insufficient_rows"
+        assert state["training_rows"] == train.x.n_rows
+        assert "model" not in stacker.to_state()
+
+    def test_default_floor_fits_normal_folds(self):
+        matrix = synthetic_hourly_matrix(days=10, seed=2)
+        train = to_supervised_slice(matrix, TEMP)
+        state = GbmStacker().fit(train).observability_state()
+        assert state["fit_status"] == "fit"
+        assert state["training_rows"] == train.x.n_rows
+
+
 def test_observability_state_is_compact():
     matrix = hour_dependent_bias_matrix()
     train = to_supervised_slice(matrix, TEMP)

@@ -9,8 +9,10 @@ from grounded_weather_forecast.blenders.protocol import (
     masked_average,
     renormalize_weights,
 )
+from grounded_weather_forecast.blenders.registry import supports_product
 from grounded_weather_forecast.contracts import (
     ForecastMatrix,
+    Product,
     SourceKind,
     SupervisedSlice,
     TargetKind,
@@ -76,6 +78,8 @@ class TestProtocolCompliance:
 
     @pytest.mark.parametrize("method_id", available_methods())
     def test_fit_predict_shapes(self, method_id, train_slice):
+        if not supports_product(method_id, Product.HOURLY, TEMP):
+            pytest.skip("variable-scoped away from the temp fixture")
         blender = get_factory(method_id)()
         assert blender.method_id == method_id
         fitted = blender.fit(train_slice)
@@ -85,6 +89,8 @@ class TestProtocolCompliance:
 
     @pytest.mark.parametrize("method_id", available_methods())
     def test_invariant_to_all_nan_source(self, method_id, train_slice):
+        if not supports_product(method_id, Product.HOURLY, TEMP):
+            pytest.skip("variable-scoped away from the temp fixture")
         blender = get_factory(method_id)().fit(train_slice)
         baseline = blender.predict(train_slice.x).point
 

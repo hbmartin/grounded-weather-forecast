@@ -58,8 +58,13 @@ from grounded_weather_forecast.dataset.matrix import (
 from grounded_weather_forecast.dataset.providers import read_forecast_archive
 from grounded_weather_forecast.evaluation import dataset_fingerprint
 from grounded_weather_forecast.leads import daily_bucket, hourly_bucket
+from grounded_weather_forecast.serve.dressing import ResidualDresser, dress_variable
 from grounded_weather_forecast.serve.history import load_archived_forecast
 from grounded_weather_forecast.serve.observability import snapshot_observability
+from grounded_weather_forecast.serve.recalibration import (
+    QuantileRecalibrator,
+    recalibrate_variable,
+)
 from grounded_weather_forecast.serve.schema import (
     SCHEMA_VERSION,
     DailyPoint,
@@ -114,6 +119,8 @@ class VariableBlend:
     release_ids: list[str | None]
     quantiles: list[dict[str, float]]
     truth_semantics: str = TruthSemantics.INSTANTANEOUS.value
+    # Per-row residual-dressing provenance; None means native (or no) quantiles.
+    quantile_sources: tuple[str | None, ...] | None = None
 
 
 def _latest_observation(
@@ -345,12 +352,7 @@ def _row_selections(
     """The validated method choice for every row, by its lead bucket."""
     product = "daily" if daily else "hourly"
     product_kind = Product.DAILY if daily else Product.HOURLY
-    leads = (
-        predict_frame["lead_days"] if daily else predict_frame["lead_hours"]
-    ).to_list()
-    buckets: list[str | None] = [
-        daily_bucket(lead) if daily else hourly_bucket(lead) for lead in leads
-    ]
+    buckets = _lead_buckets(predict_frame, daily=daily)
     return [
         _validated_selection(
             selection,
@@ -365,6 +367,20 @@ def _row_selections(
             for bucket in buckets
         )
     ]
+
+
+def _lead_buckets(predict_frame: pl.DataFrame, *, daily: bool) -> list[str | None]:
+    leads = (
+        predict_frame["lead_days"] if daily else predict_frame["lead_hours"]
+    ).to_list()
+    return [daily_bucket(lead) if daily else hourly_bucket(lead) for lead in leads]
+
+
+def _recalibrator(config: Config, product: str) -> QuantileRecalibrator | None:
+    mode = config.predict.quantile_recalibration
+    if mode == "none":
+        return None
+    return QuantileRecalibrator(config.dataset.dir / "scores", product, config, mode)
 
 
 def _blended_rows(
@@ -400,6 +416,8 @@ def _blend_variable(
     semantics: TruthSemantics,
     force_method: str | None = None,
     issue_time: datetime | None = None,
+    dresser: ResidualDresser | None = None,
+    recalibrator: QuantileRecalibrator | None = None,
 ) -> VariableBlend | None:
     """Per row: the prediction of the method selected for that row's bucket."""
     chosen = _row_selections(
@@ -447,6 +465,35 @@ def _blend_variable(
         )
     results, _ = fitted
     point, quantiles = _blended_rows(results, chosen, predict_frame.height)
+    lead_buckets = _lead_buckets(predict_frame, daily=daily)
+    quantile_sources: tuple[str | None, ...] | None = None
+    if dresser is not None:
+        # Dressing is strictly additive; any failure leaves the bare points.
+        try:
+            quantile_sources = dress_variable(
+                dresser,
+                variable,
+                semantics,
+                chosen,
+                lead_buckets,
+                point,
+                quantiles,
+            )
+        except (OSError, ValueError, pl.exceptions.PolarsError):
+            quantile_sources = None
+    if recalibrator is not None:
+        # Recalibration touches only rows with native quantiles; dressed rows
+        # are already split-conformal and keep their label and values.
+        with suppress(OSError, ValueError, pl.exceptions.PolarsError):
+            quantile_sources = recalibrate_variable(
+                recalibrator,
+                variable,
+                semantics,
+                chosen,
+                lead_buckets,
+                quantiles,
+                quantile_sources,
+            )
     return VariableBlend(
         point=point,
         methods=[selection.method_id for selection in chosen],
@@ -454,6 +501,7 @@ def _blend_variable(
         release_ids=[selection.release_id for selection in chosen],
         quantiles=quantiles,
         truth_semantics=semantics.value,
+        quantile_sources=quantile_sources,
     )
 
 
@@ -720,6 +768,12 @@ def _point_fields(
             for name, result in blended.items()
             if result.quantiles[index]
         },
+        "quantiles_source": {
+            name: source
+            for name, result in blended.items()
+            if result.quantile_sources is not None
+            and (source := result.quantile_sources[index]) is not None
+        },
         "selection_reasons": {
             name: result.reasons[index] for name, result in blended.items()
         },
@@ -745,6 +799,8 @@ def hourly_product(
     """Blended hourly path, plus the per-variable blends for the minutely product."""
     frame = snapshot.hourly.sort("valid_time")
     blended: dict[str, VariableBlend] = {}
+    dresser = ResidualDresser(config.dataset.dir / "scores", "hourly", config)
+    recalibrator = _recalibrator(config, "hourly")
     for variable in HOURLY_VARIABLES:
         variable_semantics = (
             semantics.get(variable.name, TruthSemantics.INSTANTANEOUS)
@@ -761,6 +817,8 @@ def hourly_product(
             semantics=variable_semantics,
             force_method=force_method,
             issue_time=snapshot.issue_time,
+            dresser=dresser,
+            recalibrator=recalibrator,
         )
         if result is None:
             continue
@@ -796,6 +854,8 @@ def daily_product(
     if frame.is_empty():
         return []
     blended: dict[str, VariableBlend] = {}
+    dresser = ResidualDresser(config.dataset.dir / "scores", "daily", config)
+    recalibrator = _recalibrator(config, "daily")
     for variable in DAILY_VARIABLES:
         result = _blend_variable(
             train,
@@ -807,6 +867,8 @@ def daily_product(
             semantics=TruthSemantics.INSTANTANEOUS,
             force_method=force_method,
             issue_time=snapshot.issue_time,
+            dresser=dresser,
+            recalibrator=recalibrator,
         )
         if result is None:
             continue

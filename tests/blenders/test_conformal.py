@@ -5,8 +5,9 @@ import polars as pl
 import pytest
 from conftest import synthetic_hourly_matrix
 
+from grounded_weather_forecast.blenders import conformal as conformal_module
 from grounded_weather_forecast.blenders import get_factory
-from grounded_weather_forecast.contracts import hourly_variable
+from grounded_weather_forecast.contracts import ForecastMatrix, hourly_variable
 from grounded_weather_forecast.dataset.matrix import to_supervised_slice
 from grounded_weather_forecast.metrics.probabilistic import empirical_coverage
 
@@ -68,7 +69,7 @@ class TestConformal:
         state = conformal.to_state()
         assert state["coverages"] == [0.5, 0.8, 0.9]
         assert len(state["cells"]) > 0
-        assert state["schema_version"] == 2
+        assert state["schema_version"] == 3
         assert state["calibration"]["strategy"] == "chronological_70_30"
         assert state["calibration"]["proper_rows"] >= 60
         assert state["calibration"]["calibration_rows"] >= 20
@@ -78,9 +79,19 @@ class TestConformal:
         train = to_supervised_slice(matrix, TEMP)
         conformal = get_factory("conformal_gew")().fit(train)
         state = conformal.to_state()
-        updates = sum(cell["updates"] for cell in state["cells"].values())
-        assert updates == state["calibration"]["calibration_rows"]
-        assert updates < train.x.n_rows
+        bucket_updates = sum(
+            cell["updates"]
+            for key, cell in state["cells"].items()
+            if not key.startswith("__global__")
+        )
+        global_updates = sum(
+            cell["updates"]
+            for key, cell in state["cells"].items()
+            if key.startswith("__global__")
+        )
+        assert bucket_updates == state["calibration"]["calibration_rows"]
+        assert global_updates == state["calibration"]["calibration_rows"]
+        assert bucket_updates < train.x.n_rows
 
     def test_proper_training_excludes_truth_unresolved_at_cutoff(self):
         matrix = synthetic_hourly_matrix(days=20, noise_sd=1.0, seed=46)
@@ -104,3 +115,86 @@ class TestConformal:
         result = conformal.predict(train.x)
         # 12 rows total: no cell reaches _MIN_UPDATES, base passes through
         assert result.quantiles is None
+
+    def test_mean_shift_regime_recovers_coverage(self):
+        """The base goes ~26 units off mid-archive (the station-pressure
+        pattern); warm-started, scale-aware radii must cover the tail."""
+        matrix = synthetic_hourly_matrix(days=80, noise_sd=4.0, seed=48)
+        midpoint = (
+            matrix["issue_time"].min()
+            + (matrix["issue_time"].max() - matrix["issue_time"].min()) / 2
+        )
+        matrix = matrix.with_columns(
+            pl.when(pl.col("issue_time") > midpoint)
+            .then(pl.col(column) + 26.0)
+            .otherwise(pl.col(column))
+            .alias(column)
+            for column in matrix.columns
+            if column.startswith("fx__")
+        )
+        train = to_supervised_slice(matrix, TEMP)
+        conformal = get_factory("conformal_gew")().fit(train)
+        result = conformal.predict(train.x)
+        assert result.quantiles is not None
+        issue = train.x.features["issue_time"]
+        tail = (issue > matrix["issue_time"].max() - timedelta(days=10)).to_numpy()
+        assert coverage80(result, train.y, tail) >= 0.7
+        # the radii must have reached the offset scale, not ramped from zero
+        halfwidth = float(
+            np.mean(result.quantiles[tail, 4] - result.quantiles[tail, 1]) / 2
+        )
+        assert halfwidth >= 10.0
+
+    def test_far_lead_rows_served_by_global_rung(self):
+        matrix = synthetic_hourly_matrix(days=60, noise_sd=1.0, seed=49)
+        train = to_supervised_slice(matrix, TEMP)
+        conformal = get_factory("conformal_gew")().fit(train)
+        far = ForecastMatrix.build(
+            sources=train.x.sources,
+            values=train.x.values[:8],
+            lead_hours=np.full(8, 200.0),
+            features=train.x.features[:8],
+            product=train.x.product,
+        )
+        result = conformal.predict(far)
+        # no 168-240h cell was ever trained; the pooled cell serves radii
+        assert result.quantiles is not None
+        assert np.isfinite(result.quantiles).all()
+
+
+class TestCellState:
+    def make_cell(self):
+        return conformal_module._fresh_cell()
+
+    def test_warm_start_equals_buffered_conservative_quantile(self):
+        cell = self.make_cell()
+        scores = [float(value) for value in range(1, 21)]  # 1..20
+        for score in scores:
+            cell.update(score)
+        # rank rule min(n, ceil((n+1)*c)) on n=20: c=0.5 -> 11th, 0.8 -> 17th,
+        # 0.9 -> 19th order statistic
+        assert cell.radii.tolist() == [11.0, 17.0, 19.0]
+        assert cell.error_sums.tolist() == [0.0, 0.0, 0.0]
+
+    def test_large_offset_scores_covered_at_readiness(self):
+        cell = self.make_cell()
+        rng = np.random.default_rng(3)
+        scores = rng.normal(26.0, 2.0, 300)
+        covered = []
+        for score in scores:
+            if cell.ready():
+                covered.append(float(score) <= cell.effective_radius(1))
+            cell.update(float(score))
+        assert np.mean(covered) >= 0.7
+
+    def test_persistent_misses_cannot_wind_up_past_the_scale_bound(self):
+        cell = self.make_cell()
+        for _ in range(20):
+            cell.update(1.0)
+        for _ in range(500):
+            radius_before = float(cell.radii[1])
+            bound = radius_before + 2.6 * max(cell.recent)
+            assert cell.effective_radius(1) <= bound
+            cell.update(10.0 + cell.effective_radius(1))  # always a miss
+        # the tangent integrator stays bounded by ~2.6x the trailing max score
+        assert cell.effective_radius(1) <= float(cell.radii[1]) + 2.6 * max(cell.recent)

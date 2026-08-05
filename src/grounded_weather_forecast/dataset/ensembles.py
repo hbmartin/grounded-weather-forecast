@@ -20,7 +20,7 @@ as-of eligibility semantics as the provider archive.
 """
 
 import urllib.parse
-from datetime import UTC, datetime
+from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 
 import numpy as np
@@ -29,13 +29,22 @@ import polars as pl
 from grounded_weather_forecast.config import Config
 from grounded_weather_forecast.dataset.backfill import (
     BACKFILL_VARIABLES,
+    MAX_PREVIOUS_DAYS,
+    PREVIOUS_RUNS_URL,
     Fetcher,
+    _chunks,
     http_fetcher,
 )
 from grounded_weather_forecast.dataset.snapshots import snapshot_long
 from grounded_weather_forecast.storage import atomic_write_parquet, locked_path
 
 ENSEMBLE_URL = "https://ensemble-api.open-meteo.com/v1/ensemble"
+# Open-Meteo archives per-run ensemble mean and spread (std dev of members)
+# as pseudo-models on the Previous Runs API, e.g. `ncep_gefs025_ensemble_mean`
+# with `temperature_2m_previous_day2` / `temperature_2m_spread_previous_day2`
+# fields — verified live 2026-08-04. Members themselves are retained only a
+# few days; the statistics reach back to ~March 2026.
+ENSEMBLE_MEAN_SUFFIX = "_ensemble_mean"
 FEATURE_PREFIX = "ens__"
 STAT_COLUMNS: tuple[str, ...] = ("mean", "sd", "p10", "p25", "p50", "p75", "p90")
 _QUANTILES: tuple[float, ...] = (0.1, 0.25, 0.5, 0.75, 0.9)
@@ -177,6 +186,154 @@ def ingest_ensembles(
             )
         )
     return pl.concat(frames).sort(list(_KEY))
+
+
+def ensemble_mean_model(model: str) -> str:
+    """The archived-statistics pseudo-model for an ensemble model slug.
+
+    Slugs that already end in ``_ensemble`` (e.g. ``ecmwf_aifs025_ensemble``)
+    replace that suffix rather than doubling it: the API knows
+    ``ecmwf_aifs025_ensemble_mean``, not ``…_ensemble_ensemble_mean``.
+    """
+    return model.removesuffix("_ensemble") + ENSEMBLE_MEAN_SUFFIX
+
+
+def build_ensemble_backfill_url(
+    config: Config,
+    model: str,
+    start: date,
+    end: date,
+    previous_days: int = MAX_PREVIOUS_DAYS,
+) -> str:
+    """Previous Runs request for one ensemble-mean pseudo-model."""
+    fields: list[str] = []
+    for canonical in config.ensembles.variables:
+        name = _OPEN_METEO_NAME[canonical]
+        for day in range(1, previous_days + 1):
+            fields.append(f"{name}_previous_day{day}")
+            fields.append(f"{name}_spread_previous_day{day}")
+    query = urllib.parse.urlencode(
+        {
+            "latitude": config.station.latitude,
+            "longitude": config.station.longitude,
+            "start_date": start.isoformat(),
+            "end_date": end.isoformat(),
+            "hourly": ",".join(fields),
+            "models": ensemble_mean_model(model),
+            "timezone": "UTC",
+            "wind_speed_unit": "ms",
+        }
+    )
+    return f"{PREVIOUS_RUNS_URL}?{query}"
+
+
+def parse_ensemble_mean_runs(
+    payload: dict[str, object],
+    model: str,
+    variables: tuple[str, ...],
+    previous_days: int = MAX_PREVIOUS_DAYS,
+) -> pl.DataFrame:
+    """Previous Runs payload -> the same long statistics frame the poller
+    writes: each day-offset is a run vintage with ``fetched_at`` set
+    ``day`` days before the valid hour, so the as-of join treats a
+    backfilled statistic exactly like a poll made at that instant. Only
+    ``mean`` and ``sd`` are archived; the percentile columns stay null
+    rather than being faked from a normal assumption.
+    """
+    raw_hourly = payload.get("hourly")
+    raw_times = raw_hourly.get("time") if isinstance(raw_hourly, dict) else None
+    if not isinstance(raw_hourly, dict) or not isinstance(raw_times, list):
+        msg = f"ensemble-mean payload for {model!r} has no hourly.time block"
+        raise EnsembleError(msg)
+    times = [
+        datetime.fromisoformat(t).replace(tzinfo=UTC)
+        for t in raw_times
+        if isinstance(t, str)
+    ]
+    rows: list[dict[str, object]] = []
+    for canonical in variables:
+        name = _OPEN_METEO_NAME[canonical]
+        for day in range(1, previous_days + 1):
+            means = raw_hourly.get(f"{name}_previous_day{day}")
+            spreads = raw_hourly.get(f"{name}_spread_previous_day{day}")
+            if not (isinstance(means, list) and len(means) == len(times)):
+                continue
+            if not (isinstance(spreads, list) and len(spreads) == len(times)):
+                spreads = [None] * len(times)
+            offset = timedelta(days=day)
+            rows.extend(
+                {
+                    "model": model,
+                    "fetched_at": valid - offset,
+                    "valid_time": valid,
+                    "variable": canonical,
+                    **dict.fromkeys(STAT_COLUMNS),
+                    "mean": float(mean) if isinstance(mean, (int, float)) else None,
+                    "sd": float(spread) if isinstance(spread, (int, float)) else None,
+                    "n_members": None,
+                }
+                for valid, mean, spread in zip(times, means, spreads, strict=True)
+                if isinstance(mean, (int, float))
+            )
+    if not rows:
+        msg = f"ensemble-mean payload for {model!r} contained no usable offsets"
+        raise EnsembleError(msg)
+    return pl.DataFrame(rows, schema=_SCHEMA).sort(list(_KEY))
+
+
+def backfill_ensembles(
+    config: Config,
+    start: date,
+    end: date,
+    fetcher: Fetcher = http_fetcher,
+    chunk_days: int = 90,
+    models: tuple[str, ...] | None = None,
+) -> pl.DataFrame:
+    """Archived ensemble mean/spread over a valid-date range, all models."""
+    selected = models or config.ensembles.models
+    if not selected:
+        msg = "set [ensembles].models to backfill ensemble statistics"
+        raise EnsembleError(msg)
+    if end < start:
+        msg = f"ensemble backfill end {end} precedes start {start}"
+        raise EnsembleError(msg)
+    frames: list[pl.DataFrame] = []
+    for model in selected:
+        for span_start, span_end in _chunks(start, end, chunk_days):
+            url = build_ensemble_backfill_url(config, model, span_start, span_end)
+            frames.append(
+                parse_ensemble_mean_runs(
+                    dict(fetcher(url)), model, config.ensembles.variables
+                )
+            )
+    return pl.concat(frames).sort(list(_KEY))
+
+
+def trim_backfill_to_live(frame: pl.DataFrame, existing: pl.DataFrame) -> pl.DataFrame:
+    """Drop backfilled vintages that would shadow live-polled statistics.
+
+    The as-of join keeps ONE fetched_at per (issue, model): a later-but-sparse
+    archived vintage (one valid hour per day offset) would shadow an earlier
+    live poll carrying the full horizon. Backfilled rows (``n_members`` null)
+    therefore never cross into a model's live-polled era.
+    """
+    if existing.is_empty():
+        return frame
+    live_starts = (
+        existing.filter(pl.col("n_members").is_not_null())
+        .group_by("model")
+        .agg(pl.col("fetched_at").min().alias("live_start"))
+    )
+    if live_starts.is_empty():
+        return frame
+    return (
+        frame.join(live_starts, on="model", how="left")
+        .filter(
+            pl.col("live_start").is_null()
+            | (pl.col("fetched_at") < pl.col("live_start"))
+        )
+        .drop("live_start")
+    )
 
 
 def load_ensembles(path: Path) -> pl.DataFrame:
