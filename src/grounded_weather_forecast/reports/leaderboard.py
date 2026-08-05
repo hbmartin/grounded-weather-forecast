@@ -8,13 +8,19 @@ pools live and synthetic scores.
 """
 
 import json
+import math
 from collections.abc import Mapping, Sequence
+from typing import TYPE_CHECKING
 
 import numpy as np
 import polars as pl
 from scipy import stats
 
 from grounded_weather_forecast.contracts import TruthSemantics
+
+if TYPE_CHECKING:
+    from grounded_weather_forecast.config import PromotionConfig
+    from grounded_weather_forecast.reports.eprocess import EProcessStore
 from grounded_weather_forecast.metrics.deterministic import bias, mae, pct_within, rmse
 from grounded_weather_forecast.metrics.dm import diebold_mariano
 from grounded_weather_forecast.metrics.probabilistic import (
@@ -36,6 +42,38 @@ DEFAULT_REFERENCES: tuple[str, ...] = (
     "equal_weight",
     "damped_grounded_equal_weight",
 )
+
+
+def gate_references(
+    variable: str, promotion: "PromotionConfig | None"
+) -> tuple[str, ...]:
+    """The reference class the gate holds this variable's candidates against.
+
+    ``[promotion.references]`` overrides per variable: where the raw
+    provider-space references are bias-dominated against station truth
+    (pressure's ~26 hPa console offset; the sheltered anemometer), grounded
+    variants make the gate and its fallback meaningful again.
+    """
+    if promotion is not None:
+        override = promotion.references.get(variable)
+        if override:
+            return tuple(override)
+    return DEFAULT_REFERENCES
+
+
+def union_references(promotion: "PromotionConfig | None") -> tuple[str, ...]:
+    """Defaults plus every configured override, defaults-first and deduped.
+
+    ``leaderboard()`` computes skill/DM columns for this union so the pinned
+    ``skill_vs_equal_weight``-style columns never change meaning while
+    overridden variables still get columns for their own references.
+    """
+    ordered = list(DEFAULT_REFERENCES)
+    if promotion is not None:
+        for override in promotion.references.values():
+            ordered.extend(method for method in override if method not in ordered)
+    return tuple(ordered)
+
 
 # Consumer-legible "close enough" tolerances, in each variable's metric unit.
 CONSUMER_TOLERANCES: Mapping[str, float] = {
@@ -357,6 +395,8 @@ def _mcs_gate(
     slice_scores: pl.DataFrame,
     eligible_methods: tuple[str, ...],
     alpha: float,
+    n_bootstrap: int = 500,
+    block_length: int | None = None,
 ) -> tuple[dict[str, object], str | None]:
     """Promote only when every reference is excluded from the MCS.
 
@@ -378,7 +418,13 @@ def _mcs_gate(
     matrix, methods = built
     if matrix.shape[0] < _MIN_DM_SAMPLES:
         return fallback, "mcs_thin_matrix"
-    result = model_confidence_set(matrix, methods, alpha=alpha)
+    result = model_confidence_set(
+        matrix,
+        methods,
+        alpha=alpha,
+        n_bootstrap=n_bootstrap,
+        block_length=block_length,
+    )
     candidate_id = str(candidate["method_id"])
     reference_ids = tuple(str(reference["method_id"]) for reference in references)
     if result.contains(candidate_id) and all(
@@ -388,21 +434,83 @@ def _mcs_gate(
     return fallback, "mcs_not_separated"
 
 
+def _seq_gate(
+    candidate: dict[str, object],
+    references: tuple[dict[str, object], ...],
+    slice_scores: pl.DataFrame,
+    key_parts: Mapping[str, str],
+    alpha: float,
+    store: "EProcessStore",
+) -> tuple[dict[str, object], str | None]:
+    """Promote when the candidate's e-process beats 1/alpha vs EVERY reference.
+
+    Anytime-valid across nightly re-runs (Ville's inequality on the betting
+    supermartingale): consulting the gate after every backtest refresh needs
+    no alpha bookkeeping, and a promotion, once earned, does not flap on one
+    night's noise. Updates are cursor-deduped inside the store, so calling
+    this twice on the same scores is a no-op.
+    """
+    from grounded_weather_forecast.reports.eprocess import (  # noqa: PLC0415
+        pair_key,
+    )
+    from grounded_weather_forecast.reports.mcs import (  # noqa: PLC0415
+        collapsed_loss_frame,
+    )
+
+    fallback = _reference_fallback(references)
+    candidate_id = str(candidate["method_id"])
+    threshold = math.log(1.0 / alpha)
+    worst_log_e = math.inf
+    for reference in references:
+        reference_id = str(reference["method_id"])
+        built = collapsed_loss_frame(
+            slice_scores, method_ids=(candidate_id, reference_id)
+        )
+        if built is None:
+            return fallback, "seq_no_matrix"
+        collapsed, _methods = built
+        key = pair_key(
+            key_parts.get("product", ""),
+            key_parts.get("variable", ""),
+            key_parts.get("truth_semantics", ""),
+            key_parts.get("lead_bucket", ""),
+            candidate_id,
+            reference_id,
+        )
+        entry = store.update_pair(
+            key,
+            collapsed[candidate_id].to_numpy().astype(np.float64),
+            collapsed[reference_id].to_numpy().astype(np.float64),
+            collapsed["valid_time"].to_list(),
+        )
+        worst_log_e = min(worst_log_e, entry.log_e)
+    if worst_log_e >= threshold:
+        return candidate, None
+    return fallback, "seq_e_below_threshold"
+
+
 def slice_winners(
     board: pl.DataFrame,
     scores: pl.DataFrame | None = None,
     rule: str = "legacy",
     alpha: float = 0.1,
+    *,
+    promotion: "PromotionConfig | None" = None,
+    eprocess_store: "EProcessStore | None" = None,
 ) -> pl.DataFrame:
     """Promote a challenger only past the configured statistical gate.
 
     ``rule="mcs"`` (with the raw ``scores``) uses the Model Confidence Set;
-    ``"legacy"`` keeps the single-DM gate. Coverage and effective-n gates
-    apply either way.
+    ``rule="seq_mcs"`` (with ``scores`` and an ``eprocess_store``) the
+    anytime-valid betting e-process; ``"legacy"`` keeps the single-DM gate.
+    Coverage and effective-n gates apply either way. ``promotion`` supplies
+    per-variable reference overrides and MCS bootstrap parameters.
     """
     if board.is_empty():
         return board
     normalized_scores = _with_default_semantics(scores) if scores is not None else None
+    n_bootstrap = promotion.mcs_bootstrap if promotion is not None else 500
+    block_length = promotion.mcs_block_length if promotion is not None else None
     winners: list[dict[str, object]] = []
     keys = ["product", "variable", "lead_bucket"]
     if "truth_semantics" in board.columns:
@@ -420,6 +528,8 @@ def slice_winners(
         "gate",
     )
     for slice_key, group in board.partition_by(keys, as_dict=True).items():
+        parts = dict(zip(keys, (str(part) for part in slice_key), strict=True))
+        references = gate_references(parts["variable"], promotion)
         best = group.sort("mae").row(0, named=True)
         eligible = group.filter(
             (pl.col("coverage") >= 0.8)
@@ -432,34 +542,32 @@ def slice_winners(
         candidate = ranked.row(0, named=True)
         gate: str | None = None
         reference_rows = tuple(
-            ranked.filter(pl.col("method_id").is_in(DEFAULT_REFERENCES))
+            ranked.filter(pl.col("method_id").is_in(references))
             .sort("mae")
             .iter_rows(named=True)
         )
-        if candidate["method_id"] not in DEFAULT_REFERENCES:
+        slice_scores: pl.DataFrame | None = None
+        if normalized_scores is not None:
+            slice_scores = normalized_scores.filter(
+                (pl.col("product") == parts["product"])
+                & (pl.col("variable") == parts["variable"])
+                & (pl.col("lead_bucket") == parts["lead_bucket"])
+            )
+            if "truth_semantics" in parts and "semantics" in normalized_scores.columns:
+                slice_scores = slice_scores.filter(
+                    pl.col("semantics") == parts["truth_semantics"]
+                )
+        if candidate["method_id"] not in references:
             present_references = {
                 str(reference["method_id"]) for reference in reference_rows
             }
-            if not set(DEFAULT_REFERENCES) <= present_references:
+            if not set(references) <= present_references:
                 if reference_rows:
                     candidate = _reference_fallback(reference_rows)
                     gate = "missing_reference"
                 else:
                     continue
-            elif rule == "mcs" and normalized_scores is not None:
-                parts = dict(zip(keys, slice_key, strict=True))
-                slice_scores = normalized_scores.filter(
-                    (pl.col("product") == parts["product"])
-                    & (pl.col("variable") == parts["variable"])
-                    & (pl.col("lead_bucket") == parts["lead_bucket"])
-                )
-                if (
-                    "truth_semantics" in parts
-                    and "semantics" in normalized_scores.columns
-                ):
-                    slice_scores = slice_scores.filter(
-                        pl.col("semantics") == parts["truth_semantics"]
-                    )
+            elif rule == "mcs" and slice_scores is not None:
                 # Decision-scoped matrix: the gate decides "candidate vs the
                 # references", so only those methods enter the common-case
                 # loss matrix. Intersecting cases over the full pool let every
@@ -475,6 +583,21 @@ def slice_winners(
                         *(str(row["method_id"]) for row in reference_rows),
                     ),
                     alpha,
+                    n_bootstrap=n_bootstrap,
+                    block_length=block_length,
+                )
+            elif (
+                rule == "seq_mcs"
+                and slice_scores is not None
+                and eprocess_store is not None
+            ):
+                candidate, gate = _seq_gate(
+                    candidate,
+                    reference_rows,
+                    slice_scores,
+                    parts,
+                    alpha,
+                    eprocess_store,
                 )
             elif any(
                 _legacy_gate(candidate, reference) is not candidate
@@ -552,6 +675,44 @@ def _empty_winners(keys: list[str]) -> pl.DataFrame:
             "gate": pl.String,
         }
     )
+
+
+def _benjamini_hochberg(p_values: np.ndarray) -> np.ndarray:
+    """BH step-up adjusted q-values; NaN passes through untouched."""
+    q_values = np.full(p_values.shape, np.nan)
+    finite = np.flatnonzero(np.isfinite(p_values))
+    m = finite.size
+    if m == 0:
+        return q_values
+    order = np.argsort(p_values[finite])
+    ranked = p_values[finite][order]
+    adjusted = ranked * m / np.arange(1, m + 1)
+    adjusted = np.minimum.accumulate(adjusted[::-1])[::-1]
+    q_values[finite[order]] = np.clip(adjusted, 0.0, 1.0)
+    return q_values
+
+
+def bh_adjusted(board: pl.DataFrame) -> pl.DataFrame:
+    """Board plus ``dm_q_vs_*`` columns: BH-FDR across the slice family.
+
+    Each reference's DM p-values form one family over the whole board (the
+    winner's-curse surface future-work #21 names); the q-value is the
+    smallest FDR at which that row would survive. Report-layer only — the
+    gate is unchanged.
+    """
+    if board.is_empty():
+        return board
+    result = board
+    for column in board.columns:
+        if not column.startswith("dm_p_vs_"):
+            continue
+        p_values = board[column].cast(pl.Float64).fill_null(float("nan")).to_numpy()
+        q_values = _benjamini_hochberg(np.asarray(p_values, dtype=np.float64))
+        q_column = column.replace("dm_p_vs_", "dm_q_vs_")
+        result = result.with_columns(
+            pl.Series(q_column, q_values).replace(float("nan"), None)
+        )
+    return result
 
 
 def blocked_promotions(winners: pl.DataFrame, threshold: float = 0.15) -> pl.DataFrame:

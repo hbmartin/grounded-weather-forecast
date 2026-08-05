@@ -170,6 +170,22 @@ mistaken for a method's own distribution. The leaderboard report adds a
 slice's board minimum by more than `[promotion].report_gap_threshold`
 (default 0.15), along with which gate blocked the better method.
 
+Promotion offers two mutually exclusive statistical gates, compared side by
+side in every live report's "Promotion rule comparison" section:
+`[promotion].rule = "mcs"` (bootstrap Model Confidence Set, re-run from
+scratch nightly; replicates and block length tunable via
+`[promotion].mcs_bootstrap` / `mcs_block_length`) and `"seq_mcs"` — an
+anytime-valid betting e-process per (slice, candidate, reference) whose
+wealth accumulates across nightly re-runs (state under
+`artifacts/eprocess/`, reset whenever config or code identity changes) and
+promotes when every reference's e-process exceeds `1/alpha`. The leaderboard
+also carries `dm_q_vs_*` Benjamini–Hochberg FDR-adjusted q-values beside
+every DM p-value. Where the default references are bias-dominated against
+station truth, `[promotion.references]` overrides the gate's reference class
+per variable (e.g. `pressure_sea_hpa = ["grounded_equal_weight",
+"damped_grounded_equal_weight"]`); skill columns keep their default meaning
+and extend with the configured references.
+
 Natively-emitted quantiles can additionally be recalibrated at serve time:
 live leaderboard reports carry a "Quantile recalibration (offline holdout)"
 section that fits two mutually exclusive post-hoc repairs — PIT level

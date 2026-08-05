@@ -226,6 +226,16 @@ class PromotionConfig:
     # Relative served-vs-board-minimum MAE gap above which the leaderboard
     # report flags a slice as a blocked promotion.
     report_gap_threshold: float = 0.15
+    # Bootstrap replicates and moving-block length for the MCS gate;
+    # block length 0 selects the n^(1/3) default.
+    mcs_bootstrap: int = 500
+    mcs_block_length: int = 0
+    # Per-variable gate-reference overrides ([promotion.references]): where
+    # the default provider-space references are bias-dominated against
+    # station truth, grounded variants keep the gate and fallback meaningful.
+    references: Mapping[str, tuple[str, ...]] = field(
+        default_factory=lambda: MappingProxyType({})
+    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -311,6 +321,14 @@ def _positive_int(value: Any, key: str, context: str) -> int:
     number = _finite_number(value, key, context)
     if not number.is_integer() or number <= 0.0:
         msg = f"{key!r} in [{context}] must be a positive integer"
+        raise ConfigError(msg)
+    return int(number)
+
+
+def _nonnegative_int(value: Any, key: str, context: str) -> int:
+    number = _finite_number(value, key, context)
+    if not number.is_integer() or number < 0.0:
+        msg = f"{key!r} in [{context}] must be a non-negative integer"
         raise ConfigError(msg)
     return int(number)
 
@@ -649,12 +667,27 @@ def _truth_qc(raw: Mapping[str, Any]) -> TruthQcConfig:
     )
 
 
+def _promotion_references(
+    value: Any,
+) -> Mapping[str, tuple[str, ...]]:
+    if not isinstance(value, Mapping):
+        msg = "[promotion.references] must be a table of string lists"
+        raise ConfigError(msg)
+    references: dict[str, tuple[str, ...]] = {}
+    for variable, methods in value.items():
+        parsed = _string_tuple(methods, str(variable), "promotion.references")
+        if not parsed:
+            msg = f"[promotion.references].{variable} must list at least one method id"
+            raise ConfigError(msg)
+        references[str(variable)] = parsed
+    return MappingProxyType(references)
+
+
 def _promotion(raw: Mapping[str, Any]) -> PromotionConfig:
     section = _section(raw, "promotion") if "promotion" in raw else {}
-    rule = str(section.get("rule", "mcs"))
-    if rule not in ("mcs", "legacy"):
-        msg = f"[promotion].rule must be 'mcs' or 'legacy', got {rule!r}"
-        raise ConfigError(msg)
+    rule = _choice(
+        section.get("rule", "mcs"), ("mcs", "legacy", "seq_mcs"), "rule", "promotion"
+    )
     return PromotionConfig(
         rule=rule,
         alpha=_fraction(section.get("alpha", 0.1), "alpha", "promotion"),
@@ -669,6 +702,13 @@ def _promotion(raw: Mapping[str, Any]) -> PromotionConfig:
             "report_gap_threshold",
             "promotion",
         ),
+        mcs_bootstrap=_positive_int(
+            section.get("mcs_bootstrap", 500), "mcs_bootstrap", "promotion"
+        ),
+        mcs_block_length=_nonnegative_int(
+            section.get("mcs_block_length", 0), "mcs_block_length", "promotion"
+        ),
+        references=_promotion_references(section.get("references", {})),
     )
 
 

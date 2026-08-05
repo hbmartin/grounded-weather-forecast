@@ -738,14 +738,24 @@ def _cmd_report(config: Config) -> int:
     from grounded_weather_forecast.contracts import hourly_variable  # noqa: PLC0415
     from grounded_weather_forecast.dashboard import write_dashboard  # noqa: PLC0415
     from grounded_weather_forecast.dataset.matrix import build_truth  # noqa: PLC0415
+    from grounded_weather_forecast.evaluation import (  # noqa: PLC0415
+        code_identity,
+        config_fingerprint,
+    )
     from grounded_weather_forecast.reports.correlation import (  # noqa: PLC0415
         error_correlation,
     )
+    from grounded_weather_forecast.reports.eprocess import (  # noqa: PLC0415
+        EProcessStore,
+        promotion_comparison,
+    )
     from grounded_weather_forecast.reports.leaderboard import (  # noqa: PLC0415
         aggregate_leaderboard,
+        bh_adjusted,
         blocked_promotions,
         leaderboard,
         slice_winners,
+        union_references,
     )
     from grounded_weather_forecast.reports.recalibration import (  # noqa: PLC0415
         recalibration_report,
@@ -767,25 +777,11 @@ def _cmd_report(config: Config) -> int:
         return 1
     written: list[Path] = []
     gap_threshold = config.promotion.report_gap_threshold
+    references = union_references(config.promotion)
+    eprocess_stores: dict[str, EProcessStore] = {}
     for path in score_files:
         scores = load_scores(path)
-        board = leaderboard(scores)
-        winners = slice_winners(
-            board,
-            scores=scores,
-            rule=config.promotion.rule,
-            alpha=config.promotion.alpha,
-        )
-        sections = [
-            ("Per-slice leaderboard", board),
-            ("Aggregate (n-weighted MAE)", aggregate_leaderboard(board)),
-            ("Per-slice winners", winners),
-            (
-                f"Blocked promotions (served MAE above slice best "
-                f"by more than {gap_threshold:.0%})",
-                blocked_promotions(winners, gap_threshold),
-            ),
-        ]
+        board = bh_adjusted(leaderboard(scores, references=references))
         # Serving runs on the live provider set, so its realized skill may only
         # be compared with a leaderboard built from the same provenance — a
         # synthetic board describes different sources entirely. The provenance
@@ -797,7 +793,51 @@ def _cmd_report(config: Config) -> int:
             if scores.is_empty()
             else set(scores["source_kind"].unique()) == {"live"}
         )
+        eprocess_store: EProcessStore | None = None
         if is_live:
+            product = path.stem.split("_")[1]
+            if product not in eprocess_stores:
+                eprocess_stores[product] = EProcessStore.load(
+                    config.artifacts_dir / "eprocess" / f"{product}_live.json",
+                    config_fingerprint(config),
+                    code_identity(),
+                )
+            eprocess_store = eprocess_stores[product]
+        winners = slice_winners(
+            board,
+            scores=scores,
+            rule=config.promotion.rule,
+            alpha=config.promotion.alpha,
+            promotion=config.promotion,
+            eprocess_store=eprocess_store,
+        )
+        sections = [
+            ("Per-slice leaderboard", board),
+            ("Aggregate (n-weighted MAE)", aggregate_leaderboard(board)),
+            ("Per-slice winners", winners),
+            (
+                f"Blocked promotions (served MAE above slice best "
+                f"by more than {gap_threshold:.0%})",
+                blocked_promotions(winners, gap_threshold),
+            ),
+        ]
+        if is_live and eprocess_store is not None:
+            # Both promotion rules run every report so the operator can watch
+            # them disagree before switching [promotion].rule; this is also
+            # the single writer that persists the e-process wealth.
+            sections.append(
+                (
+                    "Promotion rule comparison (mcs vs seq_mcs)",
+                    promotion_comparison(
+                        board,
+                        scores,
+                        alpha=config.promotion.alpha,
+                        promotion=config.promotion,
+                        store=eprocess_store,
+                    ),
+                )
+            )
+            eprocess_store.save()
             # Offline A/B of the two mutually exclusive post-hoc quantile
             # repairs; [predict].quantile_recalibration serves the winner.
             sections.append(

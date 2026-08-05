@@ -225,7 +225,7 @@ def test_report_skips_any_self_verification_failure(
     )
     monkeypatch.setattr(
         "grounded_weather_forecast.reports.leaderboard.leaderboard",
-        lambda _scores: empty,
+        lambda _scores, **_kwargs: empty,
     )
     monkeypatch.setattr(
         "grounded_weather_forecast.reports.leaderboard.aggregate_leaderboard",
@@ -233,6 +233,10 @@ def test_report_skips_any_self_verification_failure(
     )
     monkeypatch.setattr(
         "grounded_weather_forecast.reports.leaderboard.slice_winners",
+        lambda *_args, **_kwargs: empty,
+    )
+    monkeypatch.setattr(
+        "grounded_weather_forecast.reports.eprocess.promotion_comparison",
         lambda *_args, **_kwargs: empty,
     )
     monkeypatch.setattr(

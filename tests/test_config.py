@@ -235,6 +235,46 @@ class TestErrors:
         with pytest.raises(ConfigError, match="report_gap_threshold"):
             load_config(write(tmp_path, text))
 
+    def test_promotion_gate_defaults(self, tmp_path):
+        cfg = load_config(write(tmp_path, MINIMAL))
+        assert cfg.promotion.mcs_bootstrap == 500
+        assert cfg.promotion.mcs_block_length == 0
+        assert dict(cfg.promotion.references) == {}
+
+    def test_seq_mcs_rule_accepted(self, tmp_path):
+        text = MINIMAL + '\n[promotion]\nrule = "seq_mcs"\n'
+        cfg = load_config(write(tmp_path, text))
+        assert cfg.promotion.rule == "seq_mcs"
+
+    def test_unknown_promotion_rule_rejected(self, tmp_path):
+        text = MINIMAL + '\n[promotion]\nrule = "argmin"\n'
+        with pytest.raises(ConfigError, match="must be one of"):
+            load_config(write(tmp_path, text))
+
+    def test_promotion_references_parsed(self, tmp_path):
+        text = (
+            MINIMAL
+            + "\n[promotion.references]\n"
+            + 'pressure_sea_hpa = ["grounded_equal_weight", '
+            + '"damped_grounded_equal_weight"]\n'
+        )
+        cfg = load_config(write(tmp_path, text))
+        assert cfg.promotion.references["pressure_sea_hpa"] == (
+            "grounded_equal_weight",
+            "damped_grounded_equal_weight",
+        )
+
+    def test_empty_promotion_reference_list_rejected(self, tmp_path):
+        text = MINIMAL + "\n[promotion.references]\npressure_sea_hpa = []\n"
+        with pytest.raises(ConfigError, match="at least one"):
+            load_config(write(tmp_path, text))
+
+    def test_promotion_bootstrap_parsed(self, tmp_path):
+        text = MINIMAL + "\n[promotion]\nmcs_bootstrap = 999\nmcs_block_length = 6\n"
+        cfg = load_config(write(tmp_path, text))
+        assert cfg.promotion.mcs_bootstrap == 999
+        assert cfg.promotion.mcs_block_length == 6
+
     def test_forecast_exclusions_parsed(self, tmp_path):
         text = MINIMAL + 'exclude = ["weatherapi:dew_point_c", "weatherapi:pop"]\n'
         cfg = load_config(write(tmp_path, text))

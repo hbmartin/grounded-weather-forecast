@@ -18,7 +18,7 @@ from typing import cast
 import polars as pl
 
 from grounded_weather_forecast.backtest.scores import load_scores
-from grounded_weather_forecast.config import Config
+from grounded_weather_forecast.config import Config, PromotionConfig
 from grounded_weather_forecast.contracts import TruthSemantics
 from grounded_weather_forecast.evaluation import (
     ModelRelease,
@@ -26,10 +26,12 @@ from grounded_weather_forecast.evaluation import (
     config_fingerprint,
     dataset_fingerprint,
 )
+from grounded_weather_forecast.reports.eprocess import EProcessStore
 from grounded_weather_forecast.reports.leaderboard import (
-    DEFAULT_REFERENCES,
+    gate_references,
     leaderboard,
     slice_winners,
+    union_references,
 )
 
 FALLBACK_METHOD = "equal_weight"
@@ -128,10 +130,31 @@ def _compatible_scores(
     return candidates
 
 
+def _eprocess_store_for(
+    config: Config, product: str, cache: dict[str, EProcessStore]
+) -> EProcessStore | None:
+    """Read-only e-process wealth for the ``seq_mcs`` rule.
+
+    Only ``report`` persists the store; selection's in-memory updates are
+    cursor-deduped and deterministic, so a reader that runs before the
+    nightly writer reaches the same wealth the writer will record.
+    """
+    if config.promotion.rule != "seq_mcs":
+        return None
+    if product not in cache:
+        cache[product] = EProcessStore.load(
+            config.artifacts_dir / "eprocess" / f"{product}_live.json",
+            config_fingerprint(config),
+            code_identity(),
+        )
+    return cache[product]
+
+
 def _newest_complete_slices(
     candidates: list[pl.DataFrame],
+    promotion: PromotionConfig | None = None,
 ) -> dict[SliceKey, pl.DataFrame]:
-    """Newest atomic evaluation per slice containing both reference methods."""
+    """Newest atomic evaluation per slice containing every reference method."""
     if not candidates:
         return {}
     combined = pl.concat(candidates, how="diagonal_relaxed")
@@ -147,7 +170,7 @@ def _newest_complete_slices(
             ["product", "variable", "lead_bucket"], as_dict=True
         ).items():
             methods = {str(method) for method in frame["method_id"].unique().to_list()}
-            if not set(DEFAULT_REFERENCES) <= methods:
+            if not set(gate_references(str(slice_key[1]), promotion)) <= methods:
                 continue
             product, variable, lead_bucket = (str(part) for part in slice_key)
             key: SliceKey = (product, variable, lead_bucket)
@@ -527,16 +550,20 @@ def select_methods(
     pinned = _pins(config)
     selections: dict[tuple[str, str, str], Selection] = {}
     compatible = _compatible_scores(config, scores_dir, as_of, semantics)
-    slices = _newest_complete_slices(compatible)
+    slices = _newest_complete_slices(compatible, config.promotion)
     selected_scores: list[pl.DataFrame] = []
     fallbacks: dict[SliceKey, Selection] = {}
+    references = union_references(config.promotion)
+    eprocess_stores: dict[str, EProcessStore] = {}
     for key, frame in slices.items():
-        board = leaderboard(frame)
+        board = leaderboard(frame, references=references)
         winners = slice_winners(
             board,
             scores=frame,
             rule=config.promotion.rule,
             alpha=config.promotion.alpha,
+            promotion=config.promotion,
+            eprocess_store=_eprocess_store_for(config, key[0], eprocess_stores),
         )
         if winners.is_empty():
             continue

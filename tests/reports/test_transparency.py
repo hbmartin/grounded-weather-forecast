@@ -5,10 +5,14 @@ from datetime import timedelta
 import numpy as np
 import polars as pl
 
+from grounded_weather_forecast.config import PromotionConfig
 from grounded_weather_forecast.reports.leaderboard import (
     _mcs_gate,
+    bh_adjusted,
     blocked_promotions,
+    gate_references,
     slice_winners,
+    union_references,
 )
 from grounded_weather_forecast.timeutil import utc
 
@@ -223,6 +227,100 @@ class TestDecisionScopedMatrix:
         # and the gate returned "mcs_thin_matrix" instead of promoting.
         assert row["method_id"] == "candidate"
         assert row["gate"] is None
+
+
+class TestPerVariableReferences:
+    OVERRIDES = PromotionConfig(
+        references={
+            "humidity_pct": ("grounded_equal_weight", "damped_grounded_equal_weight")
+        }
+    )
+
+    def overridden_board(self):
+        # The raw references sit an offset off truth (the pressure pattern);
+        # the configured grounded references are competitive.
+        return make_board(
+            [
+                board_row("persistence", 12.35, skill=0.3, p=0.01),
+                board_row("equal_weight", 38.0),
+                board_row("best_provider", 39.0),
+                board_row("grounded_equal_weight", 13.0),
+                board_row("damped_grounded_equal_weight", 13.5),
+            ]
+        )
+
+    def test_gate_references_resolves_override(self):
+        assert gate_references("humidity_pct", self.OVERRIDES) == (
+            "grounded_equal_weight",
+            "damped_grounded_equal_weight",
+        )
+        assert gate_references("temp_c", self.OVERRIDES)[0] == "best_provider"
+        assert gate_references("humidity_pct", None)[0] == "best_provider"
+
+    def test_union_keeps_default_columns_first(self):
+        union = union_references(self.OVERRIDES)
+        assert union[:3] == (
+            "best_provider",
+            "equal_weight",
+            "damped_grounded_equal_weight",
+        )
+        assert "grounded_equal_weight" in union
+
+    def test_gate_failure_falls_back_to_a_grounded_reference(self):
+        board = self.overridden_board().with_columns(
+            pl.lit(0.4).alias("dm_p_vs_grounded_equal_weight").cast(pl.Float64),
+            pl.lit(0.4).alias("dm_p_vs_damped_grounded_equal_weight").cast(pl.Float64),
+            pl.lit(0.1).alias("skill_vs_grounded_equal_weight").cast(pl.Float64),
+        )
+        row = slice_winners(board, rule="legacy", promotion=self.OVERRIDES).row(
+            0, named=True
+        )
+        # The 38-off raw mean is no longer a permissible fallback.
+        assert row["method_id"] == "grounded_equal_weight"
+        assert row["gate"] == "dm_not_significant"
+
+    def test_override_absent_reference_hits_missing_reference(self):
+        board = make_board(
+            [
+                board_row("persistence", 12.35, skill=0.3, p=0.01),
+                board_row("equal_weight", 38.0),
+                board_row("best_provider", 39.0),
+                board_row("damped_grounded_equal_weight", 13.5),
+            ]
+        )
+        row = slice_winners(board, rule="legacy", promotion=self.OVERRIDES).row(
+            0, named=True
+        )
+        assert row["method_id"] == "damped_grounded_equal_weight"
+        assert row["gate"] == "missing_reference"
+
+
+class TestBhAdjusted:
+    def test_q_values_are_monotone_and_bounded(self):
+        board = make_board(
+            [
+                board_row("a", 1.0, skill=0.3, p=0.01),
+                board_row("b", 2.0, skill=0.2, p=0.04),
+                board_row("c", 3.0, skill=0.1, p=0.5),
+                board_row("equal_weight", 4.0),
+            ]
+        )
+        adjusted = bh_adjusted(board)
+        q = (
+            adjusted.drop_nulls("dm_q_vs_equal_weight")
+            .sort("dm_p_vs_equal_weight")["dm_q_vs_equal_weight"]
+            .to_list()
+        )
+        p = (
+            adjusted.drop_nulls("dm_q_vs_equal_weight")
+            .sort("dm_p_vs_equal_weight")["dm_p_vs_equal_weight"]
+            .to_list()
+        )
+        assert q == sorted(q)
+        assert all(qv >= pv for qv, pv in zip(q, p, strict=True))
+        assert all(0.0 <= qv <= 1.0 for qv in q)
+        # BH arithmetic on (0.01, 0.04, 0.5) with m=3: q = (0.03, 0.06, 0.5)
+        assert q[0] == 0.03
 
 
 class TestMcsGateReasons:
