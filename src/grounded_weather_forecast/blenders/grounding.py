@@ -49,6 +49,7 @@ def fit_affine(
     y: FloatArray,
     slope_shrinkage: float = BIAS_ONLY,
     intercept: InterceptEstimator = "mean",
+    min_rows: int = _MIN_FIT_ROWS,
 ) -> tuple[float, float]:
     """Fit ``y ~ a + b*x`` with the slope shrunk toward the identity.
 
@@ -58,12 +59,15 @@ def fit_affine(
     removing the training bias whatever the slope. The ``"median"`` intercept
     minimizes MAE — the metric the leaderboard promotes on — and only exists
     for bias-only grounding, where the residual ``y - x`` is well defined.
+    ``min_rows`` is the identity-fallback threshold; callers whose thin fits
+    are shrunk toward a global fit afterwards (the per-bucket blend) lower it
+    so a thin bucket contributes a genuine local fit instead of the identity.
     """
     n = x.shape[0]
     if intercept == "median" and slope_shrinkage != BIAS_ONLY:
         msg = "median intercept requires bias-only grounding (slope_shrinkage == 0)"
         raise ValueError(msg)
-    if n < _MIN_FIT_ROWS:
+    if n < min_rows:
         return IDENTITY
     if intercept == "median":
         return float(np.median(y - x)), 1.0
@@ -79,9 +83,34 @@ def fit_affine(
     return y_mean - slope * x_mean, slope
 
 
+def _blend_affine(
+    local: tuple[float, float],
+    global_state: tuple[float, float],
+    weight: float,
+) -> tuple[float, float]:
+    """Shrink a bucket's ``(intercept, slope)`` toward the global fit.
+
+    Linear interpolation is sound here because the correction is linear in
+    both coefficients: blending them equals blending the two corrections'
+    outputs pointwise. This is what stops a thin bucket from serving its
+    sampling noise as a constant bias.
+    """
+    local_intercept, local_slope = local
+    global_intercept, global_slope = global_state
+    return (
+        weight * local_intercept + (1.0 - weight) * global_intercept,
+        weight * local_slope + (1.0 - weight) * global_slope,
+    )
+
+
 @dataclass
 class AffineGrounding:
-    """Fitted per-source, per-lead-bucket corrections toward the station."""
+    """Fitted per-source, per-lead-bucket corrections toward the station.
+
+    Bucket fits are shrunk toward the global fit via the fitter's
+    empirical-Bayes blend, so data-starved buckets stabilise smoothly instead
+    of flipping between the global state and a barely-qualified local fit.
+    """
 
     slope_shrinkage: float = BIAS_ONLY
     buckets: tuple[LeadBucket, ...] = HOURLY_BUCKETS
@@ -99,15 +128,21 @@ class AffineGrounding:
 
             def fit_one(rows: np.ndarray, index: int = index) -> tuple[float, float]:
                 available = rows[train.x.availability[rows, index]]
+                # min_rows=1: the fitter's shrinkage blend, not an identity
+                # cliff, is what guards thin buckets here.
                 return fit_affine(
                     values[available, index],
                     y[available],
                     self.slope_shrinkage,
                     self.intercept,
+                    min_rows=1,
                 )
 
             fitter = PerBucketFitter[tuple[float, float]](
-                buckets=self.buckets, fit_one=fit_one, min_rows=_MIN_FIT_ROWS
+                buckets=self.buckets,
+                fit_one=fit_one,
+                min_rows=_MIN_FIT_ROWS,
+                blend=_blend_affine,
             )
             self._by_source[source] = fitter.fit(train.x.lead_hours)
         return self

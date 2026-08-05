@@ -71,6 +71,17 @@ backtesting or serving methods that consume ensemble features.
 - launchd `StartCalendarInterval` fires in **local time**; the 6-hourly
   ensemble job uses `StartInterval` (elapsed seconds) precisely so daylight
   saving cannot skip a model cycle.
+- `StartCalendarInterval` jobs missed while the machine is **off** are never
+  replayed (asleep is fine — launchd coalesces on wake). A machine that
+  shuts down overnight therefore silently skips `maintain` and loses folds
+  for a week at weekly cadence. Defense: give `maintain` `RunAtLoad = true`
+  plus a stamp-file guard in the script (skip when the last success is
+  < 20 h old), so every boot/login is a catch-up opportunity and calendar
+  fires stay the steady state.
+- The station logger upstream (`aw2sqlite serve`) is a hard dependency of
+  truth: run it as its own `KeepAlive` LaunchAgent, never from a Terminal
+  session — a closed session or reboot otherwise stops truth silently while
+  forecasts keep accruing (a week of unusable, label-less snapshots).
 - The scheduled `predict` run appends to the self-verification history by
   default; the `--no-history`
   ([advanced usage](advanced-usage.md)) flag opts a one-off manual serve out of

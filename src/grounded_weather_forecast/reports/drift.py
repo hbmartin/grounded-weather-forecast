@@ -11,6 +11,10 @@ lead time (a 7-day forecast's error resolves a week late). So:
 - **Slow tier** (truth-based confirmation): Page-Hinkley on the source's
   grounded-residual series — the sequential change detector that accumulates
   drift beyond a dead-band and alarms when the excursion exceeds lambda.
+  Residuals are standardized by a floored robust scale first, and
+  near-constant windows (zero-inflated precip in a dry month) are skipped
+  with a ``skipped_degenerate`` note row instead of an alarm, so silence
+  stays distinguishable from "checked and quiet".
 
 Alarms are written to a report section and ``artifacts/drift.json``; state
 resets and automated down-weighting stay manual until alarm precision has a
@@ -40,14 +44,23 @@ _FAST_Z = 6.0
 _PH_DELTA = 0.1
 _PH_LAMBDA_FLOOR = 25.0
 _PH_LAMBDA_SCALE = 4.0  # a driftless walk's excursion range grows like sqrt(n)
+# With the lambda floor at 25, no fewer than ~4 consecutive clipped samples
+# can alarm — a lone monsoon burst cannot masquerade as a mean shift.
+_PH_CLIP_SIGMA = 8.0
+_MAD_TO_SIGMA = 1.4826  # sigma-equivalent MAD for a normal distribution
+_SCALE_ABS_EPSILON = 1e-3  # metric milliunits: below any weather-scale signal
+_SCALE_IQR_FRACTION = 0.1  # per-variable floor as a share of the window IQR
+_DEGENERATE_NEAR_SHARE = 0.9  # residual share at the median that disables PH
 _MIN_ROWS = 48
+
+RESIDUAL_SKIPPED_TIER = "residual_skipped"
 
 
 @dataclass(frozen=True, slots=True)
 class DriftAlarm:
     source: str
     lead_bucket: str
-    tier: str  # "consensus" | "residual"
+    tier: str  # "consensus" | "residual" | "residual_skipped"
     statistic: float
     detail: str
 
@@ -83,6 +96,46 @@ def page_hinkley(
     upward, upward_excursion = _upward_page_hinkley(values, delta, lam)
     downward, downward_excursion = _upward_page_hinkley(-values, delta, lam)
     return upward or downward, max(upward_excursion, downward_excursion)
+
+
+@dataclass(frozen=True, slots=True)
+class _ResidualScale:
+    """Robust center/scale for one residual window, with degeneracy verdict."""
+
+    center: float
+    scale: float
+    mad_sigma: float
+    near_median_share: float
+
+    @property
+    def degenerate(self) -> bool:
+        """Near-constant residuals cannot support a mean-shift statistic."""
+        return (
+            self.near_median_share > _DEGENERATE_NEAR_SHARE
+            or self.mad_sigma < _SCALE_ABS_EPSILON
+        )
+
+
+def _residual_scale(residuals: FloatArray) -> _ResidualScale:
+    """MAD scale with a floor: a fraction of the window IQR, then epsilon.
+
+    The floor keeps a near-zero MAD (zero-inflated precip) from exploding
+    standardized residuals; the IQR term makes the floor track each
+    variable's own spread instead of a one-size absolute constant.
+    """
+    center = float(np.median(residuals))
+    distances = np.abs(residuals - center)
+    mad_sigma = float(np.median(distances)) * _MAD_TO_SIGMA
+    quartiles = np.quantile(residuals, (0.25, 0.75))
+    floor = max(
+        _SCALE_IQR_FRACTION * float(quartiles[1] - quartiles[0]), _SCALE_ABS_EPSILON
+    )
+    return _ResidualScale(
+        center=center,
+        scale=max(mad_sigma, floor),
+        mad_sigma=mad_sigma,
+        near_median_share=float(np.mean(distances <= _SCALE_ABS_EPSILON)),
+    )
 
 
 def _with_lead_bucket(matrix: pl.DataFrame) -> pl.DataFrame:
@@ -159,7 +212,7 @@ def consensus_alarms(matrix: pl.DataFrame, variable: VariableSpec) -> list[Drift
             if recent.size < 4 or baseline.size < 24:
                 continue
             center = float(np.median(baseline))
-            scale = float(np.median(np.abs(baseline - center))) * 1.4826
+            scale = float(np.median(np.abs(baseline - center))) * _MAD_TO_SIGMA
             scale = max(scale, 1e-6)
             z = (float(np.mean(recent)) - center) / (scale / np.sqrt(recent.size))
             if abs(z) > _FAST_Z:
@@ -180,12 +233,59 @@ def consensus_alarms(matrix: pl.DataFrame, variable: VariableSpec) -> list[Drift
     return alarms
 
 
+def _skipped_degenerate_row(
+    source: str, lead_bucket: str, residuals: FloatArray, robust: _ResidualScale
+) -> DriftAlarm:
+    return DriftAlarm(
+        source=source,
+        lead_bucket=lead_bucket,
+        tier=RESIDUAL_SKIPPED_TIER,
+        statistic=round(robust.near_median_share, 3),
+        detail=(
+            f"skipped_degenerate: {robust.near_median_share:.0%} of "
+            f"{residuals.shape[0]} residuals within {_SCALE_ABS_EPSILON:g} of "
+            f"the median (MAD-sigma {robust.mad_sigma:.3g}); Page-Hinkley "
+            "not run on a near-constant series"
+        ),
+    )
+
+
+def _residual_row(
+    source: str, lead_bucket: str, residuals: FloatArray
+) -> DriftAlarm | None:
+    """One report row for a bucket: alarm, skip note, or ``None`` when quiet."""
+    robust = _residual_scale(residuals)
+    if robust.degenerate:
+        return _skipped_degenerate_row(source, lead_bucket, residuals, robust)
+    standardized: FloatArray = np.clip(
+        (residuals - robust.center) / robust.scale, -_PH_CLIP_SIGMA, _PH_CLIP_SIGMA
+    )
+    alarmed, excursion = page_hinkley(standardized)
+    if not alarmed:
+        return None
+    return DriftAlarm(
+        source=source,
+        lead_bucket=lead_bucket,
+        tier="residual",
+        statistic=round(excursion, 2),
+        detail=(
+            f"two-sided Page-Hinkley excursion {excursion:.1f} on "
+            f"{residuals.shape[0]} issue-level residuals"
+        ),
+    )
+
+
 def residual_alarms(
     matrix: pl.DataFrame,
     variable: VariableSpec,
     semantics: TruthSemantics = TruthSemantics.INSTANTANEOUS,
 ) -> list[DriftAlarm]:
-    """Slow tier: Page-Hinkley on each source's standardized residuals."""
+    """Slow tier: Page-Hinkley on each source's robustly standardized residuals.
+
+    Residuals are standardized by a floored MAD scale and winsorized at
+    ``_PH_CLIP_SIGMA`` before accumulation; near-constant windows are
+    reported as ``skipped_degenerate`` rows instead of being scored.
+    """
     truth_column = (
         truth_col(variable.name, semantics)
         if variable.has_dual_semantics
@@ -229,30 +329,22 @@ def residual_alarms(
             )
             if residuals.shape[0] < _MIN_ROWS:
                 continue
-            center = float(np.median(residuals))
-            scale = float(np.median(np.abs(residuals - center))) * 1.4826
-            standardized = (residuals - center) / max(scale, 1e-6)
-            alarmed, excursion = page_hinkley(standardized)
-            if alarmed:
-                alarms.append(
-                    DriftAlarm(
-                        source=source,
-                        lead_bucket=str(bucket_key[0]),
-                        tier="residual",
-                        statistic=round(excursion, 2),
-                        detail=(
-                            f"two-sided Page-Hinkley excursion {excursion:.1f} on "
-                            f"{residuals.shape[0]} issue-level residuals"
-                        ),
-                    ),
-                )
+            if (
+                row := _residual_row(source, str(bucket_key[0]), residuals)
+            ) is not None:
+                alarms.append(row)
     return alarms
 
 
 def drift_report(
     matrix: pl.DataFrame, variables: tuple[VariableSpec, ...]
 ) -> pl.DataFrame:
-    """All alarms across both tiers, one row each; empty when all is calm."""
+    """All alarms and skip notes across both tiers, one row each.
+
+    Empty only when every evaluated bucket ran and stayed quiet — degenerate
+    buckets still produce a ``residual_skipped`` row, so an operator can tell
+    "checked but unscoreable" apart from silence.
+    """
     rows = [
         {
             "variable": variable.name,
@@ -282,8 +374,22 @@ def drift_report(
 
 
 def write_drift_artifact(alarms: pl.DataFrame, path: Path) -> None:
+    """Write alarm rows under ``alarms`` and skip notes under ``notes``.
+
+    The split keeps ``skipped_degenerate`` rows out of the alert pipeline
+    (every ``alarms`` entry becomes a pageable alert) while the dashboard —
+    which treats absence as failure — still sees that the tier was checked.
+    """
+    is_note = pl.col("tier") == RESIDUAL_SKIPPED_TIER
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(
-        json.dumps({"schema_version": 2, "alarms": alarms.to_dicts()}, indent=2),
+        json.dumps(
+            {
+                "schema_version": 2,
+                "alarms": alarms.filter(~is_note).to_dicts(),
+                "notes": alarms.filter(is_note).to_dicts(),
+            },
+            indent=2,
+        ),
         encoding="utf-8",
     )

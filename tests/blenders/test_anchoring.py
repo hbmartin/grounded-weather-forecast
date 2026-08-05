@@ -157,6 +157,67 @@ class TestAnchoredEmpirical:
         trend_mae = mae(trend.predict(train.x).point, train.y)
         assert trend_mae <= 1.1 * fitted_mae
 
+    def test_leading_unfitted_bins_ramp_toward_persistence(self):
+        """Thin short-lead bins must extrapolate the fitted decay toward 1,
+        not inherit the long-lead weight (the measured 0-1 h failure where
+        raw persistence beat every anchored method)."""
+        anchored = get_factory("anchored_fitted_grounded")()
+        rng = np.random.default_rng(7)
+        lead = np.full(60, 9.0)  # only the 6-12h bin is fittable
+        residuals = rng.normal(0.0, 2.0, 60)
+        errors = 0.6 * residuals + rng.normal(0.0, 0.05, 60)
+        trend = np.full(60, np.nan)
+
+        anchored._fit_bins(lead, residuals, errors, trend)
+
+        weights = anchored._residual_weights
+        assert weights is not None
+        assert float(weights[4]) == pytest.approx(0.6, abs=0.05)
+        # leading bins follow rho**center with rho = w4**(1/9), not a flat fill
+        rho = float(weights[4]) ** (1.0 / 9.0)
+        centers = (
+            np.asarray([0.0, 1.0, 2.0, 3.0]) + np.asarray([1.0, 2.0, 3.0, 6.0])
+        ) / 2
+        for index, center in enumerate(centers):
+            assert float(weights[index]) == pytest.approx(rho**center, rel=1e-6)
+        assert float(weights[0]) > 0.9
+        applied = anchored._weights_at(
+            np.array([0.25]), weights, ramp_to_zero_lead=True
+        )
+        assert float(applied[0]) > 0.9
+
+    def test_noise_level_weight_is_not_amplified_toward_persistence(self):
+        """A fitted weight within its own estimation noise (< ~2/sqrt(n)) must
+        flat-fill, not ramp: amplifying noise would invent an aggressive
+        anchor from nothing."""
+        anchored = get_factory("anchored_fitted_grounded")()
+        rng = np.random.default_rng(7)
+        lead = np.full(60, 9.0)
+        residuals = rng.normal(0.0, 2.0, 60)
+        errors = rng.normal(0.0, 2.0, 60)  # independent: true weight is zero
+        trend = np.full(60, np.nan)
+
+        anchored._fit_bins(lead, residuals, errors, trend)
+
+        weights = anchored._residual_weights
+        assert weights is not None
+        assert float(weights[0]) == pytest.approx(float(weights[4]), abs=1e-12)
+
+    def test_zero_lead_ramp_extends_a_measured_decay_only(self):
+        anchored = get_factory("anchored_fitted_grounded")()
+        decaying = np.array([0.9, 0.7, 0.5, 0.4, 0.3, 0.2])
+        at_zero = anchored._weights_at(
+            np.array([0.0]), decaying, ramp_to_zero_lead=True
+        )
+        assert float(decaying[0]) < float(at_zero[0]) <= 1.0
+        without_ramp = anchored._weights_at(np.array([0.0]), decaying)
+        assert float(without_ramp[0]) == pytest.approx(0.9)
+        # a flat curve is respected: no ramp is invented from equal weights
+        flat = np.full(6, 0.5)
+        assert anchored._zero_lead_weight(flat) == pytest.approx(0.5)
+        # a dead curve stays dead
+        assert anchored._zero_lead_weight(np.zeros(6)) == 0.0
+
     def test_trend_fit_uses_finite_subset(self):
         anchored = get_factory("anchored_trend_grounded")()
         lead = np.full(30, 0.5)
@@ -186,3 +247,5 @@ def test_anchored_empirical_to_state_reports_weight_curve():
     assert state["use_trend"] is False
     assert state["base_method_id"] == "grounded_equal_weight"
     assert len(state["residual_weights"]) == len(state["bin_edges"]) - 1
+    assert state["fitted_bins"] >= 1
+    assert state["residual_weights"][0] <= state["zero_lead_weight"] <= 1.0

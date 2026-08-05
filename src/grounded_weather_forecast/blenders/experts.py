@@ -54,7 +54,13 @@ _MAX_ETA = 0.5
 _SHARE = 0.005
 _MIN_AWAKE = 2
 _GLOBAL_BUCKET = "__global__"
-_STATE_SCHEMA_VERSION = 2
+# Version 3 switched the expert loss from squared to absolute error. The
+# prefix digests hash the raw training history, not the losses derived from
+# it, so a squared-loss (version 2) state would otherwise revalidate cleanly
+# and BOA would keep advancing weights and regret variance accumulated under
+# the wrong loss. The version gate makes `from_state` raise instead, which
+# callers already treat as the documented full-replay signal.
+_STATE_SCHEMA_VERSION = 3
 
 
 @dataclass
@@ -373,7 +379,13 @@ class OnlineExperts:
                         states[bucket].horizon, horizons[bucket]
                     )
                 awake = train.x.availability[row] & np.isfinite(corrected[row])
-                losses = np.where(awake, (corrected[row] - train.y[row]) ** 2, 0.0)
+                # Absolute (L1) loss: the promotion metric is MAE, so the
+                # experts must rank sources the way the leaderboard does
+                # (improvement plan section 2a). `_step`'s per-round range
+                # normalization maps any nonnegative loss into [0, 1], the
+                # scale both regret bounds assume, so the learning-rate
+                # constants need no retuning for the loss change.
+                losses = np.where(awake, np.abs(corrected[row] - train.y[row]), 0.0)
                 self._step(states[bucket], losses, awake)
             last = int(rows[-1])
             progress[bucket] = _BucketProgress(

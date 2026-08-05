@@ -32,6 +32,7 @@ from grounded_weather_forecast.blenders.protocol import (
 from grounded_weather_forecast.blenders.registry import register
 from grounded_weather_forecast.contracts import (
     BlendResult,
+    FloatArray,
     ForecastMatrix,
     SupervisedSlice,
     TargetKind,
@@ -41,6 +42,24 @@ from grounded_weather_forecast.leads import buckets_for_product
 
 _MIN_LOSS = 1e-6
 _MIN_ROWS_PER_SOURCE = 12
+
+
+def _blend_source_weights(
+    local: FloatArray, global_state: FloatArray, weight: float
+) -> FloatArray:
+    """Shrink a bucket's source weights toward the global fit.
+
+    Both sides are rescaled so their best source has weight one before
+    interpolating: raw inverse losses carry a bucket-dependent scale (error
+    grows with lead), and only relative weights matter — downstream,
+    ``renormalize_weights`` rescales per row anyway. Dividing by the maximum
+    rather than the sum keeps the blend invariant to an all-NaN source: the
+    fallback weight such a source receives is never the maximum, so its
+    presence cannot perturb the real sources' blended weights.
+    """
+    local_scaled = local / local.max()
+    global_scaled = global_state / global_state.max()
+    return weight * local_scaled + (1.0 - weight) * global_scaled
 
 
 @dataclass
@@ -93,7 +112,7 @@ class InverseErrorWeights:
         errors = np.abs(corrected - train.y[:, np.newaxis]) ** self.loss_power
         availability = train.x.availability
 
-        def fit_weights(rows: np.ndarray) -> np.ndarray:
+        def fit_weights(rows: np.ndarray) -> FloatArray:
             counts = availability[rows].sum(axis=0)
             sums = np.where(availability[rows], errors[rows], 0.0).sum(axis=0)
             mean_loss = np.where(
@@ -107,10 +126,12 @@ class InverseErrorWeights:
             mean_loss = np.where(np.isnan(mean_loss), fallback, mean_loss)
             return 1.0 / np.maximum(mean_loss, _MIN_LOSS)
 
-        fitter = PerBucketFitter[np.ndarray](
-            buckets=buckets_for_product(train.x.product), fit_one=fit_weights
+        fitter = PerBucketFitter[FloatArray](
+            buckets=buckets_for_product(train.x.product),
+            fit_one=fit_weights,
+            blend=_blend_source_weights,
         )
-        self._fitted: FittedBuckets[np.ndarray] = fitter.fit(train.x.lead_hours)
+        self._fitted: FittedBuckets[FloatArray] = fitter.fit(train.x.lead_hours)
         return self
 
     def predict(self, x: ForecastMatrix) -> BlendResult:

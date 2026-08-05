@@ -85,13 +85,25 @@ def finalize_quantiles(
 class PerBucketFitter[S]:
     """Fit one state object per lead bucket, with a global-fit fallback.
 
-    ``fit_one`` receives the row subset for a bucket and returns the state;
-    buckets with fewer than ``min_rows`` rows fall back to the global state.
+    ``fit_one`` receives the row subset for a bucket and returns the state.
+    Without ``blend``, buckets with fewer than ``min_rows`` rows fall back to
+    the global state — an all-or-nothing cliff, kept for states whose
+    parameters cannot be safely interpolated. Supplying ``blend`` replaces the
+    cliff with empirical-Bayes-style shrinkage: every non-empty bucket serves
+    ``blend(local, global, w)`` with weight ``w = n / (n + prior_rows)``, so
+    the global fit acts as a prior worth ``prior_rows`` rows of evidence. The
+    default prior of ``min_rows / 4`` puts ``w = 0.8`` at exactly ``min_rows``
+    rows — the local fit dominates right where the old cliff granted it full
+    weight — while thinner buckets shade smoothly toward the global fit
+    instead of a barely-qualified local fit serving its sampling noise as a
+    constant bias.
     """
 
     buckets: tuple[LeadBucket, ...]
     fit_one: Callable[[np.ndarray], S]
     min_rows: int = 24
+    blend: Callable[[S, S, float], S] | None = None
+    prior_rows: float | None = None
 
     def fit(self, lead: FloatArray) -> "FittedBuckets[S]":
         all_rows = np.arange(lead.shape[0])
@@ -99,11 +111,21 @@ class PerBucketFitter[S]:
         states: dict[str, S] = {}
         for bucket in self.buckets:
             rows = all_rows[(lead >= bucket.lo) & (lead < bucket.hi)]
-            if rows.shape[0] >= self.min_rows:
-                states[bucket.label] = self.fit_one(rows)
+            if (state := self._bucket_state(rows, global_state)) is not None:
+                states[bucket.label] = state
         return FittedBuckets(
             buckets=self.buckets, states=states, global_state=global_state
         )
+
+    def _bucket_state(self, rows: np.ndarray, global_state: S) -> S | None:
+        """One bucket's state: shrunk when ``blend`` is set, the cliff otherwise."""
+        n = int(rows.shape[0])
+        if self.blend is None:
+            return self.fit_one(rows) if n >= self.min_rows else None
+        if n == 0:
+            return None
+        prior = self.min_rows / 4.0 if self.prior_rows is None else self.prior_rows
+        return self.blend(self.fit_one(rows), global_state, n / (n + prior))
 
 
 @dataclass(frozen=True)
