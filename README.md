@@ -170,6 +170,21 @@ mistaken for a method's own distribution. The leaderboard report adds a
 slice's board minimum by more than `[promotion].report_gap_threshold`
 (default 0.15), along with which gate blocked the better method.
 
+Methods can be registered with a variable scope (`register(...,
+variables=frozenset({"pop"}))`), so specialist heads are simply never fitted
+off-scope: `pop_platt` vs `pop_beta` recalibrate the provider PoP mean (the
+wet-season A/B, arbitrated by the Brier column, identity-guarded on dry
+archives), `csgd_emos` fits a censored shifted-gamma to precipitation (the
+first quantile emitter whose censored mass IS the dry probability), and the
+daily temperature product gets its own A/B — `daily_marginal_emos` (direct
+Meng–Taylor marginal on daily values + hourly-path extremes) vs
+`daily_path_extreme` (grounded ensemble of per-source path extremes). The
+daily matrix carries `path__{source}__max/min` features (coverage-gated) to
+power them. Far daily buckets whose per-bucket evidence sits under the
+eligibility floor are gated on pooled D3-10 evidence instead — a promotion
+through that path is labeled `pooled_D3-10` in the winners table while
+scoring and selection stay per fine bucket.
+
 Promotion offers two mutually exclusive statistical gates, compared side by
 side in every live report's "Promotion rule comparison" section:
 `[promotion].rule = "mcs"` (bootstrap Model Confidence Set, re-run from

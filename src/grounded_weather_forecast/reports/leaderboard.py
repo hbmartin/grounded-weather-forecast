@@ -259,6 +259,11 @@ def leaderboard(
 ) -> pl.DataFrame:
     """Per (product, variable, lead bucket, method): every reported view."""
     scores = _with_default_semantics(scores)
+    if "lead_bucket" in scores.columns:
+        # Historical score files may carry rows past the last bucket edge
+        # (14-16-day provider dailies before the matrix-level filter landed);
+        # a null-bucket slice can never serve and only pollutes the board.
+        scores = scores.filter(pl.col("lead_bucket").is_not_null())
     rows: list[dict[str, object]] = []
     # Semantics joins the slice identity so a concatenated frame cannot pool
     # two truth targets into one row; per-evaluation frames are unaffected.
@@ -434,6 +439,109 @@ def _mcs_gate(
     return fallback, "mcs_not_separated"
 
 
+# Far daily buckets sit below the 8-valid-times eligibility floor for weeks
+# (n_valid_times 7/4/4 on 2026-08-05) and the MCS has its own >= 8 collapsed
+# times requirement, so lowering the board floor could not promote anything.
+# Pooling D3-10 for the GATE ONLY (scoring and selection stay per fine
+# bucket) reaches 15 unique dates today.
+_DAILY_GATE_POOL: Mapping[str, tuple[str, ...]] = {
+    "D3-4": ("D3-4", "D5-7", "D8-10"),
+    "D5-7": ("D3-4", "D5-7", "D8-10"),
+    "D8-10": ("D3-4", "D5-7", "D8-10"),
+}
+_POOLED_GATE = "pooled_D3-10"
+_POOLABLE_REASONS = frozenset({"mcs_thin_matrix", "mcs_no_matrix", "seq_no_matrix"})
+
+
+def _pooled_daily_gate(
+    parts: Mapping[str, str],
+    normalized_scores: pl.DataFrame | None,
+    references: tuple[str, ...],
+    rule: str,
+    alpha: float,
+    n_bootstrap: int,
+    block_length: int | None,
+    eprocess_store: "EProcessStore | None",
+) -> tuple[dict[str, object], str] | None:
+    """Gate a far daily bucket on pooled D3-10 evidence.
+
+    Returns the pooled decision (winner row from the pooled board, gate
+    label) or None when pooling is inapplicable or still yields nothing
+    eligible. A method promoted here carries ``gate="pooled_D3-10"`` so the
+    report shows the evidence scope; a method good at D3-4 but bad at D8-10
+    stays visible on the fine-bucket board rows.
+    """
+    pool = _DAILY_GATE_POOL.get(parts.get("lead_bucket", ""))
+    if (
+        pool is None
+        or parts.get("product") != "daily"
+        or normalized_scores is None
+        or rule == "legacy"
+    ):
+        return None
+    pooled_scores = normalized_scores.filter(
+        (pl.col("product") == "daily")
+        & (pl.col("variable") == parts["variable"])
+        & pl.col("lead_bucket").is_in(pool)
+    )
+    if "truth_semantics" in parts and "semantics" in normalized_scores.columns:
+        pooled_scores = pooled_scores.filter(
+            pl.col("semantics") == parts["truth_semantics"]
+        )
+    if pooled_scores.is_empty():
+        return None
+    pooled_scores = pooled_scores.with_columns(
+        pl.lit(_POOLED_GATE.removeprefix("pooled_")).alias("lead_bucket")
+    )
+    pooled_board = leaderboard(pooled_scores, references=references)
+    if pooled_board.is_empty():
+        return None
+    eligible = pooled_board.filter(
+        (pl.col("coverage") >= 0.8)
+        & (pl.col("n") >= 8)
+        & (pl.col("n_valid_times") >= 8)
+    )
+    if eligible.is_empty():
+        return None
+    ranked = eligible.sort("mae")
+    candidate = ranked.row(0, named=True)
+    reference_rows = tuple(
+        ranked.filter(pl.col("method_id").is_in(references))
+        .sort("mae")
+        .iter_rows(named=True)
+    )
+    if candidate["method_id"] in references:
+        return candidate, _POOLED_GATE
+    present = {str(row["method_id"]) for row in reference_rows}
+    if not set(references) <= present:
+        if reference_rows:
+            return _reference_fallback(reference_rows), "missing_reference"
+        return None
+    if rule == "seq_mcs" and eprocess_store is not None:
+        candidate, gate = _seq_gate(
+            candidate,
+            reference_rows,
+            pooled_scores,
+            {**parts, "lead_bucket": _POOLED_GATE.removeprefix("pooled_")},
+            alpha,
+            eprocess_store,
+        )
+    else:
+        candidate, gate = _mcs_gate(
+            candidate,
+            reference_rows,
+            pooled_scores,
+            (
+                str(candidate["method_id"]),
+                *(str(row["method_id"]) for row in reference_rows),
+            ),
+            alpha,
+            n_bootstrap=n_bootstrap,
+            block_length=block_length,
+        )
+    return candidate, (_POOLED_GATE if gate is None else gate)
+
+
 def _seq_gate(
     candidate: dict[str, object],
     references: tuple[dict[str, object], ...],
@@ -537,6 +645,27 @@ def slice_winners(
             & (pl.col("n_valid_times") >= 8)
         )
         if eligible.is_empty():
+            pooled = _pooled_daily_gate(
+                parts,
+                normalized_scores,
+                references,
+                rule,
+                alpha,
+                n_bootstrap,
+                block_length,
+                eprocess_store,
+            )
+            if pooled is not None:
+                pooled_candidate, pooled_gate = pooled
+                winners.append(
+                    _annotate_winner(
+                        {**pooled_candidate, **parts},
+                        best,
+                        eligible,
+                        pooled_gate,
+                        infer_gate=False,
+                    )
+                )
             continue
         ranked = eligible.sort("mae")
         candidate = ranked.row(0, named=True)
@@ -605,6 +734,29 @@ def slice_winners(
             ):
                 candidate = _reference_fallback(reference_rows)
                 gate = "dm_not_significant"
+        if gate in _POOLABLE_REASONS:
+            pooled = _pooled_daily_gate(
+                parts,
+                normalized_scores,
+                references,
+                rule,
+                alpha,
+                n_bootstrap,
+                block_length,
+                eprocess_store,
+            )
+            if pooled is not None:
+                pooled_candidate, pooled_gate = pooled
+                winners.append(
+                    _annotate_winner(
+                        {**pooled_candidate, **parts},
+                        best,
+                        eligible,
+                        pooled_gate,
+                        infer_gate=False,
+                    )
+                )
+                continue
         winners.append(_annotate_winner(candidate, best, eligible, gate))
     if not winners:
         return _empty_winners(keys)
@@ -626,10 +778,18 @@ def _annotate_winner(
     best: dict[str, object],
     eligible: pl.DataFrame,
     gate: str | None,
+    *,
+    infer_gate: bool = True,
 ) -> dict[str, object]:
-    """Attach the served-vs-board-minimum gap and the gate that caused it."""
+    """Attach the served-vs-board-minimum gap and the gate that caused it.
+
+    ``infer_gate=False`` preserves a caller-supplied label (the pooled daily
+    gate), which the best-vs-eligible inference would otherwise overwrite.
+    """
     best_id = str(best["method_id"])
-    if str(candidate["method_id"]) == best_id:
+    if not infer_gate:
+        pass
+    elif str(candidate["method_id"]) == best_id:
         gate = None
     elif not (eligible["method_id"] == best_id).any():
         # The board minimum never even reached the statistical gates.

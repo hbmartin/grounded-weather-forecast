@@ -323,6 +323,125 @@ class TestBhAdjusted:
         assert q[0] == 0.03
 
 
+def daily_scores(
+    buckets=("D3-4", "D5-7", "D8-10"),
+    times_per_bucket=5,
+    candidate_offset=0.05,
+    reference_offset=5.0,
+    seed=21,
+):
+    rng = np.random.default_rng(seed)
+    references = ("equal_weight", "best_provider", "damped_grounded_equal_weight")
+    rows = []
+    issue = utc(2026, 7, 1)
+    for bucket_index, bucket in enumerate(buckets):
+        for index in range(times_per_bucket):
+            valid = utc(2026, 7, 3) + timedelta(
+                days=bucket_index * times_per_bucket + index
+            )
+            truth = 30.0 + rng.normal(0.0, 0.1)
+            rows.append(
+                (
+                    "candidate",
+                    bucket,
+                    issue,
+                    valid,
+                    truth + candidate_offset + rng.normal(0.0, 0.05),
+                    truth,
+                )
+            )
+            rows.extend(
+                (
+                    reference,
+                    bucket,
+                    issue,
+                    valid,
+                    truth + reference_offset + rng.normal(0.0, 0.05),
+                    truth,
+                )
+                for reference in references
+            )
+    frame = pl.DataFrame(
+        rows,
+        schema={
+            "method_id": pl.String,
+            "lead_bucket": pl.String,
+            "issue_time": pl.Datetime("us", "UTC"),
+            "valid_time": pl.Datetime("us", "UTC"),
+            "y_pred": pl.Float64,
+            "y_true": pl.Float64,
+        },
+        orient="row",
+    )
+    return frame.with_columns(
+        pl.lit("daily").alias("product"),
+        pl.lit("temp_max_c").alias("variable"),
+        pl.lit(120.0).alias("lead_hours"),
+    )
+
+
+def daily_board_row(method_id, mae, n_valid_times=4):
+    return {
+        "product": "daily",
+        "variable": "temp_max_c",
+        "lead_bucket": "D5-7",
+        "method_id": method_id,
+        "n": 20,
+        "n_total": 20,
+        "n_valid_times": n_valid_times,
+        "coverage": 1.0,
+        "mae": mae,
+        "rmse": mae,
+        "bias": 0.0,
+        **{column: None for column in _SKILL_COLUMNS},
+    }
+
+
+class TestPooledDailyGate:
+    def far_board(self):
+        return make_board(
+            [
+                daily_board_row("candidate", 1.0),
+                daily_board_row("equal_weight", 5.0),
+                daily_board_row("best_provider", 5.1),
+                daily_board_row("damped_grounded_equal_weight", 5.2),
+            ]
+        )
+
+    def test_thin_far_bucket_promotes_through_the_pool(self):
+        # Each fine bucket has 5 valid times (below the 8 floor); the pool
+        # reaches 15 and the candidate separates cleanly.
+        winners = slice_winners(
+            self.far_board(), scores=daily_scores(), rule="mcs", alpha=0.1
+        )
+        row = winners.row(0, named=True)
+        assert row["lead_bucket"] == "D5-7"  # selection stays per fine bucket
+        assert row["method_id"] == "candidate"
+        assert row["gate"] == "pooled_D3-10"
+
+    def test_pool_below_the_floor_serves_nothing(self):
+        # 2 valid times per fine bucket pools to 6 — the pooled board is
+        # still ineligible, so the slice stays unserved (cold-start later)
+        # rather than promoting on six dates of evidence.
+        winners = slice_winners(
+            self.far_board(),
+            scores=daily_scores(times_per_bucket=2),
+            rule="mcs",
+            alpha=0.1,
+        )
+        assert winners.is_empty()
+
+    def test_hourly_slices_never_pool(self):
+        board = make_board(
+            [
+                board_row("persistence", 12.35, n=4),
+                board_row("equal_weight", 18.09, n=4),
+            ]
+        ).with_columns(pl.lit(4).alias("n_valid_times"))
+        winners = slice_winners(board, rule="mcs", scores=mcs_scores(4))
+        assert winners.is_empty()
+
+
 class TestMcsGateReasons:
     CANDIDATE = {"method_id": "candidate", "mae": 1.0}
     REFERENCES = ({"method_id": "equal_weight", "mae": 2.0},)

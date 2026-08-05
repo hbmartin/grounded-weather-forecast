@@ -423,12 +423,17 @@ def _equal_weight_daily_aggregates(
     temp_cols = fx_cols("temp_c")
     pop_cols = fx_cols("pop")
     precip_cols = fx_cols("precip_mm")
+    temp_sources = sorted({c.split("__")[1] for c in temp_cols})
     ew = hourly_matrix.select(
         "issue_time",
         local_date_expr(pl.col("valid_time"), timezone_name).alias("forecast_date"),
         pl.mean_horizontal([pl.col(c) for c in temp_cols]).alias("ew_temp"),
         pl.mean_horizontal([pl.col(c) for c in pop_cols]).alias("ew_pop"),
         pl.mean_horizontal([pl.col(c) for c in precip_cols]).alias("ew_precip"),
+        *(
+            pl.col(fx_col(source, "temp_c")).alias(f"src_temp__{source}")
+            for source in temp_sources
+        ),
     )
     dates = ew["forecast_date"].unique().sort()
     day_lengths = pl.DataFrame(
@@ -447,14 +452,47 @@ def _equal_weight_daily_aggregates(
             pl.col("ew_pop").max().alias("ewagg__pop"),
             pl.col("ew_precip").sum().alias("ewagg__precip_sum_mm"),
             pl.col("ew_temp").is_not_null().sum().alias("covered_hours"),
+            # Per-source hourly-path extremes: the raw material for the
+            # extreme-of-path daily heads (future-work #6) and one more
+            # signal for the GBM. A partial-day path silently underestimates
+            # the true extreme, so per-source coverage gates each value.
+            *(
+                pl.col(f"src_temp__{source}").max().alias(f"path__{source}__max")
+                for source in temp_sources
+            ),
+            *(
+                pl.col(f"src_temp__{source}").min().alias(f"path__{source}__min")
+                for source in temp_sources
+            ),
+            *(
+                pl.col(f"src_temp__{source}")
+                .is_not_null()
+                .sum()
+                .alias(f"path_covered__{source}")
+                for source in temp_sources
+            ),
         )
         .join(day_lengths, on="forecast_date", how="left")
         .with_columns(
             (pl.col("covered_hours") / pl.col("expected_hours")).alias(
                 "ewagg__coverage_frac"
-            )
+            ),
+            *(
+                pl.when(
+                    pl.col(f"path_covered__{source}") >= 0.8 * pl.col("expected_hours")
+                )
+                .then(pl.col(f"path__{source}__{bound}"))
+                .otherwise(None)
+                .alias(f"path__{source}__{bound}")
+                for source in temp_sources
+                for bound in ("max", "min")
+            ),
         )
-        .drop("covered_hours", "expected_hours")
+        .drop(
+            "covered_hours",
+            "expected_hours",
+            *(f"path_covered__{source}" for source in temp_sources),
+        )
         .sort("issue_time", "forecast_date")
     )
 
@@ -517,6 +555,10 @@ def build_daily_matrix(
         .with_columns(
             daily_bucket_expr(pl.col("lead_days").cast(pl.Float64)).alias("lead_bucket")
         )
+        # Providers publish 14-16-day dailies; lead_days beyond D8-10's edge
+        # get a null bucket, can never serve (DAILY_HORIZON_DAYS = 10), and
+        # polluted the leaderboard with an unpromotable None-bucket slice.
+        .filter(pl.col("lead_bucket").is_not_null())
         .join(
             _equal_weight_daily_aggregates(hourly_matrix, config),
             on=index,
@@ -740,6 +782,7 @@ def _synthetic_daily_matrix(
         .with_columns(
             daily_bucket_expr(pl.col("lead_days").cast(pl.Float64)).alias("lead_bucket")
         )
+        .filter(pl.col("lead_bucket").is_not_null())
         .join(
             _equal_weight_daily_aggregates(hourly_matrix, config), on=keys, how="left"
         )

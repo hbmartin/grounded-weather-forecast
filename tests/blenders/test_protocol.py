@@ -5,8 +5,10 @@ import polars as pl
 
 from grounded_weather_forecast.blenders import available_methods, get_factory
 from grounded_weather_forecast.blenders.protocol import finalize_point
+from grounded_weather_forecast.blenders.registry import supports_product
 from grounded_weather_forecast.contracts import (
     ForecastMatrix,
+    Product,
     SourceKind,
     SupervisedSlice,
     TargetKind,
@@ -97,6 +99,8 @@ class TestBoundsAcrossMethods:
         raw_mean = np.where(train.x.availability, train.x.values, 0.0).mean(axis=1)
         assert (raw_mean < 0).any()  # the fixture genuinely exercises the clamp
         for method_id in available_methods():
+            if not supports_product(method_id, Product.HOURLY, WIND):
+                continue  # variable-scoped away from wind
             point = get_factory(method_id)().fit(train).predict(train.x).point
             negatives = point[np.isfinite(point) & (point < 0.0)]
             assert negatives.size == 0, f"{method_id} emitted negative wind"

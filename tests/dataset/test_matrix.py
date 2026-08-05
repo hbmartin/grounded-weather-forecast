@@ -298,6 +298,13 @@ class TestBuildDailyMatrix:
         assert row["lead_days"] == 1  # issue Mar 22 local -> target Mar 23
         assert row["lead_bucket"] == "D1"
         assert row["source_kind"] == "live"
+        # rows past the last bucket edge are dropped, never a None slice
+        assert daily_matrix["lead_bucket"].null_count() == 0
+        # per-source hourly-path extreme features ride along for the daily heads
+        assert any(
+            column.startswith("path__") and column.endswith("__max")
+            for column in daily_matrix.columns
+        )
         contract = to_forecast_matrix(
             daily_matrix, daily_variable("temp_max_c"), daily=True
         )
