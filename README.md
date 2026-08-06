@@ -109,9 +109,14 @@ grounded-weather-forecast backtest --source live       # or --source synthetic
 #   --methods all|<ids>  --products hourly,daily  --window expanding|rolling
 #   --hourly-variables ...  --daily-variables ...  --semantics auto|inst|mean
 
-# 6b. Optional: cross-check station truth against lapse-adjusted Synoptic
-#    neighbors (free-signup token) and fit the radiation-shield error model.
-#    A drifting or decorrelating sensor alarms here before it poisons truth.
+# 6b. Optional: cross-check station truth against lapse-adjusted neighbor
+#    stations and fit the radiation-shield error model. A drifting or
+#    decorrelating sensor alarms here before it poisons truth. Keyless by
+#    default: nearby NWS METAR stations are discovered through the
+#    api.weather.gov points API; setting [truth_qc].synoptic_token routes
+#    through the Synoptic timeseries API instead. Widen
+#    [truth_qc].elevation_band_m when the only nearby METARs sit far above
+#    or below the station — the lapse adjustment is what makes them usable.
 grounded-weather-forecast truth-qc                      # --days 30
 
 # 7. Leaderboards (per-slice skill with Diebold-Mariano, aggregate, winners,

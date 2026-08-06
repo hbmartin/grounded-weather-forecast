@@ -294,3 +294,195 @@ class TestConfigSection:
 
         monkeypatch.setenv("SYNTOKEN", "abc123")
         assert resolve_token(config.truth_qc.synoptic_token) == "abc123"
+
+
+def nws_points_payload():
+    return {
+        "properties": {
+            "observationStations": "https://api.weather.gov/gridpoints/SGX/62,79/stations"
+        }
+    }
+
+
+def nws_station_feature(station_id, elevation_m, lat=34.28, lon=-117.17):
+    return {
+        "properties": {
+            "stationIdentifier": station_id,
+            "elevation": {"unitCode": "wmoUnit:m", "value": elevation_m},
+        },
+        "geometry": {"coordinates": [lon, lat]},
+    }
+
+
+def nws_directory_payload(features=None):
+    if features is None:
+        features = [
+            nws_station_feature("L35", SITE_ELEVATION - 50.0),
+            nws_station_feature("KSBD", SITE_ELEVATION + 100.0),
+            nws_station_feature("KRIV", SITE_ELEVATION - 200.0),
+            # outside the elevation band
+            nws_station_feature("KLAX", SITE_ELEVATION - 1370.0),
+            # outside the radius
+            nws_station_feature("KFAT", SITE_ELEVATION, lat=36.77, lon=-119.72),
+        ]
+    return {"features": features}
+
+
+def nws_observations_payload(offset=0.0, n_hours=24 * 10):
+    features = []
+    for h in range(n_hours):
+        temp = 20.0 + 5.0 * np.sin(2 * np.pi * h / 24) + offset
+        features.append(
+            {
+                "properties": {
+                    "timestamp": (START + timedelta(hours=h)).strftime(
+                        "%Y-%m-%dT%H:%M:%S+00:00"
+                    ),
+                    "temperature": {"unitCode": "wmoUnit:degC", "value": temp},
+                }
+            }
+        )
+    # one null-temperature METAR must be skipped, not crash
+    features.append(
+        {
+            "properties": {
+                "timestamp": (START + timedelta(hours=n_hours)).strftime(
+                    "%Y-%m-%dT%H:%M:%S+00:00"
+                ),
+                "temperature": {"unitCode": "wmoUnit:degC", "value": None},
+            }
+        }
+    )
+    return {"features": features}
+
+
+def nws_fetcher(urls_seen=None):
+    from grounded_weather_forecast.dataset import neighbors as neighbors_module
+
+    def fetch(url):
+        if urls_seen is not None:
+            urls_seen.append(url)
+        if url.startswith(neighbors_module.NWS_POINTS_URL):
+            return nws_points_payload()
+        if url.endswith("/stations"):
+            return nws_directory_payload()
+        return nws_observations_payload()
+
+    return fetch
+
+
+class TestNwsNeighbors:
+    def test_station_directory_filters_band_radius_and_caps(self, tmp_path):
+        from grounded_weather_forecast.dataset.neighbors import (
+            parse_station_directory,
+        )
+
+        stations = parse_station_directory(
+            nws_directory_payload(),
+            site_latitude=34.2768,
+            site_longitude=-117.1692,
+            site_elevation_m=SITE_ELEVATION,
+            elevation_band_m=300.0,
+            radius_km=25.0,
+        )
+        assert [station_id for station_id, _ in stations] == ["L35", "KSBD", "KRIV"]
+
+    def test_directory_cap_keeps_the_nearest(self):
+        from grounded_weather_forecast.dataset import neighbors as neighbors_module
+        from grounded_weather_forecast.dataset.neighbors import (
+            parse_station_directory,
+        )
+
+        many = [
+            nws_station_feature(f"S{i}", SITE_ELEVATION)
+            for i in range(neighbors_module._MAX_NWS_STATIONS + 4)
+        ]
+        stations = parse_station_directory(
+            {"features": many},
+            site_latitude=34.28,
+            site_longitude=-117.17,
+            site_elevation_m=SITE_ELEVATION,
+            elevation_band_m=300.0,
+            radius_km=25.0,
+        )
+        assert len(stations) == neighbors_module._MAX_NWS_STATIONS
+        assert stations[0][0] == "S0"
+
+    def test_observation_parsing_applies_lapse_and_skips_nulls(self):
+        from grounded_weather_forecast.dataset.neighbors import (
+            parse_station_observations,
+        )
+
+        frame = parse_station_observations(
+            nws_observations_payload(offset=0.0, n_hours=4),
+            "L35",
+            SITE_ELEVATION + 1000.0,
+            SITE_ELEVATION,
+            6.5,
+        )
+        assert frame.height == 4  # the null-temperature row is skipped
+        # a station 1 km higher reads colder; the lapse adds +6.5 C
+        assert frame["temp_c"][0] == pytest.approx(20.0 + 6.5)
+
+    def test_keyless_default_routes_to_nws(self, tmp_path):
+        config = write_config(tmp_path)
+        urls = []
+        checks = fetch_neighbor_checks(
+            config,
+            station_truth(),
+            fetcher=nws_fetcher(urls),
+            now=START + timedelta(hours=24 * 10),
+        )
+        assert any(url.startswith("https://api.weather.gov/points/") for url in urls)
+        assert sum("/observations?" in url for url in urls) == 3
+        assert checks.n_neighbors == 3
+        assert checks.drift_alert is False
+        assert checks.correlation_alert is False
+
+    def test_token_still_routes_to_synoptic(self, tmp_path):
+        config = write_config(
+            tmp_path,
+            extra_toml='[truth_qc]\nsynoptic_token = "tok"\n',
+        )
+        urls = []
+
+        def fetch(url):
+            urls.append(url)
+            return payload()
+
+        checks = fetch_neighbor_checks(
+            config,
+            station_truth(),
+            fetcher=fetch,
+            now=START + timedelta(hours=24 * 10),
+        )
+        assert len(urls) == 1
+        assert urls[0].startswith("https://api.synopticdata.com/")
+        assert checks.n_neighbors == 3
+
+    def test_malformed_points_payload_raises(self, tmp_path):
+        from grounded_weather_forecast.dataset.neighbors import NeighborError
+
+        config = write_config(tmp_path)
+        with pytest.raises(NeighborError, match="observationStations"):
+            fetch_neighbor_checks(
+                config,
+                station_truth(),
+                fetcher=lambda _url: {"properties": {}},
+                now=START,
+            )
+
+    def test_no_stations_in_band_is_unknown_not_error(self, tmp_path):
+        config = write_config(tmp_path)
+
+        def fetch(url):
+            if url.endswith("/stations"):
+                return {"features": []}
+            return nws_points_payload()
+
+        checks = fetch_neighbor_checks(
+            config, station_truth(), fetcher=fetch, now=START
+        )
+        assert checks.n_neighbors == 0
+        assert checks.drift_alert is None
+        assert checks.correlation_alert is None

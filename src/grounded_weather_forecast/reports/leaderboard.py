@@ -615,7 +615,13 @@ def slice_winners(
     per-variable reference overrides and MCS bootstrap parameters.
     """
     if board.is_empty():
-        return board
+        # A young archive's board is a bare frame with no columns at all;
+        # returning it verbatim broke every consumer that filters winner
+        # columns (the dashboard's reference-fallback stat, most visibly).
+        empty_keys = ["product", "variable", "lead_bucket"]
+        if "truth_semantics" in board.columns:
+            empty_keys.insert(2, "truth_semantics")
+        return _empty_winners(empty_keys)
     normalized_scores = _with_default_semantics(scores) if scores is not None else None
     n_bootstrap = promotion.mcs_bootstrap if promotion is not None else 500
     block_length = promotion.mcs_block_length if promotion is not None else None
