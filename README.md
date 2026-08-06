@@ -211,6 +211,20 @@ per variable (e.g. `pressure_sea_hpa = ["grounded_equal_weight",
 "damped_grounded_equal_weight"]`); skill columns keep their default meaning
 and extend with the configured references.
 
+Every `report` also appends to five append-only history ledgers under
+`artifacts/history/` — `quality.parquet` (per-evaluation leaderboard metrics
+plus a 14-day recent-window MAE, so genuine movement is not diluted by
+months of expanding-window history), `churn.parquet` (per-slice diffs
+between consecutive promoted releases, also rendered as
+`reports/selection_churn.md`), `verdicts.parquet` (A/B summaries: quantile
+recalibration win shares and promotion-gate agreement), `eprocess_wealth.parquet`
+(per-pair wealth snapshots, era-keyed across resets), and
+`served_quality.parquet` (daily realized served MAE vs its backtest
+promise). Appends are idempotent (re-running `report` is a no-op), bounded
+(~2 years by age plus row caps), carry full fingerprint provenance so
+trends segment across resets, and can never fail the report. The report
+prints a one-line quality delta comparing the two newest live evaluations.
+
 Natively-emitted quantiles can additionally be recalibrated at serve time:
 live leaderboard reports carry a "Quantile recalibration (offline holdout)"
 section that fits two mutually exclusive post-hoc repairs — PIT level
