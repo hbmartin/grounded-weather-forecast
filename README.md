@@ -118,9 +118,13 @@ grounded-weather-forecast truth-qc                      # --days 30
 #    absolute error, consumer %-within-3F), the provider error-correlation
 #    matrix, and self-verification of forecasts this system actually served.
 #    Also writes reports/dashboard.html — a fully offline, self-contained
-#    operator console (seven zones: liveness, data trust, learning
-#    readiness, evaluation, model internals, serving, explainability) with
-#    threshold alerts sourced from the existing config knobs.
+#    operator console (eight zones: liveness, data trust, learning
+#    readiness, evaluation, model internals, serving, explainability, and
+#    quality over time — trend charts over the artifacts/history ledgers:
+#    recent-window MAE per variable, selection churn per release, served
+#    MAE vs backtest promise, A/B verdict shares, and e-process wealth
+#    against the promotion threshold) with threshold alerts sourced from
+#    the existing config knobs.
 grounded-weather-forecast report
 
 # 8. Emit the current blended forecast (minutely + hourly + daily) as JSON.

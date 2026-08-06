@@ -62,8 +62,15 @@ def _options(
     return options
 
 
-def line_chart(labels: Sequence[str], series: Series, *, y_label: str) -> ChartSpec:
-    datasets = [
+def line_chart(
+    labels: Sequence[str],
+    series: Series,
+    *,
+    y_label: str,
+    reference: tuple[str, float] | None = None,
+) -> ChartSpec:
+    """Category-axis line chart; ``reference`` draws a dashed flat guide line."""
+    datasets: list[dict[str, object]] = [
         {
             "label": name,
             "data": list(values),
@@ -76,6 +83,19 @@ def line_chart(labels: Sequence[str], series: Series, *, y_label: str) -> ChartS
         }
         for index, (name, values) in enumerate(series)
     ]
+    if reference is not None:
+        reference_label, reference_value = reference
+        datasets.append(
+            {
+                "label": reference_label,
+                "data": [reference_value] * len(labels),
+                "borderColor": "muted",
+                "backgroundColor": "muted",
+                "borderDash": [4, 4],
+                "borderWidth": 1,
+                "pointRadius": 0,
+            }
+        )
     config = {
         "type": "line",
         "data": {"labels": list(labels), "datasets": datasets},
