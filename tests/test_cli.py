@@ -136,7 +136,7 @@ class TestQcCommand:
         # non-zero exit would report the whole nightly job as broken for the
         # first week, and the run ledger would record it as a real fault.
         assert code == 0
-        assert artifact["schema_version"] == 2
+        assert artifact["schema_version"] == 3
         assert artifact["drift_alert"] is None
         assert artifact["correlation_alert"] is None
         assert artifact["shield_alert"] is None
@@ -499,3 +499,62 @@ def test_report_served_ledger_records_only_the_products_own_rows(tmp_path, monke
     served = pl.read_parquet(served_path)
     assert served.height > 0
     assert set(served["product"].to_list()) == {"hourly"}
+
+
+def test_truth_qc_drift_streak_latches_after_three_days(tmp_path, monkeypatch):
+    import json
+    from types import SimpleNamespace
+
+    from grounded_weather_forecast.dataset.neighbors import DriftVerdict
+
+    config = write_config(tmp_path)
+    config.artifacts_dir.mkdir(parents=True, exist_ok=True)
+    verdict = DriftVerdict(
+        statistic_name="snht",
+        statistic=15.0,
+        critical=8.05,
+        exceeded=True,
+        snht_statistic=15.0,
+        pettitt_p=0.001,
+        attribution="station_drift",
+        break_date="2026-08-04",
+        days_used=30,
+        inversion_days_excluded=1,
+        neighbors_used=6,
+        series=pl.DataFrame(
+            schema={
+                "date": pl.Date(),
+                "difference": pl.Float64(),
+                "cusum": pl.Float64(),
+            }
+        ),
+        reason="test",
+    )
+    monkeypatch.setattr(
+        "grounded_weather_forecast.dataset.neighbors.drift_verdict",
+        lambda *_args, **_kwargs: verdict,
+    )
+    checks = SimpleNamespace(neighbors=pl.DataFrame({"stid": ["N1"]}))
+    truth = pl.DataFrame()
+
+    first = cli_module._drift_verdict_block(config, checks, truth)
+    assert first["streak"] == 1
+    assert first["latched"] is False
+
+    # a same-day re-run must not advance the latch
+    (config.artifacts_dir / "truth_qc.json").write_text(
+        json.dumps({"drift_verdict": first})
+    )
+    again = cli_module._drift_verdict_block(config, checks, truth)
+    assert again["streak"] == 1
+
+    # two prior days of exceedance -> today's run latches
+    seeded = dict(first)
+    seeded["streak"] = 2
+    seeded["as_of_date"] = "2000-01-01"
+    (config.artifacts_dir / "truth_qc.json").write_text(
+        json.dumps({"drift_verdict": seeded})
+    )
+    third = cli_module._drift_verdict_block(config, checks, truth)
+    assert third["streak"] == 3
+    assert third["latched"] is True

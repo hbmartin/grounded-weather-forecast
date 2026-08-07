@@ -83,6 +83,10 @@ class NeighborChecks:
     overlap_hours: int
     drift_reason: str
     correlation_reason: str
+    # The raw per-neighbor observations, so the attribution-grade
+    # ``drift_verdict`` can run pairwise statistics the collapsed
+    # consensus cannot support.
+    neighbors: pl.DataFrame | None = None
 
 
 def resolve_token(raw: str) -> str:
@@ -205,7 +209,7 @@ def parse_station_observations(
     site_elevation_m: float,
     lapse_k_per_km: float,
 ) -> pl.DataFrame:
-    """One station's METAR history -> (stid, ts, temp_c) lapse-adjusted."""
+    """One station's METAR history -> lapse-adjusted rows with elevation."""
     features = payload.get("features")
     if not isinstance(features, list):
         return _empty_neighbors()
@@ -239,6 +243,7 @@ def parse_station_observations(
             "stid": [station_id] * len(timestamps),
             "ts": timestamps,
             "temp_c": temperatures,
+            "elevation_m": [elevation_m] * len(timestamps),
         },
         schema_overrides={"ts": pl.Datetime("us", "UTC")},
     )
@@ -250,6 +255,7 @@ def _empty_neighbors() -> pl.DataFrame:
             "stid": pl.String(),
             "ts": pl.Datetime("us", "UTC"),
             "temp_c": pl.Float64(),
+            "elevation_m": pl.Float64(),
         }
     )
 
@@ -362,19 +368,325 @@ def parse_neighbors(
                         "stid": [r[0] for r in rows],
                         "ts": [datetime.fromisoformat(r[1]) for r in rows],
                         "temp_c": [r[2] for r in rows],
+                        "elevation_m": [elevation_m] * len(rows),
                     },
                     schema_overrides={"ts": pl.Datetime("us", "UTC")},
                 )
             )
     if not frames:
-        return pl.DataFrame(
-            schema={
-                "stid": pl.String(),
-                "ts": pl.Datetime("us", "UTC"),
-                "temp_c": pl.Float64(),
+        return _empty_neighbors()
+    return pl.concat(frames).sort("stid", "ts")
+
+
+_DAYTIME_START_HOUR = 12
+_DAYTIME_END_HOUR = 18
+# A day's difference median needs most of the daytime window: partial first/
+# last days carry inflated variance exactly where end-sensitive SNHT looks.
+_MIN_DAYTIME_HOURS = 6
+_DRIFT_ELEVATION_BAND_M = 700.0
+_MIN_LAPSE_STATIONS = 4
+_MIN_SIMILAR_NEIGHBORS = 3
+_DRIFT_LATCH_RUNS = 3
+
+
+@dataclass(frozen=True, slots=True)
+class DriftVerdict:
+    """Change-point verdict on the screened station-minus-consensus series.
+
+    The quick ``cross_check`` median alert stays as the fast tripwire; this
+    is the attribution-grade verdict: SNHT (or Pettitt) on a daytime-only,
+    inversion-screened, elevation-similar daily difference series, with
+    mini pairwise-PHA deciding whether a detected break belongs to the
+    station or to a regional regime. Only a latched ``station_drift`` may
+    ever gate fitting.
+    """
+
+    statistic_name: str
+    statistic: float | None
+    critical: float | None
+    exceeded: bool | None
+    snht_statistic: float | None
+    pettitt_p: float | None
+    attribution: str | None
+    break_date: str | None
+    days_used: int
+    inversion_days_excluded: int
+    neighbors_used: int
+    series: pl.DataFrame  # date, difference, cusum
+    reason: str
+
+
+def _daytime(frame: pl.DataFrame, column: str, timezone: str) -> pl.DataFrame:
+    """Rows whose local hour sits in the mixed-boundary-layer window.
+
+    Fixed-lapse adjustment is most defensible in a well-mixed daytime
+    boundary layer; nocturnal cold-air pooling at a 1400 m site vs valley
+    neighbors inverts the profile and would fabricate drift.
+    """
+    local_hour = (
+        pl.col(column).dt.convert_time_zone(timezone).dt.hour().alias("_local_hour")
+    )
+    return (
+        frame.with_columns(local_hour)
+        .filter(
+            pl.col("_local_hour").is_between(
+                _DAYTIME_START_HOUR, _DAYTIME_END_HOUR, closed="both"
+            )
+        )
+        .drop("_local_hour")
+    )
+
+
+def inversion_dates(
+    neighbors: pl.DataFrame, *, lapse_k_per_km: float, timezone: str
+) -> pl.DataFrame:
+    """Per-day fitted lapse across the neighbor network, flagging inversions.
+
+    Temps arrive already lapse-adjusted, so regressing them on elevation
+    recovers the residual profile: a raw lapse of ``fitted + lapse_k`` at or
+    above zero means temperature rising with height — an inversion day the
+    fixed adjustment cannot represent, excluded from drift accumulation.
+    """
+    empty = pl.DataFrame(
+        schema={
+            "date": pl.Date(),
+            "raw_lapse_k_per_km": pl.Float64(),
+            "inversion": pl.Boolean(),
+        }
+    )
+    if neighbors.is_empty() or "elevation_m" not in neighbors.columns:
+        return empty
+    daily = (
+        _daytime(neighbors, "ts", timezone)
+        .group_by(
+            pl.col("ts").dt.convert_time_zone(timezone).dt.date().alias("date"),
+            "stid",
+        )
+        .agg(
+            pl.col("temp_c").mean().alias("temp_c"),
+            pl.col("elevation_m").first().alias("elevation_m"),
+        )
+    )
+    rows: list[dict[str, object]] = []
+    for key, group in daily.partition_by("date", as_dict=True).items():
+        if group["elevation_m"].n_unique() < _MIN_LAPSE_STATIONS:
+            continue
+        elevation_km = group["elevation_m"].to_numpy().astype(np.float64) / 1000.0
+        temps = group["temp_c"].to_numpy().astype(np.float64)
+        design = np.column_stack([elevation_km, np.ones_like(elevation_km)])
+        slope = float(np.linalg.lstsq(design, temps, rcond=None)[0][0])
+        raw_lapse = slope - lapse_k_per_km
+        rows.append(
+            {
+                "date": key[0],
+                "raw_lapse_k_per_km": raw_lapse,
+                "inversion": raw_lapse >= 0.0,
             }
         )
-    return pl.concat(frames).sort("stid", "ts")
+    if not rows:
+        return empty
+    return pl.DataFrame(rows, schema_overrides=dict(empty.schema)).sort("date")
+
+
+def _similar_neighbors(
+    neighbors: pl.DataFrame, site_elevation_m: float
+) -> pl.DataFrame:
+    """Elevation-similar subset for the drift consensus, if it is deep enough.
+
+    Valley METARs a kilometre below the site owe their comparability
+    entirely to the lapse adjustment; the drift consensus prefers stations
+    within a tighter band (PRISM's layer logic in miniature) and keeps the
+    full set only when the similar subset is too thin to form a consensus.
+    """
+    if "elevation_m" not in neighbors.columns:
+        return neighbors
+    similar = neighbors.filter(
+        (pl.col("elevation_m") - site_elevation_m).abs() <= _DRIFT_ELEVATION_BAND_M
+    )
+    if similar["stid"].n_unique() >= _MIN_SIMILAR_NEIGHBORS:
+        return similar
+    return neighbors
+
+
+def drift_verdict(
+    truth_hourly: pl.DataFrame,
+    neighbors: pl.DataFrame,
+    *,
+    timezone: str,
+    lapse_k_per_km: float,
+    site_elevation_m: float,
+    statistic: str = "snht",
+) -> DriftVerdict:
+    """Attribution-grade drift verdict on the screened daily series."""
+    from grounded_weather_forecast.dataset import drift_stats  # noqa: PLC0415
+
+    empty_series = pl.DataFrame(
+        schema={"date": pl.Date(), "difference": pl.Float64(), "cusum": pl.Float64()}
+    )
+    inversions = inversion_dates(
+        neighbors, lapse_k_per_km=lapse_k_per_km, timezone=timezone
+    )
+    excluded = inversions.filter(pl.col("inversion"))["date"].to_list()
+    drift_pool = _similar_neighbors(neighbors, site_elevation_m)
+    daytime_pool = (
+        _daytime(drift_pool, "ts", timezone)
+        if not drift_pool.is_empty()
+        else drift_pool
+    )
+    consensus = neighbor_consensus(daytime_pool)
+    joined = (
+        truth_hourly.select("valid_hour", "t__temp_c__inst")
+        .drop_nulls()
+        .join(consensus, on="valid_hour", how="inner")
+        .with_columns(
+            (pl.col("t__temp_c__inst") - pl.col("consensus_c")).alias("difference"),
+            pl.col("valid_hour").dt.convert_time_zone(timezone).dt.date().alias("date"),
+        )
+    )
+    daily = (
+        joined.group_by("date")
+        .agg(pl.col("difference").median(), pl.len().alias("hours"))
+        .filter(
+            ~pl.col("date").is_in(excluded) & (pl.col("hours") >= _MIN_DAYTIME_HOURS)
+        )
+        .drop("hours")
+        .sort("date")
+    )
+    if daily.height < drift_stats.MIN_SERIES_DAYS:
+        return DriftVerdict(
+            statistic_name=statistic,
+            statistic=None,
+            critical=None,
+            exceeded=None,
+            snht_statistic=None,
+            pettitt_p=None,
+            attribution=None,
+            break_date=None,
+            days_used=daily.height,
+            inversion_days_excluded=len(excluded),
+            neighbors_used=int(daytime_pool["stid"].n_unique())
+            if not daytime_pool.is_empty()
+            else 0,
+            series=empty_series,
+            reason=(
+                f"need at least {drift_stats.MIN_SERIES_DAYS} screened daily "
+                f"comparisons; got {daily.height}"
+            ),
+        )
+    values = daily["difference"].to_numpy().astype(np.float64)
+    snht_test = drift_stats.snht(values)
+    pettitt_test = drift_stats.pettitt(values)
+    critical = drift_stats.snht_critical_value(values.shape[0])
+    if statistic == "pettitt":
+        chosen_statistic = pettitt_test.statistic
+        exceeded = pettitt_test.p_value is not None and pettitt_test.p_value < 0.05
+        critical_value: float | None = None
+    else:
+        chosen_statistic = snht_test.statistic
+        exceeded = snht_test.statistic > critical
+        critical_value = critical
+    attribution: str | None = None
+    break_date: str | None = None
+    if exceeded:
+        station_series, pair_series = attribution_series(
+            truth_hourly, daytime_pool, timezone=timezone, excluded_dates=excluded
+        )
+        result = drift_stats.attribute_break(station_series, pair_series)
+        attribution = result.verdict
+        break_date = result.break_date.isoformat() if result.break_date else None
+    series = daily.with_columns(pl.Series("cusum", drift_stats.craddock_cusum(values)))
+    return DriftVerdict(
+        statistic_name=statistic,
+        statistic=float(chosen_statistic),
+        critical=critical_value,
+        exceeded=bool(exceeded),
+        snht_statistic=float(snht_test.statistic),
+        pettitt_p=pettitt_test.p_value,
+        attribution=attribution,
+        break_date=break_date,
+        days_used=daily.height,
+        inversion_days_excluded=len(excluded),
+        neighbors_used=int(daytime_pool["stid"].n_unique()),
+        series=series,
+        reason=(
+            f"{statistic} statistic {chosen_statistic:.2f} on {daily.height} "
+            f"screened days ({len(excluded)} inversion days excluded)"
+        ),
+    )
+
+
+def attribution_series(
+    truth_hourly: pl.DataFrame,
+    neighbors: pl.DataFrame,
+    *,
+    timezone: str,
+    excluded_dates: list | None = None,
+) -> tuple[dict[str, pl.DataFrame], dict[str, pl.DataFrame]]:
+    """Daily difference series for the mini pairwise-PHA attribution.
+
+    Station-minus-neighbor-k series localize a break to the station when
+    most of them break together; neighbor-minus-neighbor pairs are the
+    control — they break when the network (the regime) moved.
+    """
+    excluded = excluded_dates or []
+    per_neighbor = (
+        neighbors.with_columns(
+            pl.col("ts").dt.truncate("1h").alias("valid_hour"),
+        )
+        .group_by("valid_hour", "stid")
+        .agg(pl.col("temp_c").mean())
+    )
+    station = truth_hourly.select("valid_hour", "t__temp_c__inst").drop_nulls()
+    date_expr = (
+        pl.col("valid_hour").dt.convert_time_zone(timezone).dt.date().alias("date")
+    )
+    station_series: dict[str, pl.DataFrame] = {}
+    frames: dict[str, pl.DataFrame] = {}
+    for stid in sorted(per_neighbor["stid"].unique().to_list()):
+        frames[stid] = per_neighbor.filter(pl.col("stid") == stid).select(
+            "valid_hour", "temp_c"
+        )
+        joined = station.join(frames[stid], on="valid_hour", how="inner")
+        station_series[stid] = (
+            joined.with_columns(date_expr)
+            .group_by("date")
+            .agg(
+                (pl.col("t__temp_c__inst") - pl.col("temp_c"))
+                .median()
+                .alias("difference"),
+                pl.len().alias("hours"),
+            )
+            .filter(
+                ~pl.col("date").is_in(excluded)
+                & (pl.col("hours") >= _MIN_DAYTIME_HOURS)
+            )
+            .drop("hours")
+            .sort("date")
+        )
+    pair_series: dict[str, pl.DataFrame] = {}
+    station_ids = sorted(frames)
+    for index, first in enumerate(station_ids):
+        for second in station_ids[index + 1 :]:
+            joined = frames[first].join(
+                frames[second], on="valid_hour", how="inner", suffix="_second"
+            )
+            pair_series[f"{first}~{second}"] = (
+                joined.with_columns(date_expr)
+                .group_by("date")
+                .agg(
+                    (pl.col("temp_c") - pl.col("temp_c_second"))
+                    .median()
+                    .alias("difference"),
+                    pl.len().alias("hours"),
+                )
+                .filter(
+                    ~pl.col("date").is_in(excluded)
+                    & (pl.col("hours") >= _MIN_DAYTIME_HOURS)
+                )
+                .drop("hours")
+                .sort("date")
+            )
+    return station_series, pair_series
 
 
 def neighbor_consensus(neighbors: pl.DataFrame) -> pl.DataFrame:
@@ -576,4 +888,5 @@ def fetch_neighbor_checks(
         overlap_hours=checks.overlap_hours,
         drift_reason=checks.drift_reason,
         correlation_reason=checks.correlation_reason,
+        neighbors=neighbors,
     )

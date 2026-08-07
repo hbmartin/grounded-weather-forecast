@@ -207,12 +207,19 @@ class BacktestConfig:
 
 @dataclass(frozen=True, slots=True)
 class TruthQcConfig:
-    """Neighbor-station cross-checks (Synoptic free tier)."""
+    """Neighbor-station cross-checks (keyless NWS METAR; Synoptic opt-in)."""
 
     synoptic_token: str = ""
     radius_km: float = 25.0
     elevation_band_m: float = 300.0
     lapse_k_per_km: float = 6.5
+    # Which change-point statistic GATES the drift verdict; both are always
+    # computed and recorded so the alternatives stay comparable.
+    drift_statistic: str = "snht"
+    # A latched station-drift verdict quarantines the affected truth days
+    # from new fits when true. Ships disabled: alarm precision must earn
+    # trust before an alarm is allowed to act (future-work #23's caution).
+    gate_fitting: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -699,6 +706,13 @@ def _truth_qc(raw: Mapping[str, Any]) -> TruthQcConfig:
         lapse_k_per_km=_positive_number(
             section.get("lapse_k_per_km", 6.5), "lapse_k_per_km", "truth_qc"
         ),
+        drift_statistic=_choice(
+            section.get("drift_statistic", "snht"),
+            ("snht", "pettitt"),
+            "drift_statistic",
+            "truth_qc",
+        ),
+        gate_fitting=bool(section.get("gate_fitting", False)),
     )
 
 

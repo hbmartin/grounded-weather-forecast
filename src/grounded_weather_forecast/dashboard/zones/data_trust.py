@@ -6,7 +6,11 @@ from datetime import date
 import polars as pl
 
 from grounded_weather_forecast.contracts import finite_number
-from grounded_weather_forecast.dashboard.charts import bar_chart, sequential_class
+from grounded_weather_forecast.dashboard.charts import (
+    bar_chart,
+    line_chart,
+    sequential_class,
+)
 from grounded_weather_forecast.dashboard.context import DashboardContext
 from grounded_weather_forecast.dashboard.copy import PANEL_COPY, ZONE_INTROS
 from grounded_weather_forecast.dashboard.derive import Derived
@@ -254,6 +258,74 @@ def _provenance(ctx: DashboardContext) -> Panel:
     )
 
 
+def _mapping(value: object) -> dict[str, object]:
+    if isinstance(value, dict):
+        return {str(key): item for key, item in value.items()}
+    return {}
+
+
+def _truth_cross_check(ctx: DashboardContext) -> Panel:
+    payload = _mapping(ctx.truth_qc)
+    verdict = _mapping(payload.get("drift_verdict"))
+    if not payload or not verdict:
+        return empty_panel(
+            "b5",
+            "b5",
+            "Station truth cross-check",
+            "info",
+            "no truth-qc artifact yet — the nightly truth-qc cron writes it",
+        )
+    series = verdict.get("series")
+    rows = series if isinstance(series, list) else []
+    labels = [str(row.get("date", "")) for row in rows if isinstance(row, dict)]
+    differences = [
+        finite_number(row.get("difference")) for row in rows if isinstance(row, dict)
+    ]
+    cusums = [finite_number(row.get("cusum")) for row in rows if isinstance(row, dict)]
+    latched = bool(verdict.get("latched"))
+    exceeded = verdict.get("exceeded")
+    attribution = verdict.get("attribution")
+    status: PanelStatus = (
+        "red"
+        if latched
+        else "amber"
+        if exceeded
+        else "info"
+        if exceeded is None
+        else "ok"
+    )
+    stats = (
+        Stat(
+            "verdict",
+            str(attribution) if attribution else "quiet",
+            status if status != "info" else "ok",
+        ),
+        Stat("streak", str(verdict.get("streak", 0))),
+        Stat("days used", str(verdict.get("days_used", 0))),
+        Stat("inversion days excluded", str(verdict.get("inversion_days_excluded", 0))),
+    )
+    chart = None
+    if labels and any(value is not None for value in differences):
+        chart = line_chart(
+            labels,
+            [
+                ("station - consensus (degC)", differences),
+                ("Craddock cusum", cusums),
+            ],
+            y_label="degC",
+            reference=("no drift", 0.0),
+        )
+    return Panel(
+        panel_id="b5",
+        title="Station truth cross-check",
+        status=status,
+        copy=PANEL_COPY["b5"],
+        intro=str(verdict.get("reason", "")),
+        stats=stats,
+        chart=chart,
+    )
+
+
 def build(ctx: DashboardContext, derived: Derived) -> Zone:  # noqa: ARG001
     return Zone(
         zone_id="B",
@@ -264,5 +336,6 @@ def build(ctx: DashboardContext, derived: Derived) -> Zone:  # noqa: ARG001
             _coverage_calendar(ctx),
             _provider_nulls(ctx),
             _provenance(ctx),
+            _truth_cross_check(ctx),
         ),
     )

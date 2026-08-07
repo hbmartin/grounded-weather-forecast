@@ -451,3 +451,59 @@ def test_zone_b_non_finite_coverage_is_not_healthy(tmp_path):
     panel = next(p for p in zone.panels if p.panel_id == "b2")
 
     assert panel.status == "amber", "all-NaN coverage must not render ok"
+
+
+def _truth_cross_check_panel(tmp_path, payload):
+    from dataclasses import replace
+
+    from grounded_weather_forecast.dashboard.zones import data_trust
+
+    ctx = replace(cold_context(tmp_path), truth_qc=payload)
+    zone = data_trust.build(ctx, derive(ctx))
+    return next(panel for panel in zone.panels if panel.panel_id == "b5")
+
+
+def test_zone_b_truth_cross_check_renders_young_without_artifact(tmp_path):
+    panel = _truth_cross_check_panel(tmp_path, None)
+    assert panel.status == "info"
+    assert panel.empty_reason is not None
+
+
+def test_zone_b_truth_cross_check_latched_verdict_is_red(tmp_path):
+    payload = {
+        "drift_verdict": {
+            "latched": True,
+            "exceeded": True,
+            "attribution": "station_drift",
+            "streak": 3,
+            "days_used": 30,
+            "inversion_days_excluded": 2,
+            "reason": "snht statistic 15.0 on 30 screened days",
+            "series": [
+                {"date": "2026-08-04", "difference": -1.2, "cusum": -1.2},
+                {"date": "2026-08-05", "difference": -1.1, "cusum": -2.3},
+            ],
+        }
+    }
+    panel = _truth_cross_check_panel(tmp_path, payload)
+    assert panel.status == "red"
+    assert panel.chart is not None
+    guide = panel.chart.config["data"]["datasets"][-1]
+    assert guide["borderDash"] == [4, 4]
+
+
+def test_zone_b_truth_cross_check_quiet_verdict_is_ok(tmp_path):
+    payload = {
+        "drift_verdict": {
+            "latched": False,
+            "exceeded": False,
+            "attribution": None,
+            "streak": 0,
+            "days_used": 28,
+            "inversion_days_excluded": 0,
+            "reason": "snht statistic 2.1 on 28 screened days",
+            "series": [],
+        }
+    }
+    panel = _truth_cross_check_panel(tmp_path, payload)
+    assert panel.status == "ok"

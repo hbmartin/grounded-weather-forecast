@@ -203,3 +203,54 @@ class TestResidualTierZeroInflated:
         payload = json.loads(path.read_text(encoding="utf-8"))
         assert any(alarm["tier"] == "residual" for alarm in payload["alarms"])
         assert payload["notes"] == []
+
+
+def truth_shift_matrix(offset=6.0, days=40, sources=("a", "b", "c", "d", "e")):
+    """The TRUTH shifts three days before the end: every source alarms."""
+    matrix = synthetic_hourly_matrix(days=days, sources=sources, noise_sd=0.4, seed=51)
+    cutover = matrix["valid_time"].max() - pl.duration(days=3)
+    return matrix.with_columns(
+        pl.when(pl.col("valid_time") > cutover)
+        .then(pl.col("t__temp_c__inst") + offset)
+        .otherwise(pl.col("t__temp_c__inst"))
+        .alias("t__temp_c__inst")
+    )
+
+
+class TestCommonMode:
+    def test_wall_of_alarms_collapses_to_an_attributed_headline(self):
+        truth_qc = {"drift_verdict": {"latched": True, "attribution": "station_drift"}}
+        report = drift_report(truth_shift_matrix(), (TEMP,), truth_qc)
+        tiers = report["tier"].to_list()
+        assert "common_mode" in tiers
+        assert "residual" not in tiers  # every per-source row demoted
+        headline = report.filter(pl.col("tier") == "common_mode").row(0, named=True)
+        assert "suspect station truth" in headline["detail"]
+        assert headline["source"] == "(common)"
+
+    def test_regime_verdict_reads_as_regime(self):
+        truth_qc = {"drift_verdict": {"latched": False, "attribution": "regime"}}
+        report = drift_report(truth_shift_matrix(), (TEMP,), truth_qc)
+        headline = report.filter(pl.col("tier") == "common_mode").row(0, named=True)
+        assert "regime event" in headline["detail"]
+
+    def test_missing_verdict_asks_for_truth_qc(self):
+        report = drift_report(truth_shift_matrix(), (TEMP,), None)
+        headline = report.filter(pl.col("tier") == "common_mode").row(0, named=True)
+        assert "run truth-qc" in headline["detail"]
+
+    def test_single_source_alarm_stays_per_source(self):
+        report = drift_report(swap_matrix(offset=6.0), (TEMP,))
+        tiers = report["tier"].to_list()
+        assert "common_mode" not in tiers
+        assert "residual" in tiers
+
+    def test_artifact_routes_demoted_rows_to_notes(self, tmp_path):
+        path = tmp_path / "drift.json"
+        write_drift_artifact(drift_report(truth_shift_matrix(), (TEMP,), None), path)
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        alarm_tiers = {alarm["tier"] for alarm in payload["alarms"]}
+        note_tiers = {note["tier"] for note in payload["notes"]}
+        assert "common_mode" in alarm_tiers
+        assert "residual_common" not in alarm_tiers
+        assert "residual_common" in note_tiers

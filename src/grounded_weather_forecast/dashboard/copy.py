@@ -157,6 +157,26 @@ PANEL_COPY: Mapping[str, PanelCopy] = {
         ),
         thresholds="Any frame carrying mixed source_kind values is a red.",
     ),
+    "b5": PanelCopy(
+        what=(
+            "SNHT change-point verdict on the daytime, inversion-screened "
+            "station-minus-neighbor daily series, with the Craddock cusum "
+            "and pairwise attribution (station drift vs regime)."
+        ),
+        why=(
+            "Everything upstream calibrates to the station; a drifted "
+            "sensor poisons every fit. When all providers alarm at once the "
+            "common factor is the station or the regime — this panel is the "
+            "arbiter. Drifts persist, regimes revert, so the verdict only "
+            "latches after three consecutive daily exceedances."
+        ),
+        thresholds=(
+            "Amber on an SNHT exceedance (small-sample criticals, 95%); red "
+            "only when a station-drift attribution latches for 3 straight "
+            "days. [truth_qc].gate_fitting decides whether a latch also "
+            "quarantines training labels (ships off)."
+        ),
+    ),
     "c1": PanelCopy(
         what=(
             "How much live archive exists versus what the first "

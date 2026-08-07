@@ -143,7 +143,7 @@ PoP = 1.0, no provider above 0.3) is the preview.
     consensus-deviation tier still divides by a near-zero baseline for
     zero-inflated variables (observed: statistic 8333 on a "+0.00 mm" shift).
     Apply the same MAD-floor + skip-note treatment to the consensus tier.
-    _Trigger: soon; same failure family as the fixed one._
+    _Done 2026-08-04: `CONSENSUS_SKIPPED_TIER` ships the floored robust scale._
 23. **Drift-alarm automation.** Alarms currently feed nothing. Wire the fast
     consensus tier to a grounding-state down-weight and the slow
     (Page–Hinkley) tier to a state reset + operator alert, with the
@@ -154,6 +154,12 @@ PoP = 1.0, no provider above 0.3) is the preview.
     on one variable, suppress anchoring/promotion for that variable (the
     cross-method invariant from the improvement plan §5 P3). _Trigger: with
     item 19 (needs a trustworthy external reference)._
+    _Shipped 2026-08-07: SNHT/Pettitt drift verdict with mini-PHA
+    attribution and inversion screening (`dataset/drift_stats.py`,
+    `drift_verdict`), the drift report's common-mode collapse, and the
+    `[truth_qc].gate_fitting` truth quarantine (default off until alarm
+    precision earns trust)._
+
 25. **Alignment-study thin-archive handling.** `_MIN_ROWS = 72` still makes
     dual-semantics variables default silently to instantaneous; hard-code the
     known-unambiguous cases and report default-vs-data-backed per variable.

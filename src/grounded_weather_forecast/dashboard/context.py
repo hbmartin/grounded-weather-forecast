@@ -53,6 +53,7 @@ class DashboardContext:
     releases: tuple[Mapping[str, object], ...] = ()
     alignment: Mapping[str, object] | None = None
     drift: Mapping[str, object] | None = None
+    truth_qc: Mapping[str, object] | None = None
     observability_states: tuple[ObservabilitySnapshot, ...] = ()
     observability_history: pl.DataFrame = field(default_factory=pl.DataFrame)
     runs: pl.DataFrame = field(default_factory=pl.DataFrame)
@@ -318,6 +319,11 @@ def collect_context(config: Config, *, now: datetime | None = None) -> Dashboard
             config.artifacts_dir / "drift.json",
             unreadable,
             label="artifacts/drift.json",
+        ),
+        truth_qc=_try_json(
+            config.artifacts_dir / "truth_qc.json",
+            unreadable,
+            label="artifacts/truth_qc.json",
         ),
         observability_states=_observability_states(config, unreadable),
         observability_history=_observability_history(config, unreadable),

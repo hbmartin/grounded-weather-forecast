@@ -436,6 +436,80 @@ def _cmd_backfill(config: Config, args: argparse.Namespace) -> int:
     return 0
 
 
+def _drift_verdict_block(
+    config: Config, checks: object, hourly_truth: pl.DataFrame
+) -> dict[str, object]:
+    """Attribution-grade verdict with a latch persisted across cron runs.
+
+    The streak lives in the previous artifact: SNHT is end-sensitive and
+    daily differences are autocorrelated, so a single exceedance is noise
+    until it survives three consecutive daily evaluations — drifts persist,
+    regimes revert. Only a persistent ``station_drift`` attribution latches.
+    """
+    import json  # noqa: PLC0415
+
+    from grounded_weather_forecast.dataset.neighbors import (  # noqa: PLC0415
+        DriftVerdict,
+        drift_verdict,
+    )
+
+    neighbors = getattr(checks, "neighbors", None)
+    if neighbors is None or neighbors.is_empty():
+        return {
+            "statistic_name": config.truth_qc.drift_statistic,
+            "exceeded": None,
+            "attribution": None,
+            "streak": 0,
+            "latched": False,
+            "reason": "no neighbor observations",
+        }
+    verdict: DriftVerdict = drift_verdict(
+        hourly_truth,
+        neighbors,
+        timezone=config.station.timezone,
+        lapse_k_per_km=config.truth_qc.lapse_k_per_km,
+        site_elevation_m=config.station.elevation_m,
+        statistic=config.truth_qc.drift_statistic,
+    )
+    previous_streak = 0
+    previous_date: object = None
+    artifact_path = config.artifacts_dir / "truth_qc.json"
+    try:
+        previous = json.loads(artifact_path.read_text(encoding="utf-8"))
+        block = previous.get("drift_verdict", {})
+        previous_streak = int(block.get("streak", 0))
+        previous_date = block.get("as_of_date")
+    except (OSError, ValueError, AttributeError):
+        previous_streak = 0
+    today = datetime.now(tz=UTC).date().isoformat()
+    if not verdict.exceeded:
+        streak = 0
+    elif previous_date == today:
+        # A same-day re-run must not double-count toward the latch.
+        streak = max(previous_streak, 1)
+    else:
+        streak = previous_streak + 1
+    latched = streak >= 3 and verdict.attribution == "station_drift"
+    return {
+        "as_of_date": today,
+        "statistic_name": verdict.statistic_name,
+        "statistic": verdict.statistic,
+        "critical": verdict.critical,
+        "exceeded": verdict.exceeded,
+        "snht_statistic": verdict.snht_statistic,
+        "pettitt_p": verdict.pettitt_p,
+        "attribution": verdict.attribution,
+        "break_date": verdict.break_date,
+        "days_used": verdict.days_used,
+        "inversion_days_excluded": verdict.inversion_days_excluded,
+        "neighbors_used": verdict.neighbors_used,
+        "streak": streak,
+        "latched": latched,
+        "reason": verdict.reason,
+        "series": verdict.series.to_dicts(),
+    }
+
+
 def _cmd_truth_qc(config: Config, args: argparse.Namespace) -> int:
     import json  # noqa: PLC0415
 
@@ -463,8 +537,9 @@ def _cmd_truth_qc(config: Config, args: argparse.Namespace) -> int:
     except (NeighborError, OSError, ValueError) as exc:
         print(f"truth-qc failed: {exc}")
         return 1
+    verdict_block = _drift_verdict_block(config, checks, hourly_truth)
     artifact: dict[str, object] = {
-        "schema_version": 2,
+        "schema_version": 3,
         "history_days": args.days,
         "n_neighbors": checks.n_neighbors,
         "overlap_hours": checks.overlap_hours,
@@ -473,6 +548,7 @@ def _cmd_truth_qc(config: Config, args: argparse.Namespace) -> int:
         "correlation_alert": checks.correlation_alert,
         "correlation_reason": checks.correlation_reason,
         "daily_drift": checks.daily_drift.to_dicts(),
+        "drift_verdict": verdict_block,
         "shield_alert": None,
         "shield_reason": "insufficient independent daytime neighbor overlap",
     }
@@ -528,6 +604,12 @@ def _cmd_truth_qc(config: Config, args: argparse.Namespace) -> int:
     print(f"overlap: {checks.overlap_hours} hours")
     print(
         f"drift alert: {checks.drift_alert}  correlation alert: {checks.correlation_alert}"
+    )
+    print(
+        f"drift verdict: exceeded={verdict_block['exceeded']} "
+        f"attribution={verdict_block['attribution']} "
+        f"streak={verdict_block['streak']} latched={verdict_block['latched']} "
+        f"({verdict_block['reason']})"
     )
     print(f"shield: {shield_note}")
     print(f"wrote {config.artifacts_dir / 'truth_qc.json'}")
@@ -903,7 +985,18 @@ def _cmd_report(config: Config) -> int:
                 write_drift_artifact,
             )
 
-            alarms = drift_report(matrix, HOURLY_VARIABLES)
+            truth_qc_payload: dict[str, object] | None = None
+            truth_qc_path = config.artifacts_dir / "truth_qc.json"
+            if truth_qc_path.exists():
+                import json  # noqa: PLC0415
+
+                try:
+                    truth_qc_payload = json.loads(
+                        truth_qc_path.read_text(encoding="utf-8")
+                    )
+                except (OSError, ValueError):
+                    truth_qc_payload = None
+            alarms = drift_report(matrix, HOURLY_VARIABLES, truth_qc_payload)
             write_drift_artifact(alarms, config.artifacts_dir / "drift.json")
             if alarms.is_empty():
                 print("drift: no alarms")
