@@ -255,3 +255,22 @@ class TestRunner:
         empty = run_minutely_backtest(matrix.head(0), grid, MinutelyRequest(), config)
         assert empty.is_empty()
         assert empty.schema == SCORES_SCHEMA
+
+
+def test_runner_never_emits_unscoreable_rows(tmp_path):
+    """Null y_true would reach Selection.mae as NaN and disarm the live gate."""
+    config = write_config(
+        tmp_path,
+        extra_toml="\n[backtest]\ninitial_train_days = 10\nstep_days = 5\n",
+    )
+    matrix, grid = minutely_case(days=25)
+    # punch a truth hole covering some test minutes
+    holed = grid.filter(
+        ~pl.col("valid_time").is_between(
+            utc(2026, 1, 18), utc(2026, 1, 19), closed="left"
+        )
+    )
+    scores = run_minutely_backtest(matrix, holed, MinutelyRequest(), config)
+    assert scores.height > 0
+    assert scores["y_true"].null_count() == 0
+    assert scores["y_true"].is_nan().sum() == 0
