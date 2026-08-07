@@ -192,3 +192,11 @@ PoP = 1.0, no provider above 0.3) is the preview.
 30. **Provider-tier upgrades.** WeatherKit (Apple, $99/yr dev account,
     500k calls/mo) and Met Office DataHub as further diverse feeds; both have
     collector plugins already. _Trigger: operator appetite._
+31. **Deeper build-funnel instrumentation.** The shipped funnel ledger
+    (2026-08) records layer endpoints (collector → long → matrix); the
+    intermediate steps — post-QC, post-exclusion, post-cap, post-coverage-gate
+    row counts — need counters inside the matrix builders. Worth adding the
+    first time a funnel discrepancy needs attribution beyond "lost between
+    long and matrix". Push-style alerting (the freshness alarms currently
+    surface only in report output and the dashboard) is a similarly cheap
+    follow-on. _Trigger: first unexplained funnel loss, or a missed alarm._

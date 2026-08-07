@@ -191,6 +191,11 @@ class TestLedgerEngine:
             "verdicts",
             "eprocess_wealth",
             "served_quality",
+            "pipeline",
+            "provider_health",
+            "build_funnel",
+            "changes",
+            "evaluations",
         }
 
 

@@ -29,7 +29,7 @@ def test_all_zones_render_not_yet_states_on_cold_context(tmp_path):
     ctx = cold_context(tmp_path)
     derived = derive(ctx)
     zones = [build(ctx, derived) for build in ALL_ZONES]
-    assert [zone.zone_id for zone in zones] == list("ABCDEFGH")
+    assert [zone.zone_id for zone in zones] == list("ABCDEFGHI")
     for zone in zones:
         assert zone.panels
         for panel in zone.panels:
