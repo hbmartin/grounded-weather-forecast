@@ -53,6 +53,15 @@ ZONE_INTROS: Mapping[str, str] = {
         "trends survive fingerprint resets instead of living only in "
         "tonight's report."
     ),
+    "I": (
+        "Is the machinery around the models healthy? The pipeline's two "
+        "worst historical failures were silent edge outages — a dead "
+        "station logger and a predict job that failed argparse for a week. "
+        "These panels trend the edges: end-to-end freshness, collector "
+        "provider health, stage runtimes, the collector-to-matrix build "
+        "funnel, the scores-file footprint, and every config/code identity "
+        "transition."
+    ),
 }
 
 PANEL_COPY: Mapping[str, PanelCopy] = {
@@ -513,6 +522,108 @@ PANEL_COPY: Mapping[str, PanelCopy] = {
             "Live rows only, >=20 recent quantile rows per slice; amber "
             "when a method's newest point sits more than 0.10 from the "
             "0.80 target."
+        ),
+    ),
+    "i1": PanelCopy(
+        what=(
+            "One end-to-end freshness row per day: age of the newest truth "
+            "minute, collector run, served-history row, and published "
+            "forecast document, trended over time."
+        ),
+        why=(
+            "Every historical silent outage — the truth hole, the predict "
+            "plist misfire — was an edge going quiet while the middle "
+            "looked healthy. Each age answers 'is that edge alive?' within "
+            "a day."
+        ),
+        thresholds=(
+            "Red when any age exceeds its limit (truth 120m; collector, "
+            "served history, and forecast document 180m), when truth "
+            "minutes fall below 720/day, or when predict runs fall below "
+            "12/day; the panel intro lists the active alarm strings."
+        ),
+    ),
+    "i2": PanelCopy(
+        what=(
+            "Per-provider collector health: success rate, latency, point "
+            "volumes, and the maximum stored forecast lead, with the daily "
+            "lead trended per provider."
+        ),
+        why=(
+            "A plan downgrade, quota change, or quiet API schema drift "
+            "shows up first as a contracting max lead or sagging success "
+            "rate — long before it surfaces as shrinking backtest samples."
+        ),
+        thresholds=(
+            "Amber when any provider's 24h success rate drops below 80%. "
+            "The report additionally prints a contraction note when a "
+            "provider's lead falls more than 1 day (daily) or 12 hours "
+            "(hourly) below its own 14-day median."
+        ),
+    ),
+    "i3": PanelCopy(
+        what=(
+            "Median wall-clock minutes per day for each pipeline stage "
+            "(build-dataset, backtest, report, predict), from the CLI run "
+            "ledger."
+        ),
+        why=(
+            "Performance regressions become evidence with a start date you "
+            "can join to a release id, instead of an operator's memory of "
+            "'the report felt slow this week'."
+        ),
+        thresholds=(
+            "Amber when the latest report runtime exceeds 1.5x the median "
+            "of its prior runs (needs at least 3 report days)."
+        ),
+    ),
+    "i4": PanelCopy(
+        what=(
+            "Rows and maximum stored lead per source at each storage layer "
+            "— collector, long frame, matrix — for the trailing 14 days, "
+            "with the daily native-vs-path split."
+        ),
+        why=(
+            "Data lost between layers is silent by construction: QC, caps, "
+            "exclusions, and coverage gates each drop rows on purpose, and "
+            "only a funnel view shows when one starts dropping more than "
+            "it should."
+        ),
+        thresholds=(
+            "Informational. Lead units follow the granularity: hours on "
+            "hourly rows, days on daily rows; a native/path gap on daily "
+            "rows is expected for providers whose hourly horizon is short."
+        ),
+    ),
+    "i5": PanelCopy(
+        what=(
+            "The evaluations catalog: rows per evaluation by product over "
+            "time, plus total cataloged scores volume."
+        ),
+        why=(
+            "The scores directory is the pipeline's largest artifact and "
+            "prune-scores deletes superseded files; the catalog row "
+            "outlives the file, so trend questions survive housekeeping."
+        ),
+        thresholds=(
+            "Informational. prune-scores keeps the newest 3 files per "
+            "(product, source, window) plus anything referenced by a "
+            "release promoted in the last 30 days."
+        ),
+    ),
+    "i6": PanelCopy(
+        what=(
+            "Every recorded config-fingerprint and code-version "
+            "transition, with the changed config keys."
+        ),
+        why=(
+            "config.toml is gitignored, so without this ledger a flip like "
+            "[promotion].rule has no history — and 'did quality shift "
+            "after X?' needs a reliable X to join against."
+        ),
+        thresholds=(
+            "Informational; secrets (keys containing token/secret/"
+            "password) are redacted before the snapshot is diffed."
         ),
     ),
 }

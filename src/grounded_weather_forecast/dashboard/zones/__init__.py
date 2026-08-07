@@ -1,4 +1,4 @@
-"""Zone builders, ordered A through H."""
+"""Zone builders, ordered A through I."""
 
 from collections.abc import Callable
 
@@ -11,6 +11,7 @@ from grounded_weather_forecast.dashboard.zones import (
     explain,
     internals,
     liveness,
+    operations,
     quality_history,
     readiness,
     serving,
@@ -27,4 +28,5 @@ ALL_ZONES: tuple[ZoneBuilder, ...] = (
     serving.build,
     explain.build,
     quality_history.build,
+    operations.build,
 )
