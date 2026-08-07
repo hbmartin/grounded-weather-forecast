@@ -742,6 +742,7 @@ def _cmd_report(config: Config) -> int:
         code_identity,
         config_fingerprint,
     )
+    from grounded_weather_forecast.reports import evidence  # noqa: PLC0415
     from grounded_weather_forecast.reports.correlation import (  # noqa: PLC0415
         error_correlation,
     )
@@ -782,6 +783,7 @@ def _cmd_report(config: Config) -> int:
     for path in score_files:
         scores = load_scores(path)
         board = bh_adjusted(leaderboard(scores, references=references))
+        evidence.record_quality(config, scores, board)
         # Serving runs on the live provider set, so its realized skill may only
         # be compared with a leaderboard built from the same provenance — a
         # synthetic board describes different sources entirely. The provenance
@@ -825,27 +827,26 @@ def _cmd_report(config: Config) -> int:
             # Both promotion rules run every report so the operator can watch
             # them disagree before switching [promotion].rule; this is also
             # the single writer that persists the e-process wealth.
-            sections.append(
-                (
-                    "Promotion rule comparison (mcs vs seq_mcs)",
-                    promotion_comparison(
-                        board,
-                        scores,
-                        alpha=config.promotion.alpha,
-                        promotion=config.promotion,
-                        store=eprocess_store,
-                    ),
-                )
+            comparison = promotion_comparison(
+                board,
+                scores,
+                alpha=config.promotion.alpha,
+                promotion=config.promotion,
+                store=eprocess_store,
             )
+            sections.append(("Promotion rule comparison (mcs vs seq_mcs)", comparison))
             eprocess_store.save()
+            evidence.record_eprocess_wealth(config, product, eprocess_store)
             # Offline A/B of the two mutually exclusive post-hoc quantile
             # repairs; [predict].quantile_recalibration serves the winner.
+            recalib = recalibration_report(scores)
             sections.append(
                 (
                     "Quantile recalibration (offline holdout: raw vs pit vs cqr)",
-                    recalibration_report(scores),
+                    recalib,
                 )
             )
+            evidence.record_verdicts(config, product, scores, recalib, comparison)
         if is_live and config.predict.history_path.exists():
             try:
                 minute_truth, hourly_truth, daily_truth = build_truth(config)
@@ -855,12 +856,9 @@ def _cmd_report(config: Config) -> int:
                     minute_truth,
                     daily_truth,
                 )
-                sections.append(
-                    (
-                        "Self-verification (served vs realized)",
-                        compare_to_backtest(live, board),
-                    )
-                )
+                served = compare_to_backtest(live, board)
+                sections.append(("Self-verification (served vs realized)", served))
+                evidence.record_served_quality(config, served)
             # PolarsError derives straight from Exception, so a corrupt or
             # schema-incompatible history parquet escaped this guard and took
             # the whole report -- and the dashboard with it -- down. Skipping
@@ -911,10 +909,37 @@ def _cmd_report(config: Config) -> int:
                     [("Pearson correlation of forecast errors", correlation)],
                 )
             )
+    _report_evidence_tail(config, written)
     written.append(write_dashboard(config))
     for path in written:
         print(f"wrote {path}")
     return 0
+
+
+def _report_evidence_tail(config: Config, written: list[Path]) -> None:
+    """Release-level history: the churn markdown and the quality delta line."""
+    from grounded_weather_forecast.reports import evidence  # noqa: PLC0415
+    from grounded_weather_forecast.reports.render import (  # noqa: PLC0415
+        print_summary,
+        write_markdown_report,
+    )
+
+    churn = evidence.record_selection_churn(config)
+    if churn.is_empty():
+        print("selection churn: fewer than two releases, nothing to compare")
+    else:
+        changed = churn.filter(pl.col("changed"))
+        written.append(
+            write_markdown_report(
+                config.reports_dir,
+                "selection_churn",
+                "Selection churn (vs previous release)",
+                [("Changed slices", changed), ("All slices", churn)],
+            )
+        )
+        print_summary("selection churn (vs previous release)", changed)
+    if (line := evidence.quality_delta_line(config)) is not None:
+        print(line)
 
 
 def _dispatch(

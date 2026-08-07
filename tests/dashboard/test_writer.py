@@ -40,7 +40,7 @@ def test_cold_config_writes_full_not_yet_dashboard(tmp_path):
     path = write_dashboard(config, now=NOW)
     assert path == config.reports_dir / "dashboard.html"
     text = path.read_text(encoding="utf-8")
-    for zone_id in "ABCDEFG":
+    for zone_id in "ABCDEFGH":
         assert f'id="zone-{zone_id}"' in text
     assert "alert-strip" in text
     assert "not evaluable yet" in text

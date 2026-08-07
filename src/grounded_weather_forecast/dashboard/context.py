@@ -57,6 +57,9 @@ class DashboardContext:
     observability_history: pl.DataFrame = field(default_factory=pl.DataFrame)
     runs: pl.DataFrame = field(default_factory=pl.DataFrame)
     archive_location: tuple[float, float] | None = None
+    # The artifacts/history ledgers, keyed by ledger name; every key from
+    # evidence.LEDGERS is always present (empty typed frame when absent).
+    evidence_history: Mapping[str, pl.DataFrame] = field(default_factory=dict)
 
 
 def _try_parquet(
@@ -241,6 +244,26 @@ def _archive_location(config: Config) -> tuple[float, float] | None:
         return None
 
 
+def _evidence_history(config: Config, failures: list[str]) -> dict[str, pl.DataFrame]:
+    """All five history ledgers, absent files as empty typed frames."""
+    from grounded_weather_forecast.reports.evidence import (  # noqa: PLC0415
+        LEDGERS,
+        ledger_path,
+        read_ledger,
+    )
+
+    frames: dict[str, pl.DataFrame] = {}
+    for name, spec in LEDGERS.items():
+        path = ledger_path(config, spec)
+        try:
+            frames[name] = read_ledger(path, spec.schema)
+        except (OSError, ValueError, pl.exceptions.PolarsError):
+            if path.exists():
+                failures.append(f"artifacts/history/{spec.name}.parquet")
+            frames[name] = pl.DataFrame(schema=spec.schema)
+    return frames
+
+
 def collect_context(config: Config, *, now: datetime | None = None) -> DashboardContext:
     paths = DatasetPaths.in_dir(config.dataset.dir)
     unreadable: list[str] = []
@@ -300,5 +323,6 @@ def collect_context(config: Config, *, now: datetime | None = None) -> Dashboard
         observability_history=_observability_history(config, unreadable),
         runs=_runs(config, unreadable),
         archive_location=_archive_location(config),
+        evidence_history=_evidence_history(config, unreadable),
         unreadable_artifacts=tuple(sorted(set(unreadable))),
     )

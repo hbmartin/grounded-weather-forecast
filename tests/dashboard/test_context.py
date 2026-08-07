@@ -170,3 +170,54 @@ def test_every_swallowed_artifact_failure_is_reported(tmp_path):
         failure.startswith("artifacts/observability/fp/gbm/hourly.temp_c")
         for failure in failures
     )
+
+
+class TestEvidenceHistory:
+    def test_bare_config_has_all_five_empty_ledgers(self, tmp_path):
+        from grounded_weather_forecast.reports.evidence import LEDGERS
+
+        ctx = collect_context(write_config(tmp_path))
+        assert set(ctx.evidence_history) == set(LEDGERS)
+        for name, spec in LEDGERS.items():
+            frame = ctx.evidence_history[name]
+            assert frame.is_empty()
+            assert frame.schema == spec.schema
+
+    def test_corrupt_ledger_is_labeled_unreadable(self, tmp_path):
+        config = write_config(tmp_path)
+        history = config.artifacts_dir / "history"
+        history.mkdir(parents=True)
+        (history / "quality.parquet").write_text("not parquet")
+        ctx = collect_context(config)
+        assert "artifacts/history/quality.parquet" in ctx.unreadable_artifacts
+        assert ctx.evidence_history["quality"].is_empty()
+
+    def test_seeded_ledger_loads(self, tmp_path):
+        from datetime import UTC, datetime
+
+        from grounded_weather_forecast.reports.evidence import (
+            VERDICTS_LEDGER,
+            append_ledger,
+            ledger_path,
+        )
+
+        config = write_config(tmp_path)
+        frame = pl.DataFrame(
+            [
+                {
+                    "recorded_at": datetime(2026, 8, 6, tzinfo=UTC),
+                    "evaluation_id": "eval1",
+                    "product": "hourly",
+                    "source_kind": "live",
+                    "name": "gate_agree_rate",
+                    "value": 1.0,
+                    "code_version": "code1",
+                    "config_fingerprint": "cfg1",
+                    "dataset_fingerprint": "ds1",
+                }
+            ],
+            schema_overrides=dict(VERDICTS_LEDGER.schema),
+        ).select(VERDICTS_LEDGER.schema.names())
+        append_ledger(frame, ledger_path(config, VERDICTS_LEDGER), VERDICTS_LEDGER)
+        ctx = collect_context(config)
+        assert ctx.evidence_history["verdicts"].height == 1

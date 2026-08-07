@@ -109,18 +109,27 @@ grounded-weather-forecast backtest --source live       # or --source synthetic
 #   --methods all|<ids>  --products hourly,daily  --window expanding|rolling
 #   --hourly-variables ...  --daily-variables ...  --semantics auto|inst|mean
 
-# 6b. Optional: cross-check station truth against lapse-adjusted Synoptic
-#    neighbors (free-signup token) and fit the radiation-shield error model.
-#    A drifting or decorrelating sensor alarms here before it poisons truth.
+# 6b. Optional: cross-check station truth against lapse-adjusted neighbor
+#    stations and fit the radiation-shield error model. A drifting or
+#    decorrelating sensor alarms here before it poisons truth. Keyless by
+#    default: nearby NWS METAR stations are discovered through the
+#    api.weather.gov points API; setting [truth_qc].synoptic_token routes
+#    through the Synoptic timeseries API instead. Widen
+#    [truth_qc].elevation_band_m when the only nearby METARs sit far above
+#    or below the station — the lapse adjustment is what makes them usable.
 grounded-weather-forecast truth-qc                      # --days 30
 
 # 7. Leaderboards (per-slice skill with Diebold-Mariano, aggregate, winners,
 #    absolute error, consumer %-within-3F), the provider error-correlation
 #    matrix, and self-verification of forecasts this system actually served.
 #    Also writes reports/dashboard.html — a fully offline, self-contained
-#    operator console (seven zones: liveness, data trust, learning
-#    readiness, evaluation, model internals, serving, explainability) with
-#    threshold alerts sourced from the existing config knobs.
+#    operator console (eight zones: liveness, data trust, learning
+#    readiness, evaluation, model internals, serving, explainability, and
+#    quality over time — trend charts over the artifacts/history ledgers:
+#    recent-window MAE per variable, selection churn per release, served
+#    MAE vs backtest promise, A/B verdict shares, and e-process wealth
+#    against the promotion threshold) with threshold alerts sourced from
+#    the existing config knobs.
 grounded-weather-forecast report
 
 # 8. Emit the current blended forecast (minutely + hourly + daily) as JSON.
@@ -210,6 +219,20 @@ station truth, `[promotion.references]` overrides the gate's reference class
 per variable (e.g. `pressure_sea_hpa = ["grounded_equal_weight",
 "damped_grounded_equal_weight"]`); skill columns keep their default meaning
 and extend with the configured references.
+
+Every `report` also appends to five append-only history ledgers under
+`artifacts/history/` — `quality.parquet` (per-evaluation leaderboard metrics
+plus a 14-day recent-window MAE, so genuine movement is not diluted by
+months of expanding-window history), `churn.parquet` (per-slice diffs
+between consecutive promoted releases, also rendered as
+`reports/selection_churn.md`), `verdicts.parquet` (A/B summaries: quantile
+recalibration win shares and promotion-gate agreement), `eprocess_wealth.parquet`
+(per-pair wealth snapshots, era-keyed across resets), and
+`served_quality.parquet` (daily realized served MAE vs its backtest
+promise). Appends are idempotent (re-running `report` is a no-op), bounded
+(~2 years by age plus row caps), carry full fingerprint provenance so
+trends segment across resets, and can never fail the report. The report
+prints a one-line quality delta comparing the two newest live evaluations.
 
 Natively-emitted quantiles can additionally be recalibrated at serve time:
 live leaderboard reports carry a "Quantile recalibration (offline holdout)"

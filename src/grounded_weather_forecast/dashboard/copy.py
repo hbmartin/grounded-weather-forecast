@@ -45,6 +45,14 @@ ZONE_INTROS: Mapping[str, str] = {
         "the method that produced it, the release that selected the method, "
         "the reason it was selected, and the provider inputs behind it."
     ),
+    "H": (
+        "Is the system getting better or worse? Every nightly report "
+        "appends compact snapshots to append-only ledgers under "
+        "artifacts/history — backtest skill, selection churn, "
+        "served-vs-promise gaps, A/B verdicts, and e-process wealth — so "
+        "trends survive fingerprint resets instead of living only in "
+        "tonight's report."
+    ),
 }
 
 PANEL_COPY: Mapping[str, PanelCopy] = {
@@ -386,6 +394,88 @@ PANEL_COPY: Mapping[str, PanelCopy] = {
             "visible at the served issue and match its exact point; each source "
             "shows a value and fetch age. Minutely rows expose served "
             "provenance, but no raw input matrix."
+        ),
+    ),
+    "h1": PanelCopy(
+        what=(
+            "Best recent-window (14-day) backtest MAE per product.variable, "
+            "one point per evaluation, from history/quality.parquet."
+        ),
+        why=(
+            "The nightly leaderboard is a snapshot; this is the film. A slow "
+            "MAE rise that never trips a single-night gate is exactly what a "
+            "ledger catches."
+        ),
+        thresholds=(
+            "Top 8 series by sample count, last 60 evaluations; amber when "
+            "the newest point exceeds 1.15x the median of the prior seven. "
+            "Provenance columns keep trends segmentable across fingerprint "
+            "resets."
+        ),
+    ),
+    "h2": PanelCopy(
+        what=(
+            "Share of promoted slices whose serving method changed at each "
+            "release transition, plus the newest transition's per-slice diff."
+        ),
+        why=(
+            "Churn is the promotion gate's temperature: healthy selection "
+            "settles over time; winners flapping on overnight noise is "
+            "multiplicity showing through."
+        ),
+        thresholds=(
+            "Amber when the latest transition changed at least 30% of "
+            "compared slices, red past 60%. Needs two promoted releases; "
+            "added or removed slices count as changes."
+        ),
+    ),
+    "h3": PanelCopy(
+        what=(
+            "Realized served MAE beside the backtest MAE it was promoted "
+            "on, pooled per product by day, from history/served_quality.parquet."
+        ),
+        why=(
+            "A gap that trends positive means the serving path is drifting "
+            "from the backtested one — over time, not just tonight (zone F "
+            "holds the single-night view)."
+        ),
+        thresholds=(
+            "Amber when the pooled mae_gap is positive on 4 of the last 7 "
+            "days; red when pooled live MAE exceeds [promotion].live_gap_factor "
+            "x backtest MAE."
+        ),
+    ),
+    "h4": PanelCopy(
+        what=(
+            "A/B verdict trends: the share of slices each quantile repair "
+            "(raw/pit/cqr) wins, and how often the mcs and seq_mcs promotion "
+            "gates agree."
+        ),
+        why=(
+            "One night's A/B is noise; a stable cqr win share is the "
+            "evidence that flips [predict].quantile_recalibration, and a "
+            "falling agree rate warns before switching [promotion].rule."
+        ),
+        thresholds=(
+            "Wins judged by coverage80 closest to 0.8 (pinball breaks "
+            "ties); amber when the latest gate agree rate drops below 0.8."
+        ),
+    ),
+    "h5": PanelCopy(
+        what=(
+            "Log e-process wealth for the pairs nearest (or past) the "
+            "promotion threshold, with log(1/alpha) drawn."
+        ),
+        why=(
+            "Wealth crossing the line is anytime-valid evidence a "
+            "challenger genuinely beats its reference; wealth resets when "
+            "config or code identity changes, and the ledger keeps eras "
+            "segmented."
+        ),
+        thresholds=(
+            "Top 6 pairs by latest wealth, last 60 snapshots; threshold "
+            "log(1/[promotion].alpha). Informational — crossing drives "
+            "promotion, not alarm."
         ),
     ),
 }

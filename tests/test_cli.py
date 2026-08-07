@@ -223,6 +223,13 @@ def test_report_skips_any_self_verification_failure(
         "grounded_weather_forecast.backtest.scores.load_scores",
         lambda _path: scores,
     )
+    # dashboard.context binds load_scores at import; patching through the
+    # string target imports it NOW so the mock cannot become its permanent
+    # module-level binding when this test is the first to touch it.
+    monkeypatch.setattr(
+        "grounded_weather_forecast.dashboard.context.load_scores",
+        lambda _path: scores,
+    )
     monkeypatch.setattr(
         "grounded_weather_forecast.reports.leaderboard.leaderboard",
         lambda _scores, **_kwargs: empty,
@@ -361,3 +368,75 @@ class TestRunLedger:
         )
 
         assert main(["--config", str(tmp_path / "config.toml"), "qc"]) == 0
+
+
+def test_report_writes_evidence_ledgers_and_churn(tmp_path, capsys):
+    from datetime import timedelta
+
+    from conftest import synthetic_hourly_matrix, utc
+
+    from grounded_weather_forecast.backtest.engine import run_backtest
+    from grounded_weather_forecast.backtest.scores import scores_path, write_scores
+    from grounded_weather_forecast.contracts import hourly_variable
+
+    config = write_config(
+        tmp_path,
+        extra_toml="\n[backtest]\ninitial_train_days = 10\nstep_days = 5\n",
+    )
+    matrix = synthetic_hourly_matrix(days=25, biases={"alpha": 3.0})
+    scores = run_backtest(
+        matrix,
+        BacktestRequest(
+            variables=(hourly_variable("temp_c"),),
+            methods=(
+                "equal_weight",
+                "grounded_equal_weight",
+                "best_provider",
+                "damped_grounded_equal_weight",
+            ),
+        ),
+        config,
+    )
+    write_scores(scores, scores_path(config.dataset.dir / "scores", "hourly", "live"))
+    releases = config.artifacts_dir / "releases"
+    releases.mkdir(parents=True, exist_ok=True)
+    for name, when, method in (
+        ("relA", utc(2026, 8, 1), "equal_weight"),
+        ("relB", utc(2026, 8, 2), "grounded_equal_weight"),
+    ):
+        (releases / f"{name}.json").write_text(
+            json.dumps(
+                {
+                    "release_id": name,
+                    "promoted_at": when.isoformat(),
+                    "dataset_fingerprint": "ds1",
+                    "config_fingerprint": "cfg1",
+                    "selections": {
+                        "hourly.temp_c.0-1h": {
+                            "method_id": method,
+                            "reason": "test",
+                            "evaluation_id": "eval1",
+                            "code_version": "code1",
+                            "n": 100,
+                            "mae": 1.0,
+                            "truth_semantics": "mean",
+                        }
+                    },
+                }
+            )
+        )
+
+    assert cli_module._cmd_report(config) == 0
+    quality_path = config.artifacts_dir / "history" / "quality.parquet"
+    assert quality_path.exists()
+    first_height = pl.read_parquet(quality_path).height
+    assert first_height > 0
+    assert (config.reports_dir / "selection_churn.md").exists()
+    churn_path = config.artifacts_dir / "history" / "churn.parquet"
+    churn_height = pl.read_parquet(churn_path).height
+    capsys.readouterr()
+
+    # a second run must be a complete no-op on every ledger
+    assert cli_module._cmd_report(config) == 0
+    assert pl.read_parquet(quality_path).height == first_height
+    assert pl.read_parquet(churn_path).height == churn_height
