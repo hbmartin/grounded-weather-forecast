@@ -185,11 +185,12 @@ def make_forecast_db(path, runs):
     ``runs``: list of dicts with keys ``completed_at`` (ISO str) and
     ``results``: list of dicts with ``provider``, optional ``model`` (defaults
     to provider), ``status`` ('success'), ``fetched_at`` (ISO str or None —
-    NULL mimics damage), and optional ``hourly``/``daily``/``minutely`` lists.
+    NULL mimics damage), optional ``fetched_at_unix``/``latency_ms`` (the
+    operations collectors key on them; omitted -> NULL/0, as in the damaged
+    sample archive), and optional ``hourly``/``daily``/``minutely`` lists.
     Hourly: (valid_dt, {field: value}); daily: (date_str, {field: value});
     minutely: (valid_dt, intensity, probability).
-    ``horizon_hours``/``fetched_at_unix``/``run_cycle`` are always NULL, as in
-    the damaged sample archive.
+    ``horizon_hours``/``run_cycle`` are always NULL.
     """
     connection = sqlite3.connect(path)
     try:
@@ -208,12 +209,15 @@ def make_forecast_db(path, runs):
             for result in run.get("results", []):
                 pr_cursor = connection.execute(
                     "INSERT INTO provider_results (run_id, provider, status,"
-                    " fetched_at) VALUES (?, ?, ?, ?)",
+                    " fetched_at, fetched_at_unix, latency_ms)"
+                    " VALUES (?, ?, ?, ?, ?, ?)",
                     (
                         run_id,
                         result["provider"],
                         result.get("status", "success"),
                         result.get("fetched_at"),
+                        result.get("fetched_at_unix"),
+                        result.get("latency_ms", 0),
                     ),
                 )
                 sf_cursor = connection.execute(

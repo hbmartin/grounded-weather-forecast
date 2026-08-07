@@ -433,12 +433,74 @@ def test_report_writes_evidence_ledgers_and_churn(tmp_path, capsys):
     assert (config.reports_dir / "selection_churn.md").exists()
     churn_path = config.artifacts_dir / "history" / "churn.parquet"
     churn_height = pl.read_parquet(churn_path).height
+    # the operations tail runs on the same report: freshness row, catalog
+    # row for the scores file, and the pipeline-health markdown
+    pipeline_path = config.artifacts_dir / "history" / "pipeline.parquet"
+    assert pl.read_parquet(pipeline_path).height == 1
+    catalog_path = config.artifacts_dir / "history" / "evaluations.parquet"
+    catalog = pl.read_parquet(catalog_path)
+    assert catalog.height == 1
+    assert catalog["product"].to_list() == ["hourly"]
+    assert catalog["n_folds"][0] > 0
+    assert (config.reports_dir / "pipeline_health.md").exists()
     capsys.readouterr()
 
     # a second run must be a complete no-op on every ledger
     assert cli_module._cmd_report(config) == 0
     assert pl.read_parquet(quality_path).height == first_height
     assert pl.read_parquet(churn_path).height == churn_height
+    assert pl.read_parquet(pipeline_path).height == 1
+    assert pl.read_parquet(catalog_path).height == 1
+
+
+def test_report_without_scores_still_records_pipeline_health(tmp_path, capsys):
+    write_config(tmp_path)
+    code = main(["--config", str(tmp_path / "config.toml"), "report"])
+    assert code == 1
+    output = capsys.readouterr().out
+    assert "PIPELINE ALARMS" in output
+    pipeline_path = tmp_path / "artifacts" / "history" / "pipeline.parquet"
+    assert pl.read_parquet(pipeline_path).height == 1
+
+
+def test_prune_scores_cli_respects_dry_run(tmp_path, capsys):
+    import os
+
+    from grounded_weather_forecast.reports.evidence import (
+        EVALUATIONS_LEDGER,
+        append_ledger,
+        ledger_path,
+    )
+
+    config = write_config(tmp_path)
+    scores_dir = config.dataset.dir / "scores"
+    scores_dir.mkdir(parents=True, exist_ok=True)
+    names = [f"scores_hourly_live_expanding_e{i}.parquet" for i in range(5)]
+    for age, name in enumerate(reversed(names)):
+        path = scores_dir / name
+        path.write_bytes(b"x" * 1000)
+        os.utime(path, times=(1_700_000_000 - age * 86_400,) * 2)
+    append_ledger(
+        pl.DataFrame(
+            [
+                {
+                    column: {"evaluation_id": f"e{i}", "file_name": name}.get(column)
+                    for column in EVALUATIONS_LEDGER.schema.names()
+                }
+                for i, name in enumerate(names)
+            ],
+            schema=dict(EVALUATIONS_LEDGER.schema),
+        ),
+        ledger_path(config, EVALUATIONS_LEDGER),
+        EVALUATIONS_LEDGER,
+    )
+    base = ["--config", str(tmp_path / "config.toml"), "prune-scores"]
+    assert main([*base, "--dry-run"]) == 0
+    assert "would delete 2 scores files" in capsys.readouterr().out
+    assert len(list(scores_dir.glob("*.parquet"))) == 5
+    assert main(base) == 0
+    assert "deleted 2 scores files" in capsys.readouterr().out
+    assert len(list(scores_dir.glob("*.parquet"))) == 3
 
 
 def test_report_served_ledger_records_only_the_products_own_rows(tmp_path, monkeypatch):

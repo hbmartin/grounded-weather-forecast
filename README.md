@@ -123,14 +123,24 @@ grounded-weather-forecast truth-qc                      # --days 30
 #    absolute error, consumer %-within-3F), the provider error-correlation
 #    matrix, and self-verification of forecasts this system actually served.
 #    Also writes reports/dashboard.html — a fully offline, self-contained
-#    operator console (eight zones: liveness, data trust, learning
-#    readiness, evaluation, model internals, serving, explainability, and
+#    operator console (nine zones: liveness, data trust, learning
+#    readiness, evaluation, model internals, serving, explainability,
 #    quality over time — trend charts over the artifacts/history ledgers:
 #    recent-window MAE per variable, selection churn per release, served
 #    MAE vs backtest promise, A/B verdict shares, and e-process wealth
-#    against the promotion threshold) with threshold alerts sourced from
+#    against the promotion threshold — and operations: end-to-end
+#    freshness, provider collector health, stage runtimes, the
+#    collector-to-matrix build funnel, the scores-file footprint, and
+#    config/code identity changes) with threshold alerts sourced from
 #    the existing config knobs.
 grounded-weather-forecast report
+
+# 7b. Housekeeping: delete superseded backtest scores files. Keeps the
+#    newest three per (product, source, window) group plus anything a
+#    release promoted in the last 30 days still references; files the
+#    evaluations catalog has never seen are skipped, never deleted, so
+#    pruning cannot destroy unsummarized evidence.
+grounded-weather-forecast prune-scores                 # --dry-run to preview
 
 # 8. Emit the current blended forecast (minutely + hourly + daily) as JSON.
 #    Schema version 4 carries ready/degraded status plus per-variable release
@@ -226,11 +236,11 @@ per variable (e.g. `pressure_sea_hpa = ["grounded_equal_weight",
 "damped_grounded_equal_weight"]`); skill columns keep their default meaning
 and extend with the configured references.
 
-Every `report` also appends to five append-only history ledgers under
-`artifacts/history/` — `quality.parquet` (per-evaluation leaderboard metrics
-plus a 14-day recent-window MAE, so genuine movement is not diluted by
-months of expanding-window history), `churn.parquet` (per-slice diffs
-between consecutive promoted releases, also rendered as
+Every `report` also appends to ten append-only history ledgers under
+`artifacts/history/`. Five track quality: `quality.parquet` (per-evaluation
+leaderboard metrics plus a 14-day recent-window MAE, so genuine movement is
+not diluted by months of expanding-window history), `churn.parquet`
+(per-slice diffs between consecutive promoted releases, also rendered as
 `reports/selection_churn.md`), `verdicts.parquet` (A/B summaries: quantile
 recalibration win shares and promotion-gate agreement), `eprocess_wealth.parquet`
 (per-pair wealth snapshots, era-keyed across resets), and
@@ -240,6 +250,25 @@ quality ledger also records 14-day recent-window interval coverage and
 CRPS for quantile-emitting methods — the pooled expanding-window coverage
 is frozen by history, so only a recent window can show a calibration
 repair working (dashboard panel h6 plots it against the 0.80 target).
+
+Five more track operations — the pipeline's edges, where silent failures
+live: `pipeline.parquet` (one end-to-end freshness row per day: age of the
+newest station observation, collector run, served-history row, and
+published forecast document, plus 24h run counts; hard-threshold alarm
+strings are printed by the report as `PIPELINE ALARMS`), `provider_health.parquet`
+(per-provider success rate, latency, point volumes, and maximum stored
+lead; the report prints a contraction note when a provider's lead falls
+below its own 14-day median — the plan-downgrade and quota-change
+detector), `build_funnel.parquet` (rows and max lead per source at each
+storage layer, collector → long → matrix, including the daily
+native-vs-path split, so data lost between layers is a visible trend),
+`changes.parquet` (every config-fingerprint and code-version transition
+with the changed config keys — config.toml is gitignored, so this ledger
+is its only history; secrets are redacted), and `evaluations.parquet` (a
+catalog row per scores file — size, folds, per-fold scored counts, issue
+span — that outlives the file, which is what makes `prune-scores` safe).
+All five are summarized in `reports/pipeline_health.md` and trended in the
+dashboard's operations zone.
 Appends are idempotent (re-running `report` is a no-op), bounded
 (~2 years by age plus row caps), carry full fingerprint provenance so
 trends segment across resets, and can never fail the report. The report
