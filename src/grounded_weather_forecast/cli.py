@@ -754,6 +754,7 @@ def _cmd_report(config: Config) -> int:
         aggregate_leaderboard,
         bh_adjusted,
         blocked_promotions,
+        ebh_adjusted,
         leaderboard,
         slice_winners,
         union_references,
@@ -789,6 +790,7 @@ def _cmd_report(config: Config) -> int:
         # synthetic board describes different sources entirely. The provenance
         # comes from the filename, since an empty scores frame (a young archive
         # with no folds yet) carries no rows to read it from.
+        product = path.stem.split("_")[1]
         filename_kind = path.stem.split("_")[2]
         is_live = (
             filename_kind == "live"
@@ -797,7 +799,6 @@ def _cmd_report(config: Config) -> int:
         )
         eprocess_store: EProcessStore | None = None
         if is_live:
-            product = path.stem.split("_")[1]
             if product not in eprocess_stores:
                 eprocess_stores[product] = EProcessStore.load(
                     config.artifacts_dir / "eprocess" / f"{product}_live.json",
@@ -805,6 +806,42 @@ def _cmd_report(config: Config) -> int:
                     code_identity(),
                 )
             eprocess_store = eprocess_stores[product]
+        live_sections: list[tuple[str, pl.DataFrame]] = []
+        if is_live and eprocess_store is not None:
+            # Both promotion rules run every report so the operator can watch
+            # them disagree before switching [promotion].rule; this is also
+            # the single writer that persists the e-process wealth.
+            comparison = promotion_comparison(
+                board,
+                scores,
+                alpha=config.promotion.alpha,
+                promotion=config.promotion,
+                store=eprocess_store,
+            )
+            eprocess_store.save()
+            evidence.record_eprocess_wealth(config, product, eprocess_store)
+            # e-BH reads the wealth just banked: the mutually exclusive
+            # multiplicity correction beside the DM p-value BH family.
+            board = ebh_adjusted(board, eprocess_store, alpha=config.promotion.alpha)
+            # Offline A/B of the two mutually exclusive post-hoc quantile
+            # repairs; [predict.quantile_recalibration] serves the winner.
+            recalib = recalibration_report(scores)
+            evidence.record_verdicts(
+                config,
+                product,
+                scores,
+                recalib,
+                comparison,
+                board=board,
+                alpha=config.promotion.alpha,
+            )
+            live_sections = [
+                ("Promotion rule comparison (mcs vs seq_mcs)", comparison),
+                (
+                    "Quantile recalibration (offline holdout: raw vs pit vs cqr)",
+                    recalib,
+                ),
+            ]
         winners = slice_winners(
             board,
             scores=scores,
@@ -822,31 +859,8 @@ def _cmd_report(config: Config) -> int:
                 f"by more than {gap_threshold:.0%})",
                 blocked_promotions(winners, gap_threshold),
             ),
+            *live_sections,
         ]
-        if is_live and eprocess_store is not None:
-            # Both promotion rules run every report so the operator can watch
-            # them disagree before switching [promotion].rule; this is also
-            # the single writer that persists the e-process wealth.
-            comparison = promotion_comparison(
-                board,
-                scores,
-                alpha=config.promotion.alpha,
-                promotion=config.promotion,
-                store=eprocess_store,
-            )
-            sections.append(("Promotion rule comparison (mcs vs seq_mcs)", comparison))
-            eprocess_store.save()
-            evidence.record_eprocess_wealth(config, product, eprocess_store)
-            # Offline A/B of the two mutually exclusive post-hoc quantile
-            # repairs; [predict].quantile_recalibration serves the winner.
-            recalib = recalibration_report(scores)
-            sections.append(
-                (
-                    "Quantile recalibration (offline holdout: raw vs pit vs cqr)",
-                    recalib,
-                )
-            )
-            evidence.record_verdicts(config, product, scores, recalib, comparison)
         if is_live and config.predict.history_path.exists():
             try:
                 minute_truth, hourly_truth, daily_truth = build_truth(config)
@@ -856,6 +870,11 @@ def _cmd_report(config: Config) -> int:
                     minute_truth,
                     daily_truth,
                 )
+                # Only this product's served rows may face this product's
+                # board: the whole-history frame once poisoned the ledger —
+                # the first live file in the loop wrote every product's rows
+                # with null gaps and first-write-wins dedupe kept them.
+                live = live.filter(pl.col("product") == product)
                 served = compare_to_backtest(live, board)
                 sections.append(("Self-verification (served vs realized)", served))
                 evidence.record_served_quality(config, served)

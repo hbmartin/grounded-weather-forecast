@@ -35,6 +35,8 @@ _TREND_AMBER = 1.15
 _GAP_AMBER_DAYS = 4
 _AGREE_AMBER = 0.80
 _MIN_TREND_N = 8
+_COVERAGE_TARGET = 0.80
+_COVERAGE_AMBER = 0.10
 
 
 def _densify(labels: Sequence[str], values: Mapping[str, float]) -> list[float | None]:
@@ -392,6 +394,84 @@ def _short_pair(pair_key: str) -> str:
     return f"{variable}.{bucket} {candidate}~{reference}"
 
 
+def _recent_coverage_panel(ctx: DashboardContext) -> Panel:
+    quality = ctx.evidence_history.get("quality", pl.DataFrame())
+    usable = (
+        quality.filter(
+            (pl.col("source_kind") == "live")
+            & pl.col("recent_coverage80").is_not_null()
+        )
+        if "recent_coverage80" in quality.columns
+        else pl.DataFrame()
+    )
+    if usable.is_empty():
+        return empty_panel(
+            "h6",
+            "h6",
+            "Recent-window interval coverage",
+            "info",
+            "young history — no recent-window coverage recorded yet",
+        )
+    per_method = (
+        usable.with_columns(pl.col("recent_n").fill_null(pl.col("n")).alias("weight"))
+        .group_by(["evaluation_id", "evaluation_created_at", "product", "method_id"])
+        .agg(
+            (
+                (pl.col("recent_coverage80") * pl.col("weight")).sum()
+                / pl.col("weight").sum()
+            ).alias("coverage80"),
+            pl.col("weight").sum().alias("weight"),
+        )
+        .with_columns(
+            (pl.col("product") + "." + pl.col("method_id")).alias("series"),
+            pl.col("evaluation_created_at").dt.date().cast(pl.String).alias("label"),
+        )
+        .sort("evaluation_created_at")
+    )
+    labels = list(dict.fromkeys(per_method["label"].to_list()))[-_MAX_POINTS:]
+    top = (
+        per_method.group_by("series")
+        .agg(pl.col("weight").sum().alias("total"))
+        .sort(["total", "series"], descending=[True, False])
+        .head(_MAX_SERIES)["series"]
+        .to_list()
+    )
+    series = []
+    off_target = 0
+    for name in top:
+        points = dict(
+            per_method.filter(pl.col("series") == name)
+            .select("label", "coverage80")
+            .iter_rows()
+        )
+        values = _densify(labels, points)
+        newest = next((value for value in reversed(values) if value is not None), None)
+        if newest is not None and abs(newest - _COVERAGE_TARGET) > _COVERAGE_AMBER:
+            off_target += 1
+        series.append((name, values))
+    status: PanelStatus = "info" if len(labels) < 2 else "amber" if off_target else "ok"
+    return Panel(
+        panel_id="h6",
+        title="Recent-window interval coverage",
+        status=status,
+        copy=PANEL_COPY["h6"],
+        stats=(
+            Stat("interval methods", str(len(series))),
+            Stat(
+                "off target",
+                str(off_target),
+                "amber" if off_target else "ok",
+            ),
+        ),
+        chart=line_chart(
+            labels,
+            series,
+            y_label="coverage80 (14d window)",
+            reference=("target 0.80", _COVERAGE_TARGET),
+        ),
+    )
+
+
 def build(ctx: DashboardContext, derived: Derived) -> Zone:  # noqa: ARG001
     return Zone(
         zone_id="H",
@@ -403,5 +483,6 @@ def build(ctx: DashboardContext, derived: Derived) -> Zone:  # noqa: ARG001
             _served_promise_panel(ctx),
             _verdicts_panel(ctx),
             _wealth_panel(ctx),
+            _recent_coverage_panel(ctx),
         ),
     )

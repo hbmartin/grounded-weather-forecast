@@ -881,6 +881,70 @@ def bh_adjusted(board: pl.DataFrame) -> pl.DataFrame:
     return result
 
 
+def ebh_adjusted(
+    board: pl.DataFrame, store: "EProcessStore", *, alpha: float
+) -> pl.DataFrame:
+    """Board plus ``e_vs_*`` / ``ebh_sig_vs_*``: e-BH beside the p-value BH.
+
+    The mutually exclusive alternative multiplicity correction (Wang &
+    Ramdas, arXiv:2009.02824): one hypothesis per tracked (slice, candidate,
+    reference) pair, e-value = current e-process wealth read at report time
+    (a fixed calendar time is a stopping time, so anytime validity survives
+    the nightly re-read; arXiv:2502.08539). Sort the K finite e-values
+    descending and reject the top k* = max{k : k * e_[k] / K >= 1/alpha};
+    FDR <= alpha under arbitrary dependence — the property the DM p-value
+    family only approximates. Untracked pairs stay null (they are not
+    hypotheses), never merged and never max-pooled. ``ebh_threshold_vs_*``
+    is the wealth a pair must reach to be a discovery at the current k*
+    (K/alpha when nothing rejects) — the bar that explains why a
+    Ville-passing pair may still not be an FDR discovery. Report-layer
+    only; the serving gate is unchanged.
+    """
+    from grounded_weather_forecast.reports.eprocess import pair_key  # noqa: PLC0415
+
+    if board.is_empty():
+        return board
+    result = board
+    references = [
+        column.removeprefix("dm_p_vs_")
+        for column in board.columns
+        if column.startswith("dm_p_vs_")
+    ]
+    for reference in references:
+        e_values = np.full(board.height, np.nan)
+        for index, row in enumerate(board.iter_rows(named=True)):
+            if row["method_id"] == reference:
+                continue
+            key = pair_key(
+                str(row["product"]),
+                str(row["variable"]),
+                str(row.get("truth_semantics") or ""),
+                str(row["lead_bucket"]),
+                str(row["method_id"]),
+                reference,
+            )
+            if key in store.entries:
+                e_values[index] = math.exp(store.log_e(key))
+        finite = np.isfinite(e_values)
+        family_size = int(finite.sum())
+        significant = np.zeros(board.height, dtype=bool)
+        threshold = None
+        if family_size:
+            ranked = np.sort(e_values[finite])[::-1]
+            ranks = np.arange(1, family_size + 1)
+            passing = ranks * ranked / family_size >= 1.0 / alpha
+            k_star = int(ranks[passing].max()) if passing.any() else 0
+            threshold = family_size / (alpha * max(k_star, 1))
+            if k_star:
+                significant = finite & (e_values >= ranked[k_star - 1])
+        result = result.with_columns(
+            pl.Series(f"e_vs_{reference}", e_values).replace(float("nan"), None),
+            pl.Series(f"ebh_sig_vs_{reference}", significant),
+            pl.lit(threshold).alias(f"ebh_threshold_vs_{reference}"),
+        )
+    return result
+
+
 def blocked_promotions(winners: pl.DataFrame, threshold: float = 0.15) -> pl.DataFrame:
     """Slices serving measurably above their board minimum, worst first.
 

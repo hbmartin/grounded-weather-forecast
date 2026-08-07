@@ -24,9 +24,8 @@ NOW = datetime(2026, 8, 6, 12, 0, tzinfo=UTC)
 
 def context_with(tmp_path, spec, rows):
     config = write_config(tmp_path)
-    frame = pl.DataFrame(rows, schema_overrides=dict(spec.schema)).select(
-        spec.schema.names()
-    )
+    # schema= so row dicts predating newer ledger columns null-fill them.
+    frame = pl.DataFrame(rows, schema=dict(spec.schema)).select(spec.schema.names())
     append_ledger(frame, ledger_path(config, spec), spec, now=NOW)
     return collect_context(config, now=NOW)
 
@@ -79,7 +78,7 @@ class TestColdContext:
         ctx = collect_context(write_config(tmp_path), now=NOW)
         zone = build_zone(ctx)
         assert zone.zone_id == "H"
-        assert len(zone.panels) == 5
+        assert len(zone.panels) == 6
         for panel in zone.panels:
             assert panel.status == "info"
             assert panel.empty_reason is not None
@@ -271,3 +270,52 @@ class TestWealthPanel:
         series = panel.chart.config["data"]["datasets"][0]
         finite = [value for value in series["data"] if value is not None]
         assert all(value == 9.0 for value in finite)
+
+
+def coverage_rows(coverage80, method_id="conformal_gew", evaluations=2):
+    rows = []
+    for evaluation in range(evaluations):
+        rows.append(
+            {
+                "recorded_at": NOW,
+                "evaluation_id": f"eval{evaluation}",
+                "evaluation_created_at": NOW - timedelta(days=evaluations - evaluation),
+                "product": "hourly",
+                "source_kind": "live",
+                "variable": "temp_c",
+                "truth_semantics": "mean",
+                "lead_bucket": "0-1h",
+                "method_id": method_id,
+                "n": 100,
+                "recent_n": 40,
+                "recent_coverage80": coverage80,
+                "recent_coverage90": min(coverage80 + 0.1, 1.0),
+                "recent_crps": 0.5,
+                "code_version": "code1",
+                "config_fingerprint": "cfg1",
+                "dataset_fingerprint": "ds1",
+            }
+        )
+    return rows
+
+
+class TestRecentCoveragePanel:
+    def test_off_target_is_amber_with_reference_line(self, tmp_path):
+        ctx = context_with(tmp_path, QUALITY_LEDGER, coverage_rows(0.62))
+        panel = build_zone(ctx).panels[5]
+        assert panel.panel_id == "h6"
+        assert panel.status == "amber"
+        assert panel.chart is not None
+        guide = panel.chart.config["data"]["datasets"][-1]
+        assert guide["borderDash"] == [4, 4]
+        assert guide["data"][0] == 0.80
+
+    def test_on_target_is_ok(self, tmp_path):
+        ctx = context_with(tmp_path, QUALITY_LEDGER, coverage_rows(0.79))
+        panel = build_zone(ctx).panels[5]
+        assert panel.status == "ok"
+
+    def test_point_only_history_renders_young(self, tmp_path):
+        ctx = context_with(tmp_path, QUALITY_LEDGER, quality_rows())
+        panel = build_zone(ctx).panels[5]
+        assert panel.status == "info"

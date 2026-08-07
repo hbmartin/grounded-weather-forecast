@@ -478,4 +478,21 @@ PANEL_COPY: Mapping[str, PanelCopy] = {
             "promotion, not alarm."
         ),
     ),
+    "h6": PanelCopy(
+        what=(
+            "14-day interval coverage (nominal 80%) per quantile-emitting "
+            "method, with the 0.80 target drawn."
+        ),
+        why=(
+            "The pooled expanding-window coverage is frozen by months of "
+            "pre-repair history; only a recent window can show whether a "
+            "calibration repair (conformal PID, per-bucket IDR) is working "
+            "now rather than eventually."
+        ),
+        thresholds=(
+            "Live rows only, >=20 recent quantile rows per slice; amber "
+            "when a method's newest point sits more than 0.10 from the "
+            "0.80 target."
+        ),
+    ),
 }
