@@ -150,8 +150,8 @@ class TestIdr:
             source_kind=train.source_kind,
         )
         reordered = get_factory("idr")().fit(reversed_train)
-        np.testing.assert_allclose(base._sorted_x, reordered._sorted_x)
-        np.testing.assert_allclose(base._cdf_stack, reordered._cdf_stack)
+        np.testing.assert_allclose(base._state.sorted_x, reordered._state.sorted_x)
+        np.testing.assert_allclose(base._state.cdf_stack, reordered._state.cdf_stack)
 
     def test_missing_point_masks_the_entire_distribution(self):
         train = to_supervised_slice(gaussian_matrix(), TEMP)
@@ -290,3 +290,93 @@ class TestEmosFitStatus:
             "log_sigma_intercept",
             "log_sigma_slope",
         }
+
+
+def heteroscedastic_matrix(days=40, seed=5, far_extra_sd=3.0):
+    """Tight short-lead errors, wide far-lead errors: the global IDR's
+    documented blind spot (one covariate cannot carry two dispersions)."""
+    matrix = synthetic_hourly_matrix(days=days, noise_sd=0.3, seed=seed)
+    rng = np.random.default_rng(seed + 1)
+    lead = matrix["lead_hours"].to_numpy()
+    far = (lead > 24).astype(float)
+    return matrix.with_columns(
+        (
+            pl.col("fx__alpha__temp_c")
+            + pl.Series(rng.normal(0.0, far_extra_sd, len(lead)) * far)
+        ).alias("fx__alpha__temp_c"),
+        (
+            pl.col("fx__beta__temp_c")
+            + pl.Series(rng.normal(0.0, far_extra_sd, len(lead)) * far)
+        ).alias("fx__beta__temp_c"),
+    )
+
+
+def interval_widths(result):
+    return result.quantiles[:, -2] - result.quantiles[:, 1]  # q95..q05 grid: 10-90
+
+
+class TestIdrBucket:
+    def test_bucket_fits_separate_lead_dispersions(self):
+        train = to_supervised_slice(heteroscedastic_matrix(), TEMP)
+        bucketed = get_factory("idr_bucket")().fit(train)
+        pooled = get_factory("idr")().fit(train)
+        lead = train.x.lead_hours
+        near, far = lead <= 24, lead > 24
+        bucket_widths = interval_widths(bucketed.predict(train.x))
+        pooled_widths = interval_widths(pooled.predict(train.x))
+        bucket_ratio = float(
+            np.nanmean(bucket_widths[far]) / np.nanmean(bucket_widths[near])
+        )
+        pooled_ratio = float(
+            np.nanmean(pooled_widths[far]) / np.nanmean(pooled_widths[near])
+        )
+        # per-bucket intervals widen with lead; the pooled map barely can
+        assert bucket_ratio > 1.5
+        assert bucket_ratio > pooled_ratio + 0.5
+
+    def test_refit_on_identical_data_is_identical(self):
+        train = to_supervised_slice(heteroscedastic_matrix(), TEMP)
+        first = get_factory("idr_bucket")().fit(train).predict(train.x)
+        second = get_factory("idr_bucket")().fit(train).predict(train.x)
+        np.testing.assert_allclose(first.quantiles, second.quantiles)
+
+    def test_thin_buckets_fall_back_to_the_global_fit(self):
+        train = to_supervised_slice(
+            synthetic_hourly_matrix(days=6, noise_sd=0.5, seed=9), TEMP
+        )
+        bucketed = get_factory("idr_bucket")().fit(train)
+        result = bucketed.predict(train.x)
+        assert result.quantiles is not None
+        assert np.isfinite(result.quantiles).any()
+
+
+class TestIdrBucketDcp:
+    def test_out_of_sample_coverage_hits_the_nominal_band(self):
+        train = to_supervised_slice(heteroscedastic_matrix(seed=5), TEMP)
+        fresh = to_supervised_slice(heteroscedastic_matrix(seed=6), TEMP)
+        dcp = get_factory("idr_bucket_dcp")().fit(train)
+        result = dcp.predict(fresh.x)
+        assert result.quantiles is not None
+        pit = pit_from_quantiles(fresh.y, result.quantiles, result.quantile_levels)
+        coverage = float(np.mean((pit > 0.1) & (pit < 0.9)))
+        assert coverage == pytest.approx(0.8, abs=0.12)
+
+    def test_adjusted_levels_widen_under_miscalibration(self):
+        from grounded_weather_forecast.blenders.idr import dcp_adjusted_levels
+
+        # PITs piled at the extremes = the fitted distribution is too narrow
+        pits = np.concatenate(
+            [np.full(20, 0.02), np.full(20, 0.98), np.linspace(0.3, 0.7, 11)]
+        )
+        levels = np.asarray([0.1, 0.5, 0.9])
+        adjusted = dcp_adjusted_levels(pits, levels)
+        assert adjusted[0] < 0.1  # lower tail reaches further down
+        assert adjusted[2] > 0.9  # upper tail reaches further up
+
+    def test_rank_formula_matches_the_order_statistic(self):
+        from grounded_weather_forecast.blenders.idr import dcp_adjusted_levels
+
+        pits = np.linspace(0.05, 0.95, 19)
+        adjusted = dcp_adjusted_levels(pits, np.asarray([0.5]))
+        # ceil((19 + 1) * 0.5) = 10 -> the 10th order statistic
+        assert adjusted[0] == pytest.approx(np.sort(pits)[9])
