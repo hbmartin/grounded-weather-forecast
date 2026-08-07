@@ -125,6 +125,18 @@ class MinuteFrame:
     def height(self) -> int:
         return int(self.lead_hours.shape[0])
 
+    def subset(self, mask: np.ndarray) -> "MinuteFrame":
+        keep = pl.Series(mask)
+        return MinuteFrame(
+            issue_time=self.issue_time.filter(keep),
+            valid_time=self.valid_time.filter(keep),
+            lead_hours=self.lead_hours[mask],
+            base=self.base[mask],
+            observation=self.observation[mask],
+            residual=self.residual[mask],
+            y_true=self.y_true[mask],
+        )
+
 
 class MinutelyPathMethod(Protocol):
     method_id: str
@@ -451,8 +463,16 @@ def run_minutely_backtest(
                 return minute_frame(rows, truth_grid, name, base, request.minute_step)
 
             test_frame = frame_for(test_issues)
-            if test_frame.height == 0:
+            # A minute with no station truth is unscoreable for EVERY method;
+            # emitting it would put null y_true rows in the scores frame,
+            # which the leaderboard's own-case mae (guarding y_pred only,
+            # as hourly scores never carry null truth) propagates as NaN —
+            # all the way into Selection.mae, where NaN disarms the live
+            # demotion gate. Drop those minutes at the source.
+            scoreable = np.isfinite(test_frame.y_true)
+            if not bool(scoreable.any()):
                 continue
+            test_frame = test_frame.subset(scoreable)
             train_frame = frame_for(train_issues)
             keys = (
                 pl.DataFrame(
