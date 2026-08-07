@@ -96,6 +96,16 @@ def build_parser() -> argparse.ArgumentParser:
         "alignment",
         help="study truth semantics per provider; write alignment artifact",
     )
+    prune = subparsers.add_parser(
+        "prune-scores",
+        help="delete superseded scores files (newest per group and"
+        " release-referenced evaluations are kept; catalog rows survive)",
+    )
+    prune.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="list what would be deleted without deleting anything",
+    )
     backfill = subparsers.add_parser(
         "backfill",
         help="fetch archived forecasts into the synthetic supervised matrix",
@@ -877,7 +887,10 @@ def _cmd_report(config: Config) -> int:
         code_identity,
         config_fingerprint,
     )
-    from grounded_weather_forecast.reports import evidence  # noqa: PLC0415
+    from grounded_weather_forecast.reports import (  # noqa: PLC0415
+        evidence,
+        operations,
+    )
     from grounded_weather_forecast.reports.correlation import (  # noqa: PLC0415
         error_correlation,
     )
@@ -913,14 +926,17 @@ def _cmd_report(config: Config) -> int:
     score_files = sorted(scores_dir.glob("scores_*.parquet"))
     if not score_files:
         print(f"no scores found in {scores_dir}; run backtest first")
+        _report_pipeline_health(config, [], [])
         print(f"wrote {write_dashboard(config)}")
         return 1
     written: list[Path] = []
+    catalog_rows: list[dict[str, object]] = []
     gap_threshold = config.promotion.report_gap_threshold
     references = union_references(config.promotion)
     eprocess_stores: dict[str, EProcessStore] = {}
     for path in score_files:
         scores = load_scores(path)
+        catalog_rows.append(operations.evaluation_catalog_row(path, scores))
         board = bh_adjusted(leaderboard(scores, references=references))
         evidence.record_quality(config, scores, board)
         # Serving runs on the live provider set, so its realized skill may only
@@ -1083,6 +1099,7 @@ def _cmd_report(config: Config) -> int:
                 )
             )
     _report_evidence_tail(config, written)
+    _report_pipeline_health(config, written, catalog_rows)
     written.append(write_dashboard(config))
     for path in written:
         print(f"wrote {path}")
@@ -1115,6 +1132,72 @@ def _report_evidence_tail(config: Config, written: list[Path]) -> None:
         print(line)
 
 
+def _report_pipeline_health(
+    config: Config, written: list[Path], catalog_rows: list[dict[str, object]]
+) -> None:
+    """Operational evidence: append the edge ledgers and print the alarms."""
+    from grounded_weather_forecast import runs  # noqa: PLC0415
+    from grounded_weather_forecast.reports import operations  # noqa: PLC0415
+    from grounded_weather_forecast.reports.render import (  # noqa: PLC0415
+        write_markdown_report,
+    )
+
+    health = operations.record_operations(
+        config,
+        runs_frame=runs.load_runs(runs.runs_path(config)),
+        catalog_rows=catalog_rows,
+    )
+    if health.alarms:
+        print(f"PIPELINE ALARMS: {'; '.join(health.alarms)}")
+    else:
+        print("pipeline health: OK")
+    for note in health.contractions:
+        print(f"provider contraction: {note}")
+    if not health.changes.is_empty():
+        for row in health.changes.iter_rows(named=True):
+            detail = f" ({row['detail']})" if row["detail"] else ""
+            print(
+                f"identity change: {row['kind']} "
+                f"{row['from_value']} -> {row['to_value']}{detail}"
+            )
+    written.append(
+        write_markdown_report(
+            config.reports_dir,
+            "pipeline_health",
+            "Pipeline health (freshness, providers, build funnel, changes)",
+            [
+                ("End-to-end freshness (24h window)", health.freshness),
+                ("Provider health (24h window)", health.provider_health),
+                (
+                    "Build funnel (collector -> long -> matrix, trailing 14d;"
+                    " lead units: hours for hourly rows, days for daily)",
+                    health.funnel,
+                ),
+                ("Identity changes since last report", health.changes),
+                ("Evaluations cataloged this report", health.catalog),
+            ],
+        )
+    )
+
+
+def _cmd_prune_scores(config: Config, args: argparse.Namespace) -> int:
+    from grounded_weather_forecast.reports.operations import (  # noqa: PLC0415
+        prune_scores_files,
+    )
+
+    result = prune_scores_files(config, dry_run=args.dry_run)
+    verb = "would delete" if args.dry_run else "deleted"
+    for path in result.deleted:
+        print(f"{verb} {path.name}")
+    for note in result.skipped:
+        print(f"skipped {note}")
+    print(
+        f"{verb} {len(result.deleted)} scores files ({result.freed_mb:.1f} MB), "
+        f"kept {len(result.kept)}"
+    )
+    return 0
+
+
 def _dispatch(
     config: Config, args: argparse.Namespace, parser: argparse.ArgumentParser
 ) -> int:
@@ -1137,6 +1220,8 @@ def _dispatch(
             return _cmd_truth_qc(config, args)
         case "predict":
             return _cmd_predict(config, args)
+        case "prune-scores":
+            return _cmd_prune_scores(config, args)
         case _:  # pragma: no cover - argparse enforces the choices
             parser.print_help()
             return 2

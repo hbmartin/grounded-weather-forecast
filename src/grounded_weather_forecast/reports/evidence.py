@@ -1,12 +1,17 @@
 """Append-only quality-evidence ledgers under ``artifacts/history/``.
 
 Every nightly ``report`` renders a point-in-time view and discards the
-trend; the ledgers keep it. Five parquet files record, per cycle: the
+trend; the ledgers keep it. The quality-side files record, per cycle: the
 leaderboard's quality metrics (plus a 14-day recent-window MAE so genuine
 movement is not diluted by months of expanding-window history), selection
 churn between consecutive releases, A/B verdict summaries (quantile
 recalibration and promotion-gate agreement), e-process wealth snapshots,
-and realized served quality against its backtest promise.
+and realized served quality against its backtest promise. The operations
+side (collectors in ``reports/operations.py``) records pipeline freshness,
+per-provider collector health, the collector-to-matrix build funnel,
+config/code identity changes, and a catalog of every scores file — the
+edges of the pipeline, where the two historical week-long silent failures
+(the Jul 2026 truth hole and the predict plist misfire) lived.
 
 Contracts, all inherited from the ``runs.py`` run ledger:
 
@@ -224,6 +229,135 @@ SERVED_QUALITY_LEDGER = LedgerSpec(
     max_rows=500_000,
 )
 
+PIPELINE_SCHEMA = pl.Schema(
+    {
+        "recorded_at": pl.Datetime("us", "UTC"),
+        "as_of_date": pl.Date(),
+        "truth_age_minutes": pl.Float64(),
+        "truth_samples_24h": pl.Int64(),
+        "collector_age_minutes": pl.Float64(),
+        "collector_runs_24h": pl.Int64(),
+        "provider_success_rate_24h": pl.Float64(),
+        "served_history_age_minutes": pl.Float64(),
+        "forecast_document_age_minutes": pl.Float64(),
+        "predict_runs_24h": pl.Int64(),
+        "failed_runs_24h": pl.Int64(),
+        "alarms": pl.String(),
+        "code_version": pl.String(),
+        "config_fingerprint": pl.String(),
+    }
+)
+
+PROVIDER_HEALTH_SCHEMA = pl.Schema(
+    {
+        "recorded_at": pl.Datetime("us", "UTC"),
+        "as_of_date": pl.Date(),
+        "provider": pl.String(),
+        "runs_24h": pl.Int64(),
+        "ok_24h": pl.Int64(),
+        "success_rate": pl.Float64(),
+        "median_latency_ms": pl.Float64(),
+        "hourly_rows_24h": pl.Int64(),
+        "daily_rows_24h": pl.Int64(),
+        "max_hourly_lead_hours": pl.Float64(),
+        "max_daily_lead_days": pl.Float64(),
+        "code_version": pl.String(),
+    }
+)
+
+# ``*_max_lead`` units follow the granularity: hours on "hourly" rows, days
+# on "daily" rows. The native/path split exists because a daily value can
+# reach the matrix two ways (a provider's own daily product vs an aggregate
+# of its hourly path) with very different horizons — collapsing them once
+# hid a 7-day native feed behind a 2-day path gate.
+BUILD_FUNNEL_SCHEMA = pl.Schema(
+    {
+        "recorded_at": pl.Datetime("us", "UTC"),
+        "as_of_date": pl.Date(),
+        "granularity": pl.String(),
+        "source": pl.String(),
+        "collector_rows": pl.Int64(),
+        "collector_max_lead": pl.Float64(),
+        "long_rows": pl.Int64(),
+        "long_max_lead": pl.Float64(),
+        "matrix_rows": pl.Int64(),
+        "matrix_max_lead": pl.Float64(),
+        "matrix_native_max_lead": pl.Float64(),
+        "matrix_path_max_lead": pl.Float64(),
+        "code_version": pl.String(),
+    }
+)
+
+CHANGES_SCHEMA = pl.Schema(
+    {
+        "recorded_at": pl.Datetime("us", "UTC"),
+        "as_of_date": pl.Date(),
+        "kind": pl.String(),
+        "from_value": pl.String(),
+        "to_value": pl.String(),
+        "detail": pl.String(),
+        "code_version": pl.String(),
+    }
+)
+
+EVALUATIONS_SCHEMA = pl.Schema(
+    {
+        "recorded_at": pl.Datetime("us", "UTC"),
+        "evaluation_id": pl.String(),
+        "file_name": pl.String(),
+        "product": pl.String(),
+        "source_kind": pl.String(),
+        "window": pl.String(),
+        "rows": pl.Int64(),
+        "n_methods": pl.Int64(),
+        "n_folds": pl.Int64(),
+        "fold_rows_min": pl.Int64(),
+        "fold_rows_median": pl.Float64(),
+        "issue_min": pl.Datetime("us", "UTC"),
+        "issue_max": pl.Datetime("us", "UTC"),
+        "file_size_mb": pl.Float64(),
+        "code_version": pl.String(),
+    }
+)
+
+PIPELINE_LEDGER = LedgerSpec(
+    name="pipeline",
+    schema=PIPELINE_SCHEMA,
+    # One row per day, first writer wins: a manual afternoon report must not
+    # shadow the scheduled morning snapshot the trend lines are built from.
+    dedupe_keys=("as_of_date",),
+    max_rows=10_000,
+)
+PROVIDER_HEALTH_LEDGER = LedgerSpec(
+    name="provider_health",
+    schema=PROVIDER_HEALTH_SCHEMA,
+    dedupe_keys=("as_of_date", "provider"),
+    max_rows=100_000,
+)
+BUILD_FUNNEL_LEDGER = LedgerSpec(
+    name="build_funnel",
+    schema=BUILD_FUNNEL_SCHEMA,
+    dedupe_keys=("as_of_date", "granularity", "source"),
+    max_rows=200_000,
+)
+CHANGES_LEDGER = LedgerSpec(
+    name="changes",
+    schema=CHANGES_SCHEMA,
+    # ``as_of_date`` in the key is load-bearing: a flip A->B months after an
+    # earlier A->B is a new event, not a duplicate.
+    dedupe_keys=("as_of_date", "kind", "from_value", "to_value"),
+    max_rows=10_000,
+)
+EVALUATIONS_LEDGER = LedgerSpec(
+    name="evaluations",
+    schema=EVALUATIONS_SCHEMA,
+    # Scores files are write-once (a new evaluation mints a new id), so the
+    # catalog row is immutable — and it outlives the file itself, which is
+    # what makes pruning the 600+ MB scores directory safe.
+    dedupe_keys=("evaluation_id",),
+    max_rows=100_000,
+)
+
 LEDGERS: Mapping[str, LedgerSpec] = {
     spec.name: spec
     for spec in (
@@ -232,6 +366,11 @@ LEDGERS: Mapping[str, LedgerSpec] = {
         VERDICTS_LEDGER,
         EPROCESS_WEALTH_LEDGER,
         SERVED_QUALITY_LEDGER,
+        PIPELINE_LEDGER,
+        PROVIDER_HEALTH_LEDGER,
+        BUILD_FUNNEL_LEDGER,
+        CHANGES_LEDGER,
+        EVALUATIONS_LEDGER,
     )
 }
 
