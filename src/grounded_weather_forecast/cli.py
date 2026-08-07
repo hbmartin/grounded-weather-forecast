@@ -852,6 +852,9 @@ def _cmd_report(config: Config) -> int:
         compare_to_backtest,
         verify_history,
     )
+    from grounded_weather_forecast.reports.winner_curse import (  # noqa: PLC0415
+        winner_curse_adjusted,
+    )
 
     scores_dir = config.dataset.dir / "scores"
     score_files = sorted(scores_dir.glob("scores_*.parquet"))
@@ -932,6 +935,11 @@ def _cmd_report(config: Config) -> int:
             promotion=config.promotion,
             eprocess_store=eprocess_store,
         )
+        # Two curse-corrected estimates beside every argmin-selected winner
+        # mae; report-layer only, same convention as bh/ebh_adjusted.
+        winners = winner_curse_adjusted(winners, scores, promotion=config.promotion)
+        if is_live:
+            evidence.record_winner_curse(config, product, scores, winners)
         sections = [
             ("Per-slice leaderboard", board),
             ("Aggregate (n-weighted MAE)", aggregate_leaderboard(board)),
