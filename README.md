@@ -272,6 +272,32 @@ holdout, and hysteresis is the guard. Recalibrated rows are labeled
 `recalibrated_{mode}_*` in `quantiles_source`; dressed rows are never
 transformed twice.
 
+The nowcast is measured: `backtest --products ... minutely` (on by
+default, live-only) scores the minutely PATH CONSTRUCTIONS — the un-anchored
+interpolation and flat observation persistence as the reference class, an
+anchor-decay tau grid (0.25/0.5/1/3 h, each its own method id so the
+leaderboard is the grid search), the full shift, and two fitted per-bucket
+responses (`minutely_ramp`, `minutely_fitted_slope`) — against per-minute
+station truth on sub-hourly lead buckets (0-5m through 45-60m), with the
+proxy hourly path fold-fitted under the stricter hourly truth clock.
+Promotion runs through the standard gates against `MINUTELY_REFERENCES`, and
+serving consults the promoted construction per (variable, minutely bucket);
+`[predict].minutely_tau_hours` survives as the named no-evidence fallback,
+and an already-anchored hourly path is never re-anchored. Served minutely
+history carries the applied `minutely_*` method id, closing the
+self-verification loop for the nowcast.
+
+Promoted winner MAEs carry winner's-curse corrections beside every
+argmin-selected row: `winner_bias` / `mae_debiased` (moving-block-bootstrap
+bias of the min functional — how much taking a minimum over ~40 methods
+flatters the report) and `mae_hybrid` / `mae_hybrid_upper`
+(Andrews-Kitagawa-McCloskey conditional-on-winner median-unbiased estimate
+and upper bound, hybrid scheme, Sigma from the same bootstrap), with
+`near_tie_flag` marking slices where the two estimands diverge beyond the
+winner's bootstrap SE. Report-layer only: gates, selections, and release
+ids are unchanged; the verdicts ledger accumulates `winner_bias_mean`, and
+the quality delta line carries the uncorrected-argmin caveat inline.
+
 The IDR benchmark ships as a three-way A/B: `idr` (global fit, the
 control), `idr_bucket` (per-lead-bucket fits with subagging — the
 smoothing arm), and `idr_bucket_dcp` (per-bucket fits under split

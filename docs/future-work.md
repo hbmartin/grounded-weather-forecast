@@ -55,6 +55,11 @@ PoP = 1.0, no provider above 0.3) is the preview.
    `truth_known_at`, and put `minutely_tau_hours` (still a hand-set 3.0 on
    the fallback path) into a searched grid — or delete it in favour of the
    RAFT design below. _Trigger: next serving-layer work._
+   _Shipped 2026-08-07 (`backtest/minutely.py`): path constructions scored
+   on sub-hourly buckets, tau grid leaderboard-arbitrated, serving consults
+   the promoted construction per bucket with config tau as the no-evidence
+   fallback. Deferred: native precip/pop minutely scoring (needs reset-aware
+   rain-counter intensity truth; only one candidate method exists anyway)._
 8. **Wind product decision.** Station wind truth (sheltered siting) has mean
    0.36 m/s vs provider 2.3–4.5; the current EMOS "win" is near-constant
    calm. Either declare the product station-frame (document it), pivot the
@@ -132,6 +137,8 @@ PoP = 1.0, no provider above 0.3) is the preview.
     reporting** for promoted scores (Andrews, Kitagawa & McCloskey 2024).
     _Trigger: when the live grid has enough slices for multiplicity to bite
     (~10+ promotable slices)._
+    _Winner's-curse reporting shipped 2026-08-07 (`reports/winner_curse.py`): bootstrap bias + AKM hybrid columns on every argmin-selected winner; gates unchanged._
+
 22. **E-process sequential MCS** — anytime-valid promotion so re-running
     after every backtest refresh needs no alpha bookkeeping; replaces the
     fixed-alpha block-bootstrap MCS as folds accumulate. Also expose the MCS
