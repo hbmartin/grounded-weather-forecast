@@ -65,8 +65,9 @@ def build_parser() -> argparse.ArgumentParser:
     )
     backtest.add_argument(
         "--products",
-        default="hourly,daily",
-        help="comma-separated products to backtest (hourly,daily)",
+        default="hourly,daily,minutely",
+        help="comma-separated products to backtest (hourly,daily,minutely;"
+        " minutely scores the nowcast path constructions and is live-only)",
     )
     backtest.add_argument(
         "--window",
@@ -712,6 +713,52 @@ def _cmd_predict(config: Config, args: argparse.Namespace) -> int:
     return 0
 
 
+def _run_minutely_backtest(config: Config, args: argparse.Namespace) -> int | None:
+    """The minutely product: path constructions over the HOURLY live matrix.
+
+    None signals a hard failure (missing inputs); the caller returns 1.
+    """
+    from grounded_weather_forecast.backtest.minutely import (  # noqa: PLC0415
+        MINUTELY_SCORE_VARIABLES,
+        MinutelyRequest,
+        run_minutely_backtest,
+    )
+    from grounded_weather_forecast.backtest.scores import (  # noqa: PLC0415
+        scores_path,
+        write_scores,
+    )
+    from grounded_weather_forecast.dataset.matrix import matrix_path  # noqa: PLC0415
+    from grounded_weather_forecast.dataset.truth import (  # noqa: PLC0415
+        truth_minute_grid,
+    )
+
+    if args.source != "live":
+        # No synthetic minute truth exists; scoring the nowcast against a
+        # synthetic archive would be provenance theater.
+        print("minutely: backtest is live-only, skipping")
+        return 0
+    matrix_file = matrix_path(config.dataset.dir, "hourly", "live")
+    truth_file = config.dataset.dir / "truth_minute.parquet"
+    for required, hint in (
+        (matrix_file, "build-dataset"),
+        (truth_file, "build-dataset"),
+    ):
+        if not required.exists():
+            print(f"missing {required}; run {hint} first")
+            return None
+    matrix = pl.read_parquet(matrix_file)
+    grid = truth_minute_grid(pl.read_parquet(truth_file), MINUTELY_SCORE_VARIABLES)
+    request = MinutelyRequest(window=args.window)
+    scores = run_minutely_backtest(matrix, grid, request, config)
+    evaluation_id = str(scores["evaluation_id"][0]) if not scores.is_empty() else None
+    path = scores_path(
+        config.dataset.dir / "scores", "minutely", "live", args.window, evaluation_id
+    )
+    write_scores(scores, path)
+    print(f"minutely: {scores.height} score rows -> {path}")
+    return scores.height
+
+
 def _cmd_backtest(config: Config, args: argparse.Namespace) -> int:
     from grounded_weather_forecast.backtest.engine import (  # noqa: PLC0415
         BacktestRequest,
@@ -736,6 +783,12 @@ def _cmd_backtest(config: Config, args: argparse.Namespace) -> int:
     )
     total = 0
     for product in products:
+        if product == "minutely":
+            rows = _run_minutely_backtest(config, args)
+            if rows is None:
+                return 1
+            total += rows
+            continue
         daily = product == "daily"
         matrix_file = matrix_path(config.dataset.dir, product, args.source)
         if not matrix_file.exists():

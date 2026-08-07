@@ -608,9 +608,7 @@ class TestWinnerCurseRecorder:
         config = write_config(tmp_path)
         scores = scores_frame()
         evidence.record_winner_curse(config, "hourly", scores, self.winners(), now=NOW)
-        ledger = pl.read_parquet(
-            evidence.ledger_path(config, evidence.VERDICTS_LEDGER)
-        )
+        ledger = pl.read_parquet(evidence.ledger_path(config, evidence.VERDICTS_LEDGER))
         names = set(ledger["name"].to_list())
         assert {"winner_bias_mean", "winner_bias_slices", "near_tie_slices"} <= names
         assert "argmin winner bias" in evidence._winner_bias_note(config, "hourly")

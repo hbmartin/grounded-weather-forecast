@@ -22,6 +22,9 @@ type WindowMode = Literal["expanding", "rolling"]
 
 _HOURLY_TRUTH_DELAY = timedelta(hours=2)
 _DAILY_TRUTH_DELAY = timedelta(hours=1)
+# The station logs every ~61 s and the collector appends continuously; a
+# minute of truth is knowable within its own sampling cadence plus ingest lag.
+_MINUTELY_TRUTH_DELAY = timedelta(minutes=5)
 
 
 @dataclass(frozen=True, slots=True)
@@ -35,6 +38,13 @@ def hourly_truth_known_at(frame: pl.DataFrame) -> pl.Series:
     """Interval truth for hour ``[H, H+1)`` is realized by H+1 (+1h ingest lag)."""
     return frame.select(
         (pl.col("valid_time") + _HOURLY_TRUTH_DELAY).alias("truth_known_at")
+    )["truth_known_at"]
+
+
+def minutely_truth_known_at(frame: pl.DataFrame) -> pl.Series:
+    """Per-minute truth is realized almost immediately (+5 min ingest lag)."""
+    return frame.select(
+        (pl.col("valid_time") + _MINUTELY_TRUTH_DELAY).alias("truth_known_at")
     )["truth_known_at"]
 
 

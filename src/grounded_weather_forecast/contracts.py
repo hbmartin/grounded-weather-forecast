@@ -48,6 +48,15 @@ class Product(StrEnum):
     DAILY = "daily"
 
 
+# The minutely product's promotion reference class. The hourly/daily
+# DEFAULT_REFERENCES are blender ids that never appear in minutely scores;
+# these two are "the current product minus the config anchor" and the
+# nowcast floor — a challenger must beat both through the gate. Defined here
+# (not in the runner) so leaderboard, selection, and the runner share one
+# import with no layering inversion.
+MINUTELY_REFERENCES: tuple[str, ...] = ("minutely_interp", "minutely_persistence")
+
+
 class LeadUnit(StrEnum):
     MINUTES = "minutes"
     HOURS = "hours"

@@ -197,7 +197,10 @@ def _newest_complete_slices(
             ["product", "variable", "lead_bucket"], as_dict=True
         ).items():
             methods = {str(method) for method in frame["method_id"].unique().to_list()}
-            if not set(gate_references(str(slice_key[1]), promotion)) <= methods:
+            references = gate_references(
+                str(slice_key[1]), promotion, product=str(slice_key[0])
+            )
+            if not set(references) <= methods:
                 continue
             product, variable, lead_bucket = (str(part) for part in slice_key)
             key: SliceKey = (product, variable, lead_bucket)

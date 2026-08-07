@@ -86,3 +86,50 @@ class TestExpressions:
         frame = pl.DataFrame({"lead": leads})
         got = frame.select(daily_bucket_expr(pl.col("lead")).alias("b"))["b"]
         assert got.to_list() == [daily_bucket(lead) for lead in leads]
+
+
+class TestMinutelyBuckets:
+    def test_edges_and_the_minute_sixty_boundary(self):
+        from grounded_weather_forecast.leads import (
+            MINUTELY_BUCKET_LABELS,
+            minutely_bucket,
+        )
+
+        assert minutely_bucket(1.0 / 60.0) == "0-5m"
+        assert minutely_bucket(5.0 / 60.0) == "5-15m"  # left-closed edges
+        assert minutely_bucket(0.75) == "45-60m"
+        # minute 60 is lead exactly 1.0 and must stay in the product
+        assert minutely_bucket(1.0) == "45-60m"
+        assert minutely_bucket(61.5 / 60.0) is None
+        assert MINUTELY_BUCKET_LABELS == (
+            "0-5m",
+            "5-15m",
+            "15-30m",
+            "30-45m",
+            "45-60m",
+        )
+
+    def test_expr_matches_scalar(self):
+        import polars as pl
+
+        from grounded_weather_forecast.leads import (
+            minutely_bucket,
+            minutely_bucket_expr,
+        )
+
+        leads = [m / 60.0 for m in range(1, 61)]
+        frame = pl.DataFrame({"lead": leads}).with_columns(
+            minutely_bucket_expr(pl.col("lead")).alias("bucket")
+        )
+        assert frame["bucket"].to_list() == [minutely_bucket(lead) for lead in leads]
+
+    def test_buckets_for_product_routes_minutely(self):
+        from grounded_weather_forecast.contracts import Product
+        from grounded_weather_forecast.leads import (
+            HOURLY_BUCKETS,
+            MINUTELY_BUCKETS,
+            buckets_for_product,
+        )
+
+        assert buckets_for_product(Product.MINUTELY) is MINUTELY_BUCKETS
+        assert buckets_for_product(Product.HOURLY) is HOURLY_BUCKETS

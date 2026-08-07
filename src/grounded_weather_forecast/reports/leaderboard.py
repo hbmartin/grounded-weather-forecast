@@ -16,7 +16,7 @@ import numpy as np
 import polars as pl
 from scipy import stats
 
-from grounded_weather_forecast.contracts import TruthSemantics
+from grounded_weather_forecast.contracts import MINUTELY_REFERENCES, TruthSemantics
 
 if TYPE_CHECKING:
     from grounded_weather_forecast.config import PromotionConfig
@@ -45,15 +45,21 @@ DEFAULT_REFERENCES: tuple[str, ...] = (
 
 
 def gate_references(
-    variable: str, promotion: "PromotionConfig | None"
+    variable: str,
+    promotion: "PromotionConfig | None",
+    product: str = "hourly",
 ) -> tuple[str, ...]:
     """The reference class the gate holds this variable's candidates against.
 
     ``[promotion.references]`` overrides per variable: where the raw
     provider-space references are bias-dominated against station truth
     (pressure's ~26 hPa console offset; the sheltered anemometer), grounded
-    variants make the gate and its fallback meaningful again.
+    variants make the gate and its fallback meaningful again. The minutely
+    product has its own class — its scores never contain the blender ids, so
+    the default references would block every minutely promotion outright.
     """
+    if product == "minutely":
+        return MINUTELY_REFERENCES
     if promotion is not None:
         override = promotion.references.get(variable)
         if override:
@@ -247,7 +253,17 @@ def _dm_columns(
     skill = 1.0 - float(loss_method.mean()) / reference_mae if reference_mae else None
     if loss_method.shape[0] < _MIN_DM_SAMPLES:
         return skill, None
-    lead_steps = lead_lo / 24.0 if product == "daily" else lead_lo
+    # The collapsed loss series ticks in the product's own step (minutes for
+    # the minutely product), so the Bartlett HAC horizon must count in that
+    # unit too — an hour-based horizon of 1 would understate autocorrelation
+    # across a 45-minute overlap.
+    match product:
+        case "daily":
+            lead_steps = lead_lo / 24.0
+        case "minutely":
+            lead_steps = lead_lo * 60.0
+        case _:
+            lead_steps = lead_lo
     horizon_steps = max(1, min(int(lead_steps) + 1, 48, loss_method.shape[0] - 1))
     result = diebold_mariano(loss_method, loss_reference, horizon_steps)
     return skill, result.p_value
@@ -643,7 +659,9 @@ def slice_winners(
     )
     for slice_key, group in board.partition_by(keys, as_dict=True).items():
         parts = dict(zip(keys, (str(part) for part in slice_key), strict=True))
-        references = gate_references(parts["variable"], promotion)
+        references = gate_references(
+            parts["variable"], promotion, product=parts["product"]
+        )
         best = group.sort("mae").row(0, named=True)
         eligible = group.filter(
             (pl.col("coverage") >= 0.8)
