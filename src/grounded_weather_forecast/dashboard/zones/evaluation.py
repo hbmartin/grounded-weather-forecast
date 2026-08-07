@@ -20,6 +20,7 @@ from grounded_weather_forecast.dashboard.zones.common import empty_panel, fmt
 from grounded_weather_forecast.leads import (
     DAILY_BUCKET_LABELS,
     HOURLY_BUCKET_LABELS,
+    MINUTELY_BUCKET_LABELS,
 )
 from grounded_weather_forecast.metrics.probabilistic import (
     pit_from_quantiles,
@@ -115,7 +116,13 @@ def _baseline_panel(stem: str, board: pl.DataFrame) -> Panel | None:
     if subset.is_empty():
         return None
     product = subset["product"][0]
-    canonical = DAILY_BUCKET_LABELS if product == "daily" else HOURLY_BUCKET_LABELS
+    match product:
+        case "daily":
+            canonical = DAILY_BUCKET_LABELS
+        case "minutely":
+            canonical = MINUTELY_BUCKET_LABELS
+        case _:
+            canonical = HOURLY_BUCKET_LABELS
     available = set(subset["lead_bucket"].drop_nulls().to_list())
     buckets = [label for label in canonical if label in available]
     series = []

@@ -1,6 +1,6 @@
 """The append-only quality-evidence ledgers."""
 
-from datetime import UTC, datetime, timedelta
+from datetime import timedelta
 
 import numpy as np
 import polars as pl
@@ -594,3 +594,30 @@ class TestQualityDeltaLine:
 class TestVerdictsLedgerSpec:
     def test_dedupe_keys(self):
         assert VERDICTS_LEDGER.dedupe_keys == ("evaluation_id", "product", "name")
+
+
+class TestWinnerCurseRecorder:
+    def winners(self):
+        return pl.DataFrame(
+            {"winner_bias": [-0.04, -0.02], "near_tie_flag": [True, False]}
+        )
+
+    def test_records_scalars_and_annotates_the_delta_line(self, tmp_path):
+        from conftest import write_config
+
+        config = write_config(tmp_path)
+        scores = scores_frame()
+        evidence.record_winner_curse(config, "hourly", scores, self.winners(), now=NOW)
+        ledger = pl.read_parquet(evidence.ledger_path(config, evidence.VERDICTS_LEDGER))
+        names = set(ledger["name"].to_list())
+        assert {"winner_bias_mean", "winner_bias_slices", "near_tie_slices"} <= names
+        assert "argmin winner bias" in evidence._winner_bias_note(config, "hourly")
+
+    def test_uncorrected_winners_record_nothing(self, tmp_path):
+        from conftest import write_config
+
+        config = write_config(tmp_path)
+        evidence.record_winner_curse(
+            config, "hourly", scores_frame(), pl.DataFrame({"mae": [1.0]}), now=NOW
+        )
+        assert not evidence.ledger_path(config, evidence.VERDICTS_LEDGER).exists()

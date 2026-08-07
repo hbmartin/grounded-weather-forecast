@@ -121,3 +121,17 @@ class TestFoldPlans:
             assert known_np[fold.train_rows].max() <= origin_us
             assert issue_np[fold.test_rows].min() > origin_us
             assert len(np.intersect1d(fold.train_rows, fold.test_rows)) == 0
+
+
+class TestMinutelyTruthKnownAt:
+    def test_five_minute_offset(self):
+        import polars as pl
+        from conftest import utc
+
+        from grounded_weather_forecast.backtest.splits import minutely_truth_known_at
+
+        frame = pl.DataFrame(
+            {"valid_time": [utc(2026, 8, 1, 12, 30)]},
+            schema={"valid_time": pl.Datetime("us", "UTC")},
+        )
+        assert minutely_truth_known_at(frame)[0] == utc(2026, 8, 1, 12, 35)

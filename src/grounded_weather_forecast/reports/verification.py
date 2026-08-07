@@ -16,7 +16,12 @@ from grounded_weather_forecast.contracts import (
     hourly_variable,
     truth_col,
 )
-from grounded_weather_forecast.leads import daily_bucket_expr, hourly_bucket_expr
+from grounded_weather_forecast.dataset.truth import truth_minute_grid
+from grounded_weather_forecast.leads import (
+    daily_bucket_expr,
+    hourly_bucket_expr,
+    minutely_bucket_expr,
+)
 from grounded_weather_forecast.metrics.deterministic import bias, mae, rmse
 from grounded_weather_forecast.serve.history import load_history
 
@@ -79,6 +84,8 @@ def verify_history(
         .alias("truth_semantics"),
         pl.when(pl.col("product") == "daily")
         .then(daily_bucket_expr(pl.col("lead_hours") / 24.0))
+        .when(pl.col("product") == "minutely")
+        .then(minutely_bucket_expr(pl.col("lead_hours")))
         .otherwise(hourly_bucket_expr(pl.col("lead_hours")))
         .alias("lead_bucket"),
     )
@@ -98,12 +105,7 @@ def verify_history(
             case "minutely":
                 column = variable
                 truth = (
-                    truth_minute.select(
-                        pl.col("ts").dt.truncate("1m").alias("valid_time"),
-                        column,
-                    )
-                    .group_by("valid_time")
-                    .agg(pl.col(column).mean())
+                    truth_minute_grid(truth_minute, [column])
                     if truth_minute is not None and column in truth_minute.columns
                     else pl.DataFrame()
                 )

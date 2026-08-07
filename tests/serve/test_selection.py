@@ -5,10 +5,9 @@ import polars as pl
 from conftest import synthetic_hourly_matrix, utc, write_config
 
 import grounded_weather_forecast.serve.selection as selection_module
-from grounded_weather_forecast.backtest.scores import SCORES_SCHEMA
-
 from grounded_weather_forecast.backtest.engine import BacktestRequest, run_backtest
 from grounded_weather_forecast.backtest.scores import (
+    SCORES_SCHEMA,
     load_scores,
     scores_path,
     write_scores,

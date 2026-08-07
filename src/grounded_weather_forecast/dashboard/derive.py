@@ -29,6 +29,7 @@ from grounded_weather_forecast.reports.verification import (
     compare_to_backtest,
     verify_history,
 )
+from grounded_weather_forecast.reports.winner_curse import winner_curse_adjusted
 
 
 def _eprocess_store(
@@ -103,13 +104,17 @@ def derive(ctx: DashboardContext) -> Derived:
             )
             # The dashboard never writes e-process state; under the seq_mcs
             # rule it reads the report-persisted wealth like serving does.
-            winners[stem] = slice_winners(
-                board,
-                scores=scores,
-                rule=ctx.config.promotion.rule,
-                alpha=ctx.config.promotion.alpha,
+            winners[stem] = winner_curse_adjusted(
+                slice_winners(
+                    board,
+                    scores=scores,
+                    rule=ctx.config.promotion.rule,
+                    alpha=ctx.config.promotion.alpha,
+                    promotion=ctx.config.promotion,
+                    eprocess_store=_eprocess_store(ctx.config, stem, eprocess_stores),
+                ),
+                scores,
                 promotion=ctx.config.promotion,
-                eprocess_store=_eprocess_store(ctx.config, stem, eprocess_stores),
             )
             boards[stem] = board
         except (ValueError, pl.exceptions.PolarsError):

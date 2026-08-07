@@ -6,15 +6,16 @@ rows whose truth was knowable at the fold origin, and evaluated on the
 snapshots issued in the following step. Output is the scores frame.
 """
 
-import json
-import math
 from collections.abc import Sequence
 from dataclasses import dataclass
-from datetime import datetime
 
 import polars as pl
 
-from grounded_weather_forecast.backtest.scores import SCORES_SCHEMA, empty_scores
+from grounded_weather_forecast.backtest.scores import (
+    SCORES_SCHEMA,
+    empty_scores,
+    stamped_scores,
+)
 from grounded_weather_forecast.backtest.splits import (
     WindowMode,
     daily_truth_known_at,
@@ -148,56 +149,21 @@ def run_backtest(
                 blender = factory().fit(train_slice)
                 prediction = blender.predict(test_slice.x)
                 results.append(
-                    keys.with_columns(
-                        pl.lit(method_id).alias("method_id"),
-                        pl.lit(variable.name).alias("variable"),
-                        pl.lit(product).alias("product"),
-                        pl.lit(kind).alias("source_kind"),
-                        pl.lit(evaluation.evaluation_id).alias("evaluation_id"),
-                        pl.lit(datetime.fromisoformat(evaluation.created_at)).alias(
-                            "evaluation_created_at"
-                        ),
-                        pl.lit(evaluation.dataset_fingerprint).alias(
-                            "dataset_fingerprint"
-                        ),
-                        pl.lit(json.dumps(evaluation.source_set)).alias(
-                            "source_set_json"
-                        ),
-                        pl.lit(json.dumps(evaluation.feature_set)).alias(
-                            "feature_set_json"
-                        ),
-                        pl.lit(semantics.value).alias("semantics"),
-                        pl.lit(evaluation.code_version).alias("code_version"),
-                        pl.lit(evaluation.config_fingerprint).alias(
-                            "config_fingerprint"
-                        ),
-                        pl.lit(request.window).alias("window"),
-                        pl.lit(fold.origin).alias("fold_origin"),
-                        pl.Series("y_pred", prediction.point, dtype=pl.Float64)
-                        .fill_nan(None)
-                        .alias("y_pred"),
-                        pl.Series("y_true", test_slice.y, dtype=pl.Float64).alias(
-                            "y_true"
-                        ),
-                        pl.lit(json.dumps(prediction.quantile_levels)).alias(
-                            "quantile_levels_json"
-                        ),
-                        pl.Series(
-                            "quantiles_json",
-                            [
-                                json.dumps(
-                                    [
-                                        value if math.isfinite(value) else None
-                                        for value in row.tolist()
-                                    ]
-                                )
-                                for row in prediction.quantiles
-                            ]
-                            if prediction.quantiles is not None
-                            else [None] * test_slice.x.n_rows,
-                            dtype=pl.String,
-                        ),
-                    ).select(list(SCORES_SCHEMA))
+                    stamped_scores(
+                        keys,
+                        evaluation,
+                        method_id=method_id,
+                        variable=variable.name,
+                        product=product,
+                        source_kind=kind,
+                        semantics=semantics.value,
+                        window=request.window,
+                        fold_origin=fold.origin,
+                        y_pred=prediction.point,
+                        y_true=test_slice.y,
+                        quantile_levels=prediction.quantile_levels,
+                        quantiles=prediction.quantiles,
+                    )
                 )
     if not results:
         return empty_scores()

@@ -9,6 +9,7 @@
 Insufficient coverage yields null truth — rows drop out of training/scoring.
 """
 
+from collections.abc import Sequence
 from dataclasses import dataclass
 
 import polars as pl
@@ -286,4 +287,28 @@ def truth_daily(minute: pl.DataFrame, config: Config) -> pl.DataFrame:
             "coverage_frac",
             "rain_coverage",
         )
+    )
+
+
+def truth_minute_grid(minute: pl.DataFrame, variables: Sequence[str]) -> pl.DataFrame:
+    """Minute-truncated truth grid: one row per wall-clock minute.
+
+    ``truth_minute`` rows are raw ~61 s QC'd samples (flagged values already
+    nulled at derivation); the grid averages samples within each minute so
+    the minutely backtest and self-verification score against one shared
+    definition of per-minute truth.
+    """
+    present = [variable for variable in variables if variable in minute.columns]
+    if minute.is_empty() or not present:
+        return pl.DataFrame(
+            schema={
+                "valid_time": pl.Datetime("us", "UTC"),
+                **dict.fromkeys(present, pl.Float64()),
+            }
+        )
+    return (
+        minute.select(pl.col("ts").dt.truncate("1m").alias("valid_time"), *present)
+        .group_by("valid_time")
+        .agg(*(pl.col(variable).mean() for variable in present))
+        .sort("valid_time")
     )

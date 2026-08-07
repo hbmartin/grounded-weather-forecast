@@ -52,8 +52,22 @@ DAILY_BUCKETS_HOURS: tuple[LeadBucket, ...] = tuple(
     for bucket in DAILY_BUCKETS
 )
 
+# Edges in lead_hours (everything downstream assumes that unit). 0-5m isolates
+# the near-observation regime where persistence historically wins; the rest
+# give four points on the anchor-decay curve. The 61-minute upper edge is
+# deliberate: minute 60 is lead exactly 1.0 and must stay in the product
+# instead of falling into the hourly "1-3h" bucket.
+MINUTELY_BUCKETS: tuple[LeadBucket, ...] = (
+    LeadBucket("0-5m", 0.0, 5.0 / 60.0),
+    LeadBucket("5-15m", 5.0 / 60.0, 0.25),
+    LeadBucket("15-30m", 0.25, 0.5),
+    LeadBucket("30-45m", 0.5, 0.75),
+    LeadBucket("45-60m", 0.75, 61.0 / 60.0),
+)
+
 HOURLY_BUCKET_LABELS: tuple[str, ...] = tuple(b.label for b in HOURLY_BUCKETS)
 DAILY_BUCKET_LABELS: tuple[str, ...] = tuple(b.label for b in DAILY_BUCKETS)
+MINUTELY_BUCKET_LABELS: tuple[str, ...] = tuple(b.label for b in MINUTELY_BUCKETS)
 
 
 def _bucket_label(buckets: tuple[LeadBucket, ...], lead: float) -> str | None:
@@ -79,9 +93,20 @@ def daily_bucket(lead_days: float) -> str | None:
     return _bucket_label(DAILY_BUCKETS, lead_days)
 
 
+def minutely_bucket(lead_hours: float) -> str | None:
+    """Bucket label for a sub-hourly lead in hours; ``None`` out of range."""
+    return _bucket_label(MINUTELY_BUCKETS, lead_hours)
+
+
 def buckets_for_product(product: Product) -> tuple[LeadBucket, ...]:
     """Fit/evaluation buckets expressed in the matrix's hour lead unit."""
-    return DAILY_BUCKETS_HOURS if product is Product.DAILY else HOURLY_BUCKETS
+    match product:
+        case Product.DAILY:
+            return DAILY_BUCKETS_HOURS
+        case Product.MINUTELY:
+            return MINUTELY_BUCKETS
+        case _:
+            return HOURLY_BUCKETS
 
 
 def bucket_for_product(product: Product, lead_hours: float) -> str | None:
@@ -107,3 +132,8 @@ def hourly_bucket_expr(lead_hours: pl.Expr) -> pl.Expr:
 def daily_bucket_expr(lead_days: pl.Expr) -> pl.Expr:
     """Vectorized :func:`daily_bucket` as a polars expression."""
     return _bucket_expr(DAILY_BUCKETS, lead_days)
+
+
+def minutely_bucket_expr(lead_hours: pl.Expr) -> pl.Expr:
+    """Vectorized :func:`minutely_bucket` as a polars expression."""
+    return _bucket_expr(MINUTELY_BUCKETS, lead_hours)

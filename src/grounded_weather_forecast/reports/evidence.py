@@ -826,6 +826,73 @@ def record_served_quality(
         return
 
 
+def record_winner_curse(
+    config: Config,
+    product: str,
+    scores: pl.DataFrame,
+    winners: pl.DataFrame,
+    *,
+    now: datetime | None = None,
+) -> None:
+    """Winner-bias scalars into the verdicts ledger (same keys, new names)."""
+    from grounded_weather_forecast.reports.recalibration import (  # noqa: PLC0415
+        newest_evaluation,
+    )
+    from grounded_weather_forecast.reports.winner_curse import (  # noqa: PLC0415
+        winner_curse_verdicts,
+    )
+
+    try:
+        moment = now or datetime.now(tz=UTC)
+        verdicts = winner_curse_verdicts(winners)
+        if not verdicts or scores.is_empty():
+            return
+        newest = newest_evaluation(scores)
+        rows = [
+            {
+                "recorded_at": moment,
+                "evaluation_id": _first(newest, "evaluation_id"),
+                "product": product,
+                "source_kind": _first(newest, "source_kind"),
+                "name": name,
+                "value": float(value),
+                "code_version": _first(newest, "code_version"),
+                "config_fingerprint": _first(newest, "config_fingerprint"),
+                "dataset_fingerprint": _first(newest, "dataset_fingerprint"),
+            }
+            for name, value in sorted(verdicts.items())
+        ]
+        fresh = pl.DataFrame(rows, schema_overrides=dict(VERDICTS_SCHEMA)).select(
+            VERDICTS_SCHEMA.names()
+        )
+        append_ledger(
+            fresh, ledger_path(config, VERDICTS_LEDGER), VERDICTS_LEDGER, now=moment
+        )
+    except _RECORDER_ERRORS:
+        return
+
+
+def _winner_bias_note(config: Config, product: str) -> str:
+    """The newest recorded winner bias, as a suffix for the delta line.
+
+    The delta line's "best mae" is an argmin over every method per slice —
+    the most curse-contaminated headline in the system; the note keeps the
+    uncorrected-argmin caveat attached to it.
+    """
+    try:
+        verdicts = load_ledger(
+            ledger_path(config, VERDICTS_LEDGER), VERDICTS_SCHEMA
+        ).filter(
+            (pl.col("product") == product) & (pl.col("name") == "winner_bias_mean")
+        )
+        if verdicts.is_empty():
+            return ""
+        newest = verdicts.sort("recorded_at").row(-1, named=True)
+        return f" (argmin winner bias ~ {float(newest['value']):+.3f}, uncorrected)"
+    except _RECORDER_ERRORS:
+        return ""
+
+
 def quality_delta_line(config: Config) -> str | None:
     """One line comparing the two newest live evaluations' best-slice MAE."""
     try:
@@ -877,7 +944,7 @@ def quality_delta_line(config: Config) -> str | None:
         return (
             f"quality delta ({product} live): n-weighted best mae "
             f"{previous_mae:.3f} -> {current_mae:.3f} ({percent:+.1f}%) "
-            f"over {slices} slices"
+            f"over {slices} slices{_winner_bias_note(config, product)}"
         )
     except _RECORDER_ERRORS:
         return None
