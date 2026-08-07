@@ -33,11 +33,16 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import TYPE_CHECKING, cast
 
+import numpy as np
 import polars as pl
 from filelock import Timeout
 
 from grounded_weather_forecast.config import Config
 from grounded_weather_forecast.evaluation import code_identity, config_fingerprint
+from grounded_weather_forecast.metrics.probabilistic import (
+    crps_ensemble,
+    empirical_coverage,
+)
 from grounded_weather_forecast.storage import atomic_write_parquet, locked_path
 
 if TYPE_CHECKING:
@@ -46,6 +51,7 @@ if TYPE_CHECKING:
 _LOCK_TIMEOUT_SECONDS = 5.0
 RECENT_WINDOW_DAYS = 14
 RETENTION_DAYS = 730
+_MIN_RECENT_QUANTILE_ROWS = 20
 
 _RECORDER_ERRORS = (OSError, ValueError, Timeout, pl.exceptions.PolarsError)
 
@@ -84,6 +90,9 @@ QUALITY_SCHEMA = pl.Schema(
         "pinball": pl.Float64(),
         "recent_mae": pl.Float64(),
         "recent_n": pl.Int64(),
+        "recent_coverage80": pl.Float64(),
+        "recent_coverage90": pl.Float64(),
+        "recent_crps": pl.Float64(),
         "code_version": pl.String(),
         "config_fingerprint": pl.String(),
         "dataset_fingerprint": pl.String(),
@@ -273,7 +282,18 @@ def append_ledger(
     try:
         if fresh.is_empty():
             return
-        fresh = fresh.select(spec.schema.names()).cast(spec.schema, strict=False)
+        # Same forward-compatibility as read_ledger, on the write side: a
+        # builder predating a schema column null-fills it instead of failing.
+        missing = [
+            pl.lit(None, dtype=dtype).alias(column)
+            for column, dtype in spec.schema.items()
+            if column not in fresh.columns
+        ]
+        fresh = (
+            fresh.with_columns(*missing)
+            .select(spec.schema.names())
+            .cast(spec.schema, strict=False)
+        )
         path.parent.mkdir(parents=True, exist_ok=True)
         with locked_path(path, timeout=_LOCK_TIMEOUT_SECONDS):
             existing = load_ledger(path, spec.schema)
@@ -297,6 +317,82 @@ def append_ledger(
 
 def _first(scores: pl.DataFrame, column: str) -> object:
     return scores[column][0] if column in scores.columns else None
+
+
+def _interval_coverage(
+    y: np.ndarray,
+    grids: np.ndarray,
+    levels: list[float],
+    lower: float,
+    upper: float,
+) -> float | None:
+    lower_matches = np.flatnonzero(np.isclose(np.asarray(levels), lower))
+    upper_matches = np.flatnonzero(np.isclose(np.asarray(levels), upper))
+    if not lower_matches.size or not upper_matches.size:
+        return None
+    return empirical_coverage(
+        y, grids[:, int(lower_matches[0])], grids[:, int(upper_matches[0])]
+    )
+
+
+def _recent_quantile_metrics(
+    scores: pl.DataFrame, anchor: datetime | None
+) -> pl.DataFrame:
+    """Recent-window coverage and CRPS per slice x method, from stored grids.
+
+    The pooled expanding-evaluation coverage is frozen by history: with
+    hundreds of thousands of pre-repair rows, a repaired interval mechanism
+    moves it by tenths of a point per day. The recent window is the only
+    place a calibration change is visible on a useful timescale.
+    """
+    identity = ["product", "variable", "truth_semantics", "lead_bucket", "method_id"]
+    empty = pl.DataFrame(
+        schema={
+            **dict.fromkeys(identity, pl.String()),
+            "recent_coverage80": pl.Float64(),
+            "recent_coverage90": pl.Float64(),
+            "recent_crps": pl.Float64(),
+        }
+    )
+    if anchor is None or {"quantiles_json", "quantile_levels_json"} - set(
+        scores.columns
+    ):
+        return empty
+    recent = scores.filter(
+        pl.col("valid_time") > anchor - timedelta(days=RECENT_WINDOW_DAYS)
+    ).drop_nulls(["quantiles_json", "quantile_levels_json", "y_true"])
+    if recent.is_empty():
+        return empty
+    rows: list[dict[str, object]] = []
+    group_keys = ["product", "variable", "semantics", "lead_bucket", "method_id"]
+    for key, group in recent.group_by(group_keys):
+        levels = [
+            float(level) for level in json.loads(group["quantile_levels_json"][0])
+        ]
+        if not levels:
+            continue
+        grids = np.asarray(
+            [
+                [np.nan if value is None else float(value) for value in json.loads(row)]
+                for row in group["quantiles_json"].to_list()
+            ]
+        )
+        y = group["y_true"].to_numpy().astype(np.float64)
+        usable = np.isfinite(grids).all(axis=1) & np.isfinite(y)
+        if int(usable.sum()) < _MIN_RECENT_QUANTILE_ROWS:
+            continue
+        grids, y = grids[usable], y[usable]
+        rows.append(
+            {
+                **dict(zip(identity, (str(part) for part in key), strict=True)),
+                "recent_coverage80": _interval_coverage(y, grids, levels, 0.1, 0.9),
+                "recent_coverage90": _interval_coverage(y, grids, levels, 0.05, 0.95),
+                "recent_crps": crps_ensemble(y, np.sort(grids, axis=1)),
+            }
+        )
+    if not rows:
+        return empty
+    return pl.DataFrame(rows, schema_overrides=dict(empty.schema)).select(empty.columns)
 
 
 def quality_rows(
@@ -346,6 +442,9 @@ def quality_rows(
             "recent_n": pl.Int64(),
         }
     )
+    recent_quantile = _recent_quantile_metrics(
+        scores, anchor if isinstance(anchor, datetime) else None
+    )
     if isinstance(anchor, datetime):
         # half-open (anchor - window, anchor]: exactly the last 14 days
         recent = (
@@ -362,6 +461,7 @@ def quality_rows(
         )
     return (
         rows.join(recent, on=identity, how="left")
+        .join(recent_quantile, on=identity, how="left")
         .with_columns(
             pl.lit(now).alias("recorded_at"),
             pl.lit(_first(scores, "evaluation_id")).alias("evaluation_id"),
@@ -497,6 +597,42 @@ def gate_verdicts(comparison: pl.DataFrame) -> dict[str, float]:
     }
 
 
+def discovery_verdicts(board: pl.DataFrame, *, alpha: float) -> dict[str, float]:
+    """p-BH vs e-BH discovery counts — the two corrections' running A/B.
+
+    A discovery is one (row, reference) pair the correction flags; the pair
+    totals differ between the families (DM tests every scored pair, the
+    e-process only tracked ones), so both denominators are recorded too.
+    """
+    if board.is_empty():
+        return {}
+    verdicts: dict[str, float] = {}
+    p_columns = [c for c in board.columns if c.startswith("dm_q_vs_")]
+    if p_columns:
+        q_values = board.select(p_columns)
+        verdicts["pbh_discoveries"] = float(
+            sum(
+                int(cast("int", (q_values[column] <= alpha).sum()))
+                for column in p_columns
+            )
+        )
+        verdicts["pbh_pairs"] = float(
+            sum(q_values[column].drop_nulls().len() for column in p_columns)
+        )
+    e_columns = [c for c in board.columns if c.startswith("ebh_sig_vs_")]
+    if e_columns:
+        verdicts["ebh_discoveries"] = float(
+            sum(int(cast("int", board[column].sum())) for column in e_columns)
+        )
+        verdicts["ebh_pairs"] = float(
+            sum(
+                board[column.replace("ebh_sig_vs_", "e_vs_")].drop_nulls().len()
+                for column in e_columns
+            )
+        )
+    return verdicts
+
+
 def wealth_rows(product: str, store: "EProcessStore", *, now: datetime) -> pl.DataFrame:
     """One snapshot row per e-process pair; unchanged wealth appends nothing."""
     rows = [
@@ -609,6 +745,8 @@ def record_verdicts(
     recalib: pl.DataFrame,
     comparison: pl.DataFrame,
     *,
+    board: pl.DataFrame | None = None,
+    alpha: float = 0.05,
     now: datetime | None = None,
 ) -> None:
     from grounded_weather_forecast.reports.recalibration import (  # noqa: PLC0415
@@ -618,6 +756,8 @@ def record_verdicts(
     try:
         moment = now or datetime.now(tz=UTC)
         verdicts = {**recalibration_verdicts(recalib), **gate_verdicts(comparison)}
+        if board is not None:
+            verdicts.update(discovery_verdicts(board, alpha=alpha))
         if not verdicts or scores.is_empty():
             return
         newest = newest_evaluation(scores)

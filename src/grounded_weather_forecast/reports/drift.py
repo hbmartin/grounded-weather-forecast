@@ -22,6 +22,7 @@ track record (fixed share already gives graceful re-entry either way).
 """
 
 import json
+from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -55,6 +56,12 @@ _MIN_ROWS = 48
 
 RESIDUAL_SKIPPED_TIER = "residual_skipped"
 CONSENSUS_SKIPPED_TIER = "consensus_skipped"
+COMMON_MODE_TIER = "common_mode"
+# Per-source residual rows folded into a common-mode headline keep their
+# data but leave the pageable-alert stream.
+RESIDUAL_COMMON_TIER = "residual_common"
+_COMMON_MODE_SHARE = 2.0 / 3.0
+_MIN_COMMON_MODE_SOURCES = 3
 
 
 @dataclass(frozen=True, slots=True)
@@ -357,16 +364,103 @@ def residual_alarms(
     return alarms
 
 
+def _variable_source_count(matrix: pl.DataFrame, variable_name: str) -> int:
+    return len(
+        {
+            column.split("__")[1]
+            for column in matrix.columns
+            if column.startswith("fx__") and column.endswith(f"__{variable_name}")
+        }
+    )
+
+
+def _common_mode_detail(truth_qc: Mapping[str, object] | None) -> str:
+    """One interpretable line in place of a wall of per-source alarms."""
+    if isinstance(truth_qc, Mapping):
+        block = truth_qc.get("drift_verdict")
+        if isinstance(block, Mapping):
+            attribution = block.get("attribution")
+            latched = bool(block.get("latched"))
+            if latched and attribution == "station_drift":
+                return (
+                    "suspect station truth: the neighbor cross-check holds a "
+                    "latched station-drift verdict — do not trust these "
+                    "residual alarms as provider failures"
+                )
+            if attribution == "regime":
+                return (
+                    "regime event: the neighbor network shifted too — expect "
+                    "NWP to catch up and the alarms to clear"
+                )
+            if block.get("exceeded") is False:
+                return (
+                    "neighbor cross-check is clean — a shared forecast-model "
+                    "regression or a local regime NWP misses; watch for "
+                    "reversion (regimes revert, drifts persist)"
+                )
+    return (
+        "no neighbor cross-check verdict available to arbitrate — run "
+        "truth-qc for attribution"
+    )
+
+
+def _collapse_common_mode(
+    rows: list[dict[str, object]],
+    matrix: pl.DataFrame,
+    truth_qc: Mapping[str, object] | None,
+) -> list[dict[str, object]]:
+    """Fold per-source residual walls into one attributed headline per variable.
+
+    When most sources alarm on the same variable at once, the per-source
+    rows say nothing about which source broke — the common factor is the
+    verifying station or the regional regime, and the truth-QC neighbor
+    verdict is the arbiter (future-work #24's cross-method invariant).
+    """
+    by_variable: dict[str, set[str]] = {}
+    for row in rows:
+        if row["tier"] == "residual":
+            by_variable.setdefault(str(row["variable"]), set()).add(str(row["source"]))
+    collapsed = list(rows)
+    for variable_name, alarmed in sorted(by_variable.items()):
+        n_sources = _variable_source_count(matrix, variable_name)
+        if n_sources < _MIN_COMMON_MODE_SOURCES:
+            continue
+        if len(alarmed) / n_sources < _COMMON_MODE_SHARE:
+            continue
+        for row in collapsed:
+            if row["variable"] == variable_name and row["tier"] == "residual":
+                row["tier"] = RESIDUAL_COMMON_TIER
+        collapsed.insert(
+            0,
+            {
+                "variable": variable_name,
+                "source": "(common)",
+                "lead_bucket": "(all)",
+                "tier": COMMON_MODE_TIER,
+                "statistic": float(len(alarmed)),
+                "detail": (
+                    f"{len(alarmed)}/{n_sources} sources threw residual "
+                    f"alarms together; {_common_mode_detail(truth_qc)}"
+                ),
+            },
+        )
+    return collapsed
+
+
 def drift_report(
-    matrix: pl.DataFrame, variables: tuple[VariableSpec, ...]
+    matrix: pl.DataFrame,
+    variables: tuple[VariableSpec, ...],
+    truth_qc: Mapping[str, object] | None = None,
 ) -> pl.DataFrame:
     """All alarms and skip notes across both tiers, one row each.
 
     Empty only when every evaluated bucket ran and stayed quiet — degenerate
     buckets still produce a ``residual_skipped`` row, so an operator can tell
-    "checked but unscoreable" apart from silence.
+    "checked but unscoreable" apart from silence. When most sources alarm on
+    one variable simultaneously the per-source rows collapse into a single
+    ``common_mode`` headline attributed by the truth-QC neighbor verdict.
     """
-    rows = [
+    rows: list[dict[str, object]] = [
         {
             "variable": variable.name,
             "source": alarm.source,
@@ -381,6 +475,7 @@ def drift_report(
             *residual_alarms(matrix, variable),
         )
     ]
+    rows = _collapse_common_mode(rows, matrix, truth_qc)
     return pl.DataFrame(
         rows,
         schema={
@@ -401,7 +496,9 @@ def write_drift_artifact(alarms: pl.DataFrame, path: Path) -> None:
     (every ``alarms`` entry becomes a pageable alert) while the dashboard —
     which treats absence as failure — still sees that the tier was checked.
     """
-    is_note = pl.col("tier").is_in([RESIDUAL_SKIPPED_TIER, CONSENSUS_SKIPPED_TIER])
+    is_note = pl.col("tier").is_in(
+        [RESIDUAL_SKIPPED_TIER, CONSENSUS_SKIPPED_TIER, RESIDUAL_COMMON_TIER]
+    )
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(
         json.dumps(

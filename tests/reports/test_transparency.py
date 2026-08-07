@@ -6,10 +6,16 @@ import numpy as np
 import polars as pl
 
 from grounded_weather_forecast.config import PromotionConfig
+from grounded_weather_forecast.reports.eprocess import (
+    EProcessEntry,
+    EProcessStore,
+    pair_key,
+)
 from grounded_weather_forecast.reports.leaderboard import (
     _mcs_gate,
     bh_adjusted,
     blocked_promotions,
+    ebh_adjusted,
     gate_references,
     slice_winners,
     union_references,
@@ -321,6 +327,67 @@ class TestBhAdjusted:
         assert all(0.0 <= qv <= 1.0 for qv in q)
         # BH arithmetic on (0.01, 0.04, 0.5) with m=3: q = (0.03, 0.06, 0.5)
         assert q[0] == 0.03
+
+
+def store_with(log_e_by_method, reference="equal_weight", tmp_path=None):
+    import math
+    from pathlib import Path
+
+    store = EProcessStore(
+        path=Path(tmp_path or "/dev/null"),
+        config_fingerprint="cfg1",
+        code_version="code1",
+    )
+    for method_id, e_value in log_e_by_method.items():
+        key = pair_key("hourly", "humidity_pct", "", "168-240h", method_id, reference)
+        store.entries[key] = EProcessEntry(log_e=math.log(e_value), t=10)
+    return store
+
+
+class TestEbhAdjusted:
+    def test_flags_top_wealth_pairs_and_reports_threshold(self):
+        board = make_board(
+            [
+                board_row("a", 1.0, skill=0.3, p=0.01),
+                board_row("b", 2.0, skill=0.2, p=0.04),
+                board_row("c", 3.0, skill=0.1, p=0.5),
+                board_row("untracked", 3.5, skill=0.0, p=0.9),
+                board_row("equal_weight", 4.0),
+            ]
+        )
+        store = store_with({"a": 400.0, "b": 30.0, "c": 1.5})
+        adjusted = ebh_adjusted(board, store, alpha=0.05)
+        by_method = {row["method_id"]: row for row in adjusted.iter_rows(named=True)}
+        # K = 3 tracked pairs; sorted e = (400, 30, 1.5); k * e_[k] / K vs
+        # 1/alpha = 20: k=1 -> 133, k=2 -> 20, k=3 -> 1.5, so k* = 2 and the
+        # discovery bar is K / (alpha * k*) = 30.
+        assert by_method["a"]["ebh_sig_vs_equal_weight"]
+        assert by_method["b"]["ebh_sig_vs_equal_weight"]
+        assert not by_method["c"]["ebh_sig_vs_equal_weight"]
+        assert not by_method["untracked"]["ebh_sig_vs_equal_weight"]
+        assert by_method["untracked"]["e_vs_equal_weight"] is None
+        assert by_method["equal_weight"]["e_vs_equal_weight"] is None
+        assert abs(by_method["a"]["ebh_threshold_vs_equal_weight"] - 30.0) < 1e-9
+
+    def test_no_rejections_reports_the_standing_bar(self):
+        board = make_board(
+            [
+                board_row("a", 1.0, skill=0.3, p=0.01),
+                board_row("b", 2.0, skill=0.2, p=0.04),
+                board_row("equal_weight", 4.0),
+            ]
+        )
+        store = store_with({"a": 2.0, "b": 1.2})
+        adjusted = ebh_adjusted(board, store, alpha=0.05)
+        assert not adjusted["ebh_sig_vs_equal_weight"].any()
+        # Nothing rejects, so the bar is K / alpha = 40 — the wealth a pair
+        # must reach for the first FDR discovery.
+        bars = adjusted["ebh_threshold_vs_equal_weight"].drop_nulls().unique()
+        assert bars.to_list() == [40.0]
+
+    def test_empty_board_passes_through(self):
+        empty = pl.DataFrame()
+        assert ebh_adjusted(empty, store_with({}), alpha=0.05).is_empty()
 
 
 def daily_scores(

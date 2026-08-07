@@ -20,10 +20,15 @@ Kochendorfer et al. (2018, HESS 22) with care, and the sample archive has
 essentially no precipitation to validate against yet.
 """
 
+import json
+from collections.abc import Mapping
 from dataclasses import dataclass
+from datetime import date, timedelta
 
 import numpy as np
+import polars as pl
 
+from grounded_weather_forecast.config import Config
 from grounded_weather_forecast.contracts import FloatArray
 
 _MIN_DAYTIME_ROWS = 100
@@ -90,3 +95,75 @@ def fit_shield_error(
         slope_se=slope_se,
         n_daytime=n,
     )
+
+
+def quarantine_dates(payload: Mapping[str, object]) -> list[date]:
+    """Dates a latched station-drift verdict covers: break date through today.
+
+    Empty unless the truth-QC artifact holds a LATCHED ``station_drift``
+    attribution — an exceedance alone (or a regime attribution) quarantines
+    nothing.
+    """
+    block = payload.get("drift_verdict")
+    if not isinstance(block, Mapping) or not block.get("latched"):
+        return []
+    break_date = block.get("break_date")
+    as_of = block.get("as_of_date")
+    if not isinstance(break_date, str) or not isinstance(as_of, str):
+        return []
+    try:
+        start, end = date.fromisoformat(break_date), date.fromisoformat(as_of)
+    except ValueError:
+        return []
+    if end < start:
+        return []
+    return [start + timedelta(days=offset) for offset in range((end - start).days + 1)]
+
+
+def apply_truth_quarantine(
+    hourly_truth: pl.DataFrame,
+    daily_truth: pl.DataFrame,
+    config: Config,
+) -> tuple[pl.DataFrame, pl.DataFrame, int]:
+    """Null temperature labels on quarantined days; flag, never delete.
+
+    The assimilation pattern (ECMWF blacklisting, MADIS flags, GHCN QC):
+    suspect observations leave the training signal but the rows — and every
+    other variable — stay, so scoring keeps running and recovery is visible.
+    Inert unless ``[truth_qc].gate_fitting`` is true AND the artifact holds
+    a latched station-drift verdict.
+    """
+    if not config.truth_qc.gate_fitting:
+        return hourly_truth, daily_truth, 0
+    try:
+        payload = json.loads(
+            (config.artifacts_dir / "truth_qc.json").read_text(encoding="utf-8")
+        )
+    except (OSError, ValueError):
+        return hourly_truth, daily_truth, 0
+    dates = quarantine_dates(payload)
+    if not dates:
+        return hourly_truth, daily_truth, 0
+    timezone = config.station.timezone
+    hourly_mask = (
+        pl.col("valid_hour").dt.convert_time_zone(timezone).dt.date().is_in(dates)
+    )
+    hourly_columns = [c for c in hourly_truth.columns if c.startswith("t__temp_c")]
+    hourly = hourly_truth.with_columns(
+        pl.when(hourly_mask).then(None).otherwise(pl.col(column)).alias(column)
+        for column in hourly_columns
+    )
+    daily_columns = [
+        c
+        for c in daily_truth.columns
+        if c.startswith(("t__temp_max_c", "t__temp_min_c"))
+    ]
+    date_column = "date_local" if "date_local" in daily_truth.columns else None
+    daily = daily_truth
+    if date_column is not None and daily_columns:
+        daily_mask = pl.col(date_column).is_in(dates)
+        daily = daily_truth.with_columns(
+            pl.when(daily_mask).then(None).otherwise(pl.col(column)).alias(column)
+            for column in daily_columns
+        )
+    return hourly, daily, len(dates)

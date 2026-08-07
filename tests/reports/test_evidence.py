@@ -67,7 +67,9 @@ def quality_row(evaluation_id="eval1", method_id="equal_weight", recorded_at=NOW
 
 
 def quality_frame(rows):
-    return pl.DataFrame(rows, schema_overrides=dict(QUALITY_SCHEMA)).select(
+    # schema= (not schema_overrides=) so row dicts predating newer ledger
+    # columns null-fill them, mirroring the engine's write-side tolerance.
+    return pl.DataFrame(rows, schema=dict(QUALITY_SCHEMA)).select(
         QUALITY_SCHEMA.names()
     )
 
@@ -255,6 +257,79 @@ class TestQualityRows:
         scores = scores_frame()
         assert quality_rows(pl.DataFrame(), pl.DataFrame(), now=NOW).is_empty()
         assert quality_rows(scores, pl.DataFrame(), now=NOW).is_empty()
+
+
+def quantile_scores_frame(periods=120, step_hours=6, miss_every=4):
+    """Every miss_every-th recent row falls outside the interval; the old
+    era misses entirely, so pooled and recent coverage must disagree."""
+    base = scores_frame(days=1).row(0, named=True)
+    start = utc(2026, 7, 1)
+    anchor = start + timedelta(hours=step_hours * (periods - 1))
+    rows = []
+    for index in range(periods):
+        valid = start + timedelta(hours=step_hours * index)
+        recent = valid > anchor - timedelta(days=14)
+        miss = (index % miss_every == 0) if recent else True
+        rows.append(
+            {
+                **base,
+                "valid_time": valid,
+                "issue_time": valid - timedelta(hours=1),
+                "y_pred": 20.0,
+                "y_true": 30.0 if miss else 20.0,
+                "quantile_levels_json": "[0.05, 0.1, 0.9, 0.95]",
+                "quantiles_json": "[17.0, 18.0, 22.0, 23.0]",
+            }
+        )
+    return pl.DataFrame(rows)
+
+
+class TestRecentQuantileMetrics:
+    def board_for(self, scores):
+        from grounded_weather_forecast.reports.leaderboard import leaderboard
+
+        return leaderboard(scores, references=())
+
+    def test_recent_window_coverage_diverges_from_pooled(self):
+        scores = quantile_scores_frame()
+        rows = quality_rows(scores, self.board_for(scores), now=NOW)
+        row = rows.row(0, named=True)
+        assert abs(row["recent_coverage80"] - 0.75) < 0.05
+        assert row["recent_coverage90"] == row["recent_coverage80"]
+        assert row["recent_crps"] is not None and row["recent_crps"] > 0.0
+        # the pooled board metric drowns the recent repair in the old era
+        assert row["coverage80"] < row["recent_coverage80"]
+
+    def test_point_only_method_stays_null(self):
+        scores = scores_frame()
+        rows = quality_rows(scores, self.board_for(scores), now=NOW)
+        assert rows["recent_coverage80"][0] is None
+        assert rows["recent_crps"][0] is None
+
+    def test_thin_recent_window_stays_null(self):
+        scores = quantile_scores_frame(periods=30, step_hours=24)
+        rows = quality_rows(scores, self.board_for(scores), now=NOW)
+        assert rows["recent_coverage80"][0] is None
+
+
+class TestDiscoveryVerdicts:
+    def test_counts_both_corrections(self):
+        board = pl.DataFrame(
+            {
+                "method_id": ["a", "b", "c"],
+                "dm_q_vs_ref": [0.01, 0.2, None],
+                "e_vs_ref": [50.0, 1.0, None],
+                "ebh_sig_vs_ref": [True, False, False],
+            }
+        )
+        verdicts = evidence.discovery_verdicts(board, alpha=0.05)
+        assert verdicts["pbh_discoveries"] == 1.0
+        assert verdicts["pbh_pairs"] == 2.0
+        assert verdicts["ebh_discoveries"] == 1.0
+        assert verdicts["ebh_pairs"] == 2.0
+
+    def test_empty_board_yields_nothing(self):
+        assert evidence.discovery_verdicts(pl.DataFrame(), alpha=0.05) == {}
 
 
 def release_payload(release_id, promoted_at, selections):

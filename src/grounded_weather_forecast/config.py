@@ -207,12 +207,19 @@ class BacktestConfig:
 
 @dataclass(frozen=True, slots=True)
 class TruthQcConfig:
-    """Neighbor-station cross-checks (Synoptic free tier)."""
+    """Neighbor-station cross-checks (keyless NWS METAR; Synoptic opt-in)."""
 
     synoptic_token: str = ""
     radius_km: float = 25.0
     elevation_band_m: float = 300.0
     lapse_k_per_km: float = 6.5
+    # Which change-point statistic GATES the drift verdict; both are always
+    # computed and recorded so the alternatives stay comparable.
+    drift_statistic: str = "snht"
+    # A latched station-drift verdict quarantines the affected truth days
+    # from new fits when true. Ships disabled: alarm precision must earn
+    # trust before an alarm is allowed to act (future-work #23's caution).
+    gate_fitting: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -244,9 +251,12 @@ class PredictConfig:
     history_path: Path
     methods: Mapping[str, str]
     minutely_tau_hours: float
-    # Post-hoc transform applied to natively-emitted quantiles at serve time;
-    # the offline report section arbitrates which mode earns this switch.
-    quantile_recalibration: str
+    # Post-hoc transform applied to natively-emitted quantiles at serve time,
+    # routed per product: the offline report A/B found the winner differs by
+    # aggregation level (daily favors cqr while hourly favors raw), which the
+    # postprocessing literature documents as the norm, not an anomaly. A bare
+    # string routes every product identically; a table sets each product.
+    quantile_recalibration: Mapping[str, str]
 
 
 @dataclass(frozen=True, slots=True)
@@ -315,6 +325,38 @@ def _choice(value: Any, allowed: tuple[str, ...], key: str, context: str) -> str
         msg = f"{key!r} in [{context}] must be one of {options}, got {text!r}"
         raise ConfigError(msg)
     return text
+
+
+_RECALIBRATION_PRODUCTS = ("hourly", "daily", "minutely")
+_RECALIBRATION_MODES = ("none", "pit", "cqr")
+
+
+def _quantile_recalibration(value: Any) -> Mapping[str, str]:
+    """Normalize the legacy string or a per-product table to a full mapping.
+
+    A fixed product order keeps ``repr`` — and with it the config
+    fingerprint — deterministic; an unlisted product defaults to "none".
+    """
+    key, context = "quantile_recalibration", "predict"
+    if isinstance(value, Mapping):
+        for product in value:
+            if str(product) not in _RECALIBRATION_PRODUCTS:
+                products = ", ".join(repr(p) for p in _RECALIBRATION_PRODUCTS)
+                msg = (
+                    f"{key!r} in [{context}] routes unknown product "
+                    f"{str(product)!r}; products are {products}"
+                )
+                raise ConfigError(msg)
+        return MappingProxyType(
+            {
+                product: _choice(
+                    value.get(product, "none"), _RECALIBRATION_MODES, key, context
+                )
+                for product in _RECALIBRATION_PRODUCTS
+            }
+        )
+    mode = _choice(value, _RECALIBRATION_MODES, key, context)
+    return MappingProxyType(dict.fromkeys(_RECALIBRATION_PRODUCTS, mode))
 
 
 def _positive_int(value: Any, key: str, context: str) -> int:
@@ -664,6 +706,13 @@ def _truth_qc(raw: Mapping[str, Any]) -> TruthQcConfig:
         lapse_k_per_km=_positive_number(
             section.get("lapse_k_per_km", 6.5), "lapse_k_per_km", "truth_qc"
         ),
+        drift_statistic=_choice(
+            section.get("drift_statistic", "snht"),
+            ("snht", "pettitt"),
+            "drift_statistic",
+            "truth_qc",
+        ),
+        gate_fitting=bool(section.get("gate_fitting", False)),
     )
 
 
@@ -727,11 +776,8 @@ def _predict(raw: Mapping[str, Any], dataset_dir: Path) -> PredictConfig:
             "minutely_tau_hours",
             "predict",
         ),
-        quantile_recalibration=_choice(
-            section.get("quantile_recalibration", "none"),
-            ("none", "pit", "cqr"),
-            "quantile_recalibration",
-            "predict",
+        quantile_recalibration=_quantile_recalibration(
+            section.get("quantile_recalibration", "none")
         ),
     )
 

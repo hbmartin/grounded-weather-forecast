@@ -1,4 +1,4 @@
-from datetime import timedelta
+from datetime import UTC, date, datetime, timedelta
 
 import numpy as np
 import polars as pl
@@ -486,3 +486,230 @@ class TestNwsNeighbors:
         assert checks.n_neighbors == 0
         assert checks.drift_alert is None
         assert checks.correlation_alert is None
+
+
+def _drift_frames(station_shift=0.0, regime_shift=0.0, days=30, seed=7):
+    """Synthetic truth + neighbors; shifts start on day 22."""
+    from datetime import UTC, datetime, timedelta
+
+    rng = np.random.default_rng(seed)
+    start = datetime(2026, 7, 1, tzinfo=UTC)
+    stids = [f"N{i}" for i in range(6)]
+    elevations = [1350.0, 1450.0, 1500.0, 1300.0, 1420.0, 1380.0]
+    truth_rows, neighbor_rows = [], []
+    for hour in range(days * 24):
+        ts = start + timedelta(hours=hour)
+        day = hour // 24
+        base = 20.0 + 8.0 * np.sin(2.0 * np.pi * ((hour % 24) - 14) / 24.0)
+        regime = regime_shift if day >= 22 else 0.0
+        station = station_shift if day >= 22 else 0.0
+        truth_rows.append(
+            {
+                "valid_hour": ts,
+                "t__temp_c__inst": base + regime + station + rng.normal(0.0, 0.2),
+            }
+        )
+        neighbor_rows.extend(
+            {
+                "stid": stid,
+                "ts": ts,
+                "temp_c": base + regime + rng.normal(0.0, 0.3),
+                "elevation_m": elevation,
+            }
+            for stid, elevation in zip(stids, elevations, strict=True)
+        )
+    truth = pl.DataFrame(truth_rows).with_columns(
+        pl.col("valid_hour").dt.cast_time_unit("us")
+    )
+    neighbors = pl.DataFrame(neighbor_rows).with_columns(
+        pl.col("ts").dt.cast_time_unit("us")
+    )
+    return truth, neighbors
+
+
+class TestDriftVerdict:
+    def test_station_step_latches_station_drift(self):
+        from grounded_weather_forecast.dataset.neighbors import drift_verdict
+
+        truth, neighbors = _drift_frames(station_shift=-1.5)
+        verdict = drift_verdict(
+            truth,
+            neighbors,
+            timezone="America/Los_Angeles",
+            lapse_k_per_km=6.5,
+            site_elevation_m=1400.0,
+        )
+        assert verdict.exceeded is True
+        assert verdict.attribution == "station_drift"
+        assert verdict.break_date is not None
+        assert verdict.snht_statistic is not None
+        assert verdict.pettitt_p is not None  # both statistics always recorded
+        assert set(verdict.series.columns) == {"date", "difference", "cusum"}
+
+    def test_regime_shift_stays_quiet(self):
+        from grounded_weather_forecast.dataset.neighbors import drift_verdict
+
+        # seed 0: a realization below the 95% critical — the point is that a
+        # COMMON shift cancels in the difference series entirely, leaving
+        # only noise (tail seeds are what the 3-day latch absorbs)
+        truth, neighbors = _drift_frames(regime_shift=5.0, seed=0)
+        verdict = drift_verdict(
+            truth,
+            neighbors,
+            timezone="America/Los_Angeles",
+            lapse_k_per_km=6.5,
+            site_elevation_m=1400.0,
+        )
+        assert verdict.exceeded is False
+        assert verdict.attribution is None
+
+    def test_pettitt_statistic_can_gate_instead(self):
+        from grounded_weather_forecast.dataset.neighbors import drift_verdict
+
+        truth, neighbors = _drift_frames(station_shift=-1.5)
+        verdict = drift_verdict(
+            truth,
+            neighbors,
+            timezone="America/Los_Angeles",
+            lapse_k_per_km=6.5,
+            site_elevation_m=1400.0,
+            statistic="pettitt",
+        )
+        assert verdict.statistic_name == "pettitt"
+        assert verdict.exceeded is True
+        assert verdict.critical is None  # pettitt gates on its p-value
+
+    def test_thin_series_is_not_evaluable(self):
+        from grounded_weather_forecast.dataset.neighbors import drift_verdict
+
+        truth, neighbors = _drift_frames(days=4)
+        verdict = drift_verdict(
+            truth,
+            neighbors,
+            timezone="America/Los_Angeles",
+            lapse_k_per_km=6.5,
+            site_elevation_m=1400.0,
+        )
+        assert verdict.exceeded is None
+        assert "need at least" in verdict.reason
+
+
+class TestInversionScreening:
+    def test_inversion_days_are_flagged_and_excluded(self):
+        from datetime import UTC, datetime, timedelta
+
+        from grounded_weather_forecast.dataset.neighbors import inversion_dates
+
+        start = datetime(2026, 7, 1, tzinfo=UTC)
+        rows = []
+        elevations = {"A": 300.0, "B": 800.0, "C": 1400.0, "D": 2000.0}
+        for day in range(4):
+            inverted = day < 2
+            for hour in (12, 14, 16):
+                ts = start + timedelta(days=day, hours=hour + 7)  # 12-16 PDT
+                for stid, elevation in elevations.items():
+                    # adjusted temps: flat when the fixed lapse holds; rising
+                    # with height by 3 K/km on inversion days (raw slope > 0)
+                    slope = 9.5 if inverted else 0.0
+                    rows.append(
+                        {
+                            "stid": stid,
+                            "ts": ts,
+                            "temp_c": 20.0 + slope * elevation / 1000.0,
+                            "elevation_m": elevation,
+                        }
+                    )
+        neighbors = pl.DataFrame(rows).with_columns(
+            pl.col("ts").dt.cast_time_unit("us")
+        )
+        frame = inversion_dates(
+            neighbors, lapse_k_per_km=6.5, timezone="America/Los_Angeles"
+        )
+        assert frame.filter(pl.col("inversion")).height == 2
+        assert frame.height == 4
+
+
+class TestTruthQuarantine:
+    def payload(self, latched=True, attribution="station_drift"):
+        return {
+            "drift_verdict": {
+                "latched": latched,
+                "attribution": attribution,
+                "break_date": "2026-08-04",
+                "as_of_date": "2026-08-06",
+            }
+        }
+
+    def test_latched_payload_yields_the_date_range(self):
+        from datetime import date
+
+        from grounded_weather_forecast.dataset.truth_qc import quarantine_dates
+
+        dates = quarantine_dates(self.payload())
+        assert dates == [date(2026, 8, 4), date(2026, 8, 5), date(2026, 8, 6)]
+
+    def test_unlatched_payload_quarantines_nothing(self):
+        from grounded_weather_forecast.dataset.truth_qc import quarantine_dates
+
+        assert quarantine_dates(self.payload(latched=False)) == []
+        assert quarantine_dates({}) == []
+
+    def test_gate_off_leaves_truth_untouched(self, tmp_path):
+        import json
+
+        from conftest import write_config
+
+        from grounded_weather_forecast.dataset.truth_qc import apply_truth_quarantine
+
+        config = write_config(tmp_path)
+        (config.artifacts_dir).mkdir(parents=True, exist_ok=True)
+        (config.artifacts_dir / "truth_qc.json").write_text(json.dumps(self.payload()))
+        hourly = pl.DataFrame(
+            {
+                "valid_hour": [datetime(2026, 8, 5, 12, tzinfo=UTC)],
+                "t__temp_c__inst": [20.0],
+            }
+        ).with_columns(pl.col("valid_hour").dt.cast_time_unit("us"))
+        daily = pl.DataFrame(
+            {"date_local": [date(2026, 8, 5)], "t__temp_max_c": [30.0]}
+        )
+        out_hourly, out_daily, days = apply_truth_quarantine(hourly, daily, config)
+        assert days == 0
+        assert out_hourly["t__temp_c__inst"][0] == 20.0
+
+    def test_gate_on_nulls_temperature_labels_only(self, tmp_path):
+        import json
+
+        from conftest import write_config
+
+        from grounded_weather_forecast.dataset.truth_qc import apply_truth_quarantine
+
+        config = write_config(
+            tmp_path, extra_toml="\n[truth_qc]\ngate_fitting = true\n"
+        )
+        config.artifacts_dir.mkdir(parents=True, exist_ok=True)
+        (config.artifacts_dir / "truth_qc.json").write_text(json.dumps(self.payload()))
+        hourly = pl.DataFrame(
+            {
+                "valid_hour": [
+                    datetime(2026, 8, 5, 12, tzinfo=UTC),
+                    datetime(2026, 8, 1, 12, tzinfo=UTC),
+                ],
+                "t__temp_c__inst": [20.0, 21.0],
+                "t__humidity_pct__mean": [50.0, 55.0],
+            }
+        ).with_columns(pl.col("valid_hour").dt.cast_time_unit("us"))
+        daily = pl.DataFrame(
+            {
+                "date_local": [date(2026, 8, 5), date(2026, 8, 1)],
+                "t__temp_max_c": [30.0, 29.0],
+                "t__temp_min_c": [10.0, 9.0],
+            }
+        )
+        out_hourly, out_daily, days = apply_truth_quarantine(hourly, daily, config)
+        assert days == 3
+        assert out_hourly["t__temp_c__inst"][0] is None  # quarantined day
+        assert out_hourly["t__temp_c__inst"][1] == 21.0  # before the break
+        assert out_hourly["t__humidity_pct__mean"][0] == 50.0  # other variables stay
+        assert out_daily["t__temp_max_c"][0] is None
+        assert out_daily["t__temp_min_c"][1] == 9.0

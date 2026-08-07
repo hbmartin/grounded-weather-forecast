@@ -59,6 +59,7 @@ from grounded_weather_forecast.dataset.truth import (
     truth_hourly,
     truth_minute,
 )
+from grounded_weather_forecast.dataset.truth_qc import apply_truth_quarantine
 from grounded_weather_forecast.leads import daily_bucket_expr, hourly_bucket_expr
 from grounded_weather_forecast.solar import solar_elevation_deg, toa_irradiance_wm2
 from grounded_weather_forecast.timeutil import local_date_expr, local_day_minutes
@@ -667,6 +668,14 @@ def write_dataset(config: Config) -> DatasetManifest:
     causal_minute = truth_minute(causal_flagged, config)
     hourly_truth = truth_hourly(minute, config)
     daily_truth = truth_daily(minute, config)
+    hourly_truth, daily_truth, quarantined_days = apply_truth_quarantine(
+        hourly_truth, daily_truth, config
+    )
+    if quarantined_days:
+        print(
+            f"truth quarantine: temperature labels nulled on {quarantined_days} "
+            "day(s) under a latched station-drift verdict (truth_qc.json)"
+        )
 
     archive = read_forecast_archive(config.forecasts)
     hourly_long = archive.hourly

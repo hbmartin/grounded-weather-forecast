@@ -377,7 +377,7 @@ def _lead_buckets(predict_frame: pl.DataFrame, *, daily: bool) -> list[str | Non
 
 
 def _recalibrator(config: Config, product: str) -> QuantileRecalibrator | None:
-    mode = config.predict.quantile_recalibration
+    mode = config.predict.quantile_recalibration.get(product, "none")
     if mode == "none":
         return None
     return QuantileRecalibrator(config.dataset.dir / "scores", product, config, mode)

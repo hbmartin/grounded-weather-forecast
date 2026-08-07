@@ -99,7 +99,11 @@ class TestMinimalConfig:
         assert cfg.predict.selection == "skill_per_slice"
         assert cfg.predict.history_path == Path("data/predict_history.parquet")
         assert cfg.predict.minutely_tau_hours == 3.0
-        assert cfg.predict.quantile_recalibration == "none"
+        assert dict(cfg.predict.quantile_recalibration) == {
+            "hourly": "none",
+            "daily": "none",
+            "minutely": "none",
+        }
         assert cfg.reports_dir == Path("reports")
         assert cfg.artifacts_dir == Path("artifacts")
 
@@ -211,10 +215,30 @@ class TestErrors:
         with pytest.raises(ConfigError, match="positive integer"):
             load_config(write(tmp_path, text))
 
-    def test_quantile_recalibration_mode_parsed(self, tmp_path):
+    def test_quantile_recalibration_string_routes_every_product(self, tmp_path):
         text = MINIMAL + '\n[predict]\nquantile_recalibration = "cqr"\n'
         cfg = load_config(write(tmp_path, text))
-        assert cfg.predict.quantile_recalibration == "cqr"
+        assert dict(cfg.predict.quantile_recalibration) == {
+            "hourly": "cqr",
+            "daily": "cqr",
+            "minutely": "cqr",
+        }
+
+    def test_quantile_recalibration_table_routes_per_product(self, tmp_path):
+        text = (
+            MINIMAL
+            + '\n[predict.quantile_recalibration]\ndaily = "cqr"\nhourly = "none"\n'
+        )
+        cfg = load_config(write(tmp_path, text))
+        assert cfg.predict.quantile_recalibration["daily"] == "cqr"
+        assert cfg.predict.quantile_recalibration["hourly"] == "none"
+        # an unlisted product defaults to raw quantiles
+        assert cfg.predict.quantile_recalibration["minutely"] == "none"
+
+    def test_quantile_recalibration_unknown_product_rejected(self, tmp_path):
+        text = MINIMAL + '\n[predict.quantile_recalibration]\nweekly = "cqr"\n'
+        with pytest.raises(ConfigError, match="unknown product"):
+            load_config(write(tmp_path, text))
 
     def test_unknown_quantile_recalibration_rejected(self, tmp_path):
         text = MINIMAL + '\n[predict]\nquantile_recalibration = "isotonic"\n'

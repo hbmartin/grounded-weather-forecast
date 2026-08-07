@@ -214,7 +214,13 @@ wealth accumulates across nightly re-runs (state under
 `artifacts/eprocess/`, reset whenever config or code identity changes) and
 promotes when every reference's e-process exceeds `1/alpha`. The leaderboard
 also carries `dm_q_vs_*` Benjamini–Hochberg FDR-adjusted q-values beside
-every DM p-value. Where the default references are bias-dominated against
+every DM p-value, and — on live boards — the mutually exclusive e-value
+correction beside it: `e_vs_*` (current e-process wealth read at report
+time), `ebh_sig_vs_*` (e-BH discoveries: FDR <= alpha under arbitrary
+dependence, valid under the nightly re-reading that DM p-values are not),
+and `ebh_threshold_vs_*` (the wealth a pair must reach to be a discovery —
+why a Ville-passing pair may still not clear the FDR bar). The verdicts
+ledger accumulates both corrections' discovery counts. Where the default references are bias-dominated against
 station truth, `[promotion.references]` overrides the gate's reference class
 per variable (e.g. `pressure_sea_hpa = ["grounded_equal_weight",
 "damped_grounded_equal_weight"]`); skill columns keep their default meaning
@@ -229,7 +235,12 @@ between consecutive promoted releases, also rendered as
 recalibration win shares and promotion-gate agreement), `eprocess_wealth.parquet`
 (per-pair wealth snapshots, era-keyed across resets), and
 `served_quality.parquet` (daily realized served MAE vs its backtest
-promise). Appends are idempotent (re-running `report` is a no-op), bounded
+promise, recorded per product against that product's own board). The
+quality ledger also records 14-day recent-window interval coverage and
+CRPS for quantile-emitting methods — the pooled expanding-window coverage
+is frozen by history, so only a recent window can show a calibration
+repair working (dashboard panel h6 plots it against the 0.80 target).
+Appends are idempotent (re-running `report` is a no-op), bounded
 (~2 years by age plus row caps), carry full fingerprint provenance so
 trends segment across resets, and can never fail the report. The report
 prints a one-line quality delta comparing the two newest live evaluations.
@@ -239,10 +250,50 @@ live leaderboard reports carry a "Quantile recalibration (offline holdout)"
 section that fits two mutually exclusive post-hoc repairs — PIT level
 remapping and per-level CQR margins — on the stored scores and compares
 their holdout coverage against the raw bands, and
-`[predict].quantile_recalibration = "none" | "pit" | "cqr"` (default
-`"none"`) applies the winning transform to native quantile rows in the
-served document. Recalibrated rows are labeled `recalibrated_{mode}_*` in
-`quantiles_source`; dressed rows are never transformed twice.
+`[predict].quantile_recalibration` applies the winning transform to native
+quantile rows in the served document — routed per product, because the A/B
+found the winner differs by aggregation level (daily favors `cqr`, hourly
+favors raw quantiles — the documented norm in the postprocessing
+literature, not an anomaly). A bare string (`"none" | "pit" | "cqr"`,
+default `"none"`) routes every product identically; a table sets each
+product:
+
+```toml
+[predict.quantile_recalibration]
+hourly = "none"
+daily = "cqr"
+minutely = "none"
+```
+
+Flip policy: switch a product only after its win share holds >= 0.60 for
+>= 7 consecutive evaluations in the verdicts ledger, and do not flip back
+within 14 days — data-driven routing is itself a selection made on the
+holdout, and hysteresis is the guard. Recalibrated rows are labeled
+`recalibrated_{mode}_*` in `quantiles_source`; dressed rows are never
+transformed twice.
+
+The IDR benchmark ships as a three-way A/B: `idr` (global fit, the
+control), `idr_bucket` (per-lead-bucket fits with subagging — the
+smoothing arm), and `idr_bucket_dcp` (per-bucket fits under split
+distributional conformal prediction — the guarantee arm, finite-sample
+marginal coverage however misspecified the isotonic fit is). The board and
+the coverage ledger arbitrate.
+
+Station-truth drift detection is attribution-grade: `truth-qc` runs an
+SNHT change-point test (small-sample Monte-Carlo criticals; Pettitt as the
+registered alternative via `[truth_qc].drift_statistic`) on a daytime-only,
+inversion-screened, elevation-similar station-minus-neighbor daily series,
+attributes any break with a miniature pairwise-PHA over the neighbor
+network (coincident station-minus-neighbor breaks with quiet
+neighbor-vs-neighbor pairs = station drift; broken neighbor pairs =
+regional regime), and latches only after three consecutive daily
+exceedances. When most providers throw residual drift alarms on one
+variable simultaneously, the drift report collapses them into a single
+`common_mode` headline quoting the neighbor verdict. A latched
+station-drift verdict can quarantine the affected temperature labels from
+new fits via `[truth_qc].gate_fitting` (default `false` — flag, never
+delete; the ECMWF-blacklist pattern). Dashboard zone B carries the
+cross-check panel.
 
 ## Status
 

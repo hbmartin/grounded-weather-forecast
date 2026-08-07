@@ -136,7 +136,7 @@ class TestQcCommand:
         # non-zero exit would report the whole nightly job as broken for the
         # first week, and the run ledger would record it as a real fault.
         assert code == 0
-        assert artifact["schema_version"] == 2
+        assert artifact["schema_version"] == 3
         assert artifact["drift_alert"] is None
         assert artifact["correlation_alert"] is None
         assert artifact["shield_alert"] is None
@@ -440,3 +440,121 @@ def test_report_writes_evidence_ledgers_and_churn(tmp_path, capsys):
     assert cli_module._cmd_report(config) == 0
     assert pl.read_parquet(quality_path).height == first_height
     assert pl.read_parquet(churn_path).height == churn_height
+
+
+def test_report_served_ledger_records_only_the_products_own_rows(tmp_path, monkeypatch):
+    from conftest import synthetic_hourly_matrix
+
+    from grounded_weather_forecast.backtest.engine import run_backtest
+    from grounded_weather_forecast.backtest.scores import scores_path, write_scores
+    from grounded_weather_forecast.contracts import hourly_variable
+
+    config = write_config(
+        tmp_path,
+        extra_toml="\n[backtest]\ninitial_train_days = 10\nstep_days = 5\n",
+    )
+    matrix = synthetic_hourly_matrix(days=25, biases={"alpha": 3.0})
+    scores = run_backtest(
+        matrix,
+        BacktestRequest(
+            variables=(hourly_variable("temp_c"),),
+            methods=("equal_weight", "best_provider"),
+        ),
+        config,
+    )
+    write_scores(scores, scores_path(config.dataset.dir / "scores", "hourly", "live"))
+    config.predict.history_path.parent.mkdir(parents=True, exist_ok=True)
+    pl.DataFrame({"placeholder": [1]}).write_parquet(config.predict.history_path)
+    # Whole-history verify frame spanning two products: the report loop only
+    # has an HOURLY board here, so a daily row reaching the ledger would be
+    # the cross-product poisoning regression (first-write-wins dedupe then
+    # blocks the correct rows forever).
+    live = pl.DataFrame(
+        {
+            "product": ["hourly", "daily"],
+            "variable": ["temp_c", "temp_max_c"],
+            "truth_semantics": ["mean", "inst"],
+            "lead_bucket": ["0-1h", "D1"],
+            "method_id": ["equal_weight", "equal_weight"],
+            "dataset_fingerprint": ["ds1", "ds1"],
+            "release_id": ["relA", "relA"],
+            "n": [10, 10],
+            "live_mae": [1.0, 1.0],
+            "live_rmse": [1.0, 1.0],
+            "live_bias": [0.0, 0.0],
+        }
+    )
+    monkeypatch.setattr(
+        "grounded_weather_forecast.dataset.matrix.build_truth",
+        lambda _config: (pl.DataFrame(), pl.DataFrame(), pl.DataFrame()),
+    )
+    monkeypatch.setattr(
+        "grounded_weather_forecast.reports.verification.verify_history",
+        lambda *_args, **_kwargs: live,
+    )
+
+    assert cli_module._cmd_report(config) == 0
+    served_path = config.artifacts_dir / "history" / "served_quality.parquet"
+    assert served_path.exists()
+    served = pl.read_parquet(served_path)
+    assert served.height > 0
+    assert set(served["product"].to_list()) == {"hourly"}
+
+
+def test_truth_qc_drift_streak_latches_after_three_days(tmp_path, monkeypatch):
+    import json
+    from types import SimpleNamespace
+
+    from grounded_weather_forecast.dataset.neighbors import DriftVerdict
+
+    config = write_config(tmp_path)
+    config.artifacts_dir.mkdir(parents=True, exist_ok=True)
+    verdict = DriftVerdict(
+        statistic_name="snht",
+        statistic=15.0,
+        critical=8.05,
+        exceeded=True,
+        snht_statistic=15.0,
+        pettitt_p=0.001,
+        attribution="station_drift",
+        break_date="2026-08-04",
+        days_used=30,
+        inversion_days_excluded=1,
+        neighbors_used=6,
+        series=pl.DataFrame(
+            schema={
+                "date": pl.Date(),
+                "difference": pl.Float64(),
+                "cusum": pl.Float64(),
+            }
+        ),
+        reason="test",
+    )
+    monkeypatch.setattr(
+        "grounded_weather_forecast.dataset.neighbors.drift_verdict",
+        lambda *_args, **_kwargs: verdict,
+    )
+    checks = SimpleNamespace(neighbors=pl.DataFrame({"stid": ["N1"]}))
+    truth = pl.DataFrame()
+
+    first = cli_module._drift_verdict_block(config, checks, truth)
+    assert first["streak"] == 1
+    assert first["latched"] is False
+
+    # a same-day re-run must not advance the latch
+    (config.artifacts_dir / "truth_qc.json").write_text(
+        json.dumps({"drift_verdict": first})
+    )
+    again = cli_module._drift_verdict_block(config, checks, truth)
+    assert again["streak"] == 1
+
+    # two prior days of exceedance -> today's run latches
+    seeded = dict(first)
+    seeded["streak"] = 2
+    seeded["as_of_date"] = "2000-01-01"
+    (config.artifacts_dir / "truth_qc.json").write_text(
+        json.dumps({"drift_verdict": seeded})
+    )
+    third = cli_module._drift_verdict_block(config, checks, truth)
+    assert third["streak"] == 3
+    assert third["latched"] is True
