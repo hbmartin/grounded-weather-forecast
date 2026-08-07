@@ -28,6 +28,9 @@ from grounded_weather_forecast.blenders import (  # noqa: F401
 )
 from grounded_weather_forecast.blenders import raft as _raft  # noqa: F401
 from grounded_weather_forecast.blenders import seamless as _seamless  # noqa: F401
+from grounded_weather_forecast.blenders import (  # noqa: F401
+    sparse_shrink as _sparse_shrink,
+)
 from grounded_weather_forecast.blenders import trimmed as _trimmed  # noqa: F401
 from grounded_weather_forecast.blenders.registry import (
     BlenderFactory,

@@ -14,7 +14,10 @@ Method papers referenced here are detailed in
 ## 1. Before the wet season (target: October)
 
 The archive is summer-only and bone-dry; every precipitation pathway is
-untested against real events. The July monsoon bust (truth 8.6 mm/h, wet-hour
+untested against real events — including the provider-QC cross-source floors
+for precipitation (2026-08: 25 mm daily / 10 mm hourly): sanity-check the
+first real storm's ledger rows to confirm consensus passed and nothing
+genuine was nulled. The July monsoon bust (truth 8.6 mm/h, wet-hour
 PoP = 1.0, no provider above 0.3) is the preview.
 
 1. **Zero-inflated precipitation stage.** Occurrence model

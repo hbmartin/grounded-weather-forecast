@@ -59,9 +59,11 @@ _DOCUMENT_AGE_ALARM_MINUTES = 180.0
 # The hourly predict cadence yields ~24 runs/day; half that means the
 # scheduler has been broken for at least half a day.
 _MIN_PREDICT_RUNS_24H = 12
-# A healthy station logs a sample about every 61 s (~1400/day); half that
-# is a dying logger.
-_MIN_TRUTH_SAMPLES_24H = 720
+# A healthy station logs a sample about every 61 s (~1400-1900/day); the
+# 2026-08-04..06 half-rate episode ran at ~810/day, so the floor sits above
+# that. The baseline-relative check below covers milder degradation.
+_MIN_TRUTH_SAMPLES_24H = 1000
+_TRUTH_BASELINE_SHARE = 0.7
 _SUCCESS_RATE_ALARM = 0.8
 _DAILY_LEAD_CONTRACTION_DAYS = 1.0
 _HOURLY_LEAD_CONTRACTION_HOURS = 12.0
@@ -209,8 +211,41 @@ def _stale(name: str, age: float | None, limit: float) -> list[str]:
     return []
 
 
+def _baseline_truth_alarm(
+    truth_samples: int | None, history: pl.DataFrame | None, now: datetime
+) -> list[str]:
+    """Flag a sample rate well under the station's own recent norm.
+
+    The fixed floor catches gross failure; this catches partial degradation
+    (the 2026-08-04..06 half-rate episode ran at ~810 samples/day — above
+    the old 720 floor, far below the ~1900 norm) without hardcoding the
+    station's cadence.
+    """
+    if truth_samples is None or history is None or history.is_empty():
+        return []
+    window_start = (now - timedelta(days=_BASELINE_WINDOW_DAYS)).date()
+    baseline = history.filter(
+        (pl.col("as_of_date") >= window_start)
+        & (pl.col("as_of_date") < now.date())
+        & pl.col("truth_samples_24h").is_not_null()
+    )
+    if baseline["as_of_date"].n_unique() < _BASELINE_MIN_DAYS:
+        return []
+    median = cast("float", baseline["truth_samples_24h"].median())
+    if median > 0 and truth_samples < _TRUTH_BASELINE_SHARE * median:
+        return [
+            f"thin truth vs baseline ({truth_samples} < "
+            f"{_TRUTH_BASELINE_SHARE:.0%} of 14d median {median:.0f})"
+        ]
+    return []
+
+
 def freshness_row(
-    config: Config, runs_frame: pl.DataFrame, *, now: datetime
+    config: Config,
+    runs_frame: pl.DataFrame,
+    *,
+    now: datetime,
+    pipeline_history: pl.DataFrame | None = None,
 ) -> tuple[dict[str, object], tuple[str, ...]]:
     """One end-to-end freshness snapshot plus its threshold alarms."""
     try:
@@ -241,6 +276,7 @@ def freshness_row(
         alarms.append(
             f"thin truth ({truth_samples} samples/24h < {_MIN_TRUTH_SAMPLES_24H})"
         )
+    alarms += _baseline_truth_alarm(truth_samples, pipeline_history, now)
     if counts is not None:
         predicts, failed = counts
         if predicts < _MIN_PREDICT_RUNS_24H:
@@ -779,7 +815,13 @@ def record_operations(
 ) -> OperationsReport:
     """Collect every operational surface, append the ledgers, return the view."""
     moment = now or datetime.now(tz=UTC)
-    row, alarms = freshness_row(config, runs_frame, now=moment)
+    pipeline_history = evidence.load_ledger(
+        evidence.ledger_path(config, evidence.PIPELINE_LEDGER),
+        evidence.PIPELINE_SCHEMA,
+    )
+    row, alarms = freshness_row(
+        config, runs_frame, now=moment, pipeline_history=pipeline_history
+    )
     freshness = pl.DataFrame([row]).cast(evidence.PIPELINE_SCHEMA, strict=False)
     provider = provider_health_rows(config, now=moment)
     history = evidence.load_ledger(

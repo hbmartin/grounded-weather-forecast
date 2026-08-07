@@ -89,12 +89,21 @@ DEFAULT_PROVIDER_QC_CROSS_SOURCE: tuple[str, ...] = (
     "dew_point_c",
     "humidity_pct",
     "pressure_sea_hpa",
+    "precip_mm",
+    "precip_sum_mm",
 )
 
 # Minimum absolute deviation from the cross-source median before a value can be
 # flagged, so tightly-agreeing providers cannot make a merely-different value an
 # outlier. A value is nulled only when it exceeds BOTH k*scaled-MAD and this floor,
 # which keeps the pass conservative and preserves genuine provider diversity.
+#
+# Precipitation's floor carries the whole test on dry days: the cross-source
+# median and MAD are both zero, so ``k * MAD`` is zero and the floor alone
+# separates a lone hallucinated cloudburst (tomorrow_io stored 138 mm for a
+# bone-dry 2026-08-06) from ordinary drizzle disagreement. In a genuine storm
+# multiple providers forecast heavy rain, the median rises, and a large value
+# is no longer an outlier — which is what makes a generous floor safe.
 DEFAULT_PROVIDER_QC_MIN_DEVIATION: Mapping[str, float] = MappingProxyType(
     {
         "temp_c": 8.0,
@@ -103,6 +112,8 @@ DEFAULT_PROVIDER_QC_MIN_DEVIATION: Mapping[str, float] = MappingProxyType(
         "dew_point_c": 8.0,
         "humidity_pct": 40.0,
         "pressure_sea_hpa": 20.0,
+        "precip_mm": 10.0,
+        "precip_sum_mm": 25.0,
     }
 )
 

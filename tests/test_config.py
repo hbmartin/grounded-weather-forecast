@@ -90,6 +90,10 @@ class TestMinimalConfig:
         assert cfg.provider_qc.min_sources == 4
         assert cfg.provider_qc.bounds["pressure_sea_hpa"] == (850.0, 1090.0)
         assert "pressure_sea_hpa" in cfg.provider_qc.cross_source_variables
+        # precipitation is enrolled by default, floors mandatory (dry-day MAD=0)
+        assert "precip_sum_mm" in cfg.provider_qc.cross_source_variables
+        assert cfg.provider_qc.min_deviation["precip_sum_mm"] == 25.0
+        assert cfg.provider_qc.min_deviation["precip_mm"] == 10.0
         assert cfg.qc.bounds["temp"] == (-40.0, 55.0)
         assert cfg.qc.max_step["temp"] == 5.0
         assert cfg.qc.flatline_minutes["temp"] == 180
