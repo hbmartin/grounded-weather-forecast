@@ -2,8 +2,11 @@
 
 The offline report (``reports.recalibration``) fits PIT remapping and CQR
 margins side by side on a holdout and shows which one repairs each emitter;
-``[predict].quantile_recalibration = "pit" | "cqr"`` applies the chosen
-transform to natively-emitted quantiles at serve time. Dressed rows are
+``[predict].quantile_recalibration`` applies the chosen transform to
+natively-emitted quantiles at serve time, routed per product — a bare
+string routes every product, a ``[predict.quantile_recalibration]`` table
+sets each product's mode (the A/B found daily favors cqr while hourly
+favors raw, the documented norm across aggregation levels). Dressed rows are
 untouched — their bands are already split-conformal, and correcting them
 twice would double-count the residual archive.
 

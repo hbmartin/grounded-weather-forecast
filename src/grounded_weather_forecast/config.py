@@ -244,9 +244,12 @@ class PredictConfig:
     history_path: Path
     methods: Mapping[str, str]
     minutely_tau_hours: float
-    # Post-hoc transform applied to natively-emitted quantiles at serve time;
-    # the offline report section arbitrates which mode earns this switch.
-    quantile_recalibration: str
+    # Post-hoc transform applied to natively-emitted quantiles at serve time,
+    # routed per product: the offline report A/B found the winner differs by
+    # aggregation level (daily favors cqr while hourly favors raw), which the
+    # postprocessing literature documents as the norm, not an anomaly. A bare
+    # string routes every product identically; a table sets each product.
+    quantile_recalibration: Mapping[str, str]
 
 
 @dataclass(frozen=True, slots=True)
@@ -315,6 +318,38 @@ def _choice(value: Any, allowed: tuple[str, ...], key: str, context: str) -> str
         msg = f"{key!r} in [{context}] must be one of {options}, got {text!r}"
         raise ConfigError(msg)
     return text
+
+
+_RECALIBRATION_PRODUCTS = ("hourly", "daily", "minutely")
+_RECALIBRATION_MODES = ("none", "pit", "cqr")
+
+
+def _quantile_recalibration(value: Any) -> Mapping[str, str]:
+    """Normalize the legacy string or a per-product table to a full mapping.
+
+    A fixed product order keeps ``repr`` — and with it the config
+    fingerprint — deterministic; an unlisted product defaults to "none".
+    """
+    key, context = "quantile_recalibration", "predict"
+    if isinstance(value, Mapping):
+        for product in value:
+            if str(product) not in _RECALIBRATION_PRODUCTS:
+                products = ", ".join(repr(p) for p in _RECALIBRATION_PRODUCTS)
+                msg = (
+                    f"{key!r} in [{context}] routes unknown product "
+                    f"{str(product)!r}; products are {products}"
+                )
+                raise ConfigError(msg)
+        return MappingProxyType(
+            {
+                product: _choice(
+                    value.get(product, "none"), _RECALIBRATION_MODES, key, context
+                )
+                for product in _RECALIBRATION_PRODUCTS
+            }
+        )
+    mode = _choice(value, _RECALIBRATION_MODES, key, context)
+    return MappingProxyType(dict.fromkeys(_RECALIBRATION_PRODUCTS, mode))
 
 
 def _positive_int(value: Any, key: str, context: str) -> int:
@@ -727,11 +762,8 @@ def _predict(raw: Mapping[str, Any], dataset_dir: Path) -> PredictConfig:
             "minutely_tau_hours",
             "predict",
         ),
-        quantile_recalibration=_choice(
-            section.get("quantile_recalibration", "none"),
-            ("none", "pit", "cqr"),
-            "quantile_recalibration",
-            "predict",
+        quantile_recalibration=_quantile_recalibration(
+            section.get("quantile_recalibration", "none")
         ),
     )
 
