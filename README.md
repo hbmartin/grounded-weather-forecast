@@ -142,7 +142,7 @@ grounded-weather-forecast report
 
 # 7b. Housekeeping: delete superseded backtest scores files. Keeps the
 #    newest three per (product, source, window) group plus anything a
-#    release promoted in the last 30 days still references; files the
+#    release promoted in the last 7 days still references; files the
 #    evaluations catalog has never seen are skipped, never deleted, so
 #    pruning cannot destroy unsummarized evidence.
 grounded-weather-forecast prune-scores                 # --dry-run to preview

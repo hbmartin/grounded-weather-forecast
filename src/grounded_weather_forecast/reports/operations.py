@@ -863,7 +863,7 @@ def record_operations(
 # --- scores-directory housekeeping -----------------------------------------
 
 _KEEP_NEWEST_PER_GROUP = 3
-_PROTECT_RELEASE_DAYS = 30
+_PROTECT_RELEASE_DAYS = 7
 
 
 @dataclass(frozen=True, slots=True)
@@ -901,7 +901,11 @@ def prune_scores_files(
 
     Retention: the newest ``_KEEP_NEWEST_PER_GROUP`` files per
     (product, source_kind, window) group by mtime, plus anything referenced
-    by a release promoted in the last ``_PROTECT_RELEASE_DAYS`` days. A file
+    by a release promoted in the last ``_PROTECT_RELEASE_DAYS`` days —
+    serving never reads superseded scores files (selections carry their own
+    mae/n and archived documents replay without them), so a week of rollback
+    candidates is ample and the directory rolls at ~7 days of evaluations
+    instead of 30. A file
     the evaluations catalog has never seen is skipped, never deleted —
     pruning must not destroy evidence that was never summarized.
     """
