@@ -460,7 +460,7 @@ def daily_board_row(method_id, mae, n_valid_times=4):
         "mae": mae,
         "rmse": mae,
         "bias": 0.0,
-        **{column: None for column in _SKILL_COLUMNS},
+        **dict.fromkeys(_SKILL_COLUMNS),
     }
 
 
@@ -544,3 +544,47 @@ class TestMcsGateReasons:
         )
         assert result["method_id"] == "candidate"
         assert gate is None
+
+
+class TestMinutelyReferences:
+    def test_reference_class_routes_by_product(self):
+        from grounded_weather_forecast.contracts import MINUTELY_REFERENCES
+
+        assert gate_references("temp_c", None, product="minutely") == (
+            MINUTELY_REFERENCES
+        )
+        # hourly/daily keep the blender reference class and per-variable
+        # overrides regardless of the new parameter's default
+        assert gate_references("temp_c", None) != MINUTELY_REFERENCES
+
+    def test_minutely_winner_promotes_through_its_own_references(self):
+        def minutely_row(method_id, mae, p=None):
+            return {
+                "product": "minutely",
+                "variable": "temp_c",
+                "lead_bucket": "0-5m",
+                "method_id": method_id,
+                "n": 500,
+                "n_total": 500,
+                "n_valid_times": 400,
+                "coverage": 1.0,
+                "mae": mae,
+                "rmse": mae,
+                "bias": 0.0,
+                "skill_vs_minutely_interp": 0.5 if p else None,
+                "dm_p_vs_minutely_interp": p,
+                "skill_vs_minutely_persistence": 0.5 if p else None,
+                "dm_p_vs_minutely_persistence": p,
+            }
+
+        board = pl.DataFrame(
+            [
+                minutely_row("minutely_anchor_full", 0.2, p=0.001),
+                minutely_row("minutely_interp", 1.8),
+                minutely_row("minutely_persistence", 0.4),
+            ],
+            infer_schema_length=None,
+        )
+        row = slice_winners(board, rule="legacy").row(0, named=True)
+        assert row["method_id"] == "minutely_anchor_full"
+        assert row["gate"] is None

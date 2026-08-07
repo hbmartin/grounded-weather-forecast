@@ -17,9 +17,13 @@ from collections.abc import Mapping
 from contextlib import suppress
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime, timedelta
+from typing import TYPE_CHECKING
 
 import numpy as np
 import polars as pl
+
+if TYPE_CHECKING:
+    from grounded_weather_forecast.backtest.minutely import MinutelyPathMethod
 
 from grounded_weather_forecast.backtest.splits import (
     daily_truth_known_at,
@@ -57,7 +61,12 @@ from grounded_weather_forecast.dataset.matrix import (
 )
 from grounded_weather_forecast.dataset.providers import read_forecast_archive
 from grounded_weather_forecast.evaluation import dataset_fingerprint
-from grounded_weather_forecast.leads import daily_bucket, hourly_bucket
+from grounded_weather_forecast.leads import (
+    MINUTELY_BUCKETS,
+    daily_bucket,
+    hourly_bucket,
+    minutely_bucket,
+)
 from grounded_weather_forecast.serve.dressing import ResidualDresser, dress_variable
 from grounded_weather_forecast.serve.history import load_archived_forecast
 from grounded_weather_forecast.serve.observability import snapshot_observability
@@ -983,18 +992,212 @@ def _minute_path(
     )
 
 
+@dataclass(frozen=True)
+class MinutelyPlan:
+    """One promoted minutely path construction for a (variable, bucket)."""
+
+    method_id: str
+    tau_hours: float | None = None
+    full_shift: bool = False
+    persistence: bool = False
+    interp_only: bool = False
+    predictor: "MinutelyPathMethod | None" = None  # fitted, refit as-of
+
+
+def _plan_from_selection(
+    method_id: str, predictor: "MinutelyPathMethod | None"
+) -> MinutelyPlan | None:
+    """Map a promoted minutely method id back to its path parameters."""
+    match method_id:
+        case "minutely_interp":
+            return MinutelyPlan(method_id, interp_only=True)
+        case "minutely_persistence":
+            return MinutelyPlan(method_id, persistence=True)
+        case "minutely_anchor_full":
+            return MinutelyPlan(method_id, full_shift=True)
+        case _ if method_id.startswith("minutely_anchor_tau_"):
+            raw = method_id.removeprefix("minutely_anchor_tau_").removesuffix("h")
+            try:
+                return MinutelyPlan(method_id, tau_hours=float(raw))
+            except ValueError:
+                return None
+        case "minutely_ramp" | "minutely_fitted_slope":
+            if predictor is None:
+                return None
+            return MinutelyPlan(method_id, predictor=predictor)
+        case _:
+            return None
+
+
+def _fitted_minutely_predictor(
+    config: Config,
+    method_id: str,
+    variable_name: str,
+    hourly_train: pl.DataFrame,
+) -> "MinutelyPathMethod | None":
+    """Refit a promoted ramp/slope response on the as-of training data.
+
+    ``hourly_train`` is already filtered to rows whose HOURLY truth was
+    knowable at issue time — every derived minute is at least an hour old,
+    so the minute truth clock is satisfied a fortiori.
+    """
+    from grounded_weather_forecast.backtest.minutely import (  # noqa: PLC0415
+        _PATH_MAX_LEAD_HOURS,
+        _RAMP_CLIP,
+        _SLOPE_CLIP,
+        _FittedResponse,
+        minute_frame,
+    )
+    from grounded_weather_forecast.blenders.combine import (  # noqa: PLC0415
+        GroundedEqualWeight,
+    )
+    from grounded_weather_forecast.dataset.matrix import (  # noqa: PLC0415
+        matrix_sources,
+        to_forecast_matrix,
+        to_supervised_slice,
+    )
+    from grounded_weather_forecast.dataset.truth import (  # noqa: PLC0415
+        truth_minute_grid,
+    )
+
+    truth_file = config.dataset.dir / "truth_minute.parquet"
+    truth_column = f"t__{variable_name}__inst"
+    if (
+        not truth_file.exists()
+        or hourly_train.is_empty()
+        or truth_column not in hourly_train.columns
+    ):
+        return None
+    try:
+        grid = truth_minute_grid(pl.read_parquet(truth_file), [variable_name])
+        scored = hourly_train.filter(pl.col(truth_column).is_not_null())
+        if scored.is_empty() or grid.is_empty():
+            return None
+        variable = hourly_variable(variable_name)
+        proxy = GroundedEqualWeight().fit(
+            to_supervised_slice(
+                scored,
+                variable,
+                daily=False,
+                semantics=TruthSemantics.INSTANTANEOUS,
+            )
+        )
+        path_rows = hourly_train.filter(
+            pl.col("lead_hours") <= _PATH_MAX_LEAD_HOURS
+        ).sort("issue_time", "lead_hours")
+        if path_rows.is_empty():
+            return None
+        base = proxy.predict(
+            to_forecast_matrix(path_rows, variable, sources=matrix_sources(scored))
+        ).point
+        train = minute_frame(path_rows, grid, variable_name, base, 1)
+        if train.height == 0:
+            return None
+        clip = _RAMP_CLIP if method_id == "minutely_ramp" else _SLOPE_CLIP
+        return _FittedResponse(
+            method_id=method_id,
+            clip=clip,
+            monotone_non_increasing=method_id == "minutely_ramp",
+        ).fit(train)
+    except (ValueError, pl.exceptions.PolarsError):
+        return None
+
+
+def _minutely_plans(
+    config: Config,
+    selections: SelectionMap,
+    hourly_train: pl.DataFrame,
+) -> dict[str, dict[str, MinutelyPlan]] | None:
+    """Promoted minutely constructions per (variable, minutely bucket).
+
+    None (or a missing bucket entry) leaves the config-tau fallback path
+    untouched — the closure is inert until minutely evidence exists.
+    """
+    plans: dict[str, dict[str, MinutelyPlan]] = {}
+    fitted_cache: dict[tuple[str, str], "MinutelyPathMethod | None"] = {}
+    for name in _MINUTELY_VARIABLES:
+        per_bucket: dict[str, MinutelyPlan] = {}
+        for bucket in MINUTELY_BUCKETS:
+            found = selections.get(("minutely", name, bucket.label))
+            if found is None or not found.method_id.startswith("minutely_"):
+                continue
+            predictor: MinutelyPathMethod | None = None
+            if found.method_id in ("minutely_ramp", "minutely_fitted_slope"):
+                cache_key = (found.method_id, name)
+                if cache_key not in fitted_cache:
+                    fitted_cache[cache_key] = _fitted_minutely_predictor(
+                        config, found.method_id, name, hourly_train
+                    )
+                predictor = fitted_cache[cache_key]
+            plan = _plan_from_selection(found.method_id, predictor)
+            if plan is not None:
+                per_bucket[bucket.label] = plan
+        if per_bucket:
+            plans[name] = per_bucket
+    return plans or None
+
+
+def _apply_minutely_plan(
+    plan: MinutelyPlan,
+    interpolated: float,
+    observed: float | None,
+    now_forecast: float,
+    minute: int,
+) -> tuple[float, str]:
+    """One minute's value under a promoted construction, honestly labeled.
+
+    A plan that needs the observation degrades to pure interpolation — and
+    says so — when none is fresh enough, mirroring the backtest where those
+    rows scored as the base path or dropped.
+    """
+    if plan.interp_only:
+        return interpolated, plan.method_id
+    if observed is None:
+        return interpolated, "minutely_interp"
+    if plan.persistence:
+        return observed, plan.method_id
+    residual = observed - now_forecast
+    if plan.full_shift:
+        return interpolated + residual, plan.method_id
+    if plan.tau_hours is not None:
+        weight = _anchor_weight(minute, plan.tau_hours)
+        return interpolated + weight * residual, plan.method_id
+    predictor = plan.predictor
+    if predictor is not None:
+        from grounded_weather_forecast.backtest.minutely import (  # noqa: PLC0415
+            MinuteFrame,
+        )
+
+        lead = minute / 60.0
+        single = MinuteFrame(
+            issue_time=pl.Series("issue_time", [], dtype=pl.Datetime("us", "UTC")),
+            valid_time=pl.Series("valid_time", [], dtype=pl.Datetime("us", "UTC")),
+            lead_hours=np.asarray([lead]),
+            base=np.asarray([interpolated]),
+            observation=np.asarray([observed]),
+            residual=np.asarray([residual]),
+            y_true=np.asarray([np.nan]),
+        )
+        prediction = predictor.predict(single)
+        return float(prediction[0]), plan.method_id
+    return interpolated, "minutely_interp"
+
+
 def minutely_product(
     snapshot: Snapshot,
     hourly_blend: dict[str, VariableBlend],
     config: Config,
+    plans: dict[str, dict[str, MinutelyPlan]] | None = None,
 ) -> list[MinutelyPoint]:
     """The anchored nowcast: hourly path interpolated to minutes, anchored ONCE.
 
     When the selected hourly method is already an ``anchored_*`` blender, its
     fitted correction is baked into the path and the minutely product only
     interpolates — anchoring is applied exactly once, by whichever stage the
-    leaderboard promoted. The config decay is the cold-start fallback for
-    un-anchored paths.
+    leaderboard promoted; a promoted minutely plan never overrides that (the
+    minutely evidence was built on un-anchored proxies). On un-anchored
+    paths, ``plans`` applies the promoted construction per minutely bucket;
+    absent a plan the config decay stays the named no-evidence fallback.
     """
     frame = snapshot.hourly.sort("valid_time")
     if frame.is_empty():
@@ -1005,7 +1208,9 @@ def minutely_product(
     for minute in range(1, MINUTELY_HORIZON_MINUTES + 1):
         valid = snapshot.issue_time + timedelta(minutes=minute)
         lead = minute / 60.0
+        bucket_label = minutely_bucket(lead)
         values: dict[str, float | None] = {}
+        applied: dict[str, str] = {}
         for name in _MINUTELY_VARIABLES:
             blend = hourly_blend.get(name)
             if blend is None or not np.isfinite(blend.point).any():
@@ -1024,12 +1229,25 @@ def minutely_product(
                 lead,
             )
             observed = snapshot.observation.get(name)
-            if observed is not None and not already_anchored:
-                residual = observed - now_forecast
-                interpolated += (
-                    _anchor_weight(minute, config.predict.minutely_tau_hours) * residual
+            plan = (
+                (plans or {}).get(name, {}).get(bucket_label)
+                if bucket_label is not None
+                else None
+            )
+            method_label = "anchored_hourly_blend"
+            if already_anchored or plan is None:
+                if observed is not None and not already_anchored:
+                    residual = observed - now_forecast
+                    interpolated += (
+                        _anchor_weight(minute, config.predict.minutely_tau_hours)
+                        * residual
+                    )
+            else:
+                interpolated, method_label = _apply_minutely_plan(
+                    plan, interpolated, observed, now_forecast, minute
                 )
             values[name] = _finite(interpolated, hourly_variable(name))
+            applied[name] = method_label
         temperature = values.get("temp_c")
         dew_point = values.get("dew_point_c")
         if temperature is not None and dew_point is not None:
@@ -1062,7 +1280,10 @@ def minutely_product(
                 precip_intensity_mmh=finite_intensity,
                 pop=finite_pop,
                 methods={
-                    **dict.fromkeys(values, "anchored_hourly_blend"),
+                    **{
+                        name: applied.get(name, "anchored_hourly_blend")
+                        for name in values
+                    },
                     **(
                         {
                             "precip_intensity_mmh": "native_equal_weight",
@@ -1152,7 +1373,12 @@ def predict(
         observation_at=snapshot.observation_at.isoformat()
         if snapshot.observation_at
         else None,
-        minutely=minutely_product(snapshot, hourly_blend, config),
+        minutely=minutely_product(
+            snapshot,
+            hourly_blend,
+            config,
+            plans=_minutely_plans(config, selections, hourly_train),
+        ),
         hourly=hourly,
         daily=daily,
         timezone=config.station.timezone,

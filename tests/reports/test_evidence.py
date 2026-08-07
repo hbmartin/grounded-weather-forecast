@@ -1,6 +1,6 @@
 """The append-only quality-evidence ledgers."""
 
-from datetime import UTC, datetime, timedelta
+from datetime import timedelta
 
 import numpy as np
 import polars as pl

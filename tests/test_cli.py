@@ -371,7 +371,6 @@ class TestRunLedger:
 
 
 def test_report_writes_evidence_ledgers_and_churn(tmp_path, capsys):
-    from datetime import timedelta
 
     from conftest import synthetic_hourly_matrix, utc
 

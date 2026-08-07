@@ -930,3 +930,103 @@ class TestServingPathFitting:
         assert list((config.artifacts_dir / "observability").rglob("*.json")), (
             "the dashboard's only serving-path hook must actually fire"
         )
+
+
+class TestMinutelyPromotedPlan:
+    """A promoted minutely selection replaces the config-tau construction."""
+
+    def setup_case(self):
+        import numpy as np
+
+        helper = TestMinutelySinglePass()
+        snapshot, path = helper.make_snapshot()
+        blend = helper.blend(path, "equal_weight")  # un-anchored path
+        return snapshot, blend, np.asarray(path)
+
+    def plans(self, method_id, buckets=("0-5m", "5-15m", "15-30m", "30-45m", "45-60m")):
+        from grounded_weather_forecast.serve.predict import _plan_from_selection
+
+        plan = _plan_from_selection(method_id, None)
+        assert plan is not None
+        return {"temp_c": dict.fromkeys(buckets, plan)}
+
+    def test_promoted_tau_replaces_the_config_decay(self, la_config):
+        import math
+
+        from grounded_weather_forecast.serve.predict import minutely_product
+
+        snapshot, blend, _path = self.setup_case()
+        points = minutely_product(
+            snapshot,
+            {"temp_c": blend},
+            la_config,
+            plans=self.plans("minutely_anchor_tau_0.25h"),
+        )
+        # lead-zero extrapolation = 19.0; residual = 10 - 19 = -9; minute 1
+        # under tau 0.25h: weight exp(-(1/60)/0.25)
+        expected = (19.0 + 1.0 / 60.0) + math.exp(-(1.0 / 60.0) / 0.25) * -9.0
+        assert points[0].temp_c == pytest.approx(expected, abs=0.001)
+        assert points[0].methods["temp_c"] == "minutely_anchor_tau_0.25h"
+
+    def test_persistence_plan_serves_the_flat_observation(self, la_config):
+        from grounded_weather_forecast.serve.predict import minutely_product
+
+        snapshot, blend, _path = self.setup_case()
+        points = minutely_product(
+            snapshot,
+            {"temp_c": blend},
+            la_config,
+            plans=self.plans("minutely_persistence"),
+        )
+        assert points[0].temp_c == pytest.approx(10.0)
+        assert points[59].temp_c == pytest.approx(10.0)
+        assert points[30].methods["temp_c"] == "minutely_persistence"
+
+    def test_already_anchored_path_ignores_the_plan(self, la_config):
+        from grounded_weather_forecast.serve.predict import minutely_product
+
+        helper = TestMinutelySinglePass()
+        snapshot, path = helper.make_snapshot()
+        points = minutely_product(
+            snapshot,
+            {"temp_c": helper.blend(path, "anchored_fitted_grounded")},
+            la_config,
+            plans=self.plans("minutely_anchor_full"),
+        )
+        # identical to the no-plan anchored case: pure interpolation
+        assert points[0].temp_c == pytest.approx(19.0 + 1.0 / 60.0, abs=0.001)
+        assert points[0].methods["temp_c"] == "anchored_hourly_blend"
+
+    def test_missing_observation_degrades_to_labeled_interp(self, la_config):
+        from grounded_weather_forecast.serve.predict import minutely_product
+
+        snapshot, blend, _path = self.setup_case()
+        snapshot = replace_snapshot_observation(snapshot, {})
+        points = minutely_product(
+            snapshot,
+            {"temp_c": blend},
+            la_config,
+            plans=self.plans("minutely_anchor_full"),
+        )
+        assert points[0].temp_c == pytest.approx(19.0 + 1.0 / 60.0, abs=0.001)
+        assert points[0].methods["temp_c"] == "minutely_interp"
+
+    def test_bucket_scoped_plan_leaves_other_buckets_on_the_fallback(self, la_config):
+        from grounded_weather_forecast.serve.predict import minutely_product
+
+        snapshot, blend, _path = self.setup_case()
+        points = minutely_product(
+            snapshot,
+            {"temp_c": blend},
+            la_config,
+            plans=self.plans("minutely_persistence", buckets=("0-5m",)),
+        )
+        assert points[0].methods["temp_c"] == "minutely_persistence"
+        # minute 10 has no plan for its bucket: config-tau fallback label
+        assert points[9].methods["temp_c"] == "anchored_hourly_blend"
+
+
+def replace_snapshot_observation(snapshot, observation):
+    from dataclasses import replace
+
+    return replace(snapshot, observation=observation)
