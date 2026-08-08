@@ -674,13 +674,14 @@ class TestPooledDailySelection:
             assert chosen.n == 15  # pooled evidence, not the fine bucket's 5
 
 
-def near_tie_scores(created, evaluation_id, best_method, *, rival_offset=1.02):
+def near_tie_scores(created, evaluation_id, best_method, *, rival_offset=1.05):
     """One hourly 24-48h slice: `best_method` edges `inverse_mse`-vs-`cluster`.
 
-    Noise is drawn once per valid time and shared across methods (common
-    random numbers), so board MAE gaps track the offsets deterministically.
-    All three default references are present and clearly worse, keeping the
-    MCS gate decisive so the winner is a true argmin pick.
+    A shared per-time draw plays the weather (it cancels in the paired
+    difference the retention SE is built on) and a small per-method draw
+    supplies the idiosyncratic noise that gives the difference a real
+    sampling variance. All three default references are present and clearly
+    worse, keeping the MCS gate decisive so the winner is a true argmin pick.
     """
     rng = np.random.default_rng(11)
     pair = ("inverse_mse", "cluster_equal_weight")
@@ -697,6 +698,7 @@ def near_tie_scores(created, evaluation_id, best_method, *, rival_offset=1.02):
                 offset = 1.0
             else:
                 offset = rival_offset
+            offset += rng.normal(0.0, 0.15)
             rows.append(
                 {
                     "method_id": method,
@@ -750,8 +752,9 @@ class TestIncumbentRetention:
         first = select_methods(config, scores_dir)
         assert first[self.KEY].method_id == "inverse_mse"
         assert not first[self.KEY].retained
-        # A fresh evaluation where the rival edges ahead by ~0.02 C — well
-        # inside one bootstrap SE — must not evict the serving incumbent.
+        # A fresh evaluation where the rival edges ahead on the board but the
+        # paired common-case difference stays inside one bootstrap SE — it
+        # must not evict the serving incumbent.
         write_scores(
             near_tie_scores(utc(2026, 8, 2), "evaltwo", "cluster_equal_weight"),
             scores_path(scores_dir, "hourly", "live", "expanding", "evaltwo"),

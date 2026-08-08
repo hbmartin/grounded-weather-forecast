@@ -629,7 +629,8 @@ def _incumbent_methods(config: Config) -> dict[SliceKey, tuple[str, str | None]]
     releases = _compatible_releases(config, match_dataset=False)
     if not releases:
         return {}
-    selections = _selections_from_release(max(releases, key=promoted_at)) or {}
+    newest = max(releases, key=lambda r: (promoted_at(r), str(r.get("release_id"))))
+    selections = _selections_from_release(newest) or {}
     return {
         key: (selected.method_id, selected.truth_semantics)
         for key, selected in selections.items()
@@ -678,7 +679,7 @@ def _retained_incumbent(
     if not should_retain_incumbent(
         frame,
         winner_row,
-        float(incumbent_row["mae"]),
+        incumbent_method,
         promotion=config.promotion,
     ):
         return None

@@ -309,21 +309,22 @@ _RETENTION_SE_MULT = 1.0
 def should_retain_incumbent(
     scores: pl.DataFrame | None,
     winner_row: Mapping[str, object],
-    incumbent_mae: float,
+    incumbent_method: str,
     *,
     promotion: "PromotionConfig | None" = None,
 ) -> bool:
     """One-SE incumbent retention: the argmin's near-tie guard.
 
-    Retain when the incumbent's current-board MAE sits within
-    ``_RETENTION_SE_MULT`` bootstrap SEs of the winner's — the same
-    moving-block bootstrap the bias estimate uses, so "statistically
-    indistinguishable" means one thing everywhere. Conservative on any
-    missing ingredient: no scores, a thin collapsed matrix, or the winner
-    absent from the common-case matrix all mean no retention.
+    Retain when the paired incumbent-minus-winner mean loss difference on
+    the collapsed common-case matrix sits within ``_RETENTION_SE_MULT``
+    bootstrap SEs of zero — the same moving-block bootstrap the bias
+    estimate uses, applied to the DIFFERENCE so shared weather variance
+    cancels (the Diebold-Mariano logic; an SE of either loss level alone
+    would overstate the noise and retain too freely). Conservative on any
+    missing ingredient: no scores, a thin collapsed matrix, or either
+    method absent from the common case all mean no retention.
     """
-    raw_mae = winner_row.get("mae")
-    if scores is None or raw_mae is None:
+    if scores is None:
         return False
     from grounded_weather_forecast.reports.leaderboard import (  # noqa: PLC0415
         _with_default_semantics,
@@ -344,8 +345,17 @@ def should_retain_incumbent(
     losses, method_ids = collapsed
     n_times, n_methods = losses.shape
     served = str(winner_row["method_id"])
-    if n_times < _MIN_TIMES or n_methods < 2 or served not in method_ids:
+    if (
+        n_times < _MIN_TIMES
+        or n_methods < 2
+        or served not in method_ids
+        or incumbent_method not in method_ids
+    ):
         return False
+    diffs = (
+        losses[:, method_ids.index(incumbent_method)]
+        - losses[:, method_ids.index(served)]
+    )
     rng = np.random.default_rng(_SEED)
     n_bootstrap = (
         promotion.mcs_bootstrap if promotion is not None else _DEFAULT_BOOTSTRAP
@@ -354,13 +364,12 @@ def should_retain_incumbent(
         promotion.mcs_block_length if promotion is not None else None
     ) or max(1, round(n_times ** (1.0 / 3.0)))
     indices = _block_indices(rng, n_times, block_length, n_bootstrap)
-    replicate_means = losses[indices].mean(axis=1)
-    se = float(np.std(replicate_means[:, method_ids.index(served)]))
+    se = float(np.std(diffs[indices].mean(axis=1)))
     if not math.isfinite(se) or se <= 0.0:
-        return False
-    return float(incumbent_mae) - float(cast("float", raw_mae)) <= (
-        _RETENTION_SE_MULT * se
-    )
+        # A constant difference has no sampling noise to hide in: retain
+        # only when the incumbent is not worse at all.
+        return float(diffs.mean()) <= 0.0
+    return float(diffs.mean()) <= _RETENTION_SE_MULT * se
 
 
 def winner_curse_verdicts(winners: pl.DataFrame) -> dict[str, float]:

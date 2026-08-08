@@ -1007,10 +1007,12 @@ _NBM_VERDICT_NAMES = (
 
 
 def nbm_benchmark_verdicts(board: pl.DataFrame) -> dict[str, float]:
-    """Blend-vs-NBM scalars from one leaderboard: the operational baseline.
+    """Best-non-NBM-vs-NBM scalars from one leaderboard.
 
     n-weighted over slices where ``provider_nbm`` is scored alongside at
-    least one other method; "blend" is the per-slice best over the others.
+    least one other method; the comparison value is the per-slice best over
+    every OTHER method — usually a blend, but a raw baseline can hold it,
+    which is why the printed label says "best non-nbm" rather than "blend".
     Weighted by the NBM slice n so the comparison lives where NBM has data.
     """
     required = {"method_id", "variable", "truth_semantics", "lead_bucket", "mae", "n"}
@@ -1070,7 +1072,11 @@ def nbm_benchmark_line(config: Config) -> str | None:
         ).filter(pl.col("name").is_in(list(_NBM_VERDICT_NAMES)))
         if verdicts.is_empty():
             return None
-        products = verdicts.group_by("product").len().sort("len", descending=True)
+        products = (
+            verdicts.group_by("product")
+            .len()
+            .sort(["len", "product"], descending=[True, False])
+        )
         product = str(products["product"][0])
         rows = verdicts.filter(pl.col("product") == product).sort("recorded_at")
         values: dict[str, float] = {}
@@ -1083,7 +1089,7 @@ def nbm_benchmark_line(config: Config) -> str | None:
         blend_mae = values["nbm_benchmark_blend_mae"]
         percent = (blend_mae - nbm_mae) / nbm_mae * 100.0 if nbm_mae > 0.0 else 0.0
         return (
-            f"nbm benchmark ({product} live): blend best mae {blend_mae:.3f} vs "
+            f"nbm benchmark ({product} live): best non-nbm mae {blend_mae:.3f} vs "
             f"station-nbm {nbm_mae:.3f} ({percent:+.1f}%) over "
             f"{int(values['nbm_benchmark_slices'])} slices"
         )

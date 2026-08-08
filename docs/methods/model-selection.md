@@ -284,12 +284,17 @@ method** when all of the following hold:
    slice's persisted method is already the fallback, and retaining it by name
    would outlast the demotion's own 14-day re-hearing), and passes the
    eligibility bar on the **current** board with the same truth semantics;
-3. $\text{MAE}_{\text{incumbent}} - \text{MAE}_{\text{winner}} \le
-   \texttt{\_RETENTION\_SE\_MULT} \times \widehat{SE}_{\text{boot}}$, where the
-   SE is the winner's mean-loss standard error under the same moving-block
-   bootstrap the MCS gate and §4's bias estimate use, and
+3. $\overline{d} \le \texttt{\_RETENTION\_SE\_MULT} \times
+   \widehat{SE}_{\text{boot}}(\overline{d})$, where
+   $d_t = \ell_t^{\text{incumbent}} - \ell_t^{\text{winner}}$ is the **paired**
+   per-valid-time loss difference on the collapsed common-case matrix and the
+   SE is its mean's standard error under the same moving-block bootstrap the
+   MCS gate and §4's bias estimate use. Pairing is deliberate (the
+   Diebold–Mariano logic): shared weather variance cancels, so a level-based
+   SE would overstate the noise and retain too freely.
    `_RETENTION_SE_MULT = 1.0` (a module constant — a config key would rotate
-   the config fingerprint on every tweak).
+   the config fingerprint on every tweak). Either method missing from the
+   common-case matrix, or a thin matrix, means no retention.
 
 A retained `Selection` carries the incumbent's **current-board** `n`/`mae`
 (so the live demotion gate in §6 judges it on today's promise, and keeps the

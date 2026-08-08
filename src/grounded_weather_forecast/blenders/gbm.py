@@ -18,8 +18,8 @@ import numpy as np
 
 from grounded_weather_forecast.blenders.protocol import (
     finalize_point,
-    finalize_quantiles,
     masked_average,
+    quantile_blend_result,
 )
 from grounded_weather_forecast.blenders.registry import register
 from grounded_weather_forecast.contracts import (
@@ -55,7 +55,6 @@ _NUM_ROUNDS = 300
 # bounds the ~19x fit cost.
 _QUANTILE_ROUNDS = 150
 QUANTILE_LEVELS: tuple[float, ...] = tuple(round(0.05 * i, 2) for i in range(1, 20))
-_MEDIAN_INDEX = QUANTILE_LEVELS.index(0.5)
 
 
 def _numeric_feature_columns(x: ForecastMatrix) -> list[str]:
@@ -244,14 +243,18 @@ class GbmQuantile(GbmStacker):
     """
 
     method_id: str = "gbm_quantile"
+    # Carried per instance so a state restored under a later code version
+    # keeps the grid its boosters were trained on, not the module constant.
+    _levels: tuple[float, ...] = QUANTILE_LEVELS
 
     def fit(self, train: SupervisedSlice) -> Self:
         features = self._begin_fit(train)
         if features is None:
             return self
         lightgbm = import_module("lightgbm")
+        self._levels = QUANTILE_LEVELS
         self._level_boosters = []
-        for level in QUANTILE_LEVELS:
+        for level in self._levels:
             dataset = lightgbm.Dataset(
                 features, label=train.y, feature_name=self._feature_names
             )
@@ -277,20 +280,17 @@ class GbmQuantile(GbmStacker):
                 for booster in self._level_boosters
             ]
         )
-        quantiles = finalize_quantiles(rows, self._kind, self._variable)
-        point = quantiles[:, _MEDIAN_INDEX]
-        return BlendResult(
-            point=finalize_point(point, self._kind, self._variable),
-            quantiles=quantiles,
-            quantile_levels=QUANTILE_LEVELS,
-        )
+        return quantile_blend_result(rows, self._levels, self._kind, self._variable)
+
+    def _median_position(self) -> int:
+        return min(range(len(self._levels)), key=lambda i: abs(self._levels[i] - 0.5))
 
     def to_state(self) -> dict[str, Any]:
         if self._fit_status != "fit":
             return super().to_state()
         return {
             "models": [booster.model_to_string() for booster in self._level_boosters],
-            "quantile_levels": list(QUANTILE_LEVELS),
+            "quantile_levels": list(self._levels),
             "feature_names": self._feature_names,
             "kind": self._kind.value,
             "variable": self._variable.name if self._variable else None,
@@ -299,7 +299,7 @@ class GbmQuantile(GbmStacker):
     def observability_state(self) -> dict[str, Any]:
         if self._fit_status != "fit":
             return super().observability_state()
-        median = self._level_boosters[_MEDIAN_INDEX]
+        median = self._level_boosters[self._median_position()]
         gain = median.feature_importance(importance_type="gain")
         return {
             "variable": self._variable.name if self._variable else None,
@@ -325,6 +325,10 @@ class GbmQuantile(GbmStacker):
         stacker._level_boosters = [
             lightgbm.Booster(model_str=model) for model in state["models"]
         ]
+        persisted = state.get("quantile_levels")
+        stacker._levels = (
+            tuple(float(level) for level in persisted) if persisted else QUANTILE_LEVELS
+        )
         stacker._fit_status = "fit"
         return stacker
 

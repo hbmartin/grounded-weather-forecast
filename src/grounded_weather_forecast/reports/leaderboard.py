@@ -513,11 +513,7 @@ def _pooled_daily_gate(
     pooled_board = leaderboard(pooled_scores, references=references)
     if pooled_board.is_empty():
         return None
-    eligible = pooled_board.filter(
-        (pl.col("coverage") >= 0.8)
-        & (pl.col("n") >= 8)
-        & (pl.col("n_valid_times") >= 8)
-    )
+    eligible = eligible_board_rows(pooled_board)
     if eligible.is_empty():
         return None
     ranked = eligible.sort("mae")
