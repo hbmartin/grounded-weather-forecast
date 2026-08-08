@@ -75,9 +75,10 @@ But its limits are structural, not incidental:
 
 The visible symptom in the leaderboard: `anchored_grounded_equal_weight` and
 `grounded_equal_weight` have **identical MAE to three decimals**. That is not a
-bug — with no lead under 3 hours, anchoring finds no anchor row, the τ grid search
-selects "no anchoring", and the wrapper degrades exactly to its base. The
-mechanism works; the data simply cannot exercise it.
+bug — anchoring only looks for its residual among rows with lead under
+`_ANCHOR_MAX_LEAD` (6 hours), and backfilled leads start at 24. With no anchor
+row, the τ grid search selects "no anchoring" and the wrapper degrades exactly to
+its base. The mechanism works; the data simply cannot exercise it.
 
 ---
 
@@ -264,10 +265,14 @@ non-blocking:
   temperature, because the station's `RelPress` is not actually sea-level reduced
   (it reads ≈ `AbsPress` at 1,400 m). If your station *does* reduce properly, this
   is wrong for you and the mapping should change.
-- **The precipitation counter reset rule** (negative delta ⇒ reset ⇒ the new value
-  *is* the accumulation) is untested against heavy rain, because the sample
-  database contains almost none (max event total: 1.31 in). `rainofhourly` is
-  retained as a cross-validator. Revisit when a real storm is in the archive.
+- **The precipitation counter reset rule** — a decrease below
+  `precip_reset_fraction` (0.5) of the prior value opens a new reset epoch, and
+  within an epoch rain is credited only above the running maximum — is untested
+  against heavy rain, because the sample database contains almost none (max event
+  total: 1.31 in). The 0.5 fraction in particular is a guess calibrated against
+  jitter, not against a storm. `rainofhourly` is retained as a cross-validator.
+  Revisit when a real storm is in the archive. See
+  [Methods: precipitation](methods/precipitation.md#2-truth-side-accumulation).
 - **PoP threshold** is 0.254 mm (0.01 in) — the standard "measurable" threshold,
   but a choice.
 - **The 12-hour staleness cap** materially determines which sources are

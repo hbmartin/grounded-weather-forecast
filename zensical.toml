@@ -5,27 +5,78 @@ site_url = "https://hbmartin.github.io/grounded-weather-forecast/"
 repo_url = "https://github.com/hbmartin/grounded-weather-forecast"
 repo_name = "hbmartin/grounded-weather-forecast"
 
+# LaTeX rendering. pymdownx.arithmatex in generic mode emits `.arithmatex`
+# spans/divs; MathJax typesets them on every instant-navigation page load.
+extra_javascript = [
+  "javascripts/mathjax.js",
+  "https://unpkg.com/mathjax@3/es5/tex-mml-chtml.js",
+]
+
 nav = [
   { "Home" = "index.md" },
-  { "Getting Started" = "getting-started.md" },
-  { "Advanced Usage" = "advanced-usage.md" },
-  { "Theory and Concepts" = "theory.md" },
-  { "Architecture" = "architecture.md" },
-  { "Limitations" = "limitations.md" },
-  { "Scheduling" = "scheduling.md" },
-  { "Operator Dashboard" = "dashboard.md" },
-  { "Upstream database contracts" = [
-    { "ambientweather2sqlite" = "upstream/aw2sqlite-database.md" },
-    { "omni-weather-forecast-apis" = "upstream/omni-weather-forecast-apis-database.md" },
+  { "Start here" = [
+    { "Getting Started" = "getting-started.md" },
+    { "Concepts" = "concepts.md" },
+    { "FAQ and troubleshooting" = "faq.md" },
+    { "Glossary" = "glossary.md" },
   ] },
-  { "Future Work" = "future-work.md" },
-  { "Releasing" = "releasing.md" },
-  { "Decisions" = [
-    { "SQLite files are the only upstream contract" = "adr/0001-sqlite-files-are-the-only-upstream-contract.md" },
-    { "Anchored nowcast, not disaggregation" = "adr/0002-anchored-nowcast-instead-of-temporal-disaggregation.md" },
-    { "Empirical truth-semantics calibration" = "adr/0003-empirical-truth-semantics-calibration.md" },
-    { "Grounding defaults to bias-only" = "adr/0004-grounding-defaults-to-bias-only.md" },
-    { "Promoted releases are the serving boundary" = "adr/0005-promoted-model-releases-are-the-serving-boundary.md" },
+  { "Operating" = [
+    { "Advanced Usage" = "advanced-usage.md" },
+    { "Scheduling" = "scheduling.md" },
+    { "Operator Dashboard" = "dashboard.md" },
+    { "Releasing" = "releasing.md" },
+  ] },
+  { "Reference" = [
+    { "CLI" = "reference/cli.md" },
+    { "Configuration" = "reference/configuration.md" },
+    { "Forecast JSON" = "reference/forecast-json.md" },
+    { "Outputs and layout" = "reference/outputs.md" },
+    { "API" = [
+      { "Overview" = "reference/api/index.md" },
+      { "Contracts" = "reference/api/contracts.md" },
+      { "Configuration objects" = "reference/api/config.md" },
+      { "Blenders" = "reference/api/blenders.md" },
+      { "Metrics" = "reference/api/metrics.md" },
+      { "Lead buckets" = "reference/api/leads.md" },
+      { "Forecast schema" = "reference/api/schema.md" },
+    ] },
+    { "Upstream database contracts" = [
+      { "ambientweather2sqlite" = "upstream/aw2sqlite-database.md" },
+      { "omni-weather-forecast-apis" = "upstream/omni-weather-forecast-apis-database.md" },
+    ] },
+  ] },
+  { "Methods" = [
+    { "Theory and Concepts" = "theory.md" },
+    { "Overview" = "methods/index.md" },
+    { "Notation" = "methods/notation.md" },
+    { "Grounding" = "methods/grounding.md" },
+    { "Combination" = "methods/combination.md" },
+    { "Calibration" = "methods/calibration.md" },
+    { "Uncertainty" = "methods/uncertainty.md" },
+    { "Verification" = "methods/verification.md" },
+    { "Model selection" = "methods/model-selection.md" },
+    { "Precipitation" = "methods/precipitation.md" },
+    { "Truth and QC" = "methods/truth-qc.md" },
+    { "Bibliography" = "methods/bibliography.md" },
+  ] },
+  { "Project" = [
+    { "Architecture" = "architecture.md" },
+    { "Limitations" = "limitations.md" },
+    { "Future Work" = "future-work.md" },
+    { "Research notes" = [
+      { "Overview" = "research/index.md" },
+      { "Evaluation review (2026-07-26)" = "research/evaluation-2026-07-26.md" },
+      { "Improvement methods (2026-07)" = "research/improvement-methods-2026-07.md" },
+      { "Week 2 provider diagnostic (2026-08-04)" = "research/week2-provider-diagnostic-2026-08-04.md" },
+      { "Cross-cutting summary" = "research/summary.md" },
+    ] },
+    { "Decisions" = [
+      { "SQLite files are the only upstream contract" = "adr/0001-sqlite-files-are-the-only-upstream-contract.md" },
+      { "Anchored nowcast, not disaggregation" = "adr/0002-anchored-nowcast-instead-of-temporal-disaggregation.md" },
+      { "Empirical truth-semantics calibration" = "adr/0003-empirical-truth-semantics-calibration.md" },
+      { "Grounding defaults to bias-only" = "adr/0004-grounding-defaults-to-bias-only.md" },
+      { "Promoted releases are the serving boundary" = "adr/0005-promoted-model-releases-are-the-serving-boundary.md" },
+    ] },
   ] },
 ]
 
@@ -50,10 +101,23 @@ primary = "blue"
 toggle.icon = "material/weather-sunny"
 toggle.name = "Switch to light mode"
 
+# Declaring this table replaces zensical's defaults wholesale, so anything the
+# docs rely on has to be listed here explicitly.
 [project.markdown_extensions.admonition]
+[project.markdown_extensions.attr_list]
+[project.markdown_extensions.def_list]
+[project.markdown_extensions.footnotes]
+[project.markdown_extensions.md_in_html]
 [project.markdown_extensions.pymdownx.details]
 [project.markdown_extensions.pymdownx.superfences]
+custom_fences = [
+  { name = "mermaid", class = "mermaid", format = "pymdownx.superfences.fence_code_format" },
+]
+[project.markdown_extensions.pymdownx.tabbed]
+alternate_style = true
 [project.markdown_extensions.pymdownx.highlight]
+[project.markdown_extensions.pymdownx.arithmatex]
+generic = true
 [project.markdown_extensions.tables]
 [project.markdown_extensions.toc]
 permalink = true

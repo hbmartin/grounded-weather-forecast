@@ -1,6 +1,10 @@
+- `CONTRIBUTING.md` is the canonical description of the dev workflow and every CI gate. Read it; the notes below are the short form.
 - Always run `uv run ruff check src --fix; uv run ruff format src tests; uv run pyrefly check src; uv run ty check src` after making changes (CI enforces `ruff format --check src tests`, so the format step covers tests too).
-- Run `uv run lizard -Eduplicate -x "*/dashboard/assets/*" src; uv run pytest tests/` after finishing implementation (the exclusion skips the vendored Chart.js asset).
-- Any user facing changes (e.g. new CLI flags) should be documented in the `README.md`.
+- Run `uv run lizard -Eduplicate -C 27 -x "*/dashboard/assets/*" src; uv run pytest tests/` after finishing implementation (the exclusion skips the vendored Chart.js asset; 27 is the CI ceiling).
+- Coverage must stay at or above the `fail_under` in `pyproject.toml` (currently 88).
+- Any user facing change (e.g. a new CLI flag) must be documented in **both** `README.md` (a row in the commands-at-a-glance table, naming the flag) and `docs/reference/cli.md` (full semantics). New config keys go in `docs/reference/configuration.md`.
+- New or changed methods must be documented in `docs/methods/`, with an `Implemented in:` line and the actual constants, plus a citation in `docs/methods/bibliography.md`. `docs/theory.md` owns *why*; `docs/methods/` owns *what exactly* — never put the same formula in both.
+- If docs changed, run `uv run zensical build --strict --clean` (it validates links and heading anchors).
 - Use `uv` not `python` for running scripts.
 - Treat Type Hints as First-Class
 - Prefer Explicitness and Small Functions
