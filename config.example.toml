@@ -69,6 +69,13 @@ min_sources = 4
 # pressure_sea_hpa = [850.0, 1090.0]
 # [provider_qc.min_deviation]
 # pressure_sea_hpa = 20.0
+#
+# Precipitation is cross-source-checked by default with generous floors
+# (precip_mm 10, precip_sum_mm 25): on a dry day median and MAD are zero, so
+# the floor alone separates a lone hallucinated cloudburst from drizzle
+# disagreement, while a genuine storm raises the median and passes. A variable
+# added to cross_source_variables without a min_deviation floor would null ANY
+# lone nonzero value on quiet days -- always set both together.
 
 [qc]
 # Metric units. Defaults exist for the standard channels; override here.

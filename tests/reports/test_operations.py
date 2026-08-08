@@ -55,8 +55,8 @@ def healthy_run(command="predict", minutes_ago=30, exit_code=0):
 class TestFreshness:
     def healthy_config(self, tmp_path):
         config = write_config(tmp_path, station_db="live_station.db")
-        # station: one sample per minute for 750 minutes ending just now
-        station_db(config, [NOW - timedelta(minutes=m) for m in range(750)])
+        # station: one sample per minute for the last 24 hours
+        station_db(config, [NOW - timedelta(minutes=m) for m in range(1440)])
         make_forecast_db(
             config.forecasts.db_path,
             [
@@ -92,7 +92,7 @@ class TestFreshness:
         frame = runs_frame([healthy_run(minutes_ago=30 + h * 60) for h in range(24)])
         row, alarms = operations.freshness_row(config, frame, now=NOW)
         assert alarms == ()
-        assert row["truth_samples_24h"] == 750
+        assert row["truth_samples_24h"] == 1440
         assert row["collector_runs_24h"] == 1
         assert row["provider_success_rate_24h"] == 1.0
         # ages measured against the injected clock, minute-exact
@@ -527,3 +527,43 @@ class TestPruneScores:
         ]
         assert not (scores_dir / "scores_hourly_live_expanding_e2.parquet").exists()
         assert result.freed_mb > 0
+
+
+def pipeline_history(samples, days):
+    rows = [
+        {
+            "recorded_at": NOW - timedelta(days=day),
+            "as_of_date": (NOW - timedelta(days=day)).date(),
+            "truth_samples_24h": samples,
+        }
+        for day in range(1, days + 1)
+    ]
+    return pl.DataFrame(
+        [
+            {c: row.get(c) for c in operations.evidence.PIPELINE_SCHEMA.names()}
+            for row in rows
+        ],
+        schema=dict(operations.evidence.PIPELINE_SCHEMA),
+    )
+
+
+class TestBaselineTruthAlarm:
+    def test_half_rate_flags_against_own_median(self):
+        # the Aug 4-6 half-rate episode: ~810/day against a ~1900 norm
+        notes = operations._baseline_truth_alarm(810, pipeline_history(1900, 5), NOW)
+        assert notes == ["thin truth vs baseline (810 < 70% of 14d median 1900)"]
+
+    def test_mild_dip_stays_quiet(self):
+        # 1500 > 0.7 * 1900 = 1330
+        assert (
+            operations._baseline_truth_alarm(1500, pipeline_history(1900, 5), NOW) == []
+        )
+
+    def test_thin_baseline_stays_quiet(self):
+        assert (
+            operations._baseline_truth_alarm(810, pipeline_history(1900, 2), NOW) == []
+        )
+
+    def test_no_history_stays_quiet(self):
+        assert operations._baseline_truth_alarm(810, None, NOW) == []
+        assert operations._baseline_truth_alarm(810, pl.DataFrame(), NOW) == []

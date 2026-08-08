@@ -37,7 +37,12 @@ leaderboard.
    provider has.
 
 Ground truth is QC'd (plausibility bounds, spike and flatline filters) and
-aggregated from minute data. Scoring uses MAE/RMSE/bias, CRPS, and
+aggregated from minute data. Provider forecasts get their own conservative
+QC before grounding: absolute physical bounds plus a robust cross-source
+outlier pass (temperature, humidity, pressure, dew point, and — since a
+provider stored a 138 mm cloudburst for a bone-dry day — precipitation,
+whose generous floors null a lone hallucination but never drizzle
+disagreement or genuine storm consensus). Scoring uses MAE/RMSE/bias, CRPS, and
 Brier/reliability for precipitation probability, with Diebold–Mariano
 significance per variable × lead bucket, under strict rolling-origin splits.
 Live and synthetic (backfilled) data are never pooled.
@@ -137,7 +142,7 @@ grounded-weather-forecast report
 
 # 7b. Housekeeping: delete superseded backtest scores files. Keeps the
 #    newest three per (product, source, window) group plus anything a
-#    release promoted in the last 30 days still references; files the
+#    release promoted in the last 7 days still references; files the
 #    evaluations catalog has never seen are skipped, never deleted, so
 #    pruning cannot destroy unsummarized evidence.
 grounded-weather-forecast prune-scores                 # --dry-run to preview
@@ -191,7 +196,12 @@ slice's board minimum by more than `[promotion].report_gap_threshold`
 
 Methods can be registered with a variable scope (`register(...,
 variables=frozenset({"pop"}))`), so specialist heads are simply never fitted
-off-scope: `pop_platt` vs `pop_beta` recalibrate the provider PoP mean (the
+off-scope: `precip_sparse_shrink` shrinks the daily precipitation blend
+toward harmonic climatology by a per-row source-count weight `n / (n + 2)` —
+past day six only one or two providers publish dailies, and an unfitted trust
+schedule is well-defined exactly where per-bucket evidence is too thin to fit
+one (the A/B against `damped_grounded_equal_weight`'s fitted alpha),
+`pop_platt` vs `pop_beta` recalibrate the provider PoP mean (the
 wet-season A/B, arbitrated by the Brier column, identity-guarded on dry
 archives), `csgd_emos` fits a censored shifted-gamma to precipitation (the
 first quantile emitter whose censored mass IS the dry probability), and the
