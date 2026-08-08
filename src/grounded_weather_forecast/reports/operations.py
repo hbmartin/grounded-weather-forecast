@@ -231,6 +231,7 @@ def _baseline_truth_alarm(
     )
     if baseline["as_of_date"].n_unique() < _BASELINE_MIN_DAYS:
         return []
+    # One vote per day: PIPELINE_LEDGER dedupes on as_of_date at append time.
     median = cast("float", baseline["truth_samples_24h"].median())
     if median > 0 and truth_samples < _TRUTH_BASELINE_SHARE * median:
         return [

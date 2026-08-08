@@ -218,26 +218,37 @@ This prints a JSON document with all three products. Trimmed:
 
 ```json
 {
-  "schema_version": 3,
-  "issued_at": "2026-03-22T17:00:00+00:00",
+  "schema_version": 5,
+  "issued_at": "2026-08-08T13:46:00+00:00",
+  "latitude": 34.2768,
+  "longitude": -117.1692,
+  "timezone": "America/Los_Angeles",
   "status": "ready",
-  "release_ids": ["df227d411b814f78"],
-  "observation_at": "2026-03-22T16:55:49+00:00",
-  "sources": ["met_norway", "nws", "open_meteo", "..."],
+  "status_reason": null,
+  "release_ids": ["a639c6834b5031af"],
+  "dataset_fingerprint": "d6627e2682a82537",
+  "observation_at": "2026-08-08T13:45:17+00:00",
+  "sources": ["met_norway", "nbm", "nws", "open_meteo", "..."],
   "minutely": [
-    {"valid_time": "...T17:01:00+00:00", "minutes_ahead": 1,
-     "temp_c": 19.522, "precip_intensity_mmh": 0.0, "pop": 0.0}
+    {"valid_time": "...T13:47:00+00:00", "minutes_ahead": 1,
+     "temp_c": 22.383, "precip_intensity_mmh": 0.0, "pop": 0.0,
+     "methods": {"temp_c": "anchored_hourly_blend", "pop": "native_equal_weight"}}
   ],
   "hourly": [
-    {"valid_time": "...T18:00:00+00:00", "lead_hours": 1.0, "lead_bucket": "1-3h",
-     "values":  {"temp_c": 20.83, "wind_speed_ms": 1.2, "pop": 0.0},
-     "methods": {"temp_c": "grounded_equal_weight", "pop": "equal_weight"},
-     "release_ids": {"temp_c": "df227d411b814f78"}}
+    {"valid_time": "...T14:00:00+00:00", "lead_hours": 0.23, "lead_bucket": "0-1h",
+     "values":  {"temp_c": 22.383, "wind_speed_ms": 0.088, "pop": 0.0},
+     "methods": {"temp_c": "anchored_fitted_ewma", "pop": "damped_grounded_equal_weight"},
+     "quantiles": {"temp_c": {"0.05": 19.562, "0.25": 21.596, "0.75": 23.328, "0.95": 24.663}},
+     "quantiles_source": {"temp_c": "dressed_bucket"},
+     "selection_reasons": {"temp_c": "lowest backtest MAE among promotable common-case methods"},
+     "release_ids": {"temp_c": "a639c6834b5031af"},
+     "truth_semantics": {"temp_c": "mean"}}
   ],
   "daily": [
-    {"date_local": "2026-03-23", "lead_days": 1,
-     "values":  {"temp_max_c": 23.8, "temp_min_c": 13.1, "pop": 0.0},
-     "methods": {"temp_max_c": "gbm"}}
+    {"date_local": "2026-08-08", "lead_days": 0,
+     "values":  {"temp_max_c": 35.3, "temp_min_c": 21.0, "pop": 0.0},
+     "methods": {"temp_max_c": "damped_grounded_equal_weight", "temp_min_c": "equal_weight"},
+     "truth_semantics": {"temp_max_c": "inst", "temp_min_c": "inst"}}
   ]
 }
 ```
@@ -250,10 +261,13 @@ This prints a JSON document with all three products. Trimmed:
   provider has.
 - `status` and `release_ids` — say whether compatible live evidence justified the
   forecast and identify the promoted decision, both at document level and per
-  hourly/daily variable in schema 3. A young archive emits an explicit `degraded`
-  equal-weight forecast rather than pretending grounding was fitted.
+  hourly/daily variable. Schema 5 also records each variable's `truth_semantics`,
+  its `selection_reasons`, and — via `quantiles_source` — whether an uncertainty
+  band is the method's own distribution or was dressed from live residual
+  quantiles. A young archive emits an explicit `degraded` equal-weight forecast
+  rather than pretending grounding was fitted.
 - `methods` — **every single value tells you which method produced it.** When you
-  wonder why tomorrow's high is 23.8 °C, the answer is in the document.
+  wonder why today's high is 35.3 °C, the answer is in the document.
 - `lead_bucket` — how far ahead this is, grouped. Skill is measured per bucket
   because a method that wins at 2 hours often loses at 7 days.
 
@@ -338,11 +352,15 @@ it belongs to the upstream `omni-weather-forecast-apis` project. Something like:
 
 ```cron
 # hourly for a diverse core of providers
-0 * * * *  cd /path && uv run omni-weather --config config.toml --sqlite forecasts.sqlite
+5 * * * *  cd /path/to/collector && uvx --from "omni-weather-forecast-apis[cli]" omni-weather --config ./config.toml --lat 34.2768 --lon -117.1692 --sqlite forecasts.sqlite
 
 # every 6 hours for the rest (respects free-tier quotas)
-0 */6 * * * cd /path && uv run omni-weather --config config-extended.toml --sqlite forecasts.sqlite
+5 */6 * * * cd /path/to/collector && uvx --from "omni-weather-forecast-apis[cli]" omni-weather --config ./config-extended.toml --lat 34.2768 --lon -117.1692 --sqlite forecasts.sqlite
 ```
+
+On macOS, prefer the ready-made launchd template instead — see
+[Scheduling](scheduling.md), which also covers the ensemble-ingest, predict,
+and nightly-maintain jobs and their cadence rationale.
 
 Poll a **diverse** core hourly — Open-Meteo with several *explicit* models
 (`ecmwf_ifs025`, `gfs_seamless`, `icon_seamless`), NWS, MET Norway, and one or two

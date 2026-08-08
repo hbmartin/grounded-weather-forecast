@@ -41,6 +41,10 @@ with a Diebold–Mariano test to say whether the margin is real.
   the leakage defences.
 - **[Limitations](limitations.md)** — what this cannot do, and the three real bugs
   the evaluation harness caught. **Read this before trusting any number.**
+- **[Scheduling](scheduling.md)** — the four crons that feed the system, with
+  launchd templates and cadence rationale.
+- **[Operator dashboard](dashboard.md)** — the nine-zone offline console `report`
+  writes, and what a healthy young deployment looks like.
 
 </div>
 

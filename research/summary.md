@@ -1,3 +1,5 @@
+_Synthesis (2026-07) of three parallel model research reports, since pruned from the repo._
+
 ## The good news: your repos already solved the hard boring parts
 
 The three reports all spend pages on forecast canonicalization, and you've essentially built it. `omni-weather-forecast-apis` stores `fetched_at`, a 6-hour `run_cycle` bucket, and `horizon_hours` on every hourly point, plus the `stacking_features` view — that's the supervised matrix keyed by (run, provider, model, valid_time, lead) that every method in all three reports trains on. Units are already normalized, and the README already declares ensemble/verification as a separate downstream package. `ambientweather2sqlite` gives 60-second truth with gap detection. Two genuinely missing pieces:

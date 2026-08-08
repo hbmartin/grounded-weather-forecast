@@ -104,8 +104,9 @@ Design decisions worth knowing:
   raises if any column starts with `t__`. This is a runtime guard against the
   most likely form of leakage.
 - **Quantiles travel end to end** through scores, forecast JSON, and served history.
-  Wave-1 methods are point forecasters, but EMOS/conformal can be added without a
-  storage or API break.
+  EMOS, CSGD, IDR, and the conformal wrappers emit them today; point-only winners
+  are dressed with live residual quantiles at serve time, labeled per variable in
+  the document's `quantiles_source` map.
 - **`BlendResult.point` may contain `NaN`**, which means "this method has nothing
   to say about this row" (e.g. persistence with no recent observation). The engine
   stores that as `null`; promotion compares all methods on one common-case mask and
@@ -190,6 +191,8 @@ Everything under `[dataset].dir` (git-ignored), all parquet:
 | `hourly_matrix_live.parquet` | **one row per (snapshot, valid hour)** — the supervised matrix |
 | `daily_matrix_live.parquet` | one row per (snapshot, target local date) |
 | `hourly_matrix_synthetic.parquet` | the same shape, backfilled provenance |
+| `ensembles.parquet` | append-deduped per-(model, valid_time, variable) ensemble mean/sd/p10–p90 statistics, as-of joined into `ens__*` feature columns |
+| `runs.parquet` | rolling command ledger (pruned to 90 days / 50,000 rows) — the dashboard's pipeline heartbeat |
 | `manifest.json` | row counts, per-file SHA-256, and the **dataset fingerprint** |
 | `scores/scores_{product}_{kind}_{window}_{evaluation}.parquet` | one identified evaluation run, one row per (method, variable, test case) |
 | `predict_history.parquet` | every emitted value, atomically appended with release/method/quantile attribution |
@@ -198,6 +201,13 @@ Everything under `[dataset].dir` (git-ignored), all parquet:
 **Matrices are keyed by provenance in the filename.** `..._live` and
 `..._synthetic` can never collide on disk, which makes the provenance wall a
 property of the filesystem and not merely of a runtime check.
+
+`[artifacts].dir` holds the non-dataset state: `alignment.json`,
+`drift.json`, `truth_qc.json`, `releases/` (the promoted Model Releases),
+`state/` (the blender rehydration store), `observability/` (write-only
+glass-box snapshots), `eprocess/` (sequential-gate wealth, era-keyed), and
+`history/` (the append-only quality/operations ledgers behind dashboard
+zones H and I).
 
 The **scores frame** is the pivot of the whole design. It is deliberately *long
 and dumb*:
@@ -229,10 +239,30 @@ Modules self-register on import; `blenders/__init__.py` imports them all.
 |---|---|
 | `baselines.py` | `persistence`, `climatology`, `best_provider`, `equal_weight` |
 | `grounding.py` | (not a method — the `AffineGrounding` stage others compose) |
-| `combine.py` | `grounded_equal_weight`, `affine_equal_weight`, `inverse_mse` |
-| `anchoring.py` | `anchored_grounded_equal_weight`, `anchored_inverse_mse` |
+| `combine.py` | `grounded_equal_weight`, `grounded_median_equal_weight`, `affine_equal_weight`, `inverse_mse`, `inverse_mae` |
+| `trimmed.py` | `trimmed_mean`, `grounded_trimmed_mean` |
+| `ewma_grounding.py` | `ewma_grounded_equal_weight`, `ewma_inverse_mae` |
+| `harmonic_grounding.py` | `harmonic_grounded_equal_weight` |
+| `anchoring.py` | `anchored_grounded_equal_weight`, `anchored_inverse_mse`, `anchored_fitted_grounded`, `anchored_fitted_ewma`, `anchored_trend_grounded` |
+| `raft.py` | `raft_grounded` |
+| `seamless.py` | `seamless_regression` |
+| `invcov.py` | `inverse_covariance` |
+| `damped.py` | `damped_grounded_equal_weight` |
+| `analog.py` | `analog_ensemble` |
+| `cluster.py` | `cluster_equal_weight` |
 | `gbm.py` | `gbm` |
 | `experts.py` | `ewa`, `boa` |
+| `emos.py` | `emos` |
+| `csgd.py` | `csgd_emos` (precip-scoped) |
+| `idr.py` | `idr`, `idr_bucket`, `idr_bucket_dcp` |
+| `conformal.py` | `conformal_gew`, `conformal_ewma` |
+| `pop_calibration.py` | `pop_platt`, `pop_beta` (pop-scoped) |
+| `sparse_shrink.py` | `precip_sparse_shrink` (daily-precip-scoped) |
+| `daily_heads.py` | `daily_marginal_emos`, `daily_path_extreme` (daily-temp-scoped) |
+
+`available_methods()` on the registry is the authority; the table is a map,
+not a contract. Methods marked *-scoped* register with an explicit variable
+set and never appear off-scope.
 
 Two shared abstractions live in `blenders/protocol.py`:
 
@@ -290,7 +320,9 @@ build_snapshot(config, now)          # the same as-of code the dataset build use
 dataset and requested issue time, then promotes the common-case, significance-aware
 per-slice winners into a Model Release. Config pins override. A slice with no
 compatible evidence uses the fit-free `equal_weight` fallback, marks the document
-`degraded`, and records the reason.
+`degraded`, and records the reason. Promoted releases are the serving boundary —
+evaluation evidence can never become a production decision by accident
+([ADR 0005](adr/0005-promoted-model-releases-are-the-serving-boundary.md)).
 
 Every emitted value carries the `method_id` that produced it. When someone asks
 "why is the 6 a.m. temperature 12 °C", the answer is in the document.
@@ -350,10 +382,14 @@ uv run ruff check src --fix        # lint.select = ALL
 uv run ruff format src tests
 uv run pyrefly check src           # two independent type checkers,
 uv run ty check src                #   because they disagree usefully
-uv run lizard -Eduplicate -C 27 src  # complexity ceiling + duplication
+uv run lizard -Eduplicate -C 27 -x "*/dashboard/assets/*" src  # complexity + duplication
 uv run deptry src                  # declared deps == imported deps
 uv run pytest tests/ --cov=src     # >= 88% coverage (currently ~95%)
 ```
+
+CI additionally runs the Semgrep guardrails (provider-QC grouping,
+artifact-pointer paths) and the lockfile checks (`uv lock --check`,
+`scripts/check_lock_hosts.py`) — see `.github/workflows/ci.yml`.
 
 Type hints are first-class: `pyrefly` and `ty` both run, and they catch different
 things (`ty` in particular refuses to narrow a match-guard capture, which forced
