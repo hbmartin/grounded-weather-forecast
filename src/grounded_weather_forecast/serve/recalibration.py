@@ -31,11 +31,6 @@ from grounded_weather_forecast.contracts import (
     TruthSemantics,
     VariableSpec,
 )
-from grounded_weather_forecast.evaluation import (
-    code_identity,
-    config_fingerprint,
-    dataset_fingerprint,
-)
 from grounded_weather_forecast.reports.recalibration import (
     MIN_FIT_ROWS,
     apply_cqr_margins,
@@ -43,6 +38,7 @@ from grounded_weather_forecast.reports.recalibration import (
     fit_cqr_margins,
     fit_pit_levels,
 )
+from grounded_weather_forecast.serve.score_pool import collect_live_pool
 from grounded_weather_forecast.serve.selection import Selection
 
 MODES = ("none", "pit", "cqr")
@@ -164,32 +160,18 @@ class QuantileRecalibrator:
         semantics: TruthSemantics,
         method_ids: frozenset[str],
     ) -> pl.DataFrame | None:
-        current_dataset = dataset_fingerprint(self.config)
-        current_config = config_fingerprint(self.config)
-        current_code = code_identity()
-        frames: list[pl.DataFrame] = []
-        for path in sorted(
-            self.scores_dir.glob(f"scores_{self.product}_live*.parquet")
-        ):
-            lazy = pl.scan_parquet(path)
-            if not set(lazy.collect_schema().names()) >= _REQUIRED_COLUMNS:
-                continue
-            lazy = lazy.filter(
-                (pl.col("source_kind") == "live")
-                & (pl.col("dataset_fingerprint") == current_dataset)
-                & (pl.col("config_fingerprint") == current_config)
-                & (pl.col("code_version") == current_code)
-                & (pl.col("variable") == variable.name)
-                & pl.col("method_id").is_in(sorted(method_ids))
-                & pl.col("y_true").is_not_null()
-                & pl.col("quantiles_json").is_not_null()
-            )
-            if self.product == "hourly":
-                lazy = lazy.filter(pl.col("semantics") == semantics.value)
-            frames.append(lazy.select(_POOL_COLUMNS).collect())
-        if not frames:
-            return None
-        return pl.concat(frames)
+        return collect_live_pool(
+            self.scores_dir,
+            self.product,
+            self.config,
+            variable,
+            semantics,
+            method_ids,
+            required_columns=_REQUIRED_COLUMNS,
+            pool_columns=_POOL_COLUMNS,
+            value_predicate=pl.col("y_true").is_not_null()
+            & pl.col("quantiles_json").is_not_null(),
+        )
 
 
 def _newest_evaluation_cases(

@@ -7,12 +7,14 @@ from dataclasses import dataclass
 import numpy as np
 
 from grounded_weather_forecast.contracts import (
+    BlendResult,
     BoolArray,
     FloatArray,
+    Product,
     TargetKind,
     VariableSpec,
 )
-from grounded_weather_forecast.leads import LeadBucket
+from grounded_weather_forecast.leads import LeadBucket, buckets_for_product
 
 
 def renormalize_weights(weights: FloatArray, availability: BoolArray) -> FloatArray:
@@ -79,6 +81,58 @@ def finalize_quantiles(
     lower = -np.inf if variable.minimum is None else variable.minimum
     upper = np.inf if variable.maximum is None else variable.maximum
     return np.clip(ordered, lower, upper)
+
+
+def quantile_blend_result(
+    quantiles: FloatArray,
+    levels: tuple[float, ...],
+    kind: TargetKind,
+    variable: VariableSpec | None,
+) -> BlendResult:
+    """Finalized quantiles served with their own median as the point."""
+    finalized = finalize_quantiles(quantiles, kind, variable)
+    median = finalized[:, len(levels) // 2]
+    return BlendResult(
+        point=finalize_point(median, kind, variable),
+        quantiles=finalized,
+        quantile_levels=levels,
+    )
+
+
+def coefficient_state(
+    method_id: str,
+    variable: VariableSpec | None,
+    fit_status: str,
+    parameters: FloatArray | None,
+    names: tuple[str, ...],
+) -> dict[str, object]:
+    """Glass-box ``to_state`` payload shared by coefficient-vector heads."""
+    return {
+        "schema_version": 1,
+        "method_id": method_id,
+        "variable": variable.name if variable else None,
+        "fit_status": fit_status,
+        "fitted": parameters is not None,
+        "coefficients": None
+        if parameters is None
+        else {
+            name: float(value) for name, value in zip(names, parameters, strict=True)
+        },
+    }
+
+
+def fit_shrunk_buckets(
+    product: Product,
+    lead_hours: FloatArray,
+    fit_one: Callable[[np.ndarray], FloatArray],
+) -> "FittedBuckets[FloatArray]":
+    """Per-bucket coefficient fits with linear shrinkage toward the global fit."""
+    fitter = PerBucketFitter(
+        buckets=buckets_for_product(product),
+        fit_one=fit_one,
+        blend=lambda local, glob, w: w * local + (1.0 - w) * glob,
+    )
+    return fitter.fit(lead_hours)
 
 
 @dataclass

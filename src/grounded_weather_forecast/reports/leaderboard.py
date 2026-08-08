@@ -10,6 +10,7 @@ pools live and synthetic scores.
 import json
 import math
 from collections.abc import Mapping, Sequence
+from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
 import numpy as np
@@ -613,6 +614,119 @@ def _seq_gate(
     return fallback, "seq_e_below_threshold"
 
 
+@dataclass(frozen=True)
+class _GateSettings:
+    """Statistical-gate configuration threaded through the per-slice helpers."""
+
+    rule: str
+    alpha: float
+    n_bootstrap: int
+    block_length: int | None
+    eprocess_store: "EProcessStore | None"
+
+
+def _slice_scores(
+    normalized_scores: pl.DataFrame | None, parts: Mapping[str, str]
+) -> pl.DataFrame | None:
+    if normalized_scores is None:
+        return None
+    subset = normalized_scores.filter(
+        (pl.col("product") == parts["product"])
+        & (pl.col("variable") == parts["variable"])
+        & (pl.col("lead_bucket") == parts["lead_bucket"])
+    )
+    if "truth_semantics" in parts and "semantics" in normalized_scores.columns:
+        subset = subset.filter(pl.col("semantics") == parts["truth_semantics"])
+    return subset
+
+
+def _gated_candidate(
+    candidate: dict[str, object],
+    reference_rows: tuple[dict[str, object], ...],
+    references: tuple[str, ...],
+    slice_scores: pl.DataFrame | None,
+    parts: Mapping[str, str],
+    settings: _GateSettings,
+) -> tuple[dict[str, object] | None, str | None]:
+    """The board leader after the configured gate, with the gate that held it.
+
+    ``(None, None)`` means the slice has no reference rows at all and must be
+    skipped entirely.
+    """
+    if candidate["method_id"] in references:
+        return candidate, None
+    present_references = {str(reference["method_id"]) for reference in reference_rows}
+    if not set(references) <= present_references:
+        if reference_rows:
+            return _reference_fallback(reference_rows), "missing_reference"
+        return None, None
+    if settings.rule == "mcs" and slice_scores is not None:
+        # Decision-scoped matrix: the gate decides "candidate vs the
+        # references", so only those methods enter the common-case
+        # loss matrix. Intersecting cases over the full pool let every
+        # newly registered (and sometimes abstaining) method shrink
+        # the sample and mechanically widen the max-statistic null —
+        # the 2026-08-04 cycle demoted four standing winners that way.
+        return _mcs_gate(
+            candidate,
+            reference_rows,
+            slice_scores,
+            (
+                str(candidate["method_id"]),
+                *(str(row["method_id"]) for row in reference_rows),
+            ),
+            settings.alpha,
+            n_bootstrap=settings.n_bootstrap,
+            block_length=settings.block_length,
+        )
+    if (
+        settings.rule == "seq_mcs"
+        and slice_scores is not None
+        and settings.eprocess_store is not None
+    ):
+        return _seq_gate(
+            candidate,
+            reference_rows,
+            slice_scores,
+            parts,
+            settings.alpha,
+            settings.eprocess_store,
+        )
+    if any(
+        _legacy_gate(candidate, reference) is not candidate
+        for reference in reference_rows
+    ):
+        return _reference_fallback(reference_rows), "dm_not_significant"
+    return candidate, None
+
+
+def _pooled_winner(
+    parts: dict[str, str],
+    best: dict[str, object],
+    eligible: pl.DataFrame,
+    normalized_scores: pl.DataFrame | None,
+    references: tuple[str, ...],
+    settings: _GateSettings,
+) -> dict[str, object] | None:
+    """A far daily bucket's pooled-gate fallback winner, already annotated."""
+    pooled = _pooled_daily_gate(
+        parts,
+        normalized_scores,
+        references,
+        settings.rule,
+        settings.alpha,
+        settings.n_bootstrap,
+        settings.block_length,
+        settings.eprocess_store,
+    )
+    if pooled is None:
+        return None
+    pooled_candidate, pooled_gate = pooled
+    return _annotate_winner(
+        {**pooled_candidate, **parts}, best, eligible, pooled_gate, infer_gate=False
+    )
+
+
 def slice_winners(
     board: pl.DataFrame,
     scores: pl.DataFrame | None = None,
@@ -639,8 +753,13 @@ def slice_winners(
             empty_keys.insert(2, "truth_semantics")
         return _empty_winners(empty_keys)
     normalized_scores = _with_default_semantics(scores) if scores is not None else None
-    n_bootstrap = promotion.mcs_bootstrap if promotion is not None else 500
-    block_length = promotion.mcs_block_length if promotion is not None else None
+    settings = _GateSettings(
+        rule=rule,
+        alpha=alpha,
+        n_bootstrap=promotion.mcs_bootstrap if promotion is not None else 500,
+        block_length=promotion.mcs_block_length if promotion is not None else None,
+        eprocess_store=eprocess_store,
+    )
     winners: list[dict[str, object]] = []
     keys = ["product", "variable", "lead_bucket"]
     if "truth_semantics" in board.columns:
@@ -669,117 +788,34 @@ def slice_winners(
             & (pl.col("n_valid_times") >= 8)
         )
         if eligible.is_empty():
-            pooled = _pooled_daily_gate(
-                parts,
-                normalized_scores,
-                references,
-                rule,
-                alpha,
-                n_bootstrap,
-                block_length,
-                eprocess_store,
+            pooled = _pooled_winner(
+                parts, best, eligible, normalized_scores, references, settings
             )
             if pooled is not None:
-                pooled_candidate, pooled_gate = pooled
-                winners.append(
-                    _annotate_winner(
-                        {**pooled_candidate, **parts},
-                        best,
-                        eligible,
-                        pooled_gate,
-                        infer_gate=False,
-                    )
-                )
+                winners.append(pooled)
             continue
         ranked = eligible.sort("mae")
-        candidate = ranked.row(0, named=True)
-        gate: str | None = None
         reference_rows = tuple(
             ranked.filter(pl.col("method_id").is_in(references))
             .sort("mae")
             .iter_rows(named=True)
         )
-        slice_scores: pl.DataFrame | None = None
-        if normalized_scores is not None:
-            slice_scores = normalized_scores.filter(
-                (pl.col("product") == parts["product"])
-                & (pl.col("variable") == parts["variable"])
-                & (pl.col("lead_bucket") == parts["lead_bucket"])
-            )
-            if "truth_semantics" in parts and "semantics" in normalized_scores.columns:
-                slice_scores = slice_scores.filter(
-                    pl.col("semantics") == parts["truth_semantics"]
-                )
-        if candidate["method_id"] not in references:
-            present_references = {
-                str(reference["method_id"]) for reference in reference_rows
-            }
-            if not set(references) <= present_references:
-                if reference_rows:
-                    candidate = _reference_fallback(reference_rows)
-                    gate = "missing_reference"
-                else:
-                    continue
-            elif rule == "mcs" and slice_scores is not None:
-                # Decision-scoped matrix: the gate decides "candidate vs the
-                # references", so only those methods enter the common-case
-                # loss matrix. Intersecting cases over the full pool let every
-                # newly registered (and sometimes abstaining) method shrink
-                # the sample and mechanically widen the max-statistic null —
-                # the 2026-08-04 cycle demoted four standing winners that way.
-                candidate, gate = _mcs_gate(
-                    candidate,
-                    reference_rows,
-                    slice_scores,
-                    (
-                        str(candidate["method_id"]),
-                        *(str(row["method_id"]) for row in reference_rows),
-                    ),
-                    alpha,
-                    n_bootstrap=n_bootstrap,
-                    block_length=block_length,
-                )
-            elif (
-                rule == "seq_mcs"
-                and slice_scores is not None
-                and eprocess_store is not None
-            ):
-                candidate, gate = _seq_gate(
-                    candidate,
-                    reference_rows,
-                    slice_scores,
-                    parts,
-                    alpha,
-                    eprocess_store,
-                )
-            elif any(
-                _legacy_gate(candidate, reference) is not candidate
-                for reference in reference_rows
-            ):
-                candidate = _reference_fallback(reference_rows)
-                gate = "dm_not_significant"
+        candidate, gate = _gated_candidate(
+            ranked.row(0, named=True),
+            reference_rows,
+            references,
+            _slice_scores(normalized_scores, parts),
+            parts,
+            settings,
+        )
+        if candidate is None:
+            continue
         if gate in _POOLABLE_REASONS:
-            pooled = _pooled_daily_gate(
-                parts,
-                normalized_scores,
-                references,
-                rule,
-                alpha,
-                n_bootstrap,
-                block_length,
-                eprocess_store,
+            pooled = _pooled_winner(
+                parts, best, eligible, normalized_scores, references, settings
             )
             if pooled is not None:
-                pooled_candidate, pooled_gate = pooled
-                winners.append(
-                    _annotate_winner(
-                        {**pooled_candidate, **parts},
-                        best,
-                        eligible,
-                        pooled_gate,
-                        infer_gate=False,
-                    )
-                )
+                winners.append(pooled)
                 continue
         winners.append(_annotate_winner(candidate, best, eligible, gate))
     if not winners:

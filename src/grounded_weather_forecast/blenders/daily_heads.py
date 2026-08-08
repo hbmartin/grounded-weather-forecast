@@ -35,9 +35,11 @@ from grounded_weather_forecast.blenders.emos import (
 )
 from grounded_weather_forecast.blenders.protocol import (
     FittedBuckets,
-    PerBucketFitter,
+    coefficient_state,
     finalize_point,
     finalize_quantiles,
+    fit_shrunk_buckets,
+    quantile_blend_result,
 )
 from grounded_weather_forecast.blenders.registry import BlenderFactory, register
 from grounded_weather_forecast.contracts import (
@@ -49,7 +51,6 @@ from grounded_weather_forecast.contracts import (
     TargetKind,
     VariableSpec,
 )
-from grounded_weather_forecast.leads import buckets_for_product
 
 QUANTILE_LEVELS: tuple[float, ...] = tuple(round(0.05 * i, 2) for i in range(1, 20))
 _MIN_FIT_ROWS = 60
@@ -155,36 +156,27 @@ class DailyMarginalEmos:
         sigma = np.maximum(np.exp(c + d * log_spread), _MIN_SIGMA)
         stats = import_module("scipy.stats")
         levels = np.asarray(QUANTILE_LEVELS)
-        quantiles = finalize_quantiles(
+        return quantile_blend_result(
             mu[:, np.newaxis] + sigma[:, np.newaxis] * stats.norm.ppf(levels),
+            QUANTILE_LEVELS,
             self._kind,
             self._variable,
         )
-        median = quantiles[:, len(QUANTILE_LEVELS) // 2]
-        return BlendResult(
-            point=finalize_point(median, self._kind, self._variable),
-            quantiles=quantiles,
-            quantile_levels=QUANTILE_LEVELS,
-        )
 
     def to_state(self) -> dict[str, object]:
-        parameters = self._parameters
-        return {
-            "schema_version": 1,
-            "method_id": self.method_id,
-            "variable": self._variable.name if self._variable else None,
-            "fit_status": self._fit_status,
-            "fitted": parameters is not None,
-            "coefficients": None
-            if parameters is None
-            else {
-                "mean_intercept": float(parameters[0]),
-                "mean_base_slope": float(parameters[1]),
-                "mean_path_slope": float(parameters[2]),
-                "log_sigma_intercept": float(parameters[3]),
-                "log_sigma_slope": float(parameters[4]),
-            },
-        }
+        return coefficient_state(
+            self.method_id,
+            self._variable,
+            self._fit_status,
+            self._parameters,
+            (
+                "mean_intercept",
+                "mean_base_slope",
+                "mean_path_slope",
+                "log_sigma_intercept",
+                "log_sigma_slope",
+            ),
+        )
 
 
 @dataclass
@@ -215,12 +207,7 @@ class DailyPathExtreme:
                     biases[column] = float(np.mean(y[usable] - members[usable, column]))
             return biases
 
-        fitter = PerBucketFitter(
-            buckets=buckets_for_product(train.x.product),
-            fit_one=fit_one,
-            blend=lambda local, glob, w: w * local + (1.0 - w) * glob,
-        )
-        self._fitted = fitter.fit(train.x.lead_hours)
+        self._fitted = fit_shrunk_buckets(train.x.product, train.x.lead_hours, fit_one)
         return self
 
     def predict(self, x: ForecastMatrix) -> BlendResult:

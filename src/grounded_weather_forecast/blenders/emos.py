@@ -24,7 +24,7 @@ import numpy as np
 from grounded_weather_forecast.blenders.combine import GroundedEqualWeight
 from grounded_weather_forecast.blenders.protocol import (
     finalize_point,
-    finalize_quantiles,
+    quantile_blend_result,
 )
 from grounded_weather_forecast.blenders.registry import BlenderFactory, register
 from grounded_weather_forecast.contracts import (
@@ -244,14 +244,8 @@ class Emos:
                 point=finalize_point(base_point, self._kind, self._variable)
             )
         mu, sigma = self._distribution(x)
-        quantiles = finalize_quantiles(
-            self._quantiles(mu, sigma), self._kind, self._variable
-        )
-        median = quantiles[:, len(QUANTILE_LEVELS) // 2]
-        return BlendResult(
-            point=finalize_point(median, self._kind, self._variable),
-            quantiles=quantiles,
-            quantile_levels=QUANTILE_LEVELS,
+        return quantile_blend_result(
+            self._quantiles(mu, sigma), QUANTILE_LEVELS, self._kind, self._variable
         )
 
     def to_state(self) -> dict[str, object]:

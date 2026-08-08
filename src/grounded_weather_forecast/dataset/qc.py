@@ -86,10 +86,9 @@ def _flatline_flag(channel: str, min_minutes: int, *, causal: bool = False) -> p
     )
 
 
-def apply_qc(
-    minute: pl.DataFrame, qc: QcConfig, channels: Sequence[str]
-) -> pl.DataFrame:
-    """Add ``{channel}_qc`` bitmask columns; input must be ts-sorted."""
+def _channel_flags(
+    minute: pl.DataFrame, qc: QcConfig, channels: Sequence[str], *, causal: bool
+) -> list[pl.Expr]:
     flags: list[pl.Expr] = []
     for channel in channels:
         if channel not in minute.columns:
@@ -97,12 +96,21 @@ def apply_qc(
         flag: pl.Expr = pl.lit(QC_OK, dtype=pl.UInt8)
         if (bounds := qc.bounds.get(channel)) is not None:
             flag = flag | _bounds_flag(channel, *bounds).cast(pl.UInt8)
-        if (max_step := qc.max_step.get(channel)) is not None:
+        if not causal and (max_step := qc.max_step.get(channel)) is not None:
             flag = flag | _spike_flag(channel, max_step).cast(pl.UInt8)
         if (flatline := qc.flatline_minutes.get(channel)) is not None:
-            flag = flag | _flatline_flag(channel, flatline).cast(pl.UInt8)
+            flag = flag | _flatline_flag(channel, flatline, causal=causal).cast(
+                pl.UInt8
+            )
         flags.append(flag.alias(qc_col(channel)))
-    return minute.with_columns(flags)
+    return flags
+
+
+def apply_qc(
+    minute: pl.DataFrame, qc: QcConfig, channels: Sequence[str]
+) -> pl.DataFrame:
+    """Add ``{channel}_qc`` bitmask columns; input must be ts-sorted."""
+    return minute.with_columns(_channel_flags(minute, qc, channels, causal=False))
 
 
 def apply_causal_qc(
@@ -114,17 +122,7 @@ def apply_causal_qc(
     duration crosses the threshold. The two-sided isolated-spike rule is
     intentionally excluded because it requires a following observation.
     """
-    flags: list[pl.Expr] = []
-    for channel in channels:
-        if channel not in minute.columns:
-            continue
-        flag: pl.Expr = pl.lit(QC_OK, dtype=pl.UInt8)
-        if (bounds := qc.bounds.get(channel)) is not None:
-            flag = flag | _bounds_flag(channel, *bounds).cast(pl.UInt8)
-        if (flatline := qc.flatline_minutes.get(channel)) is not None:
-            flag = flag | _flatline_flag(channel, flatline, causal=True).cast(pl.UInt8)
-        flags.append(flag.alias(qc_col(channel)))
-    return minute.with_columns(flags)
+    return minute.with_columns(_channel_flags(minute, qc, channels, causal=True))
 
 
 def masked(channel: str) -> pl.Expr:

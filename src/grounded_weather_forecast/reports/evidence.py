@@ -877,6 +877,43 @@ def _readable_releases(directory: Path) -> list[Mapping[str, object]]:
     return releases
 
 
+def _append_verdicts(
+    config: Config,
+    product: str,
+    scores: pl.DataFrame,
+    verdicts: Mapping[str, float],
+    moment: datetime,
+) -> None:
+    """Verdict scalars keyed by the newest evaluation, into the verdicts ledger."""
+    from grounded_weather_forecast.reports.recalibration import (  # noqa: PLC0415
+        newest_evaluation,
+    )
+
+    if not verdicts or scores.is_empty():
+        return
+    newest = newest_evaluation(scores)
+    rows = [
+        {
+            "recorded_at": moment,
+            "evaluation_id": _first(newest, "evaluation_id"),
+            "product": product,
+            "source_kind": _first(newest, "source_kind"),
+            "name": name,
+            "value": float(value),
+            "code_version": _first(newest, "code_version"),
+            "config_fingerprint": _first(newest, "config_fingerprint"),
+            "dataset_fingerprint": _first(newest, "dataset_fingerprint"),
+        }
+        for name, value in sorted(verdicts.items())
+    ]
+    fresh = pl.DataFrame(rows, schema_overrides=dict(VERDICTS_SCHEMA)).select(
+        VERDICTS_SCHEMA.names()
+    )
+    append_ledger(
+        fresh, ledger_path(config, VERDICTS_LEDGER), VERDICTS_LEDGER, now=moment
+    )
+
+
 def record_verdicts(
     config: Config,
     product: str,
@@ -888,38 +925,12 @@ def record_verdicts(
     alpha: float = 0.05,
     now: datetime | None = None,
 ) -> None:
-    from grounded_weather_forecast.reports.recalibration import (  # noqa: PLC0415
-        newest_evaluation,
-    )
-
     try:
         moment = now or datetime.now(tz=UTC)
         verdicts = {**recalibration_verdicts(recalib), **gate_verdicts(comparison)}
         if board is not None:
             verdicts.update(discovery_verdicts(board, alpha=alpha))
-        if not verdicts or scores.is_empty():
-            return
-        newest = newest_evaluation(scores)
-        rows = [
-            {
-                "recorded_at": moment,
-                "evaluation_id": _first(newest, "evaluation_id"),
-                "product": product,
-                "source_kind": _first(newest, "source_kind"),
-                "name": name,
-                "value": float(value),
-                "code_version": _first(newest, "code_version"),
-                "config_fingerprint": _first(newest, "config_fingerprint"),
-                "dataset_fingerprint": _first(newest, "dataset_fingerprint"),
-            }
-            for name, value in sorted(verdicts.items())
-        ]
-        fresh = pl.DataFrame(rows, schema_overrides=dict(VERDICTS_SCHEMA)).select(
-            VERDICTS_SCHEMA.names()
-        )
-        append_ledger(
-            fresh, ledger_path(config, VERDICTS_LEDGER), VERDICTS_LEDGER, now=moment
-        )
+        _append_verdicts(config, product, scores, verdicts, moment)
     except _RECORDER_ERRORS:
         return
 
@@ -974,38 +985,14 @@ def record_winner_curse(
     now: datetime | None = None,
 ) -> None:
     """Winner-bias scalars into the verdicts ledger (same keys, new names)."""
-    from grounded_weather_forecast.reports.recalibration import (  # noqa: PLC0415
-        newest_evaluation,
-    )
     from grounded_weather_forecast.reports.winner_curse import (  # noqa: PLC0415
         winner_curse_verdicts,
     )
 
     try:
         moment = now or datetime.now(tz=UTC)
-        verdicts = winner_curse_verdicts(winners)
-        if not verdicts or scores.is_empty():
-            return
-        newest = newest_evaluation(scores)
-        rows = [
-            {
-                "recorded_at": moment,
-                "evaluation_id": _first(newest, "evaluation_id"),
-                "product": product,
-                "source_kind": _first(newest, "source_kind"),
-                "name": name,
-                "value": float(value),
-                "code_version": _first(newest, "code_version"),
-                "config_fingerprint": _first(newest, "config_fingerprint"),
-                "dataset_fingerprint": _first(newest, "dataset_fingerprint"),
-            }
-            for name, value in sorted(verdicts.items())
-        ]
-        fresh = pl.DataFrame(rows, schema_overrides=dict(VERDICTS_SCHEMA)).select(
-            VERDICTS_SCHEMA.names()
-        )
-        append_ledger(
-            fresh, ledger_path(config, VERDICTS_LEDGER), VERDICTS_LEDGER, now=moment
+        _append_verdicts(
+            config, product, scores, winner_curse_verdicts(winners), moment
         )
     except _RECORDER_ERRORS:
         return
