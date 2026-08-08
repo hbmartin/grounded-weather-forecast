@@ -878,7 +878,7 @@ class PruneResult:
 
 
 def _protected_evaluations(config: Config, *, now: datetime) -> set[str]:
-    """Evaluation ids referenced by any release promoted in the last 30 days."""
+    """Evaluation ids referenced by a release promoted within the horizon."""
     directory = config.artifacts_dir / "releases"
     horizon = now - timedelta(days=_PROTECT_RELEASE_DAYS)
     protected: set[str] = set()

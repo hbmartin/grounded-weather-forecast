@@ -87,7 +87,9 @@ That works on day one. Everything else needs an archive with some history — se
 | `prune-scores` | delete superseded scores files | `--dry-run` |
 
 Global: `--config PATH` (default `config.toml`), `--version`. Exit codes: `0` ok,
-`1` command failure, `2` config error.
+`1` command failure, `2` config error, `75` another pipeline command holds the
+lock (retry later). All commands except `predict` and `ingest-ensembles`
+serialize on `<dataset dir>/pipeline.lock`.
 
 **Full semantics for every flag — defaults, choices, what each command reads and
 writes — are in the

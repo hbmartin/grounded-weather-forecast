@@ -268,6 +268,38 @@ the honest compromise.
 their board minimum — i.e. where the gate is costing real accuracy — so the
 operator can see the price of the discipline rather than only its benefits.
 
+### Incumbent retention — the winner-curse guard
+
+*Implemented in: `serve/selection.py::_retained_incumbent`,
+`reports/winner_curse.py::should_retain_incumbent`*
+
+The raw argmin churns on near-ties: two methods separated by less than their
+sampling noise trade the slice back and forth, and every trade re-realizes the
+argmin's optimism (§4). Selection therefore keeps the **previous release's
+method** when all of the following hold:
+
+1. today's winner was a true argmin pick (`gate` ∈ {∅, `eligibility`} — a
+   gate-forced reference or pooled winner is never overridden);
+2. the incumbent is a *different* method, is **not** `equal_weight` (a demoted
+   slice's persisted method is already the fallback, and retaining it by name
+   would outlast the demotion's own 14-day re-hearing), and passes the
+   eligibility bar on the **current** board with the same truth semantics;
+3. $\text{MAE}_{\text{incumbent}} - \text{MAE}_{\text{winner}} \le
+   \texttt{\_RETENTION\_SE\_MULT} \times \widehat{SE}_{\text{boot}}$, where the
+   SE is the winner's mean-loss standard error under the same moving-block
+   bootstrap the MCS gate and §4's bias estimate use, and
+   `_RETENTION_SE_MULT = 1.0` (a module constant — a config key would rotate
+   the config fingerprint on every tweak).
+
+A retained `Selection` carries the incumbent's **current-board** `n`/`mae`
+(so the live demotion gate in §6 judges it on today's promise, and keeps the
+last word), sets the `retained` flag, and persists it in the release payload.
+Consequence, documented deliberately: the release id becomes a function of
+(evidence, config, code, **previous release**) — path-dependent, but a fixed
+point under fixed evidence: re-running with the retained release as the
+previous one re-derives the same selections, hashes to the same id, and
+dedupes on write. Config pins override retention entirely.
+
 `reports/eprocess.py::promotion_comparison` computes **both** rules on every
 report so the operator can watch them disagree, and
 `evidence.gate_verdicts` records the running `gate_agree_rate`.

@@ -292,9 +292,16 @@ non-blocking:
 - **Single location.** Location is config, not a key in the model store. Adding a
   second station means a second config and a second dataset directory — no code
   change, but no shared learning either.
-- **Dataset build is single-writer.** Concurrent `build-dataset` runs against the
-  same dataset directory will race. Forecast-history appends themselves are locked
-  and atomically replaced.
+- **Pipeline mutators are serialized by a coarse lock.** `build-dataset`,
+  `backtest`, `report`, `alignment`, `backfill`, `truth-qc`, and `prune-scores`
+  take an exclusive lock on `<dataset dir>/pipeline.lock`; a second mutator
+  waits up to 60 s, then exits with code `75` (EX_TEMPFAIL) instead of racing —
+  the 2026-08-08 incident, where a scheduled `prune-scores` deleted files a
+  concurrent manual `report` had already listed, is the motivating case.
+  `predict` deliberately does not take the lock (serving must never wait behind
+  an hour-long report); its scores-directory scans retry once on a missing file
+  so a half-pruned listing is never served. Forecast-history appends themselves
+  are locked and atomically replaced.
 
 ---
 

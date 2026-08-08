@@ -4,6 +4,7 @@ from datetime import timedelta
 
 import numpy as np
 import polars as pl
+import pytest
 from conftest import write_config
 from filelock import FileLock
 
@@ -626,3 +627,55 @@ class TestWinnerCurseRecorder:
             config, "hourly", scores_frame(), pl.DataFrame({"mae": [1.0]}), now=NOW
         )
         assert not evidence.ledger_path(config, evidence.VERDICTS_LEDGER).exists()
+
+
+class TestNbmBenchmark:
+    def board(self):
+        return pl.DataFrame(
+            {
+                "method_id": [
+                    "provider_nbm",
+                    "equal_weight",
+                    "gbm",
+                    "provider_nbm",
+                    "equal_weight",
+                ],
+                "variable": [
+                    "temp_c",
+                    "temp_c",
+                    "temp_c",
+                    "dew_point_c",
+                    "dew_point_c",
+                ],
+                "truth_semantics": ["inst"] * 5,
+                "lead_bucket": ["0-1h"] * 5,
+                "mae": [2.0, 1.0, 1.5, 3.0, 4.0],
+                "n": [100, 120, 110, 50, 60],
+            }
+        )
+
+    def test_verdicts_are_weighted_by_nbm_n(self):
+        verdicts = evidence.nbm_benchmark_verdicts(self.board())
+        assert verdicts["nbm_benchmark_slices"] == 2.0
+        assert verdicts["nbm_benchmark_nbm_mae"] == pytest.approx(
+            (2.0 * 100 + 3.0 * 50) / 150
+        )
+        assert verdicts["nbm_benchmark_blend_mae"] == pytest.approx(
+            (1.0 * 100 + 4.0 * 50) / 150
+        )
+
+    def test_without_nbm_rows_records_nothing(self):
+        board = self.board().filter(pl.col("method_id") != "provider_nbm")
+        assert evidence.nbm_benchmark_verdicts(board) == {}
+
+    def test_record_then_line(self, tmp_path):
+        from conftest import write_config
+
+        config = write_config(tmp_path)
+        evidence.record_nbm_benchmark(
+            config, "hourly", scores_frame(), self.board(), now=NOW
+        )
+        line = evidence.nbm_benchmark_line(config)
+        assert line is not None
+        assert "nbm benchmark (hourly live)" in line
+        assert "2 slices" in line

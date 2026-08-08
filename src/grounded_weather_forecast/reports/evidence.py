@@ -998,6 +998,99 @@ def record_winner_curse(
         return
 
 
+NBM_BENCHMARK_METHOD = "provider_nbm"
+_NBM_VERDICT_NAMES = (
+    "nbm_benchmark_blend_mae",
+    "nbm_benchmark_nbm_mae",
+    "nbm_benchmark_slices",
+)
+
+
+def nbm_benchmark_verdicts(board: pl.DataFrame) -> dict[str, float]:
+    """Blend-vs-NBM scalars from one leaderboard: the operational baseline.
+
+    n-weighted over slices where ``provider_nbm`` is scored alongside at
+    least one other method; "blend" is the per-slice best over the others.
+    Weighted by the NBM slice n so the comparison lives where NBM has data.
+    """
+    required = {"method_id", "variable", "truth_semantics", "lead_bucket", "mae", "n"}
+    if board.is_empty() or not required <= set(board.columns):
+        return {}
+    keys = ["variable", "truth_semantics", "lead_bucket"]
+    nbm = (
+        board.filter(pl.col("method_id") == NBM_BENCHMARK_METHOD)
+        .drop_nulls(["mae", "n"])
+        .group_by(keys)
+        .agg(pl.col("mae").min().alias("nbm_mae"), pl.col("n").max().alias("nbm_n"))
+    )
+    others = (
+        board.filter(pl.col("method_id") != NBM_BENCHMARK_METHOD)
+        .drop_nulls(["mae", "n"])
+        .group_by(keys)
+        .agg(pl.col("mae").min().alias("blend_mae"))
+    )
+    paired = nbm.join(others, on=keys, how="inner").filter(pl.col("nbm_n") > 0)
+    if paired.is_empty():
+        return {}
+    total = float(cast("float", paired["nbm_n"].sum()))
+    if total <= 0.0:
+        return {}
+    return {
+        "nbm_benchmark_nbm_mae": (
+            float(cast("float", (paired["nbm_mae"] * paired["nbm_n"]).sum())) / total
+        ),
+        "nbm_benchmark_blend_mae": (
+            float(cast("float", (paired["blend_mae"] * paired["nbm_n"]).sum())) / total
+        ),
+        "nbm_benchmark_slices": float(paired.height),
+    }
+
+
+def record_nbm_benchmark(
+    config: Config,
+    product: str,
+    scores: pl.DataFrame,
+    board: pl.DataFrame,
+    *,
+    now: datetime | None = None,
+) -> None:
+    """Blend-vs-NBM scalars into the verdicts ledger."""
+    try:
+        moment = now or datetime.now(tz=UTC)
+        _append_verdicts(config, product, scores, nbm_benchmark_verdicts(board), moment)
+    except _RECORDER_ERRORS:
+        return
+
+
+def nbm_benchmark_line(config: Config) -> str | None:
+    """One line: does the served blend beat station NBM where NBM plays?"""
+    try:
+        verdicts = load_ledger(
+            ledger_path(config, VERDICTS_LEDGER), VERDICTS_SCHEMA
+        ).filter(pl.col("name").is_in(list(_NBM_VERDICT_NAMES)))
+        if verdicts.is_empty():
+            return None
+        products = verdicts.group_by("product").len().sort("len", descending=True)
+        product = str(products["product"][0])
+        rows = verdicts.filter(pl.col("product") == product).sort("recorded_at")
+        values: dict[str, float] = {}
+        for name in _NBM_VERDICT_NAMES:
+            named = rows.filter(pl.col("name") == name)
+            if named.is_empty():
+                return None
+            values[name] = float(named["value"][-1])
+        nbm_mae = values["nbm_benchmark_nbm_mae"]
+        blend_mae = values["nbm_benchmark_blend_mae"]
+        percent = (blend_mae - nbm_mae) / nbm_mae * 100.0 if nbm_mae > 0.0 else 0.0
+        return (
+            f"nbm benchmark ({product} live): blend best mae {blend_mae:.3f} vs "
+            f"station-nbm {nbm_mae:.3f} ({percent:+.1f}%) over "
+            f"{int(values['nbm_benchmark_slices'])} slices"
+        )
+    except _RECORDER_ERRORS:
+        return None
+
+
 def _winner_bias_note(config: Config, product: str) -> str:
     """The newest recorded winner bias, as a suffix for the delta line.
 

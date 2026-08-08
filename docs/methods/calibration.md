@@ -154,7 +154,10 @@ tuning-free.
 ### The estimator
 
 `pava_isotonic(values, weights)` is a weighted pool-adjacent-violators L2
-isotonic regression, implemented from scratch.
+isotonic regression, delegating to scipy's compiled
+`optimize.isotonic_regression` (the weighted L2 solution is unique, so the
+values match the former from-scratch implementation exactly; it is the hottest
+call in a backtest, at tens of thousands of fits per `idr_bucket` instance).
 
 `fit_idr_state(x, y)`: for each threshold $z$ on a grid of 49 outcome quantiles
 (`_THRESHOLD_LEVELS = np.linspace(0.02, 0.98, 49)`), fit the exceedance indicator

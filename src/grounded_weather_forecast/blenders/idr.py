@@ -34,6 +34,7 @@ observed range — a known, documented IDR limitation).
 
 import math
 from dataclasses import dataclass, field
+from importlib import import_module
 from typing import Self
 
 import numpy as np
@@ -64,36 +65,20 @@ _CALIBRATION_FRACTION = 0.25
 
 
 def pava_isotonic(values: FloatArray, weights: FloatArray | None = None) -> FloatArray:
-    """Pool-adjacent-violators: the L2 isotonic (non-decreasing) regression."""
-    n = values.shape[0]
-    w = np.ones(n) if weights is None else weights.astype(np.float64).copy()
-    level_values = values.astype(np.float64).copy()
-    level_weights = w
-    # blocks[i] = index of the last element in the block starting at i
-    starts: list[int] = []
-    means: list[float] = []
-    sizes: list[float] = []
-    counts: list[int] = []
-    for index in range(n):
-        starts.append(index)
-        means.append(float(level_values[index]))
-        sizes.append(float(level_weights[index]))
-        counts.append(1)
-        while len(means) > 1 and means[-2] >= means[-1]:
-            total = sizes[-2] + sizes[-1]
-            means[-2] = (means[-2] * sizes[-2] + means[-1] * sizes[-1]) / total
-            sizes[-2] = total
-            counts[-2] += counts[-1]
-            starts.pop()
-            means.pop()
-            sizes.pop()
-            counts.pop()
-    result = np.empty(n)
-    cursor = 0
-    for mean, count in zip(means, counts, strict=True):
-        result[cursor : cursor + count] = mean
-        cursor += count
-    return result
+    """Pool-adjacent-violators: the L2 isotonic (non-decreasing) regression.
+
+    Delegates to scipy's compiled PAVA — this is the single hottest call in a
+    backtest (tens of thousands of fits per ``idr_bucket`` instance), and the
+    weighted L2 isotonic solution is unique, so the values returned match the
+    former pure-Python stack loop exactly. Inputs are finite by construction
+    (grouped exceedance means with positive counts).
+    """
+    optimize = import_module("scipy.optimize")  # heavy import; load on first use
+    w = None if weights is None else weights.astype(np.float64)
+    result = optimize.isotonic_regression(
+        values.astype(np.float64), weights=w, increasing=True
+    )
+    return np.asarray(result.x, dtype=np.float64)
 
 
 @dataclass(frozen=True)
@@ -200,9 +185,11 @@ def quantile_rows_from_state(
     """Predictive quantiles at ``levels`` for each row's covariate value."""
     positions = _grid_positions(state, base_point)
     rows = np.empty((base_point.shape[0], levels.shape[0]))
-    for index, position in enumerate(positions):
+    # Quantiles depend only on the grid position, so interpolate once per
+    # distinct position instead of once per row.
+    for position in np.unique(positions):
         cdf = state.cdf_stack[position]
-        rows[index] = np.interp(
+        rows[positions == position] = np.interp(
             levels,
             cdf,
             state.thresholds,
@@ -216,12 +203,14 @@ def pit_values(state: IdrState, x: FloatArray, y: FloatArray) -> FloatArray:
     """F̂(y | x) for calibration rows, interpolated on the threshold grid."""
     positions = _grid_positions(state, x)
     pits = np.empty(x.shape[0])
-    for index, position in enumerate(positions):
-        cdf = state.cdf_stack[position]
-        pits[index] = np.interp(
-            y[index],
+    # np.interp vectorizes over the query points, so batch rows sharing a
+    # grid position rather than interpolating row by row.
+    for position in np.unique(positions):
+        rows = positions == position
+        pits[rows] = np.interp(
+            y[rows],
             state.thresholds,
-            cdf,
+            state.cdf_stack[position],
             left=0.0,
             right=1.0,
         )
@@ -345,6 +334,35 @@ class _BucketedIdr:
                 return self._global, None
         return self._global, None
 
+    def _rows_by_state(
+        self, lead_hours: FloatArray
+    ) -> list[tuple[IdrState, str | None, np.ndarray]]:
+        """Row indices grouped by the (state, label) that serves them.
+
+        The batched equivalent of calling ``_state_for`` per row: first
+        matching bucket wins, bucket rows without a fitted state fall to the
+        global fit under the default levels, and rows outside every bucket
+        fall to the global fit too.
+        """
+        remaining = np.ones(lead_hours.shape[0], dtype=bool)
+        grouped: list[tuple[IdrState, str | None, np.ndarray]] = []
+        global_rows: list[np.ndarray] = []
+        for bucket in self._buckets:
+            mask = remaining & (lead_hours >= bucket.lo) & (lead_hours < bucket.hi)
+            if not mask.any():
+                continue
+            remaining &= ~mask
+            state = self._states.get(bucket.label)
+            if state is not None:
+                grouped.append((state, bucket.label, np.nonzero(mask)[0]))
+            else:
+                global_rows.append(np.nonzero(mask)[0])
+        if remaining.any():
+            global_rows.append(np.nonzero(remaining)[0])
+        if self._global is not None and global_rows:
+            grouped.append((self._global, None, np.concatenate(global_rows)))
+        return grouped
+
     def predict(self, x: ForecastMatrix) -> BlendResult:
         base_point = self._base.predict(x).point
         if self._global is None and not self._states:
@@ -353,15 +371,12 @@ class _BucketedIdr:
             )
         safe_point = np.nan_to_num(base_point, nan=0.0)
         rows = np.full((x.n_rows, len(QUANTILE_LEVELS)), np.nan)
-        for index in range(x.n_rows):
-            state, label = self._state_for(float(x.lead_hours[index]))
-            if state is None:
-                continue
-            rows[index] = quantile_rows_from_state(
+        for state, label, indices in self._rows_by_state(x.lead_hours):
+            rows[indices] = quantile_rows_from_state(
                 state,
-                safe_point[index : index + 1],
+                safe_point[indices],
                 self._levels_for(label),
-            )[0]
+            )
         quantiles = finalize_quantiles(rows, self._kind, self._variable)
         missing = ~np.isfinite(base_point)
         quantiles[missing] = np.nan

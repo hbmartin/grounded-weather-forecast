@@ -92,6 +92,17 @@ backtesting or serving methods that consume ensemble features.
   (product, source, window) plus anything a release promoted in the last
   7 days are kept, and files the evaluations catalog has never seen are never
   deleted — so pruning cannot destroy unsummarized evidence.
+- Manual runs and the scheduled chain cannot interleave: every mutating
+  command takes `<dataset dir>/pipeline.lock` and exits `75` (EX_TEMPFAIL)
+  after 60 s of contention. If a manual `backtest`/`report` exits 75, a
+  scheduled chain is running — `pgrep -f "grounded-weather-forecast"` to see
+  it. `predict` and `ingest-ensembles` never contend.
+- The hourly predict+publish script auto-restores from code-identity
+  degradation: when the written document is `degraded` with "implementation
+  changed since the last backtest", it spawns one detached
+  `backtest --source live && report` (logged to `auto-restore.log` beside
+  the script) and publishes immediately — hold-last-good bridges until the
+  restore promotes. Duplicate spawns die on the pipeline lock.
 - Keep the Synoptic token out of the plist if you prefer: set
   `synoptic_token = "$SYNOPTIC_TOKEN"` in `config.toml` and provide the
   variable via `launchctl setenv SYNOPTIC_TOKEN ...` instead of the

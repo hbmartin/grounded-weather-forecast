@@ -1,3 +1,4 @@
+import json
 from datetime import UTC, datetime, timedelta
 
 import numpy as np
@@ -671,3 +672,255 @@ class TestPooledDailySelection:
             assert chosen.method_id == "inverse_mse"
             assert "pooled D3-10" in chosen.reason
             assert chosen.n == 15  # pooled evidence, not the fine bucket's 5
+
+
+def near_tie_scores(created, evaluation_id, best_method, *, rival_offset=1.02):
+    """One hourly 24-48h slice: `best_method` edges `inverse_mse`-vs-`cluster`.
+
+    Noise is drawn once per valid time and shared across methods (common
+    random numbers), so board MAE gaps track the offsets deterministically.
+    All three default references are present and clearly worse, keeping the
+    MCS gate decisive so the winner is a true argmin pick.
+    """
+    rng = np.random.default_rng(11)
+    pair = ("inverse_mse", "cluster_equal_weight")
+    references = ("equal_weight", "best_provider", "damped_grounded_equal_weight")
+    rows = []
+    for step in range(30):
+        valid = utc(2026, 7, 1) + timedelta(hours=step)
+        truth = 25.0 + rng.normal(0.0, 0.1)
+        shared_noise = rng.normal(0.0, 0.3)
+        for method in pair + references:
+            if method in references:
+                offset = 5.0
+            elif method == best_method:
+                offset = 1.0
+            else:
+                offset = rival_offset
+            rows.append(
+                {
+                    "method_id": method,
+                    "variable": "temp_c",
+                    "product": "hourly",
+                    "source_kind": "live",
+                    "evaluation_id": evaluation_id,
+                    "evaluation_created_at": created,
+                    "dataset_fingerprint": "ds1",
+                    "source_set_json": "[]",
+                    "feature_set_json": "[]",
+                    "semantics": "inst",
+                    "code_version": "code1",
+                    "config_fingerprint": "cfg1",
+                    "window": "expanding",
+                    "fold_origin": created,
+                    "issue_time": utc(2026, 7, 1),
+                    "valid_time": valid,
+                    "lead_hours": 30.0,
+                    "lead_bucket": "24-48h",
+                    "y_pred": truth + offset + shared_noise,
+                    "y_true": truth,
+                    "quantile_levels_json": "[]",
+                    "quantiles_json": None,
+                }
+            )
+    return pl.DataFrame(rows).cast(SCORES_SCHEMA)
+
+
+class TestIncumbentRetention:
+    KEY = ("hourly", "temp_c", "24-48h")
+
+    def _pin_fingerprints(self, monkeypatch):
+        monkeypatch.setattr(
+            selection_module, "dataset_fingerprint", lambda _config: "ds1"
+        )
+        monkeypatch.setattr(
+            selection_module, "config_fingerprint", lambda _config: "cfg1"
+        )
+        monkeypatch.setattr(selection_module, "code_identity", lambda: "code1")
+
+    def test_near_tie_keeps_the_incumbent(self, tmp_path, monkeypatch):
+        config = write_config(tmp_path)
+        scores_dir = tmp_path / "scores"
+        scores_dir.mkdir()
+        self._pin_fingerprints(monkeypatch)
+        write_scores(
+            near_tie_scores(utc(2026, 8, 1), "evalone", "inverse_mse"),
+            scores_path(scores_dir, "hourly", "live", "expanding", "evalone"),
+        )
+        first = select_methods(config, scores_dir)
+        assert first[self.KEY].method_id == "inverse_mse"
+        assert not first[self.KEY].retained
+        # A fresh evaluation where the rival edges ahead by ~0.02 C — well
+        # inside one bootstrap SE — must not evict the serving incumbent.
+        write_scores(
+            near_tie_scores(utc(2026, 8, 2), "evaltwo", "cluster_equal_weight"),
+            scores_path(scores_dir, "hourly", "live", "expanding", "evaltwo"),
+        )
+        second = select_methods(config, scores_dir)
+        chosen = second[self.KEY]
+        assert chosen.method_id == "inverse_mse"
+        assert chosen.retained
+        assert "retained incumbent" in chosen.reason
+        assert chosen.evaluation_id == "evaltwo"  # current evidence, not stale
+        assert chosen.mae is not None
+
+    def test_clear_winner_evicts_the_incumbent(self, tmp_path, monkeypatch):
+        config = write_config(tmp_path)
+        scores_dir = tmp_path / "scores"
+        scores_dir.mkdir()
+        self._pin_fingerprints(monkeypatch)
+        write_scores(
+            near_tie_scores(utc(2026, 8, 1), "evalone", "inverse_mse"),
+            scores_path(scores_dir, "hourly", "live", "expanding", "evalone"),
+        )
+        select_methods(config, scores_dir)
+        # The rival now wins by ~0.8 C — many SEs — so the argmin stands.
+        write_scores(
+            near_tie_scores(
+                utc(2026, 8, 2),
+                "evaltwo",
+                "cluster_equal_weight",
+                rival_offset=1.8,
+            ),
+            scores_path(scores_dir, "hourly", "live", "expanding", "evaltwo"),
+        )
+        second = select_methods(config, scores_dir)
+        chosen = second[self.KEY]
+        assert chosen.method_id == "cluster_equal_weight"
+        assert not chosen.retained
+
+    def test_retention_round_trips_through_the_release(self, tmp_path, monkeypatch):
+        config = write_config(tmp_path)
+        scores_dir = tmp_path / "scores"
+        scores_dir.mkdir()
+        self._pin_fingerprints(monkeypatch)
+        write_scores(
+            near_tie_scores(utc(2026, 8, 1), "evalone", "inverse_mse"),
+            scores_path(scores_dir, "hourly", "live", "expanding", "evalone"),
+        )
+        select_methods(config, scores_dir)
+        write_scores(
+            near_tie_scores(utc(2026, 8, 2), "evaltwo", "cluster_equal_weight"),
+            scores_path(scores_dir, "hourly", "live", "expanding", "evaltwo"),
+        )
+        second = select_methods(config, scores_dir)
+        release_id = second[self.KEY].release_id
+        raw = json.loads(
+            (config.artifacts_dir / "releases" / f"{release_id}.json").read_text()
+        )
+        payload = raw["selections"]["hourly.temp_c.24-48h"]
+        assert payload["retained"] is True
+        assert payload["method_id"] == "inverse_mse"
+        rehydrated = selection_module._selections_from_release(raw)
+        assert rehydrated is not None
+        assert rehydrated[self.KEY].retained is True
+        # And a payload without the key defaults to False (older releases).
+        del payload["retained"]
+        older = selection_module._selections_from_release(raw)
+        assert older is not None
+        assert older[self.KEY].retained is False
+
+    def test_fallback_incumbent_is_never_retained(self, tmp_path, monkeypatch):
+        config = write_config(tmp_path)
+        self._pin_fingerprints(monkeypatch)
+        frame = near_tie_scores(utc(2026, 8, 2), "evaltwo", "cluster_equal_weight")
+        board = selection_module.leaderboard(frame)
+        row = {
+            "product": "hourly",
+            "variable": "temp_c",
+            "lead_bucket": "24-48h",
+            "truth_semantics": "inst",
+            "method_id": "cluster_equal_weight",
+            "mae": 1.0,
+            "gate": None,
+        }
+        kept = selection_module._retained_incumbent(
+            config, row, board, frame, (FALLBACK_METHOD, "inst"), "evaltwo"
+        )
+        assert kept is None
+
+    def test_semantics_change_is_never_retained(self, tmp_path, monkeypatch):
+        config = write_config(tmp_path)
+        self._pin_fingerprints(monkeypatch)
+        frame = near_tie_scores(utc(2026, 8, 2), "evaltwo", "cluster_equal_weight")
+        board = selection_module.leaderboard(frame)
+        row = {
+            "product": "hourly",
+            "variable": "temp_c",
+            "lead_bucket": "24-48h",
+            "truth_semantics": "inst",
+            "method_id": "cluster_equal_weight",
+            "mae": 1.0,
+            "gate": None,
+        }
+        kept = selection_module._retained_incumbent(
+            config, row, board, frame, ("inverse_mse", "mean"), "evaltwo"
+        )
+        assert kept is None
+
+    def test_gate_forced_winner_is_never_overridden(self, tmp_path, monkeypatch):
+        config = write_config(tmp_path)
+        self._pin_fingerprints(monkeypatch)
+        frame = near_tie_scores(utc(2026, 8, 2), "evaltwo", "cluster_equal_weight")
+        board = selection_module.leaderboard(frame)
+        row = {
+            "product": "hourly",
+            "variable": "temp_c",
+            "lead_bucket": "24-48h",
+            "truth_semantics": "inst",
+            "method_id": "equal_weight",
+            "mae": 1.0,
+            "gate": "dm_not_significant",
+        }
+        kept = selection_module._retained_incumbent(
+            config, row, board, frame, ("inverse_mse", "inst"), "evaltwo"
+        )
+        assert kept is None
+
+
+class TestPruneRaceResilience:
+    """A lock-free predict must survive prune deleting files mid-scan."""
+
+    def test_scan_retries_once_when_a_file_vanishes(self, tmp_path, monkeypatch):
+        config = scored_config(tmp_path)
+        real = selection_module.load_scores
+        calls = {"count": 0}
+
+        def flaky(path, **kwargs):
+            calls["count"] += 1
+            if calls["count"] == 1:
+                raise FileNotFoundError(path)
+            return real(path, **kwargs)
+
+        monkeypatch.setattr(selection_module, "load_scores", flaky)
+        frames = selection_module._compatible_scores(
+            config, config.dataset.dir / "scores", None, None
+        )
+        assert frames  # the clean second pass recovered the evidence
+        assert calls["count"] >= 2
+
+    def test_second_pass_tolerates_persistently_missing_files(
+        self, tmp_path, monkeypatch
+    ):
+        config = scored_config(tmp_path)
+
+        def always_missing(path, **kwargs):
+            raise FileNotFoundError(path)
+
+        monkeypatch.setattr(selection_module, "load_scores", always_missing)
+        frames = selection_module._compatible_scores(
+            config, config.dataset.dir / "scores", None, None
+        )
+        assert frames == []
+
+    def test_no_evidence_reason_survives_vanishing_files(self, tmp_path, monkeypatch):
+        config = scored_config(tmp_path)
+
+        def always_missing(path, **kwargs):
+            raise FileNotFoundError(path)
+
+        monkeypatch.setattr(selection_module, "load_scores", always_missing)
+        reason = selection_module.no_evidence_reason(
+            config, config.dataset.dir / "scores"
+        )
+        assert "no live backtest evidence" in reason

@@ -29,9 +29,21 @@ pruned to 90 days / 50k rows), so `report` can tell you what actually ran.
 | `0` | success |
 | `1` | command-level failure — missing inputs, no scores to report, a backfill error |
 | `2` | configuration error, or an unknown command |
+| `75` | another pipeline command holds the lock (EX_TEMPFAIL — retry later) |
 
 Note that `truth-qc` returns `0` even when it finds no evaluable checks. A cold
 start is not a fault, and an operator's cron should not page on one.
+
+### Concurrency
+
+`build-dataset`, `backtest`, `report`, `alignment`, `backfill`, `truth-qc`, and
+`prune-scores` serialize on an exclusive lock at `<dataset dir>/pipeline.lock` —
+a second mutator waits up to 60 s, then exits `75` with a message instead of
+racing (prune deleting files a running report has already listed was the
+motivating incident). `predict` never takes the lock: serving must not wait
+behind an hour-long report, and its scores scans instead retry once when a file
+vanishes mid-read. `ingest-ensembles` keeps its own store-level lock and runs
+freely alongside the chain.
 
 ---
 
@@ -291,9 +303,11 @@ suppressed, and writes an observability snapshot to `artifacts/observability/`.
 |---|---|---|
 | `--dry-run` | off | list what would be deleted without deleting anything |
 
-Retention: the **newest file per group** is always kept, as are evaluations
-referenced by a release within the last **7 days**. Catalog rows survive deletion,
-so the history ledgers stay intact — only the bulky per-case scores are removed.
+Retention: the **newest three files per group** (product × kind × window) are
+always kept, as are evaluations referenced by a release within the last
+**7 days**. Catalog rows survive deletion, so the history ledgers stay intact —
+only the bulky per-case scores are removed. Files the evaluations catalog has
+never seen are skipped, never deleted.
 
 Always run `--dry-run` first. Deleting an evaluation still referenced by a live
 release would leave serving unable to justify what it is doing.

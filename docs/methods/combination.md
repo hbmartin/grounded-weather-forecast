@@ -151,18 +151,23 @@ three default leaderboard references.
 
 ## 4. Gradient-boosted stacking
 
-*Implemented in: `blenders/gbm.py::GbmStacker` — `gbm`*
+*Implemented in: `blenders/gbm.py::GbmStacker` — `gbm`; `GbmQuantile` — `gbm_quantile`*
 
 One LightGBM model per variable, mapping
 
 $$\bigl[\,x_{t,1..k},\ \ell,\ \sin/\cos(\text{hour}),\ \sin/\cos(\text{doy}),\
 \texttt{age}\_\_\ast,\ \texttt{obs}\_\_\ast,\ \texttt{ewagg}\_\_\ast,\
-\texttt{ens}\_\_\ast,\ \operatorname{nanstd}(x_t),\ n_{\text{avail}}\,\bigr]
+\texttt{ens}\_\_\ast,\ \operatorname{nanstd}(x_t),\ n_{\text{avail}},\
+\bar{x}_t\,\bigr]
 \;\longrightarrow\; y$$
+
+where $\bar{x}_t$ (`blend_mean`) is the equal-weight consensus over available
+sources — the same `masked_average` that `equal_weight` serves.
 
 | Parameter | Value | Why |
 |---|---|---|
-| `objective` | `regression_l1` | matches the MAE promotion metric |
+| `objective` | `huber` | LightGBM forbids `monotone_constraints` under leaf-renewing objectives (`regression_l1`, `quantile`); huber keeps L1's outlier robustness while admitting the constraint |
+| `monotone_constraints` | `+1` on `blend_mean`, `0` elsewhere (`monotone_constraints_method="advanced"`) | a higher consensus must never lower the prediction — the booster corrects the blend, it cannot invert it |
 | `_NUM_ROUNDS` | 300 | |
 | `learning_rate` | 0.05 | |
 | `num_leaves` | 31 | |
@@ -176,6 +181,15 @@ imputation, no availability special-casing — and they express *interactions* (
 provider bad only on winter mornings) that no per-bucket affine model can. It is
 the ceiling of the method set, and the `min_fit_rows = 500` abstention is what
 keeps it from being the ceiling of the *overfitting* too.
+
+**`gbm_quantile`** trains one pinball-loss booster per level of the standard
+19-level grid (`_QUANTILE_ROUNDS = 150` each; the finalized median is the
+point), so its cells carry *native* quantiles instead of serve-time residual
+dressing and the leaderboard scores its CRPS/pinball/coverage columns directly.
+The quantile objective cannot carry the monotone constraint (same LightGBM
+restriction), so this head's containment is the shared `min_fit_rows` floor,
+per-row sorting of the level grid, and board arbitration. Boosters at adjacent
+levels can cross in finite samples; `finalize_quantiles` sorts each row.
 
 ---
 
@@ -275,6 +289,18 @@ whose uncertainty is *nonparametric and conditional*. `_MIN_FIT_ROWS = 100`.
 
 **RAFT** (`raft_grounded`, Schuhen et al. 2020) and **cluster** are covered above and
 in the registry.
+
+**Single-source passthrough** (`provider_nbm`).
+*Implemented in: `blenders/baselines.py::SingleSource` — `provider_nbm`*
+The station-tuned National Blend of Models as an explicit leaderboard row:
+"does the blend beat station NBM" is the project's most informative single
+number, so it is scored like any method instead of rederived. Abstains (NaN)
+wherever the `nbm` column is missing (it carries no humidity, pressure, or
+daily rows), so the coverage bar excludes those slices; it is promotable like
+any method, and the report prints an n-weighted blend-vs-NBM benchmark line
+from the verdicts ledger. Deliberately **not** a promotion reference: a
+reference with no complete evaluation fails the gate closed, and NBM's
+partial variable coverage would trip exactly that.
 
 ---
 

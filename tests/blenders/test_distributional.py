@@ -33,6 +33,29 @@ class TestPava:
         values = np.array([1.0, 2.0, 3.0])
         assert pava_isotonic(values).tolist() == [1.0, 2.0, 3.0]
 
+    def test_equal_neighbors_stay_equal(self):
+        # The old stack loop pooled equal neighbors into one block; the
+        # compiled solver keeps them as separate blocks — the returned
+        # values must be identical either way.
+        values = np.array([1.0, 2.0, 2.0, 3.0])
+        assert pava_isotonic(values).tolist() == [1.0, 2.0, 2.0, 3.0]
+
+    def test_weighted_pooling_matches_weighted_mean(self):
+        values = np.array([1.0, 3.0, 2.0])
+        weights = np.array([1.0, 2.0, 1.0])
+        fitted = pava_isotonic(values, weights)
+        pooled = (3.0 * 2.0 + 2.0 * 1.0) / 3.0
+        assert fitted[0] == pytest.approx(1.0)
+        assert fitted[1] == pytest.approx(pooled)
+        assert fitted[2] == pytest.approx(pooled)
+
+    def test_mixed_ties_and_violators(self):
+        values = np.array([2.0, 2.0, 1.0, 4.0, 3.0, 3.0])
+        fitted = pava_isotonic(values)
+        assert (np.diff(fitted) >= 0).all()
+        assert fitted[:3].tolist() == [pytest.approx(5.0 / 3.0)] * 3
+        assert fitted[3:].tolist() == [pytest.approx(10.0 / 3.0)] * 3
+
 
 class TestFinalizeQuantiles:
     def test_sorts_and_clamps(self):

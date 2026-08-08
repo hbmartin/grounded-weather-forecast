@@ -727,6 +727,15 @@ def _pooled_winner(
     )
 
 
+def eligible_board_rows(board: pl.DataFrame) -> pl.DataFrame:
+    """The promotability bar, shared by slice_winners and incumbent retention."""
+    return board.filter(
+        (pl.col("coverage") >= 0.8)
+        & (pl.col("n") >= 8)
+        & (pl.col("n_valid_times") >= 8)
+    )
+
+
 def slice_winners(
     board: pl.DataFrame,
     scores: pl.DataFrame | None = None,
@@ -782,11 +791,7 @@ def slice_winners(
             parts["variable"], promotion, product=parts["product"]
         )
         best = group.sort("mae").row(0, named=True)
-        eligible = group.filter(
-            (pl.col("coverage") >= 0.8)
-            & (pl.col("n") >= 8)
-            & (pl.col("n_valid_times") >= 8)
-        )
+        eligible = eligible_board_rows(group)
         if eligible.is_empty():
             pooled = _pooled_winner(
                 parts, best, eligible, normalized_scores, references, settings
