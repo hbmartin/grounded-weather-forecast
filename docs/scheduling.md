@@ -14,7 +14,7 @@ systemd timer or crontab line; the cadence rationale is identical.
 | `poll` — the upstream `omni-weather` collector | **hourly** | Every missed hour of provider vintages is unrecoverable. Hourly catches every provider's update cycle while staying inside free-tier quotas (the upstream quota tracker enforces per-provider caps). If quotas pinch, drop to per-run-cycle (6-hourly) for the slow-refresh providers via the upstream config, not by slowing this job. |
 | `ingest-ensembles` | **every 6 h** (`StartInterval` 21600) | Ensemble models run on 00/06/12/18 UTC cycles and Open-Meteo retains only the latest run's members — a missed cycle's spread is gone forever. A fixed 6-hour interval catches every cycle regardless of publication lag; the as-of join tolerates any offset. |
 | `predict` | **every 10 min** (`StartInterval` 600) | Matches the 10-minute snapshot grid, so each serve sees at most one new snapshot. Every run appends to the self-verification history — the data that later powers the live-MAE demotion gate — and the online expert state advances by consuming only the rows resolved since the last serve, re-validating the processed prefix each time (so a serve costs O(history) in cursor checks, but only O(new rows) in weight updates). Widen to 15–30 min if the machine is battery-constrained; the cost is coarser verification history, not correctness. |
-| `maintain` — `build-dataset` → `backtest --source live` → `report` → `truth-qc` | **daily, 02:15 local** | The retrain loop: refreshed truth and ensemble features, refreshed evidence, re-promoted winners in the release ledger, and the neighbor/shield sensor checks. Schedule it after the latest successful ensemble ingest: ensemble rows become model features only when `build-dataset` rematerializes the matrix. Daily is the right floor — truth accrues by the hour but promotion decisions move on days. As the archive and method count grow, backtest runtime grows too; if the nightly run gets slow, pass a curated `--methods` subset nightly and run the full sweep weekly. |
+| `maintain` — `build-dataset` → `backtest --source live` → `report` → `truth-qc` | **daily, 02:15 local** | The retrain loop: refreshed truth and ensemble features, refreshed evidence, re-promoted winners in the release ledger, and the neighbor/shield sensor checks. Schedule it after the latest successful ensemble ingest: ensemble rows become model features only when `build-dataset` rematerializes the matrix. Daily is the right floor — truth accrues by the hour but promotion decisions move on days. As the archive and method count grow, backtest runtime grows too; if the nightly run gets slow, pass a curated `--methods` subset nightly and run the full sweep weekly. Follow with `prune-scores` periodically (or append it to the chain): superseded scores files accumulate at nightly cadence. |
 
 The `backfill` commands are deliberately *not* scheduled: they are one-off
 cold-start tools, and re-running them is idempotent but pointless on a cron.
@@ -87,6 +87,11 @@ backtesting or serving methods that consume ensemble features.
   ([advanced usage](advanced-usage.md)) flag opts a one-off manual serve out of
   that append, and the cron should not pass it — that history feeds the
   live-MAE demotion gate.
+- `grounded-weather-forecast prune-scores` (preview with `--dry-run`) deletes
+  superseded backtest scores files: the newest three per
+  (product, source, window) plus anything a release promoted in the last
+  7 days are kept, and files the evaluations catalog has never seen are never
+  deleted — so pruning cannot destroy unsummarized evidence.
 - Keep the Synoptic token out of the plist if you prefer: set
   `synoptic_token = "$SYNOPTIC_TOKEN"` in `config.toml` and provide the
   variable via `launchctl setenv SYNOPTIC_TOKEN ...` instead of the

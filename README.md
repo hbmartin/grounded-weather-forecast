@@ -148,8 +148,8 @@ grounded-weather-forecast report
 grounded-weather-forecast prune-scores                 # --dry-run to preview
 
 # 8. Emit the current blended forecast (minutely + hourly + daily) as JSON.
-#    Schema version 4 carries ready/degraded status plus per-variable release
-#    identity and truth semantics. It is appended atomically to a history so
+#    Schema version 5 carries ready/degraded status plus per-variable release
+#    identity, truth semantics, selection reasons, and a quantiles_source map. It is appended atomically to a history so
 #    each row is later scored against the same truth target used to select and
 #    fit it — backtest skill is an estimate, this is the measurement.
 grounded-weather-forecast predict                      # to stdout
@@ -379,9 +379,11 @@ to serve from stale provider data rather than guessing.
   bugs the evaluation harness caught. **Read before trusting any number.**
 - **[Scheduling](https://hbmartin.github.io/grounded-weather-forecast/scheduling/)** — launchd templates and cadence rationale for the
   polling, ensemble-ingest, predict, and nightly-retrain crons
-- [`docs/changes-0.4.0.md`](https://github.com/hbmartin/grounded-weather-forecast/blob/main/docs/changes-0.4.0.md) — 0.4.0 dashboard + instrumentation changes
-- [`docs/changes-0.3.0.md`](https://github.com/hbmartin/grounded-weather-forecast/blob/main/docs/changes-0.3.0.md) — 0.3.0 migration instructions and change
-  rationale (scoring semantics changed; re-run backtest before comparing)
+- **[Operator dashboard](https://hbmartin.github.io/grounded-weather-forecast/dashboard/)** — the nine-zone offline console `report` writes to
+  `reports/dashboard.html`, its alert thresholds, and what a healthy young
+  deployment looks like
+- [`CHANGELOG.md`](https://github.com/hbmartin/grounded-weather-forecast/blob/main/CHANGELOG.md) — release history and migration instructions
+  (0.3.0 changed scoring semantics; re-run backtest before comparing eras)
 - [`CONTEXT.md`](https://github.com/hbmartin/grounded-weather-forecast/blob/main/CONTEXT.md) — project glossary (issue time, valid time, lead,
   grounding, anchoring, …)
 - [`docs/adr/`](https://github.com/hbmartin/grounded-weather-forecast/tree/main/docs/adr) — architecture decision records

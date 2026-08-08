@@ -18,8 +18,6 @@ nav = [
     { "ambientweather2sqlite" = "upstream/aw2sqlite-database.md" },
     { "omni-weather-forecast-apis" = "upstream/omni-weather-forecast-apis-database.md" },
   ] },
-  { "Improvement Plan" = "improvement-plan.md" },
-  { "Papers Research (2026-07)" = "research-papers-2026-07.md" },
   { "Future Work" = "future-work.md" },
   { "Releasing" = "releasing.md" },
   { "Decisions" = [
@@ -27,6 +25,7 @@ nav = [
     { "Anchored nowcast, not disaggregation" = "adr/0002-anchored-nowcast-instead-of-temporal-disaggregation.md" },
     { "Empirical truth-semantics calibration" = "adr/0003-empirical-truth-semantics-calibration.md" },
     { "Grounding defaults to bias-only" = "adr/0004-grounding-defaults-to-bias-only.md" },
+    { "Promoted releases are the serving boundary" = "adr/0005-promoted-model-releases-are-the-serving-boundary.md" },
   ] },
 ]
 

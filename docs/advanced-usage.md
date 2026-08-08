@@ -130,16 +130,24 @@ harmonic_grounded_equal_weight                               <- drift-tracking g
 anchored_grounded_equal_weight  anchored_inverse_mse
 anchored_fitted_grounded  anchored_fitted_ewma
 anchored_trend_grounded                                      <- + short-lead anchoring
+raft_grounded  seamless_regression  inverse_covariance       <- structure challengers
 gbm                                                          <- the nonlinear ceiling
 ewa  boa                                                     <- online experts
-emos  idr  conformal_gew  conformal_ewma                     <- distributional heads
+emos  csgd_emos  idr  idr_bucket  idr_bucket_dcp
+conformal_gew  conformal_ewma                                <- distributional heads
+pop_platt  pop_beta                                          <- PoP recalibration (pop only)
+precip_sparse_shrink                                         <- sparse daily precip
+daily_marginal_emos  daily_path_extreme                      <- daily temp heads
 damped_grounded_equal_weight                                 <- climatology-damped long leads
 analog_ensemble                                              <- analog distributions (AnEn)
 cluster_equal_weight                                         <- de-duplicated provider mean
 ```
 
 `available_methods()` is the authority; this list is a reading aid, not a
-contract.
+contract. Some methods register with a variable scope
+(`register(..., variables=...)`) — `csgd_emos` and `precip_sparse_shrink` for
+precipitation, `pop_platt`/`pop_beta` for PoP, the daily heads for daily
+temperature — and never appear off-scope.
 
 `--methods all` runs everything (recommended — the baselines are the point). Or
 name a subset: `--methods gbm,equal_weight,best_provider`.
@@ -474,7 +482,8 @@ polars expression, not a 45-fold re-run.
 ## The polling cron
 
 Not part of this repo (it belongs to `omni-weather-forecast-apis`), but it
-determines everything this system can ever learn.
+determines everything this system can ever learn. The concrete invocation and
+launchd template live in [Scheduling](scheduling.md).
 
 **Recommended split:**
 

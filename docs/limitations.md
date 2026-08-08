@@ -23,7 +23,7 @@ enough to backtest anything, and the system says so rather than inventing a
 leaderboard. A typical early-run message is:
 
 ```
-hourly: 0 score rows -> data/scores/scores_hourly_live_expanding.parquet
+hourly: 0 score rows -> data/scores/scores_hourly_live_expanding_<evaluation_id>.parquet
   hourly: no rolling-origin folds. The archive spans 0.0 days of issue times
   (2026-03-22 16:19:40 .. 2026-03-22 16:28:15) but a fold needs
   initial_train_days + step_days = 97. Keep polling, or backtest --source
@@ -218,8 +218,10 @@ It does **not** say:
   advantage is verified only on synthetic fixtures.
 - Anything about wind, precipitation or PoP at production quality — those slices
   exist but are thin, and precipitation in particular is zero-inflated in a way
-  that MAE handles badly (Brier and reliability are implemented and reported, but
-  a proper occurrence/amount split is future work).
+  that MAE handles badly (Brier and reliability are implemented and reported, and
+  `csgd_emos` now models occurrence and amount jointly via its censored mass;
+  serve-time pop/amount coherence remains future work — see
+  [Future work](future-work.md)).
 
 ---
 
@@ -230,10 +232,12 @@ It does **not** say:
   p-value precisely so a thin slice announces its own weakness. Treat `p` in
   D8–10 as advisory.
 - **A per-slice winner selected on the same scores used to rank is a form of
-  selection bias.** With 12 methods × 10 buckets, some winners are noise. Promotion
-  now requires a common-case comparison, at least 80% coverage, and significant
-  improvement over the best reference when choosing a challenger. This mitigates,
-  but does not eliminate, repeated-selection bias.
+  selection bias.** With ~40 registered methods × 10 buckets, some winners are
+  noise. Promotion now requires a common-case comparison, at least 80% coverage,
+  and significant improvement over the best reference when choosing a challenger;
+  the leaderboard also prints BH-FDR q-values (e-BH on live boards) beside every
+  DM p-value and winner's-curse-corrected columns beside every argmin winner.
+  This mitigates, but does not eliminate, repeated-selection bias.
   The self-verification loop — scoring what we actually served against what
   actually happened — is the intended cure, and it needs live history to work.
 - **`bias` is computed on the same rows as MAE**; a method with low MAE and high
@@ -249,12 +253,10 @@ non-blocking:
 
 | Gap | Status |
 |---|---|
-| **Calibrated distributions** (EMOS, conformal/ACI) | The `BlendResult` protocol carries quantiles and the metrics module implements CRPS/PIT/coverage *already*, so these can be added without a breaking change or a re-backtest. No wave-1 method emits them. |
-| **Precipitation occurrence vs amount** | Currently one variable each for PoP and amount. The right structure is a two-stage occurrence (Brier/reliability) + amount (conditional on occurrence) model. |
+| **Precipitation occurrence vs amount** | Partially shipped: `csgd_emos` fits a censored shifted-gamma whose censored mass is the dry probability, and `precip_sparse_shrink` handles the sparse daily case. The remaining gap is serve-time coherence between `pop` and amounts. |
 | **Wind direction** | Circular; needs its own metric and blending rule. Deferred. |
 | **Condition enum, UV, solar** | Deferred. The condition slug should be *derived* from blended precip/cloud at the end, never blended as an enum. |
 | **Cloud, visibility** | Excluded: the station cannot verify them, so they cannot be scored, so they cannot be blended honestly. |
-| **METAR cross-check of station truth** | Deferred. A PWS with a failing radiation shield can look plausible for months; an occasional sanity check against the nearest airport observation would catch it. |
 
 ## 8. Known assumptions worth challenging
 

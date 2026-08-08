@@ -8,7 +8,7 @@ daemon: the dashboard is a read-only projection of the artifacts the
 pipeline already writes to disk, regenerated each `report` run, exactly like
 the markdown reports beside it.
 
-The page answers four operator questions, split across seven zones:
+The page answers six operator questions, split across nine zones:
 
 | Question | Zones |
 |---|---|
@@ -16,6 +16,8 @@ The page answers four operator questions, split across seven zones:
 | Can the system even learn yet? | **C** learning readiness |
 | Are the models valid, and which is winning and why? | **D** evaluation · **E** model internals |
 | Is what we actually served any good, and why that number? | **F** serving · **G** explainability |
+| Is the system getting better or worse over time? | **H** quality over time |
+| Is the machinery around the models healthy? | **I** operations |
 
 Every panel carries its own explanatory prose (what it shows, why an
 operator cares, and where its thresholds come from) in a collapsible
@@ -80,6 +82,27 @@ drawn from the newest provider snapshot visible at the served issue and matched
 to the exact served point. Minutely rows are selectable, but the dataset
 contract does not expose their raw provider-input matrix.
 The same document is replayable byte-for-byte with `predict --now <issue>`.
+
+**H — Quality over time.** Trend views over the append-only ledgers under
+`[artifacts].dir/history/` that every nightly `report` maintains, so
+movement survives fingerprint resets instead of living only in tonight's
+report: recent-window backtest MAE per variable, selection churn between
+consecutive promoted releases, served MAE against its backtest promise, A/B
+verdict shares over time (quantile-recalibration wins and promotion-gate
+agreement), e-process wealth trajectories against the promotion threshold,
+and recent-window interval coverage against its nominal target. An empty
+ledger renders a "young history" placeholder, never an alarm.
+
+**I — Operations.** The pipeline's edges, where the two historical
+week-long silent failures lived (a dead station logger; a predict job
+failing argparse): end-to-end freshness ages for the newest station
+observation, collector run, served-history row, and published document — a
+non-empty alarm string here is a live fault, the one exception to "empty
+ledgers are young, not broken" — plus per-provider collector health with
+the lead-contraction note (the plan-downgrade detector), stage runtimes
+from the runs ledger, the collector → long-frame → matrix build funnel, the
+scores-file evidence footprint that `prune-scores` manages, and every
+config-fingerprint/code-identity transition (secrets redacted).
 
 ## Alerts and their thresholds
 
