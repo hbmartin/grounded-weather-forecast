@@ -35,6 +35,11 @@ def test_variable_scope_is_daily_precip_only():
     assert not supports_product(
         "precip_sparse_shrink", Product.HOURLY, hourly_variable("temp_c")
     )
+    # The daily-only scope rests entirely on the variable allowlist (there is
+    # no product check): this fires if the scope is ever widened to precip_mm.
+    assert not supports_product(
+        "precip_sparse_shrink", Product.HOURLY, hourly_variable("precip_mm")
+    )
 
 
 def test_weight_is_the_source_count(tmp_path):
