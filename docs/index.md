@@ -14,7 +14,7 @@ into three forecast products for one location:
 
 Nothing ships because it sounds good. A method is used for a given variable and
 lead time only if it wins that slice on a rolling-origin backtest leaderboard,
-with a Diebold–Mariano test to say whether the margin is real.
+and clears a promotion gate designed to survive being read every morning.
 
 ## The three stages
 
@@ -26,31 +26,62 @@ with a Diebold–Mariano test to say whether the margin is real.
 3. **Anchoring** — short-lead correction toward the latest live observation. Your
    station is the one input no provider has.
 
-## Start here
+---
+
+## Pick a door
 
 <div class="grid cards" markdown>
 
-- **[Getting started](getting-started.md)** — install, configure, and get your
-  first forecast.
-- **[Advanced usage](advanced-usage.md)** — backfilling a synthetic archive,
-  tuning, reading the leaderboard, adding your own method.
-- **[Theory and concepts](theory.md)** — the mathematics: why grounding beats
-  weighting, what the forecast-combination puzzle costs you, and how the
-  evaluation is kept honest.
-- **[Architecture](architecture.md)** — layers, contracts, storage, libraries, and
-  the leakage defences.
-- **[Limitations](limitations.md)** — what this cannot do, and the three real bugs
-  the evaluation harness caught. **Read this before trusting any number.**
-- **[Scheduling](scheduling.md)** — the four crons that feed the system, with
-  launchd templates and cadence rationale.
-- **[Operator dashboard](dashboard.md)** — the nine-zone offline console `report`
-  writes, and what a healthy young deployment looks like.
+- ### :material-play-circle: I want to use it
+
+    ---
+
+    Install it, point it at your two databases, get a forecast.
+
+    **[Getting started](getting-started.md)** — install, configure, first run.
+    **[Concepts](concepts.md)** — the ideas, in plain language, no equations.
+    **[Glossary](glossary.md)** — every term, one line each.
+    **[FAQ](faq.md)** — every error message, and what to do about it.
+
+- ### :material-console: I want to operate it
+
+    ---
+
+    Run it on a schedule, read what it tells you, tune it.
+
+    **[Advanced usage](advanced-usage.md)** — backfilling, tuning, adding a method.
+    **[CLI reference](reference/cli.md)** — every command and flag.
+    **[Configuration](reference/configuration.md)** — every setting.
+    **[Scheduling](scheduling.md)** · **[Dashboard](dashboard.md)** ·
+    **[Outputs](reference/outputs.md)** · **[Forecast JSON](reference/forecast-json.md)**
+
+- ### :material-function-variant: I want to check the math
+
+    ---
+
+    Every estimator, score, and decision rule as implemented — with constants.
+
+    **[Theory and concepts](theory.md)** — why grounding beats weighting, what the
+    combination puzzle costs, how evaluation is kept honest.
+    **[Methods](methods/index.md)** — ten deep-dive pages: grounding, combination,
+    calibration, uncertainty, verification, model selection, precipitation, truth QC.
+    **[Bibliography](methods/bibliography.md)** — every reference, matched to its
+    module, plus what was deliberately declined.
 
 </div>
 
+!!! warning "Read this before trusting any number"
+    [Limitations](limitations.md) — what this cannot do, what the archive age
+    prevents, and the three real bugs the evaluation harness caught. Every measured
+    figure in this documentation comes from one station over a specific window.
+
+---
+
 ## A taste of what the harness found
 
-Measured on 13 months of real archived forecasts against this station:
+Measured on 13 months of real archived forecasts against this station, on an
+exploratory run in July 2026. These are historical illustrations, not packaged or
+production evidence — see [Limitations §5](limitations.md#5-what-one-historical-exploratory-leaderboard-did-and-did-not-say).
 
 - Blending beats the **best single provider** by 13–17% (MAE), significant at most
   leads.

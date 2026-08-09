@@ -14,6 +14,7 @@ from typing import TYPE_CHECKING
 import polars as pl
 
 from grounded_weather_forecast.contracts import FloatArray, MixedProvenanceError
+from grounded_weather_forecast.storage import atomic_write_parquet
 
 if TYPE_CHECKING:
     from grounded_weather_forecast.evaluation import EvaluationRun
@@ -121,8 +122,9 @@ def scores_path(
 
 
 def write_scores(scores: pl.DataFrame, path: Path) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    scores.write_parquet(path)
+    # Atomic so a concurrent reader (predict's lock-free scan) never sees a
+    # half-written file.
+    atomic_write_parquet(scores, path)
 
 
 def load_scores(path: Path, *, allow_mixed: bool = False) -> pl.DataFrame:

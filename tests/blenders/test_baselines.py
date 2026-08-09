@@ -197,6 +197,24 @@ class TestClimatology:
         assert point.max() < 50.0
 
 
+class TestSingleSource:
+    def test_registered(self):
+        assert "provider_nbm" in available_methods()
+
+    def test_passes_through_the_named_source(self):
+        from grounded_weather_forecast.blenders.baselines import SingleSource
+
+        s = make_slice([[1.0, 4.0], [2.0, np.nan]], [1.5, 2.5])
+        result = SingleSource(source="s1").fit(s).predict(s.x)
+        assert result.point[0] == 4.0
+        assert np.isnan(result.point[1])  # source missing -> abstain
+
+    def test_abstains_when_source_absent_from_matrix(self):
+        s = make_slice([[1.0, 4.0]], [1.5])
+        result = get_factory("provider_nbm")().fit(s).predict(s.x)
+        assert np.isnan(result.point).all()
+
+
 class TestPersistence:
     def test_returns_issue_time_obs(self):
         matrix = synthetic_hourly_matrix(days=5)

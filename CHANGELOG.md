@@ -8,6 +8,36 @@ adheres to [Semantic Versioning](https://semver.org/).
 
 ### Added
 
+- **GBM containment, part two**: `gbm` gains a `blend_mean` feature (the
+  equal-weight consensus) with a `+1` monotone constraint — the booster can
+  correct the blend but not invert it — which required moving its objective
+  from `regression_l1` to `huber` (LightGBM forbids monotone constraints
+  under leaf-renewing objectives). New `gbm_quantile` variant trains one
+  pinball booster per level of the 19-level grid and serves native
+  quantiles, so the leaderboard scores its CRPS/pinball/coverage directly.
+- **`pava_isotonic` now delegates to scipy's compiled `isotonic_regression`**
+  (values are identical; it was 59% of backtest wall-clock at 26,571 calls
+  per `idr_bucket` fit) and the idr predict path batches rows per bucket and
+  grid position (~10× faster `idr_bucket`).
+- **Incumbent retention (winner-curse guard)**: selection keeps the previous
+  release's method when a new argmin winner is within one bootstrap SE of it
+  on the current board — near-ties stop churning the served method and stop
+  re-realizing the argmin's optimism. Retained selections carry the
+  current-board evidence, a `retained` flag in the release payload, and the
+  live demotion gate keeps the last word; config pins override entirely.
+- **NBM benchmark row**: new `provider_nbm` single-source passthrough method
+  (abstains where the provider has no data), so the operational baseline
+  gets an explicit leaderboard row; `report` prints an n-weighted
+  blend-vs-NBM benchmark line and records the scalars in the verdicts
+  ledger.
+- **Pipeline mutex**: `build-dataset`, `backtest`, `report`, `alignment`,
+  `backfill`, `truth-qc`, and `prune-scores` serialize on
+  `<dataset dir>/pipeline.lock`; contention exits `75` (EX_TEMPFAIL) after
+  60 s. `predict` stays lock-free and instead retries its scores-directory
+  scan once when a file vanishes mid-read, so a concurrent prune can neither
+  crash serving nor feed it a half-pruned evidence set. Scores files are now
+  written atomically.
+
 - Forecast document **schema 5**: per-variable `truth_semantics`,
   `selection_reasons`, and a `quantiles_source` map; point-only winners are
   dressed with live residual quantiles at serve time, and blocked promotions

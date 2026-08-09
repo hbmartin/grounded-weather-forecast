@@ -29,11 +29,13 @@ from grounded_weather_forecast.evaluation import (
 from grounded_weather_forecast.reports.eprocess import EProcessStore
 from grounded_weather_forecast.reports.leaderboard import (
     _DAILY_GATE_POOL,
+    eligible_board_rows,
     gate_references,
     leaderboard,
     slice_winners,
     union_references,
 )
+from grounded_weather_forecast.reports.winner_curse import should_retain_incumbent
 
 FALLBACK_METHOD = "equal_weight"
 _LIVE_KEY = ("product", "variable", "lead_bucket", "method_id")
@@ -67,6 +69,10 @@ class Selection:
     pinned: bool = False
     degraded: bool = False
     truth_semantics: str | None = None
+    # True when the winner-curse guard kept the previous release's method
+    # over a statistically indistinguishable new argmin. Appended last —
+    # field order is a compatibility contract.
+    retained: bool = False
 
 
 type SelectionMap = Mapping[tuple[str, str, str], Selection]
@@ -92,11 +98,39 @@ def _compatible_scores(
     as_of: datetime | None,
     semantics: Mapping[str, TruthSemantics] | None,
 ) -> list[pl.DataFrame]:
+    # Prune (which runs under the pipeline lock) can delete a file between
+    # this reader's glob and read — predict deliberately does not take that
+    # lock. A mixed pre/post-prune view must never mint a release, so retry
+    # the whole scan once against a consistent post-prune listing; skipping
+    # individual files is the second pass's last resort.
+    try:
+        return _scan_compatible_scores(
+            config, scores_dir, as_of, semantics, skip_missing=False
+        )
+    except FileNotFoundError:
+        return _scan_compatible_scores(
+            config, scores_dir, as_of, semantics, skip_missing=True
+        )
+
+
+def _scan_compatible_scores(
+    config: Config,
+    scores_dir: Path,
+    as_of: datetime | None,
+    semantics: Mapping[str, TruthSemantics] | None,
+    *,
+    skip_missing: bool,
+) -> list[pl.DataFrame]:
     current_dataset = dataset_fingerprint(config)
     current_code = code_identity()
     candidates: list[pl.DataFrame] = []
     for path in sorted(scores_dir.glob("scores_*.parquet")):
-        scores = load_scores(path)
+        try:
+            scores = load_scores(path)
+        except FileNotFoundError:
+            if not skip_missing:
+                raise
+            continue
         if scores.is_empty() or set(scores["source_kind"].unique()) != {"live"}:
             continue
         required_identity = {
@@ -223,6 +257,7 @@ def _selection_payload(
             "n": selected.n,
             "mae": selected.mae,
             "truth_semantics": selected.truth_semantics,
+            "retained": selected.retained,
         }
         for key, selected in sorted(selections.items())
     }
@@ -415,6 +450,7 @@ def _selections_from_release(release: Mapping[str, object]) -> SelectionMap | No
             truth_semantics=_release_selection_truth_semantics(
                 release, selection_mapping, variable
             ),
+            retained=bool(selection_mapping.get("retained", False)),
         )
     return selections
 
@@ -567,6 +603,99 @@ def _release_as_of(
     return selections
 
 
+_RETAINED_REASON = "retained incumbent within one SE of best (winner-curse guard)"
+# Retention only ever overrides an argmin pick; a gate-forced reference or a
+# pooled winner was not selected on the minimum, so there is no curse to guard.
+_RETENTION_GATES = (None, "eligibility")
+
+
+def _incumbent_methods(config: Config) -> dict[SliceKey, tuple[str, str | None]]:
+    """The previous release's (method_id, truth_semantics) per slice.
+
+    Newest ``promoted_at`` among config-compatible releases, with the dataset
+    and code filters deliberately off: the dataset fingerprint rotates on
+    every ingest and the code digest on every deploy, so an exact-match
+    lookup would make retention dead code on precisely the re-runs it exists
+    for. Only the method identity is read — every statistical input comes
+    from the current board.
+    """
+
+    def promoted_at(release: Mapping[str, object]) -> datetime:
+        with suppress(ValueError, TypeError):
+            moment = datetime.fromisoformat(str(release.get("promoted_at")))
+            return moment if moment.tzinfo else moment.replace(tzinfo=UTC)
+        return datetime.min.replace(tzinfo=UTC)
+
+    releases = _compatible_releases(config, match_dataset=False)
+    if not releases:
+        return {}
+    newest = max(releases, key=lambda r: (promoted_at(r), str(r.get("release_id"))))
+    selections = _selections_from_release(newest) or {}
+    return {
+        key: (selected.method_id, selected.truth_semantics)
+        for key, selected in selections.items()
+    }
+
+
+def _retained_incumbent(
+    config: Config,
+    winner_row: Mapping[str, object],
+    board: pl.DataFrame,
+    frame: pl.DataFrame,
+    incumbent: tuple[str, str | None] | None,
+    evaluation_id: str,
+) -> Selection | None:
+    """The winner-curse guard: keep a statistically indistinguishable incumbent.
+
+    Near-ties churn the served method while flattering the report's argmin
+    number. When the previous release served a *different* method for this
+    slice and that method is still eligible on the current board, with the
+    same truth semantics, and within one bootstrap SE of today's winner,
+    keep serving it. The live demotion gate still runs afterwards and keeps
+    the last word; the config-pin pass overwrites retention entirely.
+    """
+    if incumbent is None:
+        return None
+    incumbent_method, incumbent_semantics = incumbent
+    if (
+        incumbent_method == str(winner_row["method_id"])
+        or winner_row.get("gate") not in _RETENTION_GATES
+        # A demoted slice's persisted method is already the fallback;
+        # retaining it by name would outlast the demotion's own re-hearing.
+        or incumbent_method == FALLBACK_METHOD
+    ):
+        return None
+    slice_semantics = str(frame["semantics"][0])
+    if incumbent_semantics is not None and incumbent_semantics != slice_semantics:
+        return None
+    candidates = eligible_board_rows(
+        board.filter(pl.col("method_id") == incumbent_method)
+    ).sort("mae")
+    if candidates.is_empty():
+        return None
+    incumbent_row = candidates.row(0, named=True)
+    if incumbent_row.get("mae") is None:
+        return None
+    if not should_retain_incumbent(
+        frame,
+        winner_row,
+        incumbent_method,
+        promotion=config.promotion,
+    ):
+        return None
+    return Selection(
+        method_id=incumbent_method,
+        reason=_RETAINED_REASON,
+        n=int(incumbent_row["n"]),
+        mae=float(incumbent_row["mae"]),
+        evaluation_id=evaluation_id,
+        dataset_fingerprint=dataset_fingerprint(config),
+        code_version=str(frame["code_version"][0]),
+        truth_semantics=slice_semantics,
+        retained=True,
+    )
+
+
 def select_methods(
     config: Config,
     scores_dir: Path,
@@ -580,6 +709,7 @@ def select_methods(
     pinned = _pins(config)
     selections: dict[tuple[str, str, str], Selection] = {}
     compatible = _compatible_scores(config, scores_dir, as_of, semantics)
+    incumbents = _incumbent_methods(config)
     slices = _newest_complete_slices(compatible, config.promotion)
     selected_scores: list[pl.DataFrame] = []
     fallbacks: dict[SliceKey, Selection] = {}
@@ -613,6 +743,11 @@ def select_methods(
             code_version=str(frame["code_version"][0]),
             truth_semantics=str(frame["semantics"][0]),
         )
+        retained = _retained_incumbent(
+            config, row, board, frame, incumbents.get(key), evaluation_id
+        )
+        if retained is not None:
+            selections[key] = retained
         fallback_rows = board.filter(pl.col("method_id") == FALLBACK_METHOD).sort("mae")
         if not fallback_rows.is_empty():
             fallback = fallback_rows.row(0, named=True)
@@ -816,25 +951,21 @@ def apply_live_gate(
     return gated
 
 
-def no_evidence_reason(config: Config, scores_dir: Path) -> str:
-    """Why serving is degraded: cold start vs invalidated evidence.
-
-    A rebuild that adds matrix columns changes the dataset fingerprint, which
-    correctly invalidates promoted evidence — but that failure reads exactly
-    like a cold start unless it is named. The distinction decides the fix:
-    keep polling, or just re-run the backtest.
-    """
+def _live_identity_sets(
+    scores_dir: Path, *, skip_missing: bool
+) -> tuple[bool, set[str], set[str], set[str]]:
+    """(any files found, live dataset / config / code identities on disk)."""
     paths = sorted(scores_dir.glob("scores_*.parquet"))
-    if not paths:
-        return (
-            "cold start: no backtest scores exist yet; run "
-            "`backtest --source live` then `report` once the archive has folds"
-        )
     live_datasets: set[str] = set()
     live_configs: set[str] = set()
     live_code_versions: set[str] = set()
     for path in paths:
-        scores = load_scores(path)
+        try:
+            scores = load_scores(path)
+        except FileNotFoundError:
+            if not skip_missing:
+                raise
+            continue
         if scores.is_empty() or set(scores["source_kind"].unique()) != {"live"}:
             continue
         if "dataset_fingerprint" in scores.columns:
@@ -849,6 +980,33 @@ def no_evidence_reason(config: Config, scores_dir: Path) -> str:
             live_code_versions |= {
                 str(value) for value in scores["code_version"].unique().to_list()
             }
+    return bool(paths), live_datasets, live_configs, live_code_versions
+
+
+def no_evidence_reason(config: Config, scores_dir: Path) -> str:
+    """Why serving is degraded: cold start vs invalidated evidence.
+
+    A rebuild that adds matrix columns changes the dataset fingerprint, which
+    correctly invalidates promoted evidence — but that failure reads exactly
+    like a cold start unless it is named. The distinction decides the fix:
+    keep polling, or just re-run the backtest.
+    """
+    # Same prune-vs-reader retry as _compatible_scores: one clean re-scan
+    # before tolerating missing files, so the diagnosis never reflects a
+    # half-pruned directory.
+    try:
+        found_any, live_datasets, live_configs, live_code_versions = (
+            _live_identity_sets(scores_dir, skip_missing=False)
+        )
+    except FileNotFoundError:
+        found_any, live_datasets, live_configs, live_code_versions = (
+            _live_identity_sets(scores_dir, skip_missing=True)
+        )
+    if not found_any:
+        return (
+            "cold start: no backtest scores exist yet; run "
+            "`backtest --source live` then `report` once the archive has folds"
+        )
     if not live_datasets:
         return (
             "no live backtest evidence yet (synthetic evidence is never "
@@ -912,6 +1070,7 @@ def selection_report(selections: SelectionMap) -> pl.DataFrame:
             "evaluation_id": chosen.evaluation_id,
             "release_id": chosen.release_id,
             "truth_semantics": chosen.truth_semantics,
+            "retained": chosen.retained,
         }
         for (product, variable, bucket), chosen in sorted(selections.items())
     ]

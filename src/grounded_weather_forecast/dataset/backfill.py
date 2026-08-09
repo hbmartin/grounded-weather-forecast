@@ -36,7 +36,7 @@ import polars as pl
 
 from grounded_weather_forecast.config import Config
 from grounded_weather_forecast.contracts import SourceKind
-from grounded_weather_forecast.dataset.providers import HOURLY_COLUMN_MAP
+from grounded_weather_forecast.dataset.providers import HOURLY_COLUMN_MAP, dedupe_long
 
 type Fetcher = Callable[[str], Mapping[str, Any]]
 
@@ -154,7 +154,7 @@ def parse_previous_runs(
         for canonical in HOURLY_COLUMN_MAP.values()
         if canonical not in combined.columns
     ]
-    return (
+    decorated = (
         combined.with_columns(
             pl.col("valid_time").dt.replace_time_zone("UTC"),
             pl.col("fetched_at").dt.replace_time_zone("UTC"),
@@ -170,10 +170,11 @@ def parse_previous_runs(
             ).alias("lead_hours")
         )
         .drop_nulls("valid_time")
-        .sort("source", "fetched_at", "valid_time")
-        .unique(subset=["source", "fetched_at", "valid_time"], keep="last")
-        .sort("source", "fetched_at", "valid_time")
-        .select(
+    )
+    return dedupe_long(
+        decorated,
+        "valid_time",
+        (
             "run_id",
             "source",
             "source_kind",
@@ -181,7 +182,7 @@ def parse_previous_runs(
             "valid_time",
             "lead_hours",
             *HOURLY_COLUMN_MAP.values(),
-        )
+        ),
     )
 
 

@@ -200,11 +200,42 @@ class EqualWeight:
         return BlendResult(point=finalize_point(point, self._kind, self._variable))
 
 
+@dataclass
+class SingleSource:
+    """Passthrough of one named provider: an explicit operational baseline.
+
+    Registered for ``nbm`` (the station-tuned National Blend of Models):
+    "does the blend beat station NBM" is the project's most informative
+    single number, so NBM gets a leaderboard row of its own instead of a
+    rederivation. Abstains (NaN) wherever the provider is missing, so the
+    coverage bar keeps it out of slices the provider does not serve — and if
+    it honestly wins a slice, serving it is honest too.
+    """
+
+    source: str = "nbm"
+    method_id: str = "provider_nbm"
+    _kind: TargetKind = TargetKind.CONTINUOUS
+    _variable: VariableSpec | None = None
+
+    def fit(self, train: SupervisedSlice) -> Self:
+        self._kind = train.variable.kind
+        self._variable = train.variable
+        return self
+
+    def predict(self, x: ForecastMatrix) -> BlendResult:
+        point = np.full(x.n_rows, np.nan)
+        if self.source in x.sources:
+            column = x.sources.index(self.source)
+            point = np.where(x.availability[:, column], x.values[:, column], np.nan)
+        return BlendResult(point=finalize_point(point, self._kind, self._variable))
+
+
 def _register_baselines() -> None:
     register("persistence", Persistence)
     register("climatology", HarmonicClimatology)
     register("best_provider", BestProvider)
     register("equal_weight", EqualWeight)
+    register("provider_nbm", SingleSource)
 
 
 _register_baselines()
@@ -214,4 +245,5 @@ _PROTOCOL_CHECK: tuple[type[Blender], ...] = (
     HarmonicClimatology,
     BestProvider,
     EqualWeight,
+    SingleSource,
 )

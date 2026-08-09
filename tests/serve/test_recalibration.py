@@ -7,7 +7,7 @@ import polars as pl
 import pytest
 from conftest import write_config
 
-import grounded_weather_forecast.serve.recalibration as recal_module
+import grounded_weather_forecast.serve.score_pool as score_pool_module
 from grounded_weather_forecast.backtest.scores import SCORES_SCHEMA, write_scores
 from grounded_weather_forecast.contracts import TruthSemantics, hourly_variable
 from grounded_weather_forecast.serve.recalibration import (
@@ -74,9 +74,9 @@ def env(tmp_path, monkeypatch):
     config = write_config(tmp_path)
     scores_dir = tmp_path / "scores"
     scores_dir.mkdir()
-    monkeypatch.setattr(recal_module, "dataset_fingerprint", lambda _config: "ds1")
-    monkeypatch.setattr(recal_module, "config_fingerprint", lambda _config: "cfg1")
-    monkeypatch.setattr(recal_module, "code_identity", lambda: "code1")
+    monkeypatch.setattr(score_pool_module, "dataset_fingerprint", lambda _config: "ds1")
+    monkeypatch.setattr(score_pool_module, "config_fingerprint", lambda _config: "cfg1")
+    monkeypatch.setattr(score_pool_module, "code_identity", lambda: "code1")
     return config, scores_dir
 
 

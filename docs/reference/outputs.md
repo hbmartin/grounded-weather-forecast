@@ -1,0 +1,170 @@
+# Outputs and on-disk layout
+
+What each command writes, where, and which files are safe to delete.
+
+Three roots, configured by `[dataset] dir`, `[artifacts] dir`, and
+`[reports] dir`:
+
+| Root | Default | Contains | Regenerable? |
+|---|---|---|---|
+| `data/` | `data` | parquet: truth, matrices, scores, history | mostly — see below |
+| `artifacts/` | `artifacts` | JSON and parquet: releases, ledgers, studies | **partly not** |
+| `reports/` | `reports` | markdown and HTML for humans | entirely |
+
+The short version: **`reports/` is disposable, `data/` is rebuildable from the
+two SQLite files, and `artifacts/` contains history that cannot be recovered.**
+
+---
+
+## `data/` — the dataset layer
+
+Written by `build-dataset` unless noted.
+
+| File | Contents |
+|---|---|
+| `truth_minute.parquet` | QC'd per-minute station observations |
+| `truth_hourly.parquet` | hourly truth, **both** `_inst` and `_mean` semantics |
+| `truth_daily.parquet` | local-day extremes and sums |
+| `forecasts_long.parquet` | canonical long frame of hourly provider forecasts |
+| `daily_long.parquet` | canonical long frame of daily provider forecasts |
+| `minutely_long.parquet` | native provider minutely nowcasts |
+| `hourly_matrix_live.parquet` | the supervised hourly matrix, **live** provenance |
+| `hourly_matrix_synthetic.parquet` | the supervised hourly matrix, **backfilled** |
+| `daily_matrix_live.parquet` / `_synthetic.parquet` | supervised daily matrices |
+| `ensembles.parquet` | written by `ingest-ensembles`; ensemble spread features |
+| `manifest.json` | per-file SHA-256 plus the **dataset fingerprint** |
+| `predict_history.parquet` | written by `predict`; every served forecast |
+| `runs.parquet` | every CLI invocation; pruned to 90 days / 50k rows |
+| `scores/` | written by `backtest` |
+| `served_forecasts/` | archived served documents |
+
+!!! danger "`predict_history.parquet` is not regenerable"
+    It is the record of what the system actually served, and it is the only input
+    to [self-verification](../methods/verification.md#8-self-verification). Delete
+    it and you permanently lose the ability to measure serving-path drift for
+    that period. Back it up; do not point `[predict] history_path` at a temp
+    directory.
+
+### The provenance wall is in the filename
+
+`_live` and `_synthetic` matrices are separate files. This is deliberate: the
+provenance is a filesystem property, not merely a runtime check, so mixing them
+requires deleting a guard rather than forgetting one. Attempting to pool raises
+`MixedProvenanceError`. See
+[Methods: verification §7](../methods/verification.md#7-the-provenance-wall).
+
+### `data/scores/`
+
+```
+scores_{product}_{kind}_{window}_{evaluation_id}.parquet
+```
+
+| Component | Values |
+|---|---|
+| `product` | `hourly`, `daily`, `minutely` |
+| `kind` | `live`, `synthetic` |
+| `window` | `expanding`, `rolling` |
+| `evaluation_id` | identity of the backtest run |
+
+The scores frame is deliberately **long and dumb**: one row per scored case per
+method, and no winner declared. Every leaderboard is a downstream `group_by`,
+which is what lets `report` recompute leaderboards under new statistical rules
+without re-running a single fit.
+
+These files are the bulk of the disk footprint. `prune-scores` manages them.
+
+---
+
+## `artifacts/` — evidence and identity
+
+| Path | Written by | Contents |
+|---|---|---|
+| `releases/*.json` | `backtest`, `report` | **promoted `ModelRelease` records — the serving boundary** |
+| `eprocess/{product}_{kind}.json` | `report` | accumulated betting wealth per candidate/reference pair |
+| `history/*.parquet` | `report` | ten append-only ledgers (below) |
+| `alignment.json` | `alignment` | measured truth semantics per provider |
+| `truth_qc.json` | `truth-qc` | neighbour verdicts and the shield fit (schema v3) |
+| `drift.json` | `report` | provider drift alarms |
+| `observability/` | `predict` | per-serve snapshots |
+
+### The history ledgers
+
+`artifacts/history/` holds ten append-only parquet ledgers driving dashboard zone
+H: `quality`, `churn`, `verdicts`, `served_quality`, `eprocess_wealth`,
+`pipeline`, `provider_health`, `build_funnel`, `changes`, `evaluations`.
+
+Append-only is the point — they record what was true *at the time*, so a
+regression is visible as a trend rather than only as a current value.
+
+!!! danger "`artifacts/` holds two things that cannot be rebuilt"
+    **`eprocess/`** — a betting e-process is a sequential accumulation. A bet,
+    once made, is never revised, and deleting the store discards all accumulated
+    evidence; the gate restarts from zero wealth and re-earns significance from
+    scratch. (It resets deliberately on a config or code-version change, because
+    a different implementation is a different null hypothesis — but *only* then.)
+
+    **`history/`** — append-only ledgers. Deleting them erases the past.
+
+    `releases/` and `alignment.json` can be regenerated by re-running the
+    pipeline; the two above cannot.
+
+---
+
+## `reports/` — for humans
+
+Everything here is regenerated by `report`. Safe to delete entirely.
+
+| File | Contents |
+|---|---|
+| `dashboard.html` | the nine-zone offline operator console |
+| `leaderboard_{product}_{source}_{window}_{hash}.md` | per-slice leaderboards |
+| `drift.md` | provider drift alarms |
+| `correlation_{variable}.md` | provider error correlation and $k_{\text{eff}}$ |
+| `alignment.md` | truth-semantics study |
+| `truth_qc.md` | neighbour cross-check and shield fit |
+| `pipeline_health.md` | end-to-end freshness and funnel |
+| `selection_churn.md` | how often the served method changes |
+
+Six files have stable names and are overwritten. Leaderboards are
+**hash-suffixed per evaluation run**, so they accumulate — dozens of files is
+normal. `prune-scores` does **not** touch them (it deletes only scores
+parquet files); delete old leaderboard markdown by hand if the directory
+bothers you.
+
+`dashboard.html` is fully self-contained: CSS, vendored Chart.js, and the data
+payload are inlined, so it opens from `file://` with no server and can be emailed
+as a single file. See [Operator dashboard](../dashboard.md).
+
+---
+
+## Retention: `prune-scores`
+
+```bash
+grounded-weather-forecast prune-scores --dry-run   # always look first
+grounded-weather-forecast prune-scores
+```
+
+Kept:
+
+- the **newest three scores files per group** (product × kind × window);
+- any evaluation **referenced by a release within the last 7 days**;
+- **all catalog rows** — the ledgers survive; only the bulky per-case scores go.
+
+An evaluation still backing a live release is never deleted, so serving can
+always point at the evidence that justified it.
+
+---
+
+## Backup priority
+
+If you back up only some of this:
+
+1. **The two upstream SQLite files.** Everything in `data/` derives from them,
+   and the forecast archive in particular *cannot be recreated* — you cannot ask
+   a provider what it predicted last Tuesday.
+2. **`artifacts/history/` and `artifacts/eprocess/`.** Append-only and sequential;
+   not rebuildable.
+3. **`data/predict_history.parquet`.** The record of what you served.
+4. `config.toml`.
+
+Everything else is a function of those.

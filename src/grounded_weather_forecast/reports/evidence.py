@@ -877,6 +877,43 @@ def _readable_releases(directory: Path) -> list[Mapping[str, object]]:
     return releases
 
 
+def _append_verdicts(
+    config: Config,
+    product: str,
+    scores: pl.DataFrame,
+    verdicts: Mapping[str, float],
+    moment: datetime,
+) -> None:
+    """Verdict scalars keyed by the newest evaluation, into the verdicts ledger."""
+    from grounded_weather_forecast.reports.recalibration import (  # noqa: PLC0415
+        newest_evaluation,
+    )
+
+    if not verdicts or scores.is_empty():
+        return
+    newest = newest_evaluation(scores)
+    rows = [
+        {
+            "recorded_at": moment,
+            "evaluation_id": _first(newest, "evaluation_id"),
+            "product": product,
+            "source_kind": _first(newest, "source_kind"),
+            "name": name,
+            "value": float(value),
+            "code_version": _first(newest, "code_version"),
+            "config_fingerprint": _first(newest, "config_fingerprint"),
+            "dataset_fingerprint": _first(newest, "dataset_fingerprint"),
+        }
+        for name, value in sorted(verdicts.items())
+    ]
+    fresh = pl.DataFrame(rows, schema_overrides=dict(VERDICTS_SCHEMA)).select(
+        VERDICTS_SCHEMA.names()
+    )
+    append_ledger(
+        fresh, ledger_path(config, VERDICTS_LEDGER), VERDICTS_LEDGER, now=moment
+    )
+
+
 def record_verdicts(
     config: Config,
     product: str,
@@ -888,38 +925,12 @@ def record_verdicts(
     alpha: float = 0.05,
     now: datetime | None = None,
 ) -> None:
-    from grounded_weather_forecast.reports.recalibration import (  # noqa: PLC0415
-        newest_evaluation,
-    )
-
     try:
         moment = now or datetime.now(tz=UTC)
         verdicts = {**recalibration_verdicts(recalib), **gate_verdicts(comparison)}
         if board is not None:
             verdicts.update(discovery_verdicts(board, alpha=alpha))
-        if not verdicts or scores.is_empty():
-            return
-        newest = newest_evaluation(scores)
-        rows = [
-            {
-                "recorded_at": moment,
-                "evaluation_id": _first(newest, "evaluation_id"),
-                "product": product,
-                "source_kind": _first(newest, "source_kind"),
-                "name": name,
-                "value": float(value),
-                "code_version": _first(newest, "code_version"),
-                "config_fingerprint": _first(newest, "config_fingerprint"),
-                "dataset_fingerprint": _first(newest, "dataset_fingerprint"),
-            }
-            for name, value in sorted(verdicts.items())
-        ]
-        fresh = pl.DataFrame(rows, schema_overrides=dict(VERDICTS_SCHEMA)).select(
-            VERDICTS_SCHEMA.names()
-        )
-        append_ledger(
-            fresh, ledger_path(config, VERDICTS_LEDGER), VERDICTS_LEDGER, now=moment
-        )
+        _append_verdicts(config, product, scores, verdicts, moment)
     except _RECORDER_ERRORS:
         return
 
@@ -974,41 +985,116 @@ def record_winner_curse(
     now: datetime | None = None,
 ) -> None:
     """Winner-bias scalars into the verdicts ledger (same keys, new names)."""
-    from grounded_weather_forecast.reports.recalibration import (  # noqa: PLC0415
-        newest_evaluation,
-    )
     from grounded_weather_forecast.reports.winner_curse import (  # noqa: PLC0415
         winner_curse_verdicts,
     )
 
     try:
         moment = now or datetime.now(tz=UTC)
-        verdicts = winner_curse_verdicts(winners)
-        if not verdicts or scores.is_empty():
-            return
-        newest = newest_evaluation(scores)
-        rows = [
-            {
-                "recorded_at": moment,
-                "evaluation_id": _first(newest, "evaluation_id"),
-                "product": product,
-                "source_kind": _first(newest, "source_kind"),
-                "name": name,
-                "value": float(value),
-                "code_version": _first(newest, "code_version"),
-                "config_fingerprint": _first(newest, "config_fingerprint"),
-                "dataset_fingerprint": _first(newest, "dataset_fingerprint"),
-            }
-            for name, value in sorted(verdicts.items())
-        ]
-        fresh = pl.DataFrame(rows, schema_overrides=dict(VERDICTS_SCHEMA)).select(
-            VERDICTS_SCHEMA.names()
-        )
-        append_ledger(
-            fresh, ledger_path(config, VERDICTS_LEDGER), VERDICTS_LEDGER, now=moment
+        _append_verdicts(
+            config, product, scores, winner_curse_verdicts(winners), moment
         )
     except _RECORDER_ERRORS:
         return
+
+
+NBM_BENCHMARK_METHOD = "provider_nbm"
+_NBM_VERDICT_NAMES = (
+    "nbm_benchmark_blend_mae",
+    "nbm_benchmark_nbm_mae",
+    "nbm_benchmark_slices",
+)
+
+
+def nbm_benchmark_verdicts(board: pl.DataFrame) -> dict[str, float]:
+    """Best-non-NBM-vs-NBM scalars from one leaderboard.
+
+    n-weighted over slices where ``provider_nbm`` is scored alongside at
+    least one other method; the comparison value is the per-slice best over
+    every OTHER method — usually a blend, but a raw baseline can hold it,
+    which is why the printed label says "best non-nbm" rather than "blend".
+    Weighted by the NBM slice n so the comparison lives where NBM has data.
+    """
+    required = {"method_id", "variable", "truth_semantics", "lead_bucket", "mae", "n"}
+    if board.is_empty() or not required <= set(board.columns):
+        return {}
+    keys = ["variable", "truth_semantics", "lead_bucket"]
+    nbm = (
+        board.filter(pl.col("method_id") == NBM_BENCHMARK_METHOD)
+        .drop_nulls(["mae", "n"])
+        .group_by(keys)
+        .agg(pl.col("mae").min().alias("nbm_mae"), pl.col("n").max().alias("nbm_n"))
+    )
+    others = (
+        board.filter(pl.col("method_id") != NBM_BENCHMARK_METHOD)
+        .drop_nulls(["mae", "n"])
+        .group_by(keys)
+        .agg(pl.col("mae").min().alias("blend_mae"))
+    )
+    paired = nbm.join(others, on=keys, how="inner").filter(pl.col("nbm_n") > 0)
+    if paired.is_empty():
+        return {}
+    total = float(cast("float", paired["nbm_n"].sum()))
+    if total <= 0.0:
+        return {}
+    return {
+        "nbm_benchmark_nbm_mae": (
+            float(cast("float", (paired["nbm_mae"] * paired["nbm_n"]).sum())) / total
+        ),
+        "nbm_benchmark_blend_mae": (
+            float(cast("float", (paired["blend_mae"] * paired["nbm_n"]).sum())) / total
+        ),
+        "nbm_benchmark_slices": float(paired.height),
+    }
+
+
+def record_nbm_benchmark(
+    config: Config,
+    product: str,
+    scores: pl.DataFrame,
+    board: pl.DataFrame,
+    *,
+    now: datetime | None = None,
+) -> None:
+    """Blend-vs-NBM scalars into the verdicts ledger."""
+    try:
+        moment = now or datetime.now(tz=UTC)
+        _append_verdicts(config, product, scores, nbm_benchmark_verdicts(board), moment)
+    except _RECORDER_ERRORS:
+        return
+
+
+def nbm_benchmark_line(config: Config) -> str | None:
+    """One line: does the served blend beat station NBM where NBM plays?"""
+    try:
+        verdicts = load_ledger(
+            ledger_path(config, VERDICTS_LEDGER), VERDICTS_SCHEMA
+        ).filter(pl.col("name").is_in(list(_NBM_VERDICT_NAMES)))
+        if verdicts.is_empty():
+            return None
+        products = (
+            verdicts.group_by("product")
+            .len()
+            .sort(["len", "product"], descending=[True, False])
+        )
+        product = str(products["product"][0])
+        rows = verdicts.filter(pl.col("product") == product).sort("recorded_at")
+        values: dict[str, float] = {}
+        for name in _NBM_VERDICT_NAMES:
+            named = rows.filter(pl.col("name") == name)
+            if named.is_empty():
+                return None
+            values[name] = float(named["value"][-1])
+        nbm_mae = values["nbm_benchmark_nbm_mae"]
+        blend_mae = values["nbm_benchmark_blend_mae"]
+        percent = (blend_mae - nbm_mae) / nbm_mae * 100.0 if nbm_mae > 0.0 else 0.0
+        return (
+            f"nbm benchmark ({product} live): best non-nbm mae {blend_mae:.3f} vs "
+            f"station-nbm {nbm_mae:.3f} ({percent:+.1f}%) over "
+            f"{int(values['nbm_benchmark_slices'])} slices"
+        )
+    except _RECORDER_ERRORS:
+        return None
 
 
 def _winner_bias_note(config: Config, product: str) -> str:

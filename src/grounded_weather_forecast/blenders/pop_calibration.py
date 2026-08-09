@@ -27,8 +27,8 @@ import numpy as np
 
 from grounded_weather_forecast.blenders.protocol import (
     FittedBuckets,
-    PerBucketFitter,
     finalize_point,
+    fit_shrunk_buckets,
     masked_average,
 )
 from grounded_weather_forecast.blenders.registry import register
@@ -41,7 +41,6 @@ from grounded_weather_forecast.contracts import (
     TargetKind,
     VariableSpec,
 )
-from grounded_weather_forecast.leads import buckets_for_product
 
 _EPS = 1e-4
 _MAX_COEF = 8.0  # separation guard: a one-class window cannot run away
@@ -154,12 +153,7 @@ class PopCalibrator:
                 identity,
             )
 
-        fitter = PerBucketFitter(
-            buckets=buckets_for_product(train.x.product),
-            fit_one=fit_one,
-            blend=lambda local, glob, w: w * local + (1.0 - w) * glob,
-        )
-        self._fitted = fitter.fit(train.x.lead_hours)
+        self._fitted = fit_shrunk_buckets(train.x.product, train.x.lead_hours, fit_one)
         return self
 
     def predict(self, x: ForecastMatrix) -> BlendResult:

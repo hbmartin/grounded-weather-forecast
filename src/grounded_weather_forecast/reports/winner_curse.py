@@ -32,7 +32,7 @@ to the reported number, not recomputed from a different sample.
 """
 
 import math
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from typing import TYPE_CHECKING, cast
 
 import numpy as np
@@ -298,6 +298,78 @@ def winner_curse_adjusted(
         for name, dtype in CURSE_COLUMNS
     ]
     return winners.with_columns(columns)
+
+
+# One winner-SE of slack before a new argmin evicts a serving incumbent. A
+# module constant, not a config key: a new config field would rotate
+# config_fingerprint and invalidate every score and release once per tweak.
+_RETENTION_SE_MULT = 1.0
+
+
+def should_retain_incumbent(
+    scores: pl.DataFrame | None,
+    winner_row: Mapping[str, object],
+    incumbent_method: str,
+    *,
+    promotion: "PromotionConfig | None" = None,
+) -> bool:
+    """One-SE incumbent retention: the argmin's near-tie guard.
+
+    Retain when the paired incumbent-minus-winner mean loss difference on
+    the collapsed common-case matrix sits within ``_RETENTION_SE_MULT``
+    bootstrap SEs of zero — the same moving-block bootstrap the bias
+    estimate uses, applied to the DIFFERENCE so shared weather variance
+    cancels (the Diebold-Mariano logic; an SE of either loss level alone
+    would overstate the noise and retain too freely). Conservative on any
+    missing ingredient: no scores, a thin collapsed matrix, or either
+    method absent from the common case all mean no retention.
+    """
+    if scores is None:
+        return False
+    from grounded_weather_forecast.reports.leaderboard import (  # noqa: PLC0415
+        _with_default_semantics,
+    )
+
+    slice_scores = _with_default_semantics(scores).filter(
+        (pl.col("product") == winner_row["product"])
+        & (pl.col("variable") == winner_row["variable"])
+        & (pl.col("lead_bucket") == winner_row["lead_bucket"])
+    )
+    if "truth_semantics" in winner_row and "semantics" in slice_scores.columns:
+        slice_scores = slice_scores.filter(
+            pl.col("semantics") == winner_row["truth_semantics"]
+        )
+    collapsed = collapsed_loss_matrix(slice_scores)
+    if collapsed is None:
+        return False
+    losses, method_ids = collapsed
+    n_times, n_methods = losses.shape
+    served = str(winner_row["method_id"])
+    if (
+        n_times < _MIN_TIMES
+        or n_methods < 2
+        or served not in method_ids
+        or incumbent_method not in method_ids
+    ):
+        return False
+    diffs = (
+        losses[:, method_ids.index(incumbent_method)]
+        - losses[:, method_ids.index(served)]
+    )
+    rng = np.random.default_rng(_SEED)
+    n_bootstrap = (
+        promotion.mcs_bootstrap if promotion is not None else _DEFAULT_BOOTSTRAP
+    )
+    block_length = (
+        promotion.mcs_block_length if promotion is not None else None
+    ) or max(1, round(n_times ** (1.0 / 3.0)))
+    indices = _block_indices(rng, n_times, block_length, n_bootstrap)
+    se = float(np.std(diffs[indices].mean(axis=1)))
+    if not math.isfinite(se) or se <= 0.0:
+        # A constant difference has no sampling noise to hide in: retain
+        # only when the incumbent is not worse at all.
+        return float(diffs.mean()) <= 0.0
+    return float(diffs.mean()) <= _RETENTION_SE_MULT * se
 
 
 def winner_curse_verdicts(winners: pl.DataFrame) -> dict[str, float]:

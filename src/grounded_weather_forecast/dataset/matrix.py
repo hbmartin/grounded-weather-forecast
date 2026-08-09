@@ -498,6 +498,49 @@ def _equal_weight_daily_aggregates(
     )
 
 
+def _finalize_daily_matrix(
+    daily: pl.DataFrame,
+    kind: str,
+    hourly_matrix: pl.DataFrame,
+    truth_daily_frame: pl.DataFrame,
+    config: Config,
+) -> pl.DataFrame:
+    """Leads, buckets, hourly aggregates, and daily truth joined onto ``daily``."""
+    timezone_name = config.station.timezone
+    keys = ["issue_time", "forecast_date"]
+    return (
+        daily.with_columns(
+            (
+                pl.col("forecast_date")
+                - local_date_expr(pl.col("issue_time"), timezone_name)
+            )
+            .dt.total_days()
+            .cast(pl.Int16)
+            .alias("lead_days"),
+            pl.lit(kind).alias("source_kind"),
+        )
+        .filter(pl.col("lead_days") >= 0)
+        .with_columns(
+            daily_bucket_expr(pl.col("lead_days").cast(pl.Float64)).alias("lead_bucket")
+        )
+        # Providers publish 14-16-day dailies; lead_days beyond D8-10's edge
+        # get a null bucket, can never serve (DAILY_HORIZON_DAYS = 10), and
+        # polluted the leaderboard with an unpromotable None-bucket slice.
+        .filter(pl.col("lead_bucket").is_not_null())
+        .join(
+            _equal_weight_daily_aggregates(hourly_matrix, config),
+            on=keys,
+            how="left",
+        )
+        .join(
+            truth_daily_frame.rename({"date_local": "forecast_date"}),
+            on="forecast_date",
+            how="left",
+        )
+        .sort(keys)
+    )
+
+
 def build_daily_matrix(
     daily_long: pl.DataFrame,
     snapshots: pl.DataFrame,
@@ -541,36 +584,8 @@ def build_daily_matrix(
     wide = snap.select(index).unique(maintain_order=True).sort(index)
     for variable in DAILY_MATRIX_VARIABLES:
         wide = wide.join(_pivot(snap, index, variable, fxd_col), on=index, how="left")
-    matrix = (
-        wide.with_columns(
-            (
-                pl.col("forecast_date")
-                - local_date_expr(pl.col("issue_time"), timezone_name)
-            )
-            .dt.total_days()
-            .cast(pl.Int16)
-            .alias("lead_days"),
-            pl.lit(kind).alias("source_kind"),
-        )
-        .filter(pl.col("lead_days") >= 0)
-        .with_columns(
-            daily_bucket_expr(pl.col("lead_days").cast(pl.Float64)).alias("lead_bucket")
-        )
-        # Providers publish 14-16-day dailies; lead_days beyond D8-10's edge
-        # get a null bucket, can never serve (DAILY_HORIZON_DAYS = 10), and
-        # polluted the leaderboard with an unpromotable None-bucket slice.
-        .filter(pl.col("lead_bucket").is_not_null())
-        .join(
-            _equal_weight_daily_aggregates(hourly_matrix, config),
-            on=index,
-            how="left",
-        )
-        .join(
-            truth_daily_frame.rename({"date_local": "forecast_date"}),
-            on="forecast_date",
-            how="left",
-        )
-        .sort("issue_time", "forecast_date")
+    matrix = _finalize_daily_matrix(
+        wide, kind, hourly_matrix, truth_daily_frame, config
     )
     return matrix.with_columns(daily_truth_known_at(matrix, timezone_name))
 
@@ -776,31 +791,8 @@ def _synthetic_daily_matrix(
         if expressions:
             aggregated = with_date.group_by(keys).agg(*expressions)
             daily = daily.join(aggregated, on=keys, how="left")
-    return (
-        daily.with_columns(
-            (
-                pl.col("forecast_date")
-                - local_date_expr(pl.col("issue_time"), timezone_name)
-            )
-            .dt.total_days()
-            .cast(pl.Int16)
-            .alias("lead_days"),
-            pl.lit(SourceKind.SYNTHETIC.value).alias("source_kind"),
-        )
-        .filter(pl.col("lead_days") >= 0)
-        .with_columns(
-            daily_bucket_expr(pl.col("lead_days").cast(pl.Float64)).alias("lead_bucket")
-        )
-        .filter(pl.col("lead_bucket").is_not_null())
-        .join(
-            _equal_weight_daily_aggregates(hourly_matrix, config), on=keys, how="left"
-        )
-        .join(
-            truth_daily_frame.rename({"date_local": "forecast_date"}),
-            on="forecast_date",
-            how="left",
-        )
-        .sort(keys)
+    return _finalize_daily_matrix(
+        daily, SourceKind.SYNTHETIC.value, hourly_matrix, truth_daily_frame, config
     )
 
 

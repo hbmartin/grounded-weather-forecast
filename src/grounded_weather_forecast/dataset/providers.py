@@ -7,7 +7,7 @@ Missing tables, empty sources, and NULL fetch timestamps are tolerated.
 """
 
 import sqlite3
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 
 import polars as pl
@@ -134,6 +134,19 @@ def _with_provenance(frame: pl.DataFrame, forecasts: ForecastsConfig) -> pl.Data
     return slugged
 
 
+def dedupe_long(
+    frame: pl.DataFrame, time_column: str, columns: Sequence[str]
+) -> pl.DataFrame:
+    """Keep the last row per (source, fetched_at, time) and order the output."""
+    keys = ("source", "fetched_at", time_column)
+    return (
+        frame.sort(*keys)
+        .unique(subset=list(keys), keep="last")
+        .sort(*keys)
+        .select(*columns)
+    )
+
+
 def _open(forecasts: ForecastsConfig) -> sqlite3.Connection:
     if not forecasts.db_path.exists():
         msg = f"cannot open forecast archive {forecasts.db_path}: file not found"
@@ -153,7 +166,7 @@ def _read_hourly_long(
         | {column: pl.Float64() for column in HOURLY_COLUMN_MAP}
     )
     raw = pl.DataFrame(rows, schema=schema, orient="row")
-    return (
+    decorated = (
         _with_provenance(raw.drop_nulls("timestamp_unix"), forecasts)
         .with_columns(
             pl.from_epoch("timestamp_unix", time_unit="s")
@@ -168,10 +181,11 @@ def _read_hourly_long(
             ).alias("lead_hours")
         )
         .rename(dict(HOURLY_COLUMN_MAP))
-        .sort("source", "fetched_at", "valid_time")
-        .unique(subset=["source", "fetched_at", "valid_time"], keep="last")
-        .sort("source", "fetched_at", "valid_time")
-        .select(
+    )
+    return dedupe_long(
+        decorated,
+        "valid_time",
+        (
             "run_id",
             "source",
             "source_kind",
@@ -179,7 +193,7 @@ def _read_hourly_long(
             "valid_time",
             "lead_hours",
             *HOURLY_COLUMN_MAP.values(),
-        )
+        ),
     )
 
 
@@ -202,22 +216,23 @@ def _read_daily_long(
         | {column: pl.Float64() for column in DAILY_COLUMN_MAP}
     )
     raw = pl.DataFrame(rows, schema=schema, orient="row")
-    return (
+    decorated = (
         _with_provenance(raw.drop_nulls("forecast_date"), forecasts)
         .with_columns(pl.col("forecast_date").str.to_date("%Y-%m-%d", strict=False))
         .drop_nulls("forecast_date")
         .rename(dict(DAILY_COLUMN_MAP))
-        .sort("source", "fetched_at", "forecast_date")
-        .unique(subset=["source", "fetched_at", "forecast_date"], keep="last")
-        .sort("source", "fetched_at", "forecast_date")
-        .select(
+    )
+    return dedupe_long(
+        decorated,
+        "forecast_date",
+        (
             "run_id",
             "source",
             "source_kind",
             "fetched_at",
             "forecast_date",
             *DAILY_COLUMN_MAP.values(),
-        )
+        ),
     )
 
 
@@ -247,7 +262,7 @@ def _read_minutely_long(
         }
     )
     raw = pl.DataFrame(rows, schema=schema, orient="row")
-    return (
+    decorated = (
         _with_provenance(raw.drop_nulls("timestamp_unix"), forecasts)
         .with_columns(
             pl.from_epoch("timestamp_unix", time_unit="s")
@@ -261,10 +276,11 @@ def _read_minutely_long(
                 "precipitation_probability": "pop",
             }
         )
-        .sort("source", "fetched_at", "valid_time")
-        .unique(subset=["source", "fetched_at", "valid_time"], keep="last")
-        .sort("source", "fetched_at", "valid_time")
-        .select(
+    )
+    return dedupe_long(
+        decorated,
+        "valid_time",
+        (
             "run_id",
             "source",
             "source_kind",
@@ -272,7 +288,7 @@ def _read_minutely_long(
             "valid_time",
             "precip_intensity_mmh",
             "pop",
-        )
+        ),
     )
 
 

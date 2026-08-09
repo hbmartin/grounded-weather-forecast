@@ -75,9 +75,10 @@ But its limits are structural, not incidental:
 
 The visible symptom in the leaderboard: `anchored_grounded_equal_weight` and
 `grounded_equal_weight` have **identical MAE to three decimals**. That is not a
-bug — with no lead under 3 hours, anchoring finds no anchor row, the τ grid search
-selects "no anchoring", and the wrapper degrades exactly to its base. The
-mechanism works; the data simply cannot exercise it.
+bug — anchoring only looks for its residual among rows with lead under
+`_ANCHOR_MAX_LEAD` (6 hours), and backfilled leads start at 24. With no anchor
+row, the τ grid search selects "no anchoring" and the wrapper degrades exactly to
+its base. The mechanism works; the data simply cannot exercise it.
 
 ---
 
@@ -264,10 +265,14 @@ non-blocking:
   temperature, because the station's `RelPress` is not actually sea-level reduced
   (it reads ≈ `AbsPress` at 1,400 m). If your station *does* reduce properly, this
   is wrong for you and the mapping should change.
-- **The precipitation counter reset rule** (negative delta ⇒ reset ⇒ the new value
-  *is* the accumulation) is untested against heavy rain, because the sample
-  database contains almost none (max event total: 1.31 in). `rainofhourly` is
-  retained as a cross-validator. Revisit when a real storm is in the archive.
+- **The precipitation counter reset rule** — a decrease below
+  `precip_reset_fraction` (0.5) of the prior value opens a new reset epoch, and
+  within an epoch rain is credited only above the running maximum — is untested
+  against heavy rain, because the sample database contains almost none (max event
+  total: 1.31 in). The 0.5 fraction in particular is a guess calibrated against
+  jitter, not against a storm. `rainofhourly` is retained as a cross-validator.
+  Revisit when a real storm is in the archive. See
+  [Methods: precipitation](methods/precipitation.md#2-truth-side-accumulation).
 - **PoP threshold** is 0.254 mm (0.01 in) — the standard "measurable" threshold,
   but a choice.
 - **The 12-hour staleness cap** materially determines which sources are
@@ -287,9 +292,16 @@ non-blocking:
 - **Single location.** Location is config, not a key in the model store. Adding a
   second station means a second config and a second dataset directory — no code
   change, but no shared learning either.
-- **Dataset build is single-writer.** Concurrent `build-dataset` runs against the
-  same dataset directory will race. Forecast-history appends themselves are locked
-  and atomically replaced.
+- **Pipeline mutators are serialized by a coarse lock.** `build-dataset`,
+  `backtest`, `report`, `alignment`, `backfill`, `truth-qc`, and `prune-scores`
+  take an exclusive lock on `<dataset dir>/pipeline.lock`; a second mutator
+  waits up to 60 s, then exits with code `75` (EX_TEMPFAIL) instead of racing —
+  the 2026-08-08 incident, where a scheduled `prune-scores` deleted files a
+  concurrent manual `report` had already listed, is the motivating case.
+  `predict` deliberately does not take the lock (serving must never wait behind
+  an hour-long report); its scores-directory scans retry once on a missing file
+  so a half-pruned listing is never served. Forecast-history appends themselves
+  are locked and atomically replaced.
 
 ---
 

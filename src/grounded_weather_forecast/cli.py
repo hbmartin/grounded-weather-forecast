@@ -935,7 +935,13 @@ def _cmd_report(config: Config) -> int:
     references = union_references(config.promotion)
     eprocess_stores: dict[str, EProcessStore] = {}
     for path in score_files:
-        scores = load_scores(path)
+        try:
+            scores = load_scores(path)
+        except FileNotFoundError:
+            # The pipeline lock keeps prune out of a running report; this
+            # guard covers deletion by anything outside that lock's scope.
+            print(f"skipping {path.name}: deleted since listing", file=sys.stderr)
+            continue
         catalog_rows.append(operations.evaluation_catalog_row(path, scores))
         board = bh_adjusted(leaderboard(scores, references=references))
         evidence.record_quality(config, scores, board)
@@ -1009,6 +1015,7 @@ def _cmd_report(config: Config) -> int:
         winners = winner_curse_adjusted(winners, scores, promotion=config.promotion)
         if is_live:
             evidence.record_winner_curse(config, product, scores, winners)
+            evidence.record_nbm_benchmark(config, product, scores, board)
         sections = [
             ("Per-slice leaderboard", board),
             ("Aggregate (n-weighted MAE)", aggregate_leaderboard(board)),
@@ -1130,6 +1137,8 @@ def _report_evidence_tail(config: Config, written: list[Path]) -> None:
         print_summary("selection churn (vs previous release)", changed)
     if (line := evidence.quality_delta_line(config)) is not None:
         print(line)
+    if (line := evidence.nbm_benchmark_line(config)) is not None:
+        print(line)
 
 
 def _report_pipeline_health(
@@ -1198,7 +1207,50 @@ def _cmd_prune_scores(config: Config, args: argparse.Namespace) -> int:
     return 0
 
 
+# Commands that mutate or bulk-read the scores directory and its artifacts.
+# `predict` is excluded: serving must never block behind an hour-long report.
+# `ingest-ensembles` is excluded: its store has its own sidecar lock and
+# atomic replace, and the coarse lock would make its 6-hourly launchd fire
+# lose an API snapshot whenever the maintain chain is running.
+_LOCKED_COMMANDS = frozenset(
+    {
+        "build-dataset",
+        "backtest",
+        "report",
+        "alignment",
+        "backfill",
+        "truth-qc",
+        "prune-scores",
+    }
+)
+# EX_TEMPFAIL: lets the runs ledger and scheduler scripts tell lock
+# contention apart from a genuine command failure (1) or config error (2).
+EXIT_CONTENTION = 75
+
+
 def _dispatch(
+    config: Config, args: argparse.Namespace, parser: argparse.ArgumentParser
+) -> int:
+    if args.command not in _LOCKED_COMMANDS:
+        return _run_command(config, args, parser)
+    from filelock import Timeout  # noqa: PLC0415
+
+    from grounded_weather_forecast.storage import pipeline_lock  # noqa: PLC0415
+
+    try:
+        with pipeline_lock(config.dataset.dir):
+            return _run_command(config, args, parser)
+    except Timeout:
+        print(
+            "another pipeline command is running "
+            f"(lock: {config.dataset.dir / 'pipeline.lock'}); "
+            "try again once it finishes",
+            file=sys.stderr,
+        )
+        return EXIT_CONTENTION
+
+
+def _run_command(
     config: Config, args: argparse.Namespace, parser: argparse.ArgumentParser
 ) -> int:
     match args.command:

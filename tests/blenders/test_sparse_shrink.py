@@ -12,8 +12,6 @@ from grounded_weather_forecast.blenders.registry import supports_product
 from grounded_weather_forecast.contracts import (
     ForecastMatrix,
     Product,
-    SourceKind,
-    SupervisedSlice,
     daily_variable,
     hourly_variable,
 )

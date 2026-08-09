@@ -28,8 +28,9 @@ from grounded_weather_forecast.blenders.emos import (
     _spread,
 )
 from grounded_weather_forecast.blenders.protocol import (
+    coefficient_state,
     finalize_point,
-    finalize_quantiles,
+    quantile_blend_result,
 )
 from grounded_weather_forecast.blenders.registry import BlenderFactory, register
 from grounded_weather_forecast.contracts import (
@@ -150,32 +151,24 @@ class CsgdEmos:
             ),
             0.0,
         )
-        quantiles = finalize_quantiles(quantiles, self._kind, self._variable)
-        median = quantiles[:, len(QUANTILE_LEVELS) // 2]
-        return BlendResult(
-            point=finalize_point(median, self._kind, self._variable),
-            quantiles=quantiles,
-            quantile_levels=QUANTILE_LEVELS,
+        return quantile_blend_result(
+            quantiles, QUANTILE_LEVELS, self._kind, self._variable
         )
 
     def to_state(self) -> dict[str, object]:
-        parameters = self._parameters
-        return {
-            "schema_version": 1,
-            "method_id": self.method_id,
-            "variable": self._variable.name if self._variable else None,
-            "fit_status": self._fit_status,
-            "fitted": parameters is not None,
-            "coefficients": None
-            if parameters is None
-            else {
-                "mean_intercept": float(parameters[0]),
-                "mean_slope": float(parameters[1]),
-                "log_sigma_intercept": float(parameters[2]),
-                "log_sigma_slope": float(parameters[3]),
-                "shift": float(parameters[4]),
-            },
-        }
+        return coefficient_state(
+            self.method_id,
+            self._variable,
+            self._fit_status,
+            self._parameters,
+            (
+                "mean_intercept",
+                "mean_slope",
+                "log_sigma_intercept",
+                "log_sigma_slope",
+                "shift",
+            ),
+        )
 
 
 def _csgd_emos() -> Blender:
