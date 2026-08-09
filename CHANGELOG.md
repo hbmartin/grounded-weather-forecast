@@ -6,6 +6,14 @@ adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Changed
+
+- **Served hourly horizon extended 48h → 96h** (`HOURLY_HORIZON_HOURS`), so
+  the published document carries hourly rows for today plus the next three
+  station-local days. Leads 48–96h serve from the existing `48-96h` bucket's
+  promoted methods; the open-sun publisher and schema accept the new buckets
+  as of publisher 1.2.0/1.3.0.
+
 ### Added
 
 - **GBM containment, part two**: `gbm` gains a `blend_mean` feature (the
