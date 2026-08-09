@@ -89,7 +89,7 @@ from grounded_weather_forecast.serve.selection import (
 )
 
 MINUTELY_HORIZON_MINUTES = 60
-HOURLY_HORIZON_HOURS = 48
+HOURLY_HORIZON_HOURS = 96
 DAILY_HORIZON_DAYS = 10
 OBS_STALENESS = timedelta(minutes=30)
 _MINUTELY_VARIABLES = (
