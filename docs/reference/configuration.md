@@ -37,7 +37,7 @@ configured.
 | Key | Type | Default | Meaning |
 |---|---|---|---|
 | `db_path` | path | *required* | the `ambientweather2sqlite` SQLite file |
-| `timezone` | IANA name | *required* | defines the **local day** for daily products and DST handling |
+| `timezone` | IANA name | `UTC` | defines the **local day** for daily products and DST handling |
 | `latitude` | float | *required* | decimal degrees, north positive |
 | `longitude` | float | *required* | decimal degrees, east positive |
 | `elevation_m` | float | *required* | metres; used for pressure reduction and neighbour lapse adjustment |
@@ -278,7 +278,7 @@ deliberate override of the system's own evidence rather than a tuning knob.
 | Key | Type | Default | Meaning |
 |---|---|---|---|
 | `rule` | `mcs` \| `legacy` \| `seq_mcs` | `mcs` | which promotion gate to apply |
-| `alpha` | float > 0 | `0.1` | level for the MCS, the e-process threshold $\ln(1/\alpha)$, and FDR control |
+| `alpha` | float with $0 < \alpha < 1$ | `0.1` | level for the MCS, the e-process threshold $\ln(1/\alpha)$, and FDR control |
 | `live_gap_factor` | float > 0 | `1.5` | demote when realized MAE exceeds this multiple of backtest MAE |
 | `min_live_n` | int > 0 | `24` | scored live cases required before demotion can fire |
 | `report_gap_threshold` | float > 0 | `0.15` | relative gap above which a slice is listed under "Blocked promotions" |

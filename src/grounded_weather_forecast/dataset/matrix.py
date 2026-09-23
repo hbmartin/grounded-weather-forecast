@@ -62,6 +62,7 @@ from grounded_weather_forecast.dataset.truth import (
 from grounded_weather_forecast.dataset.truth_qc import apply_truth_quarantine
 from grounded_weather_forecast.leads import daily_bucket_expr, hourly_bucket_expr
 from grounded_weather_forecast.solar import solar_elevation_deg, toa_irradiance_wm2
+from grounded_weather_forecast.storage import dataset_lock, stage_parquet, stage_text
 from grounded_weather_forecast.timeutil import local_date_expr, local_day_minutes
 
 _SECONDS_PER_HOUR = 3600.0
@@ -657,6 +658,51 @@ class DatasetManifest:
         )
 
 
+def _publish_dataset(
+    frames: Mapping[str, tuple[Path, pl.DataFrame]],
+    manifest_path: Path,
+    *,
+    sources: tuple[str, ...],
+    snapshots: int,
+) -> DatasetManifest:
+    """Stage a complete live dataset, then expose it under one short lock."""
+    staged: dict[str, tuple[Path, Path]] = {}
+    staged_manifest: Path | None = None
+    try:
+        files: dict[str, FileInfo] = {}
+        for name, (path, frame) in frames.items():
+            temporary = stage_parquet(frame, path)
+            staged[name] = (path, temporary)
+            files[name] = FileInfo(
+                rows=frame.height,
+                sha256_16=_file_digest(temporary),
+            )
+        fingerprint = hashlib.sha256(
+            json.dumps(
+                {name: [info.rows, info.sha256_16] for name, info in files.items()},
+                sort_keys=True,
+            ).encode()
+        ).hexdigest()[:16]
+        manifest = DatasetManifest(
+            created_at=datetime.now(tz=timezone.utc).isoformat(),
+            sources=sources,
+            snapshots=snapshots,
+            files=files,
+            fingerprint=fingerprint,
+        )
+        staged_manifest = stage_text(manifest.to_json(), manifest_path)
+        with dataset_lock(manifest_path.parent, timeout=-1):
+            for path, temporary in staged.values():
+                temporary.replace(path)
+            staged_manifest.replace(manifest_path)
+        return manifest
+    finally:
+        for _, temporary in staged.values():
+            temporary.unlink(missing_ok=True)
+        if staged_manifest is not None:
+            staged_manifest.unlink(missing_ok=True)
+
+
 def active_ensembles(config: Config) -> pl.DataFrame | None:
     """Persisted ensemble rows still enabled by the active configuration."""
     if not config.ensembles.enabled:
@@ -721,27 +767,16 @@ def write_dataset(config: Config) -> DatasetManifest:
         "hourly_matrix": (paths.hourly_matrix, hourly_matrix),
         "daily_matrix": (paths.daily_matrix, daily_matrix),
     }
-    files: dict[str, FileInfo] = {}
-    for name, (path, frame) in frames.items():
-        frame.write_parquet(path)
-        files[name] = FileInfo(rows=frame.height, sha256_16=_file_digest(path))
-    fingerprint = hashlib.sha256(
-        json.dumps(
-            {name: [info.rows, info.sha256_16] for name, info in files.items()},
-            sort_keys=True,
-        ).encode()
-    ).hexdigest()[:16]
-    manifest = DatasetManifest(
-        created_at=datetime.now(tz=timezone.utc).isoformat(),
-        sources=tuple(sorted(hourly_long["source"].unique().to_list()))
-        if hourly_long.height
-        else (),
+    return _publish_dataset(
+        frames,
+        paths.manifest,
+        sources=(
+            tuple(sorted(hourly_long["source"].unique().to_list()))
+            if hourly_long.height
+            else ()
+        ),
         snapshots=snapshots.height,
-        files=files,
-        fingerprint=fingerprint,
     )
-    paths.manifest.write_text(manifest.to_json(), encoding="utf-8")
-    return manifest
 
 
 def build_truth(config: Config) -> tuple[pl.DataFrame, pl.DataFrame, pl.DataFrame]:

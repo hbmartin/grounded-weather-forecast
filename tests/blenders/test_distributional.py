@@ -374,6 +374,56 @@ class TestIdrBucket:
 
 
 class TestIdrBucketDcp:
+    def test_fit_partition_is_subagged(self, monkeypatch):
+        import grounded_weather_forecast.blenders.idr as idr_module
+
+        calls = []
+        original = idr_module.subagged_idr_state
+
+        def tracked(x, y, *, min_rows=100):
+            calls.append((len(x), min_rows))
+            return original(x, y, min_rows=min_rows)
+
+        monkeypatch.setattr(idr_module, "subagged_idr_state", tracked)
+        train = to_supervised_slice(heteroscedastic_matrix(seed=5), TEMP)
+        get_factory("idr_bucket_dcp")().fit(train)
+        assert calls
+        assert {minimum for _, minimum in calls} == {50}
+
+    def test_chronological_calibration_tail_is_untouched(self, monkeypatch):
+        import grounded_weather_forecast.blenders.idr as idr_module
+
+        seen = {}
+        original_fit = idr_module.subagged_idr_state
+        original_pit = idr_module.pit_values
+
+        def tracked_fit(x, y, *, min_rows=100):
+            seen["fit"] = x.copy()
+            return original_fit(x, y, min_rows=min_rows)
+
+        def tracked_pit(state, x, y):
+            seen["calibration"] = x.copy()
+            return original_pit(state, x, y)
+
+        monkeypatch.setattr(idr_module, "subagged_idr_state", tracked_fit)
+        monkeypatch.setattr(idr_module, "pit_values", tracked_pit)
+        x = np.arange(200, dtype=float)
+        y = x + np.sin(x)
+
+        state = get_factory("idr_bucket_dcp")()._fit_bucket(
+            x, y, np.arange(x.size), "0-1h"
+        )
+
+        assert state is not None
+        assert seen["fit"].tolist() == list(range(150))
+        assert seen["calibration"].tolist() == list(range(150, 200))
+
+    def test_refit_on_identical_data_is_identical(self):
+        train = to_supervised_slice(heteroscedastic_matrix(seed=5), TEMP)
+        first = get_factory("idr_bucket_dcp")().fit(train).predict(train.x)
+        second = get_factory("idr_bucket_dcp")().fit(train).predict(train.x)
+        np.testing.assert_allclose(first.quantiles, second.quantiles)
+
     def test_out_of_sample_coverage_hits_the_nominal_band(self):
         train = to_supervised_slice(heteroscedastic_matrix(seed=5), TEMP)
         fresh = to_supervised_slice(heteroscedastic_matrix(seed=6), TEMP)

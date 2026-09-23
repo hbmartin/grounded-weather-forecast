@@ -146,6 +146,32 @@ class TestLeaderboard:
         assert other_rows["n"].sum() == full_other["n"].sum()
         assert "n_valid_times" in board.columns
 
+    def test_non_finite_truth_rows_are_not_score_cases(self):
+        """Historical malformed frames cannot poison metrics or coverage."""
+        start = utc(2026, 3, 1)
+        malformed = pl.DataFrame(
+            {
+                "product": ["hourly"] * 5,
+                "variable": ["temp_c"] * 5,
+                "lead_bucket": ["1-3h"] * 5,
+                "method_id": ["candidate"] * 5,
+                "issue_time": [start + timedelta(hours=i) for i in range(5)],
+                "valid_time": [start + timedelta(hours=i + 1) for i in range(5)],
+                "lead_hours": [1.0] * 5,
+                "y_pred": [1.0, 100.0, 100.0, 100.0, 100.0],
+                "y_true": [0.0, None, float("nan"), float("inf"), float("-inf")],
+            }
+        )
+
+        row = leaderboard(malformed).row(0, named=True)
+
+        assert row["n"] == 1
+        assert row["n_total"] == 1
+        assert row["n_valid_times"] == 1
+        assert row["coverage"] == 1.0
+        assert row["mae"] == 1.0
+        assert leaderboard(malformed.slice(1)).is_empty()
+
     def test_aggregate_rmse_combines_squared_error(self):
         board = pl.DataFrame(
             {

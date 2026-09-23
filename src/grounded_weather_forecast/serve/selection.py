@@ -22,6 +22,7 @@ from grounded_weather_forecast.config import Config, PromotionConfig
 from grounded_weather_forecast.contracts import TruthSemantics
 from grounded_weather_forecast.evaluation import (
     ModelRelease,
+    activate_release,
     code_identity,
     config_fingerprint,
     dataset_fingerprint,
@@ -789,6 +790,7 @@ def select_methods(
     )
     release = _make_release(config, selections, selected_scores)
     release.write(config.artifacts_dir / "releases")
+    activate_release(config.artifacts_dir, release.release_id)
     return {
         key: replace(selected, release_id=release.release_id)
         for key, selected in selections.items()

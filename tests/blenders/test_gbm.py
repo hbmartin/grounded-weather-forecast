@@ -78,7 +78,7 @@ class TestGbmStacker:
         assert "n_available" in names
         assert "blend_mean" in names
 
-    def test_blend_mean_is_monotone_constrained(self):
+    def test_blend_mean_is_monotone_when_every_other_feature_is_fixed(self):
         matrix = hour_dependent_bias_matrix()
         train = to_supervised_slice(matrix, TEMP)
         fitted = GbmStacker().fit(train)
@@ -141,6 +141,22 @@ class TestGbmQuantile:
         rebuilt = restored.predict(train.x)
         np.testing.assert_allclose(rebuilt.point, original.point)
         np.testing.assert_allclose(rebuilt.quantiles, original.quantiles)
+
+    def test_state_rejects_booster_level_count_mismatch(self):
+        matrix = synthetic_hourly_matrix(days=15, seed=1)
+        train = to_supervised_slice(matrix, TEMP)
+        state = GbmQuantile().fit(train).to_state()
+        state["models"] = state["models"][:-1]
+        with pytest.raises(ValueError, match="booster count"):
+            GbmQuantile.from_state(state)
+
+    def test_empty_persisted_grid_is_not_replaced_by_the_default(self):
+        matrix = synthetic_hourly_matrix(days=15, seed=1)
+        train = to_supervised_slice(matrix, TEMP)
+        state = GbmQuantile().fit(train).to_state()
+        state["quantile_levels"] = []
+        with pytest.raises(ValueError, match="booster count"):
+            GbmQuantile.from_state(state)
 
     def test_abstains_below_floor(self):
         matrix = synthetic_hourly_matrix(days=10, seed=2)

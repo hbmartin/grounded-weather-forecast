@@ -2,7 +2,7 @@
 
 import argparse
 import sys
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 
@@ -15,12 +15,64 @@ from grounded_weather_forecast.contracts import (
     TruthSemantics,
     VariableSpec,
 )
+from grounded_weather_forecast.serve.schema import Forecast
 
 HOURLY_DEFAULT_VARIABLES = (
     "temp_c,humidity_pct,dew_point_c,wind_speed_ms,wind_gust_ms,"
     "pressure_sea_hpa,precip_mm,pop"
 )
 DAILY_DEFAULT_VARIABLES = "temp_max_c,temp_min_c,pop,precip_sum_mm"
+
+
+def _add_backtest_arguments(
+    parser: argparse.ArgumentParser,
+    *,
+    include_source: bool,
+) -> None:
+    parser.add_argument(
+        "--methods",
+        default="all",
+        help="comma-separated method ids, or 'all' registered (default)",
+    )
+    parser.add_argument(
+        "--hourly-variables",
+        default=HOURLY_DEFAULT_VARIABLES,
+        help="comma-separated hourly variables",
+    )
+    parser.add_argument(
+        "--daily-variables",
+        default=DAILY_DEFAULT_VARIABLES,
+        help="comma-separated daily variables",
+    )
+    parser.add_argument(
+        "--products",
+        default="hourly,daily,minutely",
+        help="comma-separated products to backtest (hourly,daily,minutely;"
+        " minutely scores the nowcast path constructions and is live-only)",
+    )
+    parser.add_argument(
+        "--window",
+        choices=("expanding", "rolling"),
+        default="expanding",
+        help="training window mode",
+    )
+    if include_source:
+        parser.add_argument(
+            "--source",
+            choices=("live", "synthetic"),
+            default="live",
+            help="which provenance the matrices must carry",
+        )
+    else:
+        parser.set_defaults(source="live")
+    parser.add_argument(
+        "--semantics",
+        choices=("auto", "inst", "mean"),
+        default="auto",
+        help="hourly truth semantics: inst, mean, or auto (alignment artifact"
+        " majority recommendation, falling back to inst); variables without"
+        " dual semantics always use inst",
+    )
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -48,46 +100,21 @@ def build_parser() -> argparse.ArgumentParser:
     backtest = subparsers.add_parser(
         "backtest", help="rolling-origin backtest over the supervised matrices"
     )
-    backtest.add_argument(
-        "--methods",
-        default="all",
-        help="comma-separated method ids, or 'all' registered (default)",
+    _add_backtest_arguments(backtest, include_source=True)
+    maintain = subparsers.add_parser(
+        "maintain",
+        help="run build, live backtest, report, and truth QC under one lock",
     )
-    backtest.add_argument(
-        "--hourly-variables",
-        default=HOURLY_DEFAULT_VARIABLES,
-        help="comma-separated hourly variables",
+    _add_backtest_arguments(maintain, include_source=False)
+    maintain.add_argument(
+        "--truth-qc-days",
+        type=int,
+        default=30,
+        help="neighbor history window passed to truth-qc (default: 30)",
     )
-    backtest.add_argument(
-        "--daily-variables",
-        default=DAILY_DEFAULT_VARIABLES,
-        help="comma-separated daily variables",
-    )
-    backtest.add_argument(
-        "--products",
-        default="hourly,daily,minutely",
-        help="comma-separated products to backtest (hourly,daily,minutely;"
-        " minutely scores the nowcast path constructions and is live-only)",
-    )
-    backtest.add_argument(
-        "--window",
-        choices=("expanding", "rolling"),
-        default="expanding",
-        help="training window mode",
-    )
-    backtest.add_argument(
-        "--source",
-        choices=("live", "synthetic"),
-        default="live",
-        help="which provenance the matrices must carry",
-    )
-    backtest.add_argument(
-        "--semantics",
-        choices=("auto", "inst", "mean"),
-        default="auto",
-        help="hourly truth semantics: inst, mean, or auto (alignment artifact"
-        " majority recommendation, falling back to inst); variables without"
-        " dual semantics always use inst",
+    subparsers.add_parser(
+        "recover",
+        help="deduplicate and run build, live backtest, and report recovery",
     )
     subparsers.add_parser(
         "report", help="render leaderboards and correlation reports from scores"
@@ -195,6 +222,21 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help="issue the forecast as of this UTC instant instead of now; useful"
         " for reproducing a served forecast from an archived snapshot",
+    )
+    publish = subparsers.add_parser(
+        "publish",
+        help="publish a forecast with hold-last-good and automatic recovery",
+    )
+    publish.add_argument(
+        "--out",
+        required=True,
+        help="forecast JSON destination (required)",
+    )
+    publish.add_argument(
+        "--semantics",
+        choices=("auto", "inst", "mean"),
+        default="auto",
+        help="hourly truth semantics used when fitting (see backtest)",
     )
     return parser
 
@@ -666,43 +708,71 @@ def _cmd_ingest_ensembles(config: Config, args: argparse.Namespace) -> int:
     return 0
 
 
-def _cmd_predict(config: Config, args: argparse.Namespace) -> int:
-    from grounded_weather_forecast.serve.history import append_history  # noqa: PLC0415
-    from grounded_weather_forecast.serve.predict import (  # noqa: PLC0415
-        NoForecastDataError,
-        UnsupportedMethodError,
-        predict,
-    )
+def _forecast_document(
+    config: Config,
+    *,
+    method: str,
+    semantics_flag: str,
+    now: datetime | None,
+    lock_timeout: float | None = None,
+) -> Forecast:
+    from grounded_weather_forecast.serve.predict import predict  # noqa: PLC0415
     from grounded_weather_forecast.serve.selection import (  # noqa: PLC0415
         select_methods,
     )
+    from grounded_weather_forecast.storage import dataset_lock  # noqa: PLC0415
 
-    forced = None if args.method == "auto" else args.method
-    now = args.now
+    forced = None if method == "auto" else method
     if now is not None and now.tzinfo is None:
         now = now.replace(tzinfo=UTC)
-    semantics = _semantics_by_variable(config, args.semantics, HOURLY_VARIABLES)
-    selections = (
-        select_methods(
-            config,
-            config.dataset.dir / "scores",
-            as_of=now,
-            semantics=semantics,
+    semantics = _semantics_by_variable(config, semantics_flag, HOURLY_VARIABLES)
+    with dataset_lock(config.dataset.dir, timeout=lock_timeout):
+        selections = (
+            select_methods(
+                config,
+                config.dataset.dir / "scores",
+                as_of=now,
+                semantics=semantics,
+            )
+            if not forced
+            else {}
         )
-        if not forced
-        else {}
-    )
-    try:
-        document = predict(
+        return predict(
             config,
             selections,
             now=now,
             semantics=semantics,
             force_method=forced,
         )
+
+
+def _cmd_predict(config: Config, args: argparse.Namespace) -> int:
+    from filelock import Timeout  # noqa: PLC0415
+
+    from grounded_weather_forecast.serve.history import append_history  # noqa: PLC0415
+    from grounded_weather_forecast.serve.predict import (  # noqa: PLC0415
+        NoForecastDataError,
+        UnsupportedMethodError,
+    )
+    from grounded_weather_forecast.storage import (  # noqa: PLC0415
+        atomic_write_text,
+    )
+
+    try:
+        document = _forecast_document(
+            config,
+            method=args.method,
+            semantics_flag=args.semantics,
+            now=args.now,
+        )
     except (NoForecastDataError, UnsupportedMethodError) as exc:
         print(f"cannot predict: {exc}")
         return 1
+    except Timeout:
+        print(
+            "dataset publication is in progress; try prediction again", file=sys.stderr
+        )
+        return EXIT_CONTENTION
 
     if document.status == "degraded" and document.status_reason:
         print(f"degraded: {document.status_reason}", file=sys.stderr)
@@ -711,8 +781,7 @@ def _cmd_predict(config: Config, args: argparse.Namespace) -> int:
         print(payload)
     else:
         out = Path(args.out)
-        out.parent.mkdir(parents=True, exist_ok=True)
-        out.write_text(payload, encoding="utf-8")
+        atomic_write_text(payload, out)
         print(f"wrote {out}")
     if not args.no_history:
         added = append_history(document, config.predict.history_path)
@@ -720,6 +789,51 @@ def _cmd_predict(config: Config, args: argparse.Namespace) -> int:
             f"appended {added} rows to {config.predict.history_path}",
             file=sys.stderr if args.out == "-" else sys.stdout,
         )
+    return 0
+
+
+def _cmd_publish(config: Config, args: argparse.Namespace) -> int:
+    from filelock import Timeout  # noqa: PLC0415
+
+    from grounded_weather_forecast.serve.predict import (  # noqa: PLC0415
+        NoForecastDataError,
+        UnsupportedMethodError,
+    )
+    from grounded_weather_forecast.serve.publish import (  # noqa: PLC0415
+        publish_document,
+        schedule_recovery,
+    )
+
+    try:
+        document = _forecast_document(
+            config,
+            method="auto",
+            semantics_flag=args.semantics,
+            now=None,
+        )
+        outcome = publish_document(
+            document,
+            Path(args.out),
+            config.predict.history_path,
+        )
+        scheduled = schedule_recovery(
+            config,
+            Path(args.config),
+            document,
+        )
+    except Timeout:
+        print(
+            "dataset publication is in progress; kept existing output", file=sys.stderr
+        )
+        return EXIT_CONTENTION
+    except (NoForecastDataError, UnsupportedMethodError, OSError, ValueError) as exc:
+        print(f"cannot publish: {exc}", file=sys.stderr)
+        return 1
+    print(f"publish: {outcome.action} -> {args.out}")
+    if outcome.history_rows:
+        print(f"appended {outcome.history_rows} rows to {config.predict.history_path}")
+    if scheduled:
+        print("scheduled detached recovery", file=sys.stderr)
     return 0
 
 
@@ -1207,6 +1321,89 @@ def _cmd_prune_scores(config: Config, args: argparse.Namespace) -> int:
     return 0
 
 
+def _run_pipeline_steps(
+    steps: tuple[tuple[str, Callable[[], int]], ...],
+) -> int:
+    for name, step in steps:
+        print(f"pipeline step: {name}")
+        result = step()
+        if result:
+            print(f"pipeline stopped: {name} exited {result}", file=sys.stderr)
+            return result
+    return 0
+
+
+def _cmd_maintain(config: Config, args: argparse.Namespace) -> int:
+    truth_args = argparse.Namespace(days=args.truth_qc_days)
+    return _run_pipeline_steps(
+        (
+            ("build-dataset", lambda: _cmd_build_dataset(config)),
+            ("backtest --source live", lambda: _cmd_backtest(config, args)),
+            ("report", lambda: _cmd_report(config)),
+            ("truth-qc", lambda: _cmd_truth_qc(config, truth_args)),
+        )
+    )
+
+
+def _recovery_backtest_args() -> argparse.Namespace:
+    return argparse.Namespace(
+        methods="all",
+        hourly_variables=HOURLY_DEFAULT_VARIABLES,
+        daily_variables=DAILY_DEFAULT_VARIABLES,
+        products="hourly,daily,minutely",
+        window="expanding",
+        source="live",
+        semantics="auto",
+    )
+
+
+def _recovery_needed(config: Config) -> bool:
+    """Re-run serving; valid selections can still yield no served release id."""
+    from grounded_weather_forecast.serve.predict import (  # noqa: PLC0415
+        NoForecastDataError,
+        UnsupportedMethodError,
+    )
+
+    try:
+        document = _forecast_document(
+            config,
+            method="auto",
+            semantics_flag="auto",
+            now=None,
+            lock_timeout=-1,
+        )
+    except (NoForecastDataError, UnsupportedMethodError, OSError, ValueError):
+        return True
+    return document.status == "degraded"
+
+
+def _cmd_recover(config: Config) -> int:
+    from filelock import FileLock, Timeout  # noqa: PLC0415
+
+    from grounded_weather_forecast.storage import pipeline_lock  # noqa: PLC0415
+
+    config.artifacts_dir.mkdir(parents=True, exist_ok=True)
+    try:
+        with (
+            FileLock(config.artifacts_dir / "auto-restore.lock", timeout=0),
+            pipeline_lock(config.dataset.dir, timeout=-1),
+        ):
+            if not _recovery_needed(config):
+                print("recovery no longer needed")
+                return 0
+            args = _recovery_backtest_args()
+            return _run_pipeline_steps(
+                (
+                    ("build-dataset", lambda: _cmd_build_dataset(config)),
+                    ("backtest --source live", lambda: _cmd_backtest(config, args)),
+                    ("report", lambda: _cmd_report(config)),
+                )
+            )
+    except Timeout:
+        print("another automatic recovery is already running", file=sys.stderr)
+        return EXIT_CONTENTION
+
+
 # Commands that mutate or bulk-read the scores directory and its artifacts.
 # `predict` is excluded: serving must never block behind an hour-long report.
 # `ingest-ensembles` is excluded: its store has its own sidecar lock and
@@ -1216,6 +1413,7 @@ _LOCKED_COMMANDS = frozenset(
     {
         "build-dataset",
         "backtest",
+        "maintain",
         "report",
         "alignment",
         "backfill",
@@ -1238,7 +1436,8 @@ def _dispatch(
     from grounded_weather_forecast.storage import pipeline_lock  # noqa: PLC0415
 
     try:
-        with pipeline_lock(config.dataset.dir):
+        timeout = -1 if args.command == "maintain" else None
+        with pipeline_lock(config.dataset.dir, timeout=timeout):
             return _run_command(config, args, parser)
     except Timeout:
         print(
@@ -1260,6 +1459,8 @@ def _run_command(
             return _cmd_build_dataset(config)
         case "backtest":
             return _cmd_backtest(config, args)
+        case "maintain":
+            return _cmd_maintain(config, args)
         case "report":
             return _cmd_report(config)
         case "alignment":
@@ -1272,6 +1473,10 @@ def _run_command(
             return _cmd_truth_qc(config, args)
         case "predict":
             return _cmd_predict(config, args)
+        case "publish":
+            return _cmd_publish(config, args)
+        case "recover":
+            return _cmd_recover(config)
         case "prune-scores":
             return _cmd_prune_scores(config, args)
         case _:  # pragma: no cover - argparse enforces the choices

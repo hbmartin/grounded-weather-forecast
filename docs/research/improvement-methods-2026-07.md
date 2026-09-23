@@ -275,8 +275,9 @@ Sequenced by data appetite:
    lasso-regularized for collinearity —
    [Uniejewski & Weron 2021](https://doi.org/10.1016/j.eneco.2021.105121)):
    pinball regression on provider points; GEFCom-winning pedigree; LightGBM
-   quantile mode with a monotone constraint on the blend feature is the
-   nonlinear variant. Always sort quantiles (monotone rearrangement).
+   point mode with an isolated-feature monotone constraint on the blend mean
+   is the nonlinear point-forecast variant. Always sort quantiles (monotone
+   rearrangement).
 5. **CRPS Learning as the unifying upgrade**
    ([Berrisch & Ziel 2023, J. Econometrics](https://arxiv.org/abs/2102.00968)):
    quantile-wise BOA with smoothing across levels — turns the *existing*

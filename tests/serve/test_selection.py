@@ -63,6 +63,12 @@ class TestSelectMethods:
         assert all(c.evaluation_id for c in selections.values())
         assert all(c.release_id for c in selections.values())
         assert list((config.artifacts_dir / "releases").glob("*.json"))
+        active = json.loads(
+            (config.artifacts_dir / "active_release.json").read_text(encoding="utf-8")
+        )
+        assert active["release_id"] in {
+            choice.release_id for choice in selections.values()
+        }
 
     def test_config_pin_overrides(self, tmp_path):
         config = scored_config(
@@ -96,6 +102,8 @@ class TestSelectMethods:
     def test_historical_issue_loads_release_that_already_existed(self, tmp_path):
         config = scored_config(tmp_path)
         promoted = select_methods(config, config.dataset.dir / "scores")
+        pointer = config.artifacts_dir / "active_release.json"
+        pointer.write_text('{"release_id": "do-not-move"}', encoding="utf-8")
         restored = select_methods(
             config,
             config.dataset.dir / "scores",
@@ -105,6 +113,9 @@ class TestSelectMethods:
         assert {choice.release_id for choice in restored.values()} == {
             choice.release_id for choice in promoted.values()
         }
+        assert json.loads(pointer.read_text(encoding="utf-8"))["release_id"] == (
+            "do-not-move"
+        )
 
     def test_new_targeted_evaluation_updates_only_its_slice(self, tmp_path):
         config = scored_config(tmp_path)

@@ -43,7 +43,11 @@ from filelock import Timeout
 from grounded_weather_forecast.config import Config
 from grounded_weather_forecast.dataset.providers import source_slug
 from grounded_weather_forecast.dataset.station import sqlite_uri
-from grounded_weather_forecast.evaluation import code_identity, config_fingerprint
+from grounded_weather_forecast.evaluation import (
+    active_release_path,
+    code_identity,
+    config_fingerprint,
+)
 from grounded_weather_forecast.reports import evidence
 
 _COLLECTOR_ERRORS = (OSError, ValueError, sqlite3.Error, pl.exceptions.PolarsError)
@@ -878,10 +882,10 @@ class PruneResult:
 
 
 def _protected_evaluations(config: Config, *, now: datetime) -> set[str]:
-    """Evaluation ids referenced by a release promoted within the horizon."""
+    """Evaluation ids referenced by the active or recent releases."""
     directory = config.artifacts_dir / "releases"
     horizon = now - timedelta(days=_PROTECT_RELEASE_DAYS)
-    protected: set[str] = set()
+    releases: list[tuple[str, datetime, set[str]]] = []
     for path in sorted(directory.glob("*.json")) if directory.exists() else []:
         try:
             release = json.loads(path.read_text(encoding="utf-8"))
@@ -890,8 +894,27 @@ def _protected_evaluations(config: Config, *, now: datetime) -> set[str]:
             continue
         if promoted_at.tzinfo is None:
             promoted_at = promoted_at.replace(tzinfo=UTC)
-        if promoted_at >= horizon:
-            protected |= {str(e) for e in release.get("evaluation_ids", [])}
+        release_id = str(release.get("release_id", path.stem))
+        evaluations = {str(e) for e in release.get("evaluation_ids", [])}
+        releases.append((release_id, promoted_at, evaluations))
+    if not releases:
+        return set()
+    active_id: str | None = None
+    try:
+        pointer = json.loads(
+            active_release_path(config.artifacts_dir).read_text(encoding="utf-8")
+        )
+        candidate = pointer.get("release_id")
+        if isinstance(candidate, str) and any(r[0] == candidate for r in releases):
+            active_id = candidate
+    except (OSError, ValueError, AttributeError):
+        pass
+    if active_id is None:
+        active_id = max(releases, key=lambda release: (release[1], release[0]))[0]
+    protected: set[str] = set()
+    for release_id, promoted_at, evaluations in releases:
+        if release_id == active_id or promoted_at >= horizon:
+            protected |= evaluations
     return protected
 
 
@@ -902,7 +925,8 @@ def prune_scores_files(
 
     Retention: the newest ``_KEEP_NEWEST_PER_GROUP`` files per
     (product, source_kind, window) group by mtime, plus anything referenced
-    by a release promoted in the last ``_PROTECT_RELEASE_DAYS`` days —
+    by the active release or a release promoted in the last
+    ``_PROTECT_RELEASE_DAYS`` days —
     serving never reads superseded scores files (selections carry their own
     mae/n and archived documents replay without them), so a week of rollback
     candidates is ample and the directory rolls at ~7 days of evaluations

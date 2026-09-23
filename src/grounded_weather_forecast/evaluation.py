@@ -9,6 +9,9 @@ from pathlib import Path
 from grounded_weather_forecast import __version__
 from grounded_weather_forecast.config import Config
 from grounded_weather_forecast.contracts import TruthSemantics
+from grounded_weather_forecast.storage import atomic_write_text, locked_path
+
+ACTIVE_RELEASE_FILE = "active_release.json"
 
 
 def dataset_fingerprint(config: Config) -> str:
@@ -41,6 +44,18 @@ def code_identity() -> str:
         digest.update(path.read_bytes())
         digest.update(b"\0")
     return f"{__version__}+{digest.hexdigest()[:12]}"
+
+
+def active_release_path(artifacts_dir: Path) -> Path:
+    """The mutable pointer to the release selected for current-time serving."""
+    return artifacts_dir / ACTIVE_RELEASE_FILE
+
+
+def activate_release(artifacts_dir: Path, release_id: str) -> Path:
+    """Atomically point current-time serving at an immutable release."""
+    path = active_release_path(artifacts_dir)
+    atomic_write_text(json.dumps({"release_id": release_id}, indent=2), path)
+    return path
 
 
 def _identity(payload: object) -> str:
@@ -155,7 +170,7 @@ class ModelRelease:
     def write(self, directory: Path) -> Path:
         directory.mkdir(parents=True, exist_ok=True)
         path = directory / f"{self.release_id}.json"
-        if path.exists():
-            return path
-        path.write_text(json.dumps(asdict(self), indent=2), encoding="utf-8")
+        with locked_path(path):
+            if not path.exists():
+                atomic_write_text(json.dumps(asdict(self), indent=2), path)
         return path

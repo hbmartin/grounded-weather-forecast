@@ -6,9 +6,11 @@ import sqlite3
 from datetime import timedelta
 
 import polars as pl
+import pytest
 from conftest import make_forecast_db, utc, write_config
 
 from grounded_weather_forecast.reports import operations
+from grounded_weather_forecast.evaluation import activate_release
 from grounded_weather_forecast.reports.evidence import (
     EVALUATIONS_LEDGER,
     PIPELINE_LEDGER,
@@ -527,6 +529,57 @@ class TestPruneScores:
         ]
         assert not (scores_dir / "scores_hourly_live_expanding_e2.parquet").exists()
         assert result.freed_mb > 0
+
+    def test_active_release_is_protected_without_an_age_limit(self, tmp_path):
+        config, scores_dir = self.seeded(tmp_path)
+        release = config.artifacts_dir / "releases" / "r1.json"
+        release.write_text(
+            json.dumps(
+                {
+                    "release_id": "r1",
+                    "promoted_at": (NOW - timedelta(days=30)).isoformat(),
+                    "evaluation_ids": ["e1"],
+                }
+            ),
+            encoding="utf-8",
+        )
+        activate_release(config.artifacts_dir, "r1")
+
+        operations.prune_scores_files(config, dry_run=False, now=NOW)
+
+        assert (scores_dir / "scores_hourly_live_expanding_e1.parquet").exists()
+
+    @pytest.mark.parametrize("pointer_payload", [None, "{broken"])
+    def test_missing_or_malformed_pointer_falls_back_to_newest_release(
+        self, tmp_path, pointer_payload
+    ):
+        config, scores_dir = self.seeded(tmp_path)
+        releases = config.artifacts_dir / "releases"
+        for path in releases.glob("*.json"):
+            path.unlink()
+        for release_id, age, evaluation_id in (
+            ("older", 30, "e1"),
+            ("newest", 20, "e2"),
+        ):
+            (releases / f"{release_id}.json").write_text(
+                json.dumps(
+                    {
+                        "release_id": release_id,
+                        "promoted_at": (NOW - timedelta(days=age)).isoformat(),
+                        "evaluation_ids": [evaluation_id],
+                    }
+                ),
+                encoding="utf-8",
+            )
+        if pointer_payload is not None:
+            (config.artifacts_dir / "active_release.json").write_text(
+                pointer_payload, encoding="utf-8"
+            )
+
+        operations.prune_scores_files(config, dry_run=False, now=NOW)
+
+        assert not (scores_dir / "scores_hourly_live_expanding_e1.parquet").exists()
+        assert (scores_dir / "scores_hourly_live_expanding_e2.parquet").exists()
 
 
 def pipeline_history(samples, days):

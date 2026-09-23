@@ -90,8 +90,21 @@ def quantile_blend_result(
     variable: VariableSpec | None,
 ) -> BlendResult:
     """Finalized quantiles served with their own median as the point."""
+    if quantiles.ndim != 2:
+        msg = "quantiles must be a two-dimensional matrix"
+        raise ValueError(msg)
+    level_values = np.asarray(levels, dtype=np.float64)
+    if (
+        not levels
+        or quantiles.shape[1] != len(levels)
+        or not np.isfinite(level_values).all()
+        or not (np.diff(level_values) > 0.0).all()
+    ):
+        msg = "quantile levels must be finite, strictly increasing, and match columns"
+        raise ValueError(msg)
     finalized = finalize_quantiles(quantiles, kind, variable)
-    median = finalized[:, len(levels) // 2]
+    median_position = int(np.argmin(np.abs(level_values - 0.5)))
+    median = finalized[:, median_position]
     return BlendResult(
         point=finalize_point(median, kind, variable),
         quantiles=finalized,

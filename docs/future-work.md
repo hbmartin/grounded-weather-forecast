@@ -121,13 +121,15 @@ PoP = 1.0, no provider above 0.3) is the preview.
     combination at archive maturity (McAlinn & West 2019,
     doi:10.1016/j.jeconom.2018.11.010; Jobst, Möller & Groß 2023,
     doi:10.1002/qj.4521). _Trigger: ~9–12 months live._
-17. **GBM containment, part two.** _Shipped 2026-08-08_: `blend_mean`
+17. **GBM isolated monotonicity.** _Shipped 2026-08-08_: `blend_mean`
     consensus feature with a `+1` monotone constraint (objective moved
     `regression_l1` → `huber`; LightGBM forbids monotone constraints under
     leaf-renewing objectives) and the `gbm_quantile` native-quantile
     variant (19 pinball boosters, unconstrained — same LightGBM
-    restriction applies to the quantile objective; containment there is the
-    fit-rows floor and board arbitration)._
+    restriction applies to the quantile objective). The constraint guarantees
+    only isolated partial dependence with all other features fixed; it does not
+    constrain the feasible path where raw sources and their derived consensus
+    change together._
 18. **Performance hygiene.** 2026-08-08 profiling (largest live fold,
     34,956 rows × 11 sources, all 34 hourly methods) rewrote this item's
     premise: the `ewma_grounding.py` loops were 1.5% of a fold and the EMOS

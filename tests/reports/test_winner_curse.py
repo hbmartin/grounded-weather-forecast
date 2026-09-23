@@ -13,6 +13,7 @@ from grounded_weather_forecast.reports.leaderboard import (
 )
 from grounded_weather_forecast.reports.winner_curse import (
     _slice_correction,
+    should_retain_incumbent,
     winner_curse_adjusted,
     winner_curse_verdicts,
 )
@@ -189,6 +190,23 @@ class TestWinnerCurseAdjusted:
         assert blocked_promotions(adjusted, 0.15).height == (
             blocked_promotions(winners, 0.15).height
         )
+
+
+def test_incumbent_retention_ignores_unrelated_sparse_method():
+    winner = curse_scores(n_times=20, k=1).with_columns(
+        pl.lit("winner").alias("method_id")
+    )
+    incumbent = winner.with_columns(pl.lit("incumbent").alias("method_id"))
+    pair = pl.concat([winner, incumbent])
+    row = winners_row(method_id="winner")
+    assert should_retain_incumbent(pair, row, "incumbent")
+
+    sparse = winner.head(1).with_columns(pl.lit("sparse").alias("method_id"))
+    assert should_retain_incumbent(
+        pl.concat([pair, sparse]),
+        row,
+        "incumbent",
+    )
 
 
 class TestWinnerCurseVerdicts:

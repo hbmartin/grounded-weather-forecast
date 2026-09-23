@@ -185,6 +185,11 @@ preserves isotonicity, so the average is still a valid IDR fit; the RNG is seede
 by $n$ for reproducibility. This smooths the step CDF that a single PAVA fit
 produces on a few hundred rows.
 
+`idr_bucket` keeps the standard `_MIN_FIT_ROWS = 100` floor. For
+`idr_bucket_dcp`, the chronological fit partition is subagged with the
+half-floor of 50 rows; the later calibration partition is untouched and is used
+only to compute the split-conformal PIT adjustment.
+
 The bucket→global fallback is a **cliff, not a blend** — unlike everywhere else
 in the codebase. Two step CDFs defined on different covariate grids have no
 principled linear interpolation, so `PerBucketFitter` is used in its

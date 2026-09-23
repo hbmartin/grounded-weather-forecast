@@ -8,9 +8,11 @@ order see [Advanced usage](../advanced-usage.md).
 grounded-weather-forecast [--config CONFIG] [--version] <command> [options]
 ```
 
-The entry point is `grounded_weather_forecast.cli:main`. Every invocation —
-successful or not — is appended to the **run ledger** (`data/runs.parquet`,
-pruned to 90 days / 50k rows), so `report` can tell you what actually ran.
+The entry point is `grounded_weather_forecast.cli:main`. Once a command has
+parsed and its configuration has loaded successfully, its outcome is appended
+to the **run ledger** (`data/runs.parquet`, pruned to 90 days / 50k rows), so
+`report` can tell you what actually ran. Help, `--version`, parse failures, and
+configuration failures occur before ledgering.
 
 ---
 
@@ -29,7 +31,7 @@ pruned to 90 days / 50k rows), so `report` can tell you what actually ran.
 | `0` | success |
 | `1` | command-level failure — missing inputs, no scores to report, a backfill error |
 | `2` | configuration error, or an unknown command |
-| `75` | another pipeline command holds the lock (EX_TEMPFAIL — retry later) |
+| `75` | pipeline, dataset-publication, or automatic-recovery lock contention (EX_TEMPFAIL — retry later) |
 
 Note that `truth-qc` returns `0` even when it finds no evaluable checks. A cold
 start is not a fault, and an operator's cron should not page on one.
@@ -37,13 +39,19 @@ start is not a fault, and an operator's cron should not page on one.
 ### Concurrency
 
 `build-dataset`, `backtest`, `report`, `alignment`, `backfill`, `truth-qc`, and
-`prune-scores` serialize on an exclusive lock at `<dataset dir>/pipeline.lock` —
-a second mutator waits up to 60 s, then exits `75` with a message instead of
-racing (prune deleting files a running report has already listed was the
-motivating incident). `predict` never takes the lock: serving must not wait
-behind an hour-long report, and its scores scans instead retry once when a file
-vanishes mid-read. `ingest-ensembles` keeps its own store-level lock and runs
-freely alongside the chain.
+`prune-scores` serialize on an exclusive lock at `<dataset dir>/pipeline.lock`.
+A second interactive mutator waits up to 60 s, then exits `75`. `maintain`
+instead waits indefinitely and holds that lock once across its entire four-step
+transaction. `recover` deduplicates itself on `auto-restore.lock`, waits for the
+pipeline lock, and rechecks whether work is still necessary before running.
+
+Dataset publication has a separate short `<dataset dir>/dataset.lock`.
+`build-dataset` stages every live parquet and the manifest, acquires that lock,
+replaces all parquets, then replaces the manifest last. `predict` and `publish`
+hold the same lock across selection and generation, waiting up to 60 s before
+exiting `75`, so serving sees one complete dataset publication. They do not wait
+behind an hour-long backtest or report. `ingest-ensembles` keeps its own
+store-level lock and runs freely alongside the chain.
 
 ---
 
@@ -62,7 +70,7 @@ flowchart LR
     D --> E[report]
     B --> F[truth-qc]
     F --> E
-    E --> G[predict]
+    E --> G[publish]
     E --> H[prune-scores]
 ```
 
@@ -100,8 +108,8 @@ constructs as-of snapshots, and writes the supervised matrices.
 |---|---|
 | `truth_minute.parquet`, `truth_hourly.parquet`, `truth_daily.parquet` | the aggregation ladder |
 | `forecasts_long.parquet`, `daily_long.parquet`, `minutely_long.parquet` | canonical long frames |
-| `hourly_matrix_{live,synthetic}.parquet` | the supervised hourly matrices |
-| `daily_matrix_{live,synthetic}.parquet` | the supervised daily matrices |
+| `hourly_matrix_live.parquet` | the supervised live hourly matrix |
+| `daily_matrix_live.parquet` | the supervised live daily matrix |
 | `manifest.json` | per-file SHA-256 and the **dataset fingerprint** |
 
 The build is byte-reproducible: stable sorts precede every pivot, so the same
@@ -110,6 +118,10 @@ staleness and what serving checks before trusting a release.
 
 Prints the fingerprint, source list, snapshot count, and per-file row counts with
 a 16-character hash.
+
+`build-dataset` does not write synthetic matrices. `backfill` writes
+`hourly_matrix_synthetic.parquet` and `daily_matrix_synthetic.parquet` from
+archive providers, keeping that provenance separate from live observations.
 
 ---
 
@@ -147,6 +159,27 @@ On live sources it then runs method selection and prints the promoted release id
 
 ---
 
+## `maintain`
+
+> run the scheduled live maintenance transaction under one pipeline lock
+
+| Flag | Choices / type | Default | Meaning |
+|---|---|---|---|
+| `--methods` | CSV or `all` | `all` | method ids passed to the live backtest |
+| `--hourly-variables` | CSV | same as `backtest` | hourly variables passed to the live backtest |
+| `--daily-variables` | CSV | same as `backtest` | daily variables passed to the live backtest |
+| `--products` | CSV of `hourly`,`daily`,`minutely` | `hourly,daily,minutely` | products passed to the live backtest |
+| `--window` | `expanding` \| `rolling` | `expanding` | training window passed to the live backtest |
+| `--semantics` | `auto` \| `inst` \| `mean` | `auto` | hourly truth semantics passed to the live backtest |
+| `--truth-qc-days` | int > 0 | `30` | neighbour history passed to the final truth-QC step |
+
+The source is always `live`. The command waits for `pipeline.lock`, then runs
+`build-dataset` → `backtest --source live` → `report` → `truth-qc` while holding
+that one lock. It stops immediately on the first nonzero result, so later steps
+never consume a failed predecessor's output.
+
+---
+
 ## `report`
 
 > render leaderboards and correlation reports from scores
@@ -165,7 +198,7 @@ scores served forecasts against realized truth, and detects drift.
 | `reports/correlation_{variable}.md` | provider error correlation and $k_{\text{eff}}$ |
 | `reports/pipeline_health.md`, `reports/selection_churn.md` | operations |
 | `reports/dashboard.html` | the nine-zone offline console |
-| `artifacts/eprocess/`, `artifacts/history/`, `artifacts/releases/` | evidence ledgers and promoted releases |
+| `artifacts/eprocess/`, `artifacts/history/` | evidence ledgers |
 
 `reports/dashboard.html` is fully self-contained — CSS, vendored Chart.js, and the
 data payload are inlined — so it opens from `file://` with no server. See
@@ -295,6 +328,45 @@ suppressed, and writes an observability snapshot to `artifacts/observability/`.
 
 ---
 
+## `publish`
+
+> generate an automatic forecast and safely manage the published document
+
+| Flag | Type | Default | Meaning |
+|---|---|---|---|
+| `--out` | path | *required* | published forecast JSON document |
+| `--semantics` | `auto` \| `inst` \| `mean` | `auto` | hourly truth semantics used when fitting |
+
+The command always uses automatic method selection. A ready candidate atomically
+replaces `--out` and that exact forecast is appended to serving history. If a
+candidate is degraded and `--out` already contains a parseable ready forecast,
+the existing bytes remain unchanged and the rejected candidate is not archived.
+On a cold start with no ready document, the degraded candidate is published and
+archived so downstream consumers still receive a valid forecast document.
+
+Every degraded candidate derives a recovery signature from its reason and the
+dataset, configuration, and code identities. `publish` starts a detached
+`recover` unless that unchanged signature was attempted during the previous six
+hours. A changed signature is immediately eligible. Recovery state and logs are
+written to `artifacts/auto-restore.json` and
+`artifacts/auto-restore.log`. Publication and hold-last-good return `0`; forecast
+generation, output, or recovery-process launch failures return nonzero.
+
+---
+
+## `recover`
+
+> restore live evidence after an automatically published degraded forecast
+
+No flags. Concurrent requests deduplicate on `artifacts/auto-restore.lock`.
+After acquiring it, `recover` waits for `pipeline.lock`, re-runs automatic
+selection, and exits successfully if serving is already ready. Otherwise it
+runs `build-dataset` → `backtest --source live` → `report`, stopping at the first
+nonzero result. The recheck avoids repeating expensive work after another
+maintenance or recovery process has already restored readiness.
+
+---
+
 ## `prune-scores`
 
 > delete superseded scores files
@@ -304,10 +376,11 @@ suppressed, and writes an observability snapshot to `artifacts/observability/`.
 | `--dry-run` | off | list what would be deleted without deleting anything |
 
 Retention: the **newest three files per group** (product × kind × window) are
-always kept, as are evaluations referenced by a release within the last
-**7 days**. Catalog rows survive deletion, so the history ledgers stay intact —
-only the bulky per-case scores are removed. Files the evaluations catalog has
-never seen are skipped, never deleted.
+always kept, as are evaluations referenced by the active release and releases
+within the last **7 days**. If an upgraded installation has no readable active
+pointer, the newest readable release is treated as active. Catalog rows survive
+deletion, so the history ledgers stay intact — only the bulky per-case scores are
+removed. Files the evaluations catalog has never seen are skipped, never deleted.
 
 Always run `--dry-run` first. Deleting an evaluation still referenced by a live
 release would leave serving unable to justify what it is doing.

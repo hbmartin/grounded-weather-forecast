@@ -269,6 +269,17 @@ class TestErrors:
         assert cfg.promotion.mcs_block_length == 0
         assert dict(cfg.promotion.references) == {}
 
+    @pytest.mark.parametrize("alpha", [0.0, 1.0])
+    def test_promotion_alpha_endpoints_rejected(self, tmp_path, alpha):
+        text = MINIMAL + f"\n[promotion]\nalpha = {alpha}\n"
+        with pytest.raises(ConfigError, match="strictly between 0 and 1"):
+            load_config(write(tmp_path, text))
+
+    @pytest.mark.parametrize("alpha", [0.001, 0.5, 0.999])
+    def test_promotion_alpha_interior_values_accepted(self, tmp_path, alpha):
+        text = MINIMAL + f"\n[promotion]\nalpha = {alpha}\n"
+        assert load_config(write(tmp_path, text)).promotion.alpha == alpha
+
     def test_seq_mcs_rule_accepted(self, tmp_path):
         text = MINIMAL + '\n[promotion]\nrule = "seq_mcs"\n'
         cfg = load_config(write(tmp_path, text))

@@ -10,12 +10,23 @@
   <string>com.grounded-weather-forecast.maintain</string>
   <key>ProgramArguments</key>
   <array>
-    <string>/bin/sh</string>
-    <string>-lc</string>
-    <string>cd __REPO__ &amp;&amp; grounded-weather-forecast build-dataset &amp;&amp; grounded-weather-forecast backtest --source live &amp;&amp; grounded-weather-forecast report &amp;&amp; grounded-weather-forecast truth-qc</string>
+    <string>__LAUNCHER__</string>
+    <string>maintain</string>
+    <string>__REPO__</string>
+    <string>__UV__</string>
+    <string>--directory</string>
+    <string>__REPO__</string>
+    <string>run</string>
+    <string>--locked</string>
+    <string>--project</string>
+    <string>__REPO__</string>
+    <string>grounded-weather-forecast</string>
+    <string>maintain</string>
   </array>
   <key>EnvironmentVariables</key>
   <dict>
+    <key>PATH</key>
+    <string>/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
     <key>SYNOPTIC_TOKEN</key>
     <string>__SYNOPTIC_TOKEN__</string>
   </dict>
@@ -30,7 +41,5 @@
   <string>__LOG_DIR__/maintain.log</string>
   <key>StandardErrorPath</key>
   <string>__LOG_DIR__/maintain.log</string>
-  <key>RunAtLoad</key>
-  <false/>
 </dict>
 </plist>

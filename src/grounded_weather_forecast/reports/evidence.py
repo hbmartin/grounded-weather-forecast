@@ -1006,43 +1006,115 @@ _NBM_VERDICT_NAMES = (
 )
 
 
-def nbm_benchmark_verdicts(board: pl.DataFrame) -> dict[str, float]:
-    """Best-non-NBM-vs-NBM scalars from one leaderboard.
+def _paired_nbm_rows(scores: pl.DataFrame, board: pl.DataFrame) -> pl.DataFrame:
+    """Best non-NBM pair per slice, measured only where that pair both scored."""
+    from grounded_weather_forecast.reports.leaderboard import (  # noqa: PLC0415
+        _with_default_semantics,
+        eligible_board_rows,
+    )
+    from grounded_weather_forecast.reports.mcs import (  # noqa: PLC0415
+        collapsed_loss_frame,
+    )
 
-    n-weighted over slices where ``provider_nbm`` is scored alongside at
-    least one other method; the comparison value is the per-slice best over
-    every OTHER method — usually a blend, but a raw baseline can hold it,
-    which is why the printed label says "best non-nbm" rather than "blend".
-    Weighted by the NBM slice n so the comparison lives where NBM has data.
-    """
-    required = {"method_id", "variable", "truth_semantics", "lead_bucket", "mae", "n"}
-    if board.is_empty() or not required <= set(board.columns):
+    normalized = _with_default_semantics(scores)
+    keys = ("variable", "truth_semantics", "lead_bucket")
+    rows: list[dict[str, object]] = []
+    for variable, semantics, lead_bucket in board.select(keys).unique().iter_rows():
+        slice_board = eligible_board_rows(
+            board.filter(
+                (pl.col("variable") == variable)
+                & (pl.col("truth_semantics") == semantics)
+                & (pl.col("lead_bucket") == lead_bucket)
+            ).drop_nulls(["mae", "n"])
+        )
+        if NBM_BENCHMARK_METHOD not in set(slice_board["method_id"].to_list()):
+            continue
+        methods = sorted(
+            str(method)
+            for method in slice_board["method_id"].unique().to_list()
+            if method != NBM_BENCHMARK_METHOD
+        )
+        slice_scores = normalized.filter(
+            (pl.col("variable") == variable)
+            & (pl.col("semantics") == semantics)
+            & (pl.col("lead_bucket") == lead_bucket)
+        )
+        best: tuple[float, str, float, int] | None = None
+        for method in methods:
+            built = collapsed_loss_frame(
+                slice_scores,
+                method_ids=(NBM_BENCHMARK_METHOD, method),
+            )
+            if built is None:
+                continue
+            paired, _ = built
+            contender = (
+                float(cast("float", paired[method].mean())),
+                method,
+                float(cast("float", paired[NBM_BENCHMARK_METHOD].mean())),
+                paired.height,
+            )
+            if best is None or contender[:2] < best[:2]:
+                best = contender
+        if best is not None:
+            blend_mae, _, nbm_mae, common_n = best
+            rows.append(
+                {
+                    "blend_mae": blend_mae,
+                    "nbm_mae": nbm_mae,
+                    "common_n": common_n,
+                }
+            )
+    return pl.DataFrame(rows) if rows else pl.DataFrame()
+
+
+def nbm_benchmark_verdicts(
+    scores: pl.DataFrame, board: pl.DataFrame
+) -> dict[str, float]:
+    """Best-non-NBM-vs-NBM scalars on pairwise-common cases."""
+    required = {
+        "method_id",
+        "variable",
+        "truth_semantics",
+        "lead_bucket",
+        "mae",
+        "n",
+        "coverage",
+        "n_valid_times",
+    }
+    score_required = {
+        "method_id",
+        "variable",
+        "semantics",
+        "lead_bucket",
+        "issue_time",
+        "valid_time",
+        "y_pred",
+        "y_true",
+    }
+    if (
+        board.is_empty()
+        or scores.is_empty()
+        or not required <= set(board.columns)
+        or not score_required <= set(scores.columns)
+    ):
         return {}
-    keys = ["variable", "truth_semantics", "lead_bucket"]
-    nbm = (
-        board.filter(pl.col("method_id") == NBM_BENCHMARK_METHOD)
-        .drop_nulls(["mae", "n"])
-        .group_by(keys)
-        .agg(pl.col("mae").min().alias("nbm_mae"), pl.col("n").max().alias("nbm_n"))
-    )
-    others = (
-        board.filter(pl.col("method_id") != NBM_BENCHMARK_METHOD)
-        .drop_nulls(["mae", "n"])
-        .group_by(keys)
-        .agg(pl.col("mae").min().alias("blend_mae"))
-    )
-    paired = nbm.join(others, on=keys, how="inner").filter(pl.col("nbm_n") > 0)
+    paired = _paired_nbm_rows(scores, board)
     if paired.is_empty():
         return {}
-    total = float(cast("float", paired["nbm_n"].sum()))
+    paired = paired.filter(pl.col("common_n") > 0)
+    if paired.is_empty():
+        return {}
+    total = float(cast("float", paired["common_n"].sum()))
     if total <= 0.0:
         return {}
     return {
         "nbm_benchmark_nbm_mae": (
-            float(cast("float", (paired["nbm_mae"] * paired["nbm_n"]).sum())) / total
+            float(cast("float", (paired["nbm_mae"] * paired["common_n"]).sum())) / total
         ),
         "nbm_benchmark_blend_mae": (
-            float(cast("float", (paired["blend_mae"] * paired["nbm_n"]).sum())) / total
+            float(cast("float", (paired["blend_mae"] * paired["common_n"]).sum()))
+            / total
         ),
         "nbm_benchmark_slices": float(paired.height),
     }
@@ -1059,7 +1131,13 @@ def record_nbm_benchmark(
     """Blend-vs-NBM scalars into the verdicts ledger."""
     try:
         moment = now or datetime.now(tz=UTC)
-        _append_verdicts(config, product, scores, nbm_benchmark_verdicts(board), moment)
+        _append_verdicts(
+            config,
+            product,
+            scores,
+            nbm_benchmark_verdicts(scores, board),
+            moment,
+        )
     except _RECORDER_ERRORS:
         return
 

@@ -36,8 +36,9 @@ from grounded_weather_forecast.contracts import (
 
 _PARAMS: dict[str, Any] = {
     # huber, not regression_l1: LightGBM forbids monotone_constraints under
-    # leaf-renewing objectives (l1, quantile), and the blend-mean constraint
-    # is the point of the containment. Huber keeps l1's outlier robustness.
+    # leaf-renewing objectives (l1, quantile). Huber keeps l1's outlier
+    # robustness while allowing isolated blend-mean partial dependence to be
+    # constrained.
     "objective": "huber",
     "learning_rate": 0.05,
     "num_leaves": 31,
@@ -88,15 +89,15 @@ def build_features(x: ForecastMatrix) -> tuple[FloatArray, list[str]]:
     names.append("source_spread")
     columns.append(x.availability.sum(axis=1).astype(np.float64)[:, np.newaxis])
     names.append("n_available")
-    # The equal-weight consensus, appended so the booster can be monotone-
-    # constrained on it: a higher blend must never lower the prediction.
+    # The equal-weight consensus, appended so its isolated partial dependence
+    # is monotone when every other feature is held fixed.
     columns.append(masked_average(x.values, x.availability)[:, np.newaxis])
     names.append("blend_mean")
     return np.column_stack(columns), names
 
 
 def _monotone_constraints(feature_names: list[str]) -> list[int]:
-    """+1 on the blend consensus, unconstrained elsewhere.
+    """+1 on isolated blend consensus changes, unconstrained elsewhere.
 
     Built from the fitted feature order, never hard-coded — predict()
     realigns columns by name when the schema drifts.
@@ -234,12 +235,11 @@ class GbmStacker:
 class GbmQuantile(GbmStacker):
     """Native quantile head: one pinball-loss booster per level.
 
-    The containment counterpart to ``gbm``: instead of a point that gets
-    residual-dressed at serve time, every level is learned directly (with the
-    same blend-mean monotone constraint), so the leaderboard scores its
-    CRPS/pinball columns and arbitrates whether it is ever trusted. Boosters
-    at neighboring levels can cross in finite samples; ``finalize_quantiles``
-    sorts each row's grid.
+    Instead of a point that gets residual-dressed at serve time, every level is
+    learned directly and without a monotone constraint, so the leaderboard
+    scores its CRPS/pinball columns and arbitrates whether it is ever trusted.
+    Boosters at neighboring levels can cross in finite samples;
+    ``finalize_quantiles`` sorts each row's grid.
     """
 
     method_id: str = "gbm_quantile"
@@ -259,9 +259,8 @@ class GbmQuantile(GbmStacker):
                 features, label=train.y, feature_name=self._feature_names
             )
             # No monotone constraint here: LightGBM forbids it under the
-            # quantile objective (leaf-renewing). Containment for this head
-            # is the fit-rows floor, the sorted grid, and the leaderboard's
-            # CRPS/pinball columns.
+            # quantile objective (leaf-renewing). The fit-rows floor, sorted
+            # grid, and leaderboard arbitration remain the safeguards.
             params = {**_PARAMS, "objective": "quantile", "alpha": level}
             self._level_boosters.append(
                 lightgbm.train(params, dataset, num_boost_round=_QUANTILE_ROUNDS)
@@ -322,13 +321,19 @@ class GbmQuantile(GbmStacker):
         stacker._kind = TargetKind(state["kind"])
         stacker._variable = _variable_spec(state.get("variable"))
         stacker._feature_names = list(state["feature_names"])
-        stacker._level_boosters = [
-            lightgbm.Booster(model_str=model) for model in state["models"]
-        ]
         persisted = state.get("quantile_levels")
         stacker._levels = (
-            tuple(float(level) for level in persisted) if persisted else QUANTILE_LEVELS
+            QUANTILE_LEVELS
+            if persisted is None
+            else tuple(float(level) for level in persisted)
         )
+        models = list(state["models"])
+        if len(models) != len(stacker._levels):
+            msg = "persisted GBM quantile booster count does not match its level grid"
+            raise ValueError(msg)
+        stacker._level_boosters = [
+            lightgbm.Booster(model_str=model) for model in models
+        ]
         stacker._fit_status = "fit"
         return stacker
 

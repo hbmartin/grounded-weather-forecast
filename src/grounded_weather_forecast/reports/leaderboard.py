@@ -276,6 +276,11 @@ def leaderboard(
 ) -> pl.DataFrame:
     """Per (product, variable, lead bucket, method): every reported view."""
     scores = _with_default_semantics(scores)
+    # A row without finite truth is not a score case for any method. Current
+    # runners drop these rows at the source, but historical persisted frames
+    # may still contain them; exclude them before defining n_total/coverage or
+    # computing any deterministic, probabilistic, or pairwise metric.
+    scores = scores.filter(pl.col("y_true").is_finite())
     if "lead_bucket" in scores.columns:
         # Historical score files may carry rows past the last bucket edge
         # (14-16-day provider dailies before the matrix-level filter landed);

@@ -78,18 +78,23 @@ That works on day one. Everything else needs an archive with some history — se
 | `qc` | summarize station truth quality control | — |
 | `build-dataset` | materialize truth tables and supervised matrices as parquet | — |
 | `backtest` | rolling-origin backtest over the supervised matrices | `--methods` `--hourly-variables` `--daily-variables` `--products` `--window` `--source` `--semantics` |
+| `maintain` | run one locked live build → backtest → report → truth-QC transaction | `--methods` `--hourly-variables` `--daily-variables` `--products` `--window` `--semantics` `--truth-qc-days` |
 | `report` | leaderboards, correlation reports, evidence ledgers, and `reports/dashboard.html` | — |
 | `alignment` | study truth semantics per provider; write the alignment artifact | — |
 | `backfill` | fetch archived forecasts into the synthetic supervised matrix | `--provider` `--models` `--start` `--end` `--chunk-days` |
 | `truth-qc` | cross-check truth against lapse-adjusted neighbors; fit the radiation-shield model | `--days` |
 | `ingest-ensembles` | poll the Open-Meteo Ensemble API for per-model spread features | `--models` |
 | `predict` | emit the current blended forecast as JSON | `--out` `--method` `--no-history` `--semantics` `--now` |
+| `publish` | safely publish an automatic forecast, holding the last ready document during degradation | `--out` `--semantics` |
+| `recover` | recheck degradation, then rebuild live evidence and reports when recovery is still needed | — |
 | `prune-scores` | delete superseded scores files | `--dry-run` |
 
 Global: `--config PATH` (default `config.toml`), `--version`. Exit codes: `0` ok,
-`1` command failure, `2` config error, `75` another pipeline command holds the
-lock (retry later). All commands except `predict` and `ingest-ensembles`
-serialize on `<dataset dir>/pipeline.lock`.
+`1` command failure, `2` config error, `75` lock contention (retry later).
+Pipeline mutators serialize on `<dataset dir>/pipeline.lock`;
+scheduled `maintain` waits for it and holds it across the whole transaction.
+`predict` and `publish` instead take the short `<dataset dir>/dataset.lock`
+while selecting and generating a forecast.
 
 **Full semantics for every flag — defaults, choices, what each command reads and
 writes — are in the
@@ -101,8 +106,8 @@ and the emitted document is specified in
 
 ### Running it for real
 
-Steady state is four crons — poll, ingest ensembles, predict, and a nightly
-`build-dataset && backtest && report && truth-qc` chain. Cadence rationale and
+Steady state is four crons — poll, ingest ensembles, `publish`, and nightly
+`maintain`. Cadence rationale and
 launchd templates are in
 [Scheduling](https://hbmartin.github.io/grounded-weather-forecast/scheduling/).
 
