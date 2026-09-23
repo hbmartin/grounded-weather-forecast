@@ -76,7 +76,11 @@ backtesting or serving methods that consume ensemble features.
   timer and service state; `START` followed by a mount error means the volume
   was absent; `MOUNT_OK` followed by a `uv` error means the volume was present
   but project access or environment setup failed. Application output follows
-  `INVOKE`; use `launchctl print` for the final exit status.
+  `INVOKE`; use `launchctl print` for the final exit status. If `INVOKE` appears
+  but `uv` produces no output, check for a pending macOS Removable Volumes
+  permission prompt. A Homebrew `uv` update can require a new grant; while the
+  prompt is unanswered, the one-shot job remains running and can miss its next
+  calendar firing.
 - A degraded `publish` candidate and `maintain` finding no folds are **normal**
   early states. The candidate names its cause in `status_reason`; `publish`
   preserves an existing parseable ready document byte-for-byte, or publishes
