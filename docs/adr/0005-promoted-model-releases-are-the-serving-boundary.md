@@ -49,5 +49,7 @@ reconstructed with future data.
   per-slice method, so a release is a function of (evidence, config, code, previous
   release) — path-dependent by design. Retention is a fixed point under fixed evidence
   (a re-run with the retained release as the previous one re-derives the same
-  selections and hashes to the same id), so independent same-evidence runs still
-  converge, and two different serving decisions can never share a release id.
+  selections and hashes to the same id) **within one release history**. Different
+  prior incumbents can settle on different path-dependent fixed points under the
+  same near-tie evidence. Two different serving decisions still cannot share a
+  release id.

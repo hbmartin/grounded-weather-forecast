@@ -1,12 +1,36 @@
 import json
 from concurrent.futures import ThreadPoolExecutor
 from concurrent.futures import TimeoutError as FutureTimeoutError
+from dataclasses import replace
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from threading import Barrier, Event
 
 import pytest
 
 from grounded_weather_forecast.artifacts import ArtifactError, ArtifactStore
+from grounded_weather_forecast.evaluation import ModelRelease
+
+
+def test_model_release_document_is_immutable(tmp_path):
+    release = ModelRelease.create(
+        dataset="dataset",
+        configuration="config",
+        evaluation_ids=("evaluation",),
+        evaluation_contexts=(),
+        training_cutoff=None,
+        selections={"hourly.temp_c.0-1h": {"method_id": "equal_weight"}},
+        promoted_at=datetime(2026, 8, 1, tzinfo=UTC),
+    )
+    path = release.write(tmp_path / "releases")
+    original = path.read_bytes()
+
+    replace(
+        release,
+        promoted_at=(datetime(2026, 8, 1, tzinfo=UTC) + timedelta(days=1)).isoformat(),
+    ).write(tmp_path / "releases")
+
+    assert path.read_bytes() == original
 
 
 class TestArtifactStore:

@@ -135,7 +135,12 @@ def _grid_positions(state: IdrState, points: FloatArray) -> np.ndarray:
     )
 
 
-def subagged_idr_state(x: FloatArray, y: FloatArray) -> IdrState | None:
+def subagged_idr_state(
+    x: FloatArray,
+    y: FloatArray,
+    *,
+    min_rows: int = _MIN_FIT_ROWS,
+) -> IdrState | None:
     """Per-bucket IDR with subsample aggregation (JRSS-B scheme).
 
     Halves without replacement, CDFs averaged on the full sample's covariate
@@ -144,14 +149,15 @@ def subagged_idr_state(x: FloatArray, y: FloatArray) -> IdrState | None:
     the sample size so refits on identical data are identical (backtest
     reproducibility; no wall-clock or global randomness).
     """
-    full = fit_idr_state(x, y)
+    full = fit_idr_state(x, y, min_rows=min_rows)
     if full is None:
         return None
     scored = np.isfinite(x) & np.isfinite(y)
     x_finite, y_finite = x[scored], y[scored]
     n = x_finite.shape[0]
     half = n // 2
-    if half < _MIN_FIT_ROWS // 2:
+    subsample_min_rows = max(1, min_rows // 2)
+    if half < subsample_min_rows:
         return full
     rng = np.random.default_rng(n)
     accumulated = np.zeros_like(full.cdf_stack)
@@ -162,7 +168,7 @@ def subagged_idr_state(x: FloatArray, y: FloatArray) -> IdrState | None:
             x_finite[chosen],
             y_finite[chosen],
             thresholds=full.thresholds,
-            min_rows=_MIN_FIT_ROWS // 2,
+            min_rows=subsample_min_rows,
         )
         if state is None:
             continue
@@ -431,7 +437,11 @@ class IdrBucketDcp(_BucketedIdr):
         if split < _MIN_FIT_ROWS // 2:
             return None
         fit_rows, calibration_rows = rows[:split], rows[split:]
-        state = fit_idr_state(x[fit_rows], y[fit_rows], min_rows=_MIN_FIT_ROWS // 2)
+        state = subagged_idr_state(
+            x[fit_rows],
+            y[fit_rows],
+            min_rows=_MIN_FIT_ROWS // 2,
+        )
         if state is None:
             return None
         finite = np.isfinite(x[calibration_rows]) & np.isfinite(y[calibration_rows])

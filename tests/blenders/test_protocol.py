@@ -2,9 +2,13 @@ from datetime import timedelta
 
 import numpy as np
 import polars as pl
+import pytest
 
 from grounded_weather_forecast.blenders import available_methods, get_factory
-from grounded_weather_forecast.blenders.protocol import finalize_point
+from grounded_weather_forecast.blenders.protocol import (
+    finalize_point,
+    quantile_blend_result,
+)
 from grounded_weather_forecast.blenders.registry import supports_product
 from grounded_weather_forecast.contracts import (
     ForecastMatrix,
@@ -48,6 +52,45 @@ class TestFinalizePoint:
     def test_unbounded_variable_passes_through(self):
         point = finalize_point(np.array([-40.0]), TargetKind.CONTINUOUS, TEMP)
         assert point[0] == -40.0
+
+
+class TestQuantileBlendResult:
+    def test_even_asymmetric_grid_uses_the_actual_median_level(self):
+        result = quantile_blend_result(
+            np.asarray([[1.0, 5.0, 8.0, 9.0]]),
+            (0.1, 0.5, 0.8, 0.9),
+            TargetKind.CONTINUOUS,
+            TEMP,
+        )
+        assert result.point.tolist() == [5.0]
+
+    def test_nearest_level_is_used_when_exact_median_is_absent(self):
+        result = quantile_blend_result(
+            np.asarray([[1.0, 4.0, 9.0]]),
+            (0.1, 0.4, 0.9),
+            TargetKind.CONTINUOUS,
+            TEMP,
+        )
+        assert result.point.tolist() == [4.0]
+
+    @pytest.mark.parametrize(
+        ("quantiles", "levels"),
+        [
+            (np.asarray([[1.0, 2.0]]), (0.1,)),
+            (np.asarray([[1.0, 2.0]]), (0.5, 0.5)),
+            (np.asarray([[1.0, 2.0]]), (0.9, 0.1)),
+            (np.asarray([[1.0]]), (float("nan"),)),
+            (np.asarray([1.0]), (0.5,)),
+        ],
+    )
+    def test_invalid_grid_is_rejected(self, quantiles, levels):
+        with pytest.raises(ValueError, match="quantile"):
+            quantile_blend_result(
+                quantiles,
+                levels,
+                TargetKind.CONTINUOUS,
+                TEMP,
+            )
 
 
 def make_wind_slice(n=600):

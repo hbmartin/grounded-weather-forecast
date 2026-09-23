@@ -167,7 +167,7 @@ sources — the same `masked_average` that `equal_weight` serves.
 | Parameter | Value | Why |
 |---|---|---|
 | `objective` | `huber` | LightGBM forbids `monotone_constraints` under leaf-renewing objectives (`regression_l1`, `quantile`); huber keeps L1's outlier robustness while admitting the constraint |
-| `monotone_constraints` | `+1` on `blend_mean`, `0` elsewhere (`monotone_constraints_method="advanced"`) | a higher consensus must never lower the prediction — the booster corrects the blend, it cannot invert it |
+| `monotone_constraints` | `+1` on `blend_mean`, `0` elsewhere (`monotone_constraints_method="advanced"`) | guarantees non-decreasing isolated partial dependence when `blend_mean` changes and every other feature is fixed |
 | `_NUM_ROUNDS` | 300 | |
 | `learning_rate` | 0.05 | |
 | `num_leaves` | 31 | |
@@ -182,14 +182,19 @@ provider bad only on winter mornings) that no per-bucket affine model can. It is
 the ceiling of the method set, and the `min_fit_rows = 500` abstention is what
 keeps it from being the ceiling of the *overfitting* too.
 
+The constraint is deliberately only a partial-dependence statement.
+`blend_mean` is derived from the raw source features, which remain
+unconstrained; changing a source changes both inputs and may move the fitted
+prediction in either direction.
+
 **`gbm_quantile`** trains one pinball-loss booster per level of the standard
 19-level grid (`_QUANTILE_ROUNDS = 150` each; the finalized median is the
 point), so its cells carry *native* quantiles instead of serve-time residual
 dressing and the leaderboard scores its CRPS/pinball/coverage columns directly.
 The quantile objective cannot carry the monotone constraint (same LightGBM
-restriction), so this head's containment is the shared `min_fit_rows` floor,
-per-row sorting of the level grid, and board arbitration. Boosters at adjacent
-levels can cross in finite samples; `finalize_quantiles` sorts each row.
+restriction). Its safeguards are the shared `min_fit_rows` floor, per-row
+sorting of the level grid, and board arbitration. Boosters at adjacent levels
+can cross in finite samples; `finalize_quantiles` sorts each row.
 
 ---
 

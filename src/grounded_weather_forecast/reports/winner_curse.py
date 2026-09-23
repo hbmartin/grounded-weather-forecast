@@ -339,12 +339,15 @@ def should_retain_incumbent(
         slice_scores = slice_scores.filter(
             pl.col("semantics") == winner_row["truth_semantics"]
         )
-    collapsed = collapsed_loss_matrix(slice_scores)
+    served = str(winner_row["method_id"])
+    collapsed = collapsed_loss_matrix(
+        slice_scores,
+        method_ids=(served, incumbent_method),
+    )
     if collapsed is None:
         return False
     losses, method_ids = collapsed
     n_times, n_methods = losses.shape
-    served = str(winner_row["method_id"])
     if (
         n_times < _MIN_TIMES
         or n_methods < 2

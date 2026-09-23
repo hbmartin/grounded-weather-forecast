@@ -394,6 +394,14 @@ def _fraction(value: Any, key: str, context: str) -> float:
     return number
 
 
+def _open_fraction(value: Any, key: str, context: str) -> float:
+    number = _finite_number(value, key, context)
+    if not 0.0 < number < 1.0:
+        msg = f"{key!r} in [{context}] must be strictly between 0 and 1"
+        raise ConfigError(msg)
+    return number
+
+
 def _str_map(value: Any, key: str, context: str) -> dict[str, str]:
     match value:
         case dict() as mapping if all(
@@ -750,7 +758,7 @@ def _promotion(raw: Mapping[str, Any]) -> PromotionConfig:
     )
     return PromotionConfig(
         rule=rule,
-        alpha=_fraction(section.get("alpha", 0.1), "alpha", "promotion"),
+        alpha=_open_fraction(section.get("alpha", 0.1), "alpha", "promotion"),
         live_gap_factor=_positive_number(
             section.get("live_gap_factor", 1.5), "live_gap_factor", "promotion"
         ),

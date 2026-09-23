@@ -3,23 +3,38 @@
   "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
-  <!-- Serve + self-verify: each run appends to the forecast history that the
-       verification loop later scores against arriving truth. -->
+  <!-- Safely publish + self-verify: ready forecasts replace the document and
+       enter history; degradation holds the last ready document and triggers
+       bounded automatic recovery. -->
   <key>Label</key>
   <string>com.grounded-weather-forecast.predict</string>
   <key>ProgramArguments</key>
   <array>
-    <string>/bin/sh</string>
-    <string>-lc</string>
-    <string>cd __REPO__ &amp;&amp; grounded-weather-forecast predict --out __OUT_JSON__</string>
+    <string>__LAUNCHER__</string>
+    <string>publish</string>
+    <string>__REPO__</string>
+    <string>__UV__</string>
+    <string>--directory</string>
+    <string>__REPO__</string>
+    <string>run</string>
+    <string>--locked</string>
+    <string>--project</string>
+    <string>__REPO__</string>
+    <string>grounded-weather-forecast</string>
+    <string>publish</string>
+    <string>--out</string>
+    <string>__OUT_JSON__</string>
   </array>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>PATH</key>
+    <string>/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+  </dict>
   <key>StartInterval</key>
   <integer>600</integer>
   <key>StandardOutPath</key>
   <string>__LOG_DIR__/predict.log</string>
   <key>StandardErrorPath</key>
   <string>__LOG_DIR__/predict.log</string>
-  <key>RunAtLoad</key>
-  <true/>
 </dict>
 </plist>

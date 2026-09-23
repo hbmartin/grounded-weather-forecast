@@ -1,0 +1,48 @@
+#!/bin/zsh
+
+# Install this file on the internal disk. The project may live on an external
+# volume, so launchd must be able to start the launcher before that volume is
+# available. The remaining arguments are an executable and its exact argv.
+set -u
+
+timestamp() {
+  /bin/date '+%Y-%m-%dT%H:%M:%S%z'
+}
+
+fail() {
+  local code="$1"
+  shift
+  print -u2 -- "$(timestamp) ERROR mode=${mode:-unknown}: $*"
+  exit "$code"
+}
+
+mode="${1:-}"
+project="${2:-}"
+if (( $# < 3 )); then
+  fail 64 'usage: launch-grounded MODE ABSOLUTE_PROJECT COMMAND [ARG ...]'
+fi
+shift 2
+
+case "$mode" in
+  maintain|predict|publish) ;;
+  *) fail 64 "unsupported mode: $mode" ;;
+esac
+
+[[ "$project" = /* ]] || fail 64 "project path must be absolute: $project"
+[[ "$1" = /* ]] || fail 64 "command path must be absolute: $1"
+
+print -- "$(timestamp) START mode=$mode pid=$$ ppid=$PPID cwd=$PWD project=$project command=$1"
+
+# Read the mount table, rather than probing the project with this shell: macOS
+# may grant access to uv while denying it to a shell launched by launchd.
+if [[ "$project" = /Volumes/* ]]; then
+  volume_name="${project#/Volumes/}"
+  volume="/Volumes/${volume_name%%/*}"
+  /sbin/mount | /usr/bin/grep -Fq " on $volume (" ||
+    fail 75 "required volume is not mounted: $volume"
+  print -- "$(timestamp) MOUNT_OK mode=$mode volume=$volume"
+fi
+
+[[ -x "$1" ]] || fail 75 "command missing or not executable: $1"
+print -- "$(timestamp) INVOKE mode=$mode command=$1"
+exec "$@"

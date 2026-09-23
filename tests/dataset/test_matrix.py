@@ -1,4 +1,8 @@
+import json
+import threading
+from contextlib import contextmanager
 from datetime import timedelta
+from pathlib import Path
 
 import polars as pl
 import pytest
@@ -38,6 +42,8 @@ from grounded_weather_forecast.dataset.providers import (
     read_hourly_long,
     read_run_completions,
 )
+from grounded_weather_forecast.storage import dataset_lock
+import grounded_weather_forecast.dataset.matrix as matrix_module
 from grounded_weather_forecast.dataset.snapshots import snapshot_times
 from grounded_weather_forecast.dataset.truth import truth_daily, truth_hourly
 
@@ -395,6 +401,160 @@ class TestWriteDataset:
         first = write_dataset(config)
         second = write_dataset(config)
         assert first.fingerprint == second.fingerprint
+
+
+class TestDatasetPublication:
+    def test_reader_sees_old_or_complete_new_generation(self, tmp_path, monkeypatch):
+        first_path = tmp_path / "first.parquet"
+        second_path = tmp_path / "second.parquet"
+        manifest_path = tmp_path / "manifest.json"
+        pl.DataFrame({"generation": [0]}).write_parquet(first_path)
+        pl.DataFrame({"generation": [0]}).write_parquet(second_path)
+        manifest_path.write_text('{"fingerprint": "old"}', encoding="utf-8")
+        attempted = threading.Event()
+        real_lock = matrix_module.dataset_lock
+
+        @contextmanager
+        def observed_lock(directory, timeout=None):
+            attempted.set()
+            with real_lock(directory, timeout=timeout):
+                yield
+
+        monkeypatch.setattr(matrix_module, "dataset_lock", observed_lock)
+        result = []
+
+        def publish():
+            result.append(
+                matrix_module._publish_dataset(
+                    {
+                        "first": (first_path, pl.DataFrame({"generation": [1]})),
+                        "second": (second_path, pl.DataFrame({"generation": [1]})),
+                    },
+                    manifest_path,
+                    sources=("alpha",),
+                    snapshots=1,
+                )
+            )
+
+        with dataset_lock(tmp_path):
+            thread = threading.Thread(target=publish)
+            thread.start()
+            assert attempted.wait(timeout=2)
+            assert pl.read_parquet(first_path)["generation"].to_list() == [0]
+            assert pl.read_parquet(second_path)["generation"].to_list() == [0]
+            assert json.loads(manifest_path.read_text(encoding="utf-8")) == {
+                "fingerprint": "old"
+            }
+        thread.join(timeout=2)
+
+        assert not thread.is_alive()
+        assert len(result) == 1
+        assert pl.read_parquet(first_path)["generation"].to_list() == [1]
+        assert pl.read_parquet(second_path)["generation"].to_list() == [1]
+        assert (
+            json.loads(manifest_path.read_text(encoding="utf-8"))["fingerprint"]
+            == result[0].fingerprint
+        )
+        assert not list(tmp_path.glob(".*.tmp"))
+
+    def test_reader_blocks_until_manifest_last_publication_finishes(
+        self, tmp_path, monkeypatch
+    ):
+        first_path = tmp_path / "first.parquet"
+        second_path = tmp_path / "second.parquet"
+        manifest_path = tmp_path / "manifest.json"
+        pl.DataFrame({"generation": [0]}).write_parquet(first_path)
+        pl.DataFrame({"generation": [0]}).write_parquet(second_path)
+        manifest_path.write_text('{"fingerprint": "old"}', encoding="utf-8")
+        first_replaced = threading.Event()
+        finish_publication = threading.Event()
+        reader_attempted = threading.Event()
+        reader_finished = threading.Event()
+        replacement_order = []
+        original_replace = Path.replace
+
+        def tracked_replace(path, target):
+            replacement_order.append(Path(target).name)
+            result = original_replace(path, target)
+            if Path(target) == first_path:
+                first_replaced.set()
+                assert finish_publication.wait(timeout=2)
+            return result
+
+        monkeypatch.setattr(Path, "replace", tracked_replace)
+        published = []
+        observed = []
+
+        def publish():
+            published.append(
+                matrix_module._publish_dataset(
+                    {
+                        "first": (first_path, pl.DataFrame({"generation": [1]})),
+                        "second": (second_path, pl.DataFrame({"generation": [1]})),
+                    },
+                    manifest_path,
+                    sources=("alpha",),
+                    snapshots=1,
+                )
+            )
+
+        def read():
+            reader_attempted.set()
+            with dataset_lock(tmp_path):
+                observed.append(
+                    (
+                        pl.read_parquet(first_path)["generation"].item(),
+                        pl.read_parquet(second_path)["generation"].item(),
+                        json.loads(manifest_path.read_text(encoding="utf-8"))[
+                            "fingerprint"
+                        ],
+                    )
+                )
+            reader_finished.set()
+
+        publisher = threading.Thread(target=publish)
+        publisher.start()
+        assert first_replaced.wait(timeout=2)
+        reader = threading.Thread(target=read)
+        reader.start()
+        assert reader_attempted.wait(timeout=2)
+        assert not reader_finished.wait(timeout=0.05)
+        finish_publication.set()
+        publisher.join(timeout=2)
+        reader.join(timeout=2)
+
+        assert not publisher.is_alive()
+        assert not reader.is_alive()
+        assert replacement_order[-1] == "manifest.json"
+        assert observed == [(1, 1, published[0].fingerprint)]
+        assert not list(tmp_path.glob(".*.tmp"))
+
+    def test_staged_files_are_cleaned_when_staging_fails(self, tmp_path, monkeypatch):
+        original = matrix_module.stage_parquet
+        calls = 0
+
+        def fail_second(frame, path):
+            nonlocal calls
+            calls += 1
+            if calls == 2:
+                raise OSError("boom")
+            return original(frame, path)
+
+        monkeypatch.setattr(matrix_module, "stage_parquet", fail_second)
+        with pytest.raises(OSError, match="boom"):
+            matrix_module._publish_dataset(
+                {
+                    "first": (tmp_path / "first.parquet", pl.DataFrame({"x": [1]})),
+                    "second": (
+                        tmp_path / "second.parquet",
+                        pl.DataFrame({"x": [2]}),
+                    ),
+                },
+                tmp_path / "manifest.json",
+                sources=(),
+                snapshots=0,
+            )
+        assert not list(tmp_path.glob(".*.tmp"))
 
 
 class TestSourceLimits:

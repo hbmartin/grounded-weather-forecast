@@ -1,9 +1,11 @@
 """Locked, atomic filesystem writes shared by persistent artifact stores."""
 
+import os
+import secrets
+import stat
 from collections.abc import Iterator
 from contextlib import contextmanager
 from pathlib import Path
-from tempfile import NamedTemporaryFile
 
 import polars as pl
 from filelock import FileLock
@@ -12,6 +14,7 @@ from filelock import FileLock
 # operational knob there would invalidate promoted evidence every time the
 # operator tuned it.
 PIPELINE_LOCK_TIMEOUT_S = 60.0
+DATASET_LOCK_TIMEOUT_S = 60.0
 
 
 @contextmanager
@@ -21,13 +24,23 @@ def pipeline_lock(dataset_dir: Path, timeout: float | None = None) -> Iterator[N
     build-dataset, backtest, report, and prune-scores all read or rewrite the
     scores directory; running two of them at once (a manual cycle against the
     scheduled maintain chain) lets prune delete files a concurrent report has
-    already globbed. ``predict`` deliberately stays outside — serving must
-    never wait behind an hour-long report; its glob races are handled by
-    retrying the scan instead. Raises ``filelock.Timeout`` on contention.
+    already globbed. ``predict`` and ``publish`` deliberately stay outside and
+    use the short dataset publication lock instead, so serving never waits
+    behind an hour-long report. Raises ``filelock.Timeout`` on contention.
     """
     lock_path = dataset_dir / "pipeline.lock"
     lock_path.parent.mkdir(parents=True, exist_ok=True)
     resolved = PIPELINE_LOCK_TIMEOUT_S if timeout is None else timeout
+    with FileLock(lock_path, timeout=resolved):
+        yield
+
+
+@contextmanager
+def dataset_lock(dataset_dir: Path, timeout: float | None = None) -> Iterator[None]:
+    """Serialize the short live-dataset publication/read window."""
+    lock_path = dataset_dir / "dataset.lock"
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    resolved = DATASET_LOCK_TIMEOUT_S if timeout is None else timeout
     with FileLock(lock_path, timeout=resolved):
         yield
 
@@ -45,13 +58,54 @@ def locked_path(path: Path, timeout: float = -1) -> Iterator[None]:
         yield
 
 
-def atomic_write_parquet(frame: pl.DataFrame, path: Path) -> None:
-    """Write parquet beside its destination, then replace it atomically."""
+def _temporary_sibling(path: Path) -> Path:
+    """Create an exclusive sibling using normal umask-derived permissions."""
     path.parent.mkdir(parents=True, exist_ok=True)
-    with NamedTemporaryFile(dir=path.parent, suffix=".parquet", delete=False) as tmp:
-        temporary = Path(tmp.name)
+    existing_mode = stat.S_IMODE(path.stat().st_mode) if path.exists() else None
+    for _ in range(100):
+        candidate = path.with_name(f".{path.name}.{secrets.token_hex(8)}.tmp")
+        try:
+            descriptor = os.open(
+                candidate,
+                os.O_CREAT | os.O_EXCL | os.O_WRONLY,
+                0o666,
+            )
+        except FileExistsError:  # pragma: no cover - cryptographic-name collision
+            continue
+        os.close(descriptor)
+        if existing_mode is not None:
+            candidate.chmod(existing_mode)
+        return candidate
+    msg = f"could not allocate a temporary sibling for {path}"
+    raise FileExistsError(msg)
+
+
+def stage_parquet(frame: pl.DataFrame, path: Path) -> Path:
+    """Write parquet to a uniquely named sibling without replacing ``path``."""
+    temporary = _temporary_sibling(path)
     try:
         frame.write_parquet(temporary)
+    except (Exception,):  # noqa: B013 - project style requires tuple clauses
+        temporary.unlink(missing_ok=True)
+        raise
+    return temporary
+
+
+def stage_text(text: str, path: Path) -> Path:
+    """Write text to a uniquely named sibling without replacing ``path``."""
+    temporary = _temporary_sibling(path)
+    try:
+        temporary.write_text(text, encoding="utf-8")
+    except (Exception,):  # noqa: B013 - project style requires tuple clauses
+        temporary.unlink(missing_ok=True)
+        raise
+    return temporary
+
+
+def atomic_write_parquet(frame: pl.DataFrame, path: Path) -> None:
+    """Write parquet beside its destination, then replace it atomically."""
+    temporary = stage_parquet(frame, path)
+    try:
         temporary.replace(path)
     finally:
         temporary.unlink(missing_ok=True)
@@ -59,16 +113,7 @@ def atomic_write_parquet(frame: pl.DataFrame, path: Path) -> None:
 
 def atomic_write_text(text: str, path: Path) -> None:
     """Write text beside its destination, then replace it atomically."""
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with NamedTemporaryFile(
-        dir=path.parent,
-        suffix=path.suffix,
-        mode="w",
-        encoding="utf-8",
-        delete=False,
-    ) as tmp:
-        tmp.write(text)
-        temporary = Path(tmp.name)
+    temporary = stage_text(text, path)
     try:
         temporary.replace(path)
     finally:

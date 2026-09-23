@@ -630,6 +630,32 @@ class TestWinnerCurseRecorder:
 
 
 class TestNbmBenchmark:
+    def scores(self):
+        rows = []
+        start = utc(2026, 6, 1)
+        for variable, count, errors in (
+            ("temp_c", 100, {"provider_nbm": 2.0, "equal_weight": 1.0, "gbm": 1.5}),
+            ("dew_point_c", 50, {"provider_nbm": 3.0, "equal_weight": 4.0}),
+        ):
+            for index in range(count):
+                valid = start + timedelta(hours=index)
+                for method, error in errors.items():
+                    rows.append(
+                        {
+                            "method_id": method,
+                            "variable": variable,
+                            "product": "hourly",
+                            "semantics": "inst",
+                            "lead_bucket": "0-1h",
+                            "lead_hours": 1.0,
+                            "issue_time": valid - timedelta(hours=1),
+                            "valid_time": valid,
+                            "y_pred": error,
+                            "y_true": 0.0,
+                        }
+                    )
+        return pl.DataFrame(rows)
+
     def board(self):
         return pl.DataFrame(
             {
@@ -651,11 +677,13 @@ class TestNbmBenchmark:
                 "lead_bucket": ["0-1h"] * 5,
                 "mae": [2.0, 1.0, 1.5, 3.0, 4.0],
                 "n": [100, 120, 110, 50, 60],
+                "coverage": [1.0] * 5,
+                "n_valid_times": [100, 100, 100, 50, 50],
             }
         )
 
-    def test_verdicts_are_weighted_by_nbm_n(self):
-        verdicts = evidence.nbm_benchmark_verdicts(self.board())
+    def test_verdicts_are_weighted_by_pairwise_common_n(self):
+        verdicts = evidence.nbm_benchmark_verdicts(self.scores(), self.board())
         assert verdicts["nbm_benchmark_slices"] == 2.0
         assert verdicts["nbm_benchmark_nbm_mae"] == pytest.approx(
             (2.0 * 100 + 3.0 * 50) / 150
@@ -666,14 +694,61 @@ class TestNbmBenchmark:
 
     def test_without_nbm_rows_records_nothing(self):
         board = self.board().filter(pl.col("method_id") != "provider_nbm")
-        assert evidence.nbm_benchmark_verdicts(board) == {}
+        assert evidence.nbm_benchmark_verdicts(self.scores(), board) == {}
+
+    def test_ineligible_rival_is_not_selected(self):
+        board = self.board().with_columns(
+            pl.when(
+                (pl.col("method_id") == "equal_weight")
+                & (pl.col("variable") == "temp_c")
+            )
+            .then(0.5)
+            .otherwise(pl.col("coverage"))
+            .alias("coverage")
+        )
+        verdicts = evidence.nbm_benchmark_verdicts(self.scores(), board)
+        assert verdicts["nbm_benchmark_blend_mae"] == pytest.approx(
+            (1.5 * 100 + 4.0 * 50) / 150
+        )
+
+    def test_coverage_asymmetry_cannot_reverse_the_common_case_result(self):
+        start = utc(2026, 5, 1)
+        rows = []
+        for index in range(100):
+            valid = start + timedelta(hours=index)
+            if index < 90:
+                rows.append(("provider_nbm", valid, 10.0))
+            if index < 80:
+                rows.append(("rival", valid, 10.5))
+            elif index >= 90:
+                rows.append(("rival", valid, 0.0))
+        scores = pl.DataFrame(
+            {
+                "method_id": [row[0] for row in rows],
+                "variable": ["temp_c"] * len(rows),
+                "product": ["hourly"] * len(rows),
+                "semantics": ["inst"] * len(rows),
+                "lead_bucket": ["0-1h"] * len(rows),
+                "lead_hours": [1.0] * len(rows),
+                "issue_time": [row[1] - timedelta(hours=1) for row in rows],
+                "valid_time": [row[1] for row in rows],
+                "y_pred": [row[2] for row in rows],
+                "y_true": [0.0] * len(rows),
+            }
+        )
+        from grounded_weather_forecast.reports.leaderboard import leaderboard
+
+        board = leaderboard(scores, references=())
+        verdicts = evidence.nbm_benchmark_verdicts(scores, board)
+        assert verdicts["nbm_benchmark_nbm_mae"] == pytest.approx(10.0)
+        assert verdicts["nbm_benchmark_blend_mae"] == pytest.approx(10.5)
 
     def test_record_then_line(self, tmp_path):
         from conftest import write_config
 
         config = write_config(tmp_path)
         evidence.record_nbm_benchmark(
-            config, "hourly", scores_frame(), self.board(), now=NOW
+            config, "hourly", self.scores(), self.board(), now=NOW
         )
         line = evidence.nbm_benchmark_line(config)
         assert line is not None
