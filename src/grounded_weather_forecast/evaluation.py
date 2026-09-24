@@ -47,7 +47,7 @@ def code_identity() -> str:
 
 
 def active_release_path(artifacts_dir: Path) -> Path:
-    """The mutable pointer to the release selected for current-time serving."""
+    """The mutable record of releases in the local serving output."""
     return artifacts_dir / ACTIVE_RELEASE_FILE
 
 
@@ -55,6 +55,22 @@ def activate_release(artifacts_dir: Path, release_id: str) -> Path:
     """Atomically point current-time serving at an immutable release."""
     path = active_release_path(artifacts_dir)
     atomic_write_text(json.dumps({"release_id": release_id}, indent=2), path)
+    return path
+
+
+def activate_served_document(
+    artifacts_dir: Path, release_ids: list[str], output_path: Path
+) -> Path:
+    """Record the releases in the document visible at the local output path."""
+    path = active_release_path(artifacts_dir)
+    ids = sorted(set(release_ids))
+    payload: dict[str, object] = {
+        "release_ids": ids,
+        "output_path": str(output_path.absolute()),
+    }
+    if len(ids) == 1:
+        payload["release_id"] = ids[0]
+    atomic_write_text(json.dumps(payload, indent=2), path)
     return path
 
 

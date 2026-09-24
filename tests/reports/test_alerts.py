@@ -38,6 +38,24 @@ def test_empty_inputs_degrade_to_not_evaluable(tmp_path):
             assert alert.message.startswith("not evaluable yet:")
 
 
+def test_held_degraded_candidate_alerts_while_served_document_is_ready(tmp_path):
+    alerts = evaluate_alerts(
+        make_inputs(
+            tmp_path,
+            latest_status=("ready", None),
+            latest_publish_attempt={
+                "candidate_status": "degraded",
+                "status_reason": "no compatible release",
+                "action": "held_last_good",
+            },
+        )
+    )
+    degraded = by_panel(alerts, "serving-degraded")
+    assert len(degraded) == 1
+    assert degraded[0].severity == "amber"
+    assert "no compatible release" in degraded[0].message
+
+
 def test_silent_empty_manifest_states_fire_red(tmp_path):
     manifest = {
         "fingerprint": "abc",

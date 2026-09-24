@@ -22,7 +22,6 @@ from grounded_weather_forecast.config import Config, PromotionConfig
 from grounded_weather_forecast.contracts import TruthSemantics
 from grounded_weather_forecast.evaluation import (
     ModelRelease,
-    activate_release,
     code_identity,
     config_fingerprint,
     dataset_fingerprint,
@@ -98,6 +97,7 @@ def _compatible_scores(
     scores_dir: Path,
     as_of: datetime | None,
     semantics: Mapping[str, TruthSemantics] | None,
+    dataset_id: str | None = None,
 ) -> list[pl.DataFrame]:
     # Prune (which runs under the pipeline lock) can delete a file between
     # this reader's glob and read — predict deliberately does not take that
@@ -106,11 +106,11 @@ def _compatible_scores(
     # individual files is the second pass's last resort.
     try:
         return _scan_compatible_scores(
-            config, scores_dir, as_of, semantics, skip_missing=False
+            config, scores_dir, as_of, semantics, dataset_id, skip_missing=False
         )
     except FileNotFoundError:
         return _scan_compatible_scores(
-            config, scores_dir, as_of, semantics, skip_missing=True
+            config, scores_dir, as_of, semantics, dataset_id, skip_missing=True
         )
 
 
@@ -119,10 +119,11 @@ def _scan_compatible_scores(
     scores_dir: Path,
     as_of: datetime | None,
     semantics: Mapping[str, TruthSemantics] | None,
+    dataset_id: str | None = None,
     *,
     skip_missing: bool,
 ) -> list[pl.DataFrame]:
-    current_dataset = dataset_fingerprint(config)
+    current_dataset = dataset_id or dataset_fingerprint(config)
     current_code = code_identity()
     candidates: list[pl.DataFrame] = []
     for path in sorted(scores_dir.glob("scores_*.parquet")):
@@ -354,6 +355,7 @@ def _make_release(
     config: Config,
     selections: Mapping[SliceKey, Selection],
     selected_scores: list[pl.DataFrame],
+    dataset_id: str | None = None,
 ) -> ModelRelease:
     evaluation_ids = tuple(
         sorted(
@@ -365,7 +367,7 @@ def _make_release(
         )
     )
     return ModelRelease.create(
-        dataset=dataset_fingerprint(config),
+        dataset=dataset_id or dataset_fingerprint(config),
         configuration=config_fingerprint(config),
         evaluation_ids=evaluation_ids,
         evaluation_contexts=_evaluation_contexts(selected_scores),
@@ -645,6 +647,7 @@ def _retained_incumbent(
     frame: pl.DataFrame,
     incumbent: tuple[str, str | None] | None,
     evaluation_id: str,
+    dataset_id: str | None = None,
 ) -> Selection | None:
     """The winner-curse guard: keep a statistically indistinguishable incumbent.
 
@@ -690,7 +693,7 @@ def _retained_incumbent(
         n=int(incumbent_row["n"]),
         mae=float(incumbent_row["mae"]),
         evaluation_id=evaluation_id,
-        dataset_fingerprint=dataset_fingerprint(config),
+        dataset_fingerprint=dataset_id or dataset_fingerprint(config),
         code_version=str(frame["code_version"][0]),
         truth_semantics=slice_semantics,
         retained=True,
@@ -703,13 +706,17 @@ def select_methods(
     as_of: datetime | None = None,
     *,
     semantics: Mapping[str, TruthSemantics] | None = None,
+    dataset_id: str | None = None,
 ) -> SelectionMap:
     """Select only live evidence compatible with this dataset and issue time."""
     if as_of is not None:
         return _release_as_of(config, as_of, semantics) or {}
+    current_dataset = dataset_id or dataset_fingerprint(config)
     pinned = _pins(config)
     selections: dict[tuple[str, str, str], Selection] = {}
-    compatible = _compatible_scores(config, scores_dir, as_of, semantics)
+    compatible = _compatible_scores(
+        config, scores_dir, as_of, semantics, current_dataset
+    )
     incumbents = _incumbent_methods(config)
     slices = _newest_complete_slices(compatible, config.promotion)
     selected_scores: list[pl.DataFrame] = []
@@ -740,12 +747,18 @@ def select_methods(
             n=int(row["n"]),
             mae=float(row["mae"]),
             evaluation_id=evaluation_id,
-            dataset_fingerprint=dataset_fingerprint(config),
+            dataset_fingerprint=current_dataset,
             code_version=str(frame["code_version"][0]),
             truth_semantics=str(frame["semantics"][0]),
         )
         retained = _retained_incumbent(
-            config, row, board, frame, incumbents.get(key), evaluation_id
+            config,
+            row,
+            board,
+            frame,
+            incumbents.get(key),
+            evaluation_id,
+            current_dataset,
         )
         if retained is not None:
             selections[key] = retained
@@ -758,7 +771,7 @@ def select_methods(
                 n=int(fallback["n"]),
                 mae=float(fallback["mae"]),
                 evaluation_id=evaluation_id,
-                dataset_fingerprint=dataset_fingerprint(config),
+                dataset_fingerprint=current_dataset,
                 code_version=str(frame["code_version"][0]),
                 truth_semantics=str(frame["semantics"][0]),
             )
@@ -788,9 +801,8 @@ def select_methods(
             config, selections, evaluation_contexts
         ),
     )
-    release = _make_release(config, selections, selected_scores)
+    release = _make_release(config, selections, selected_scores, current_dataset)
     release.write(config.artifacts_dir / "releases")
-    activate_release(config.artifacts_dir, release.release_id)
     return {
         key: replace(selected, release_id=release.release_id)
         for key, selected in selections.items()
@@ -985,7 +997,9 @@ def _live_identity_sets(
     return bool(paths), live_datasets, live_configs, live_code_versions
 
 
-def no_evidence_reason(config: Config, scores_dir: Path) -> str:
+def no_evidence_reason(
+    config: Config, scores_dir: Path, *, dataset_id: str | None = None
+) -> str:
     """Why serving is degraded: cold start vs invalidated evidence.
 
     A rebuild that adds matrix columns changes the dataset fingerprint, which
@@ -1014,7 +1028,7 @@ def no_evidence_reason(config: Config, scores_dir: Path) -> str:
             "no live backtest evidence yet (synthetic evidence is never "
             "promoted); keep polling and run `backtest --source live`"
         )
-    if dataset_fingerprint(config) not in live_datasets:
+    if (dataset_id or dataset_fingerprint(config)) not in live_datasets:
         return (
             "dataset fingerprint changed since the last backtest (a rebuild "
             "invalidates promoted evidence); re-run `backtest --source live` "

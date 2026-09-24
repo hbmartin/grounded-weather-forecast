@@ -48,8 +48,9 @@ pipeline lock, and rechecks whether work is still necessary before running.
 Dataset publication has a separate short `<dataset dir>/dataset.lock`.
 `build-dataset` stages every live parquet and the manifest, acquires that lock,
 replaces all parquets, then replaces the manifest last. `predict` and `publish`
-hold the same lock across selection and generation, waiting up to 60 s before
-exiting `75`, so serving sees one complete dataset publication. They do not wait
+copy and validate all live files under that lock, waiting up to 60 s before
+exiting `75`. Selection and fitting use the pinned in-memory snapshot after
+releasing the lock, so serving sees one complete dataset publication. They do not wait
 behind an hour-long backtest or report. `ingest-ensembles` keeps its own
 store-level lock and runs freely alongside the chain.
 
@@ -305,6 +306,8 @@ apparent diversity without adding information.
 | `--method` | method id or `auto` | `auto` | force one method for every slice, or use the leaderboard |
 | `--no-history` | flag | off | do not append to the self-verification history |
 | `--semantics` | `auto` \| `inst` \| `mean` | `auto` | hourly truth semantics used when fitting |
+| `--recovery-methods` | comma-separated methods or `all` | `all` | methods passed to detached recovery backtest |
+| `--recovery-window` | `expanding` \| `rolling` | `expanding` | window passed to detached recovery backtest |
 | `--now` | ISO datetime (UTC) | now | issue as of this instant instead of now |
 
 Emits a schema v5 `Forecast` document — see
@@ -339,18 +342,25 @@ suppressed, and writes an observability snapshot to `artifacts/observability/`.
 
 The command always uses automatic method selection. A ready candidate atomically
 replaces `--out` and that exact forecast is appended to serving history. If a
-candidate is degraded and `--out` already contains a parseable ready forecast,
-the existing bytes remain unchanged and the rejected candidate is not archived.
+candidate is degraded and `--out` already contains a matching ready forecast
+issued within six hours (same schema, location, and timezone), the existing
+bytes remain unchanged and the rejected candidate is not archived. Symlinked
+output paths retain the symlink and atomically replace its resolved target.
 On a cold start with no ready document, the degraded candidate is published and
 archived so downstream consumers still receive a valid forecast document.
 
+Every attempt writes `artifacts/latest_publish_attempt.json`, including the
+candidate status, reason, hold decision, and served document. This makes a
+degraded candidate visible to alerts even while the last ready output is held.
 Every degraded candidate derives a recovery signature from its reason and the
-dataset, configuration, and code identities. `publish` starts a detached
+configuration, code, and recovery-profile identities. `publish` starts a detached
 `recover` unless that unchanged signature was attempted during the previous six
 hours. A changed signature is immediately eligible. Recovery state and logs are
 written to `artifacts/auto-restore.json` and
 `artifacts/auto-restore.log`. Publication and hold-last-good return `0`; forecast
-generation, output, or recovery-process launch failures return nonzero.
+generation, output, history, or recovery-process launch failures return nonzero.
+If history append fails after output replacement, the output stays visible and
+recovery scheduling is still attempted.
 
 ---
 
@@ -358,7 +368,13 @@ generation, output, or recovery-process launch failures return nonzero.
 
 > restore live evidence after an automatically published degraded forecast
 
-No flags. Concurrent requests deduplicate on `artifacts/auto-restore.lock`.
+| Flag | Type | Default | Meaning |
+|---|---|---|---|
+| `--semantics` | `auto` \| `inst` \| `mean` | `auto` | truth semantics for readiness recheck and backtest |
+| `--methods` | comma-separated methods or `all` | `all` | recovery backtest methods |
+| `--window` | `expanding` \| `rolling` | `expanding` | recovery backtest window |
+
+Concurrent requests deduplicate on `artifacts/auto-restore.lock`.
 After acquiring it, `recover` waits for `pipeline.lock`, re-runs automatic
 selection, and exits successfully if serving is already ready. Otherwise it
 runs `build-dataset` → `backtest --source live` → `report`, stopping at the first

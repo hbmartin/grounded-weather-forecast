@@ -34,7 +34,7 @@ Written by `build-dataset` unless noted.
 | `ensembles.parquet` | written by `ingest-ensembles`; ensemble spread features |
 | `manifest.json` | per-file SHA-256 plus the **dataset fingerprint** |
 | `predict_history.parquet` | written by `predict` and `publish`; every accepted served forecast |
-| `runs.parquet` | parsed commands with valid configuration; pruned to 90 days / 50k rows |
+| `runs.parquet` | parsed command invocations and maintenance/recovery child stages (`record_kind`, `parent_run_id`, `failure_kind`); older ledgers remain readable; pruned to 90 days / 50k rows |
 | `scores/` | written by `backtest` |
 | `served_forecasts/` | archived served documents |
 
@@ -80,7 +80,7 @@ These files are the bulk of the disk footprint. `prune-scores` manages them.
 | Path | Written by | Contents |
 |---|---|---|
 | `releases/*.json` | `backtest`, `predict`, `publish` | immutable promoted `ModelRelease` records — the serving boundary |
-| `active_release.json` | `backtest`, `predict`, `publish` | atomic pointer to the release activated by the latest current-time selection |
+| `active_release.json` | `predict`, `publish` | atomic record of the local output: `release_ids` (possibly empty) and `output_path`; older `release_id` pointers remain readable |
 | `eprocess/{product}_{kind}.json` | `report` | accumulated betting wealth per candidate/reference pair |
 | `history/*.parquet` | `report` | ten append-only ledgers (below) |
 | `alignment.json` | `alignment` | measured truth semantics per provider |
@@ -88,6 +88,7 @@ These files are the bulk of the disk footprint. `prune-scores` manages them.
 | `drift.json` | `report` | provider drift alarms |
 | `observability/` | `predict`, `publish` | per-serve snapshots |
 | `auto-restore.json` | `publish` | last automatic-recovery signature and attempt time |
+| `latest_publish_attempt.json` | `publish` | latest candidate status, reason, hold decision, and locally served document |
 | `auto-restore.log` | `recover` | detached recovery stdout and stderr |
 
 ### The history ledgers

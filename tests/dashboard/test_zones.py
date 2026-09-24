@@ -12,6 +12,7 @@ from grounded_weather_forecast.dashboard.zones import (
     ALL_ZONES,
     evaluation,
     liveness,
+    operations,
     readiness,
     serving,
 )
@@ -36,6 +37,29 @@ def test_all_zones_render_not_yet_states_on_cold_context(tmp_path):
             assert panel.copy.what
             if panel.chart is None and panel.table is None:
                 assert panel.raw_html is not None or panel.empty_reason
+
+
+def test_runtime_panel_includes_publish_and_child_stage_rows(tmp_path):
+    config = write_config(tmp_path)
+    ctx = DashboardContext(
+        config=config,
+        now=NOW,
+        runs=pl.DataFrame(
+            {
+                "command": ["publish", "build-dataset", "backtest"],
+                "started_at": [NOW] * 3,
+                "duration_ms": [60_000, 120_000, 180_000],
+            }
+        ),
+    )
+    panel = operations._runtime_panel(ctx)
+    assert panel.chart is not None
+    datasets = panel.chart.config["data"]["datasets"]
+    assert {row["label"] for row in datasets} >= {
+        "publish",
+        "build-dataset",
+        "backtest",
+    }
 
 
 def test_zone_a_marks_aged_out_providers_grey(tmp_path):

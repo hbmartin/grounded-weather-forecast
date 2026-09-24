@@ -33,6 +33,9 @@ RUNS_SCHEMA = pl.Schema(
         "dataset_fingerprint": pl.String(),
         "config_fingerprint": pl.String(),
         "code_version": pl.String(),
+        "record_kind": pl.String(),
+        "parent_run_id": pl.String(),
+        "failure_kind": pl.String(),
     }
 )
 
@@ -51,6 +54,9 @@ class RunRecord:
     dataset_fingerprint: str
     config_fingerprint: str
     code_version: str
+    record_kind: str = "invocation"
+    parent_run_id: str | None = None
+    failure_kind: str | None = None
 
 
 def run_id_for(command: str, started_at: datetime) -> str:
@@ -158,5 +164,8 @@ def _to_frame(record: RunRecord) -> pl.DataFrame:
         "dataset_fingerprint": record.dataset_fingerprint,
         "config_fingerprint": record.config_fingerprint,
         "code_version": record.code_version,
+        "record_kind": record.record_kind,
+        "parent_run_id": record.parent_run_id,
+        "failure_kind": record.failure_kind,
     }
     return pl.DataFrame([row], schema=RUNS_SCHEMA)

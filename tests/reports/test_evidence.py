@@ -696,6 +696,78 @@ class TestNbmBenchmark:
         board = self.board().filter(pl.col("method_id") != "provider_nbm")
         assert evidence.nbm_benchmark_verdicts(self.scores(), board) == {}
 
+    def test_low_nbm_overall_coverage_does_not_disqualify_available_pairs(self):
+        board = self.board().with_columns(
+            pl.when(pl.col("method_id") == "provider_nbm")
+            .then(0.2)
+            .otherwise(pl.col("coverage"))
+            .alias("coverage")
+        )
+        verdicts = evidence.nbm_benchmark_verdicts(self.scores(), board)
+        assert verdicts["nbm_benchmark_slices"] == 2.0
+        assert verdicts["nbm_benchmark_blend_mae"] == pytest.approx((100 + 200) / 150)
+
+    def test_nonfinite_truth_and_predictions_are_excluded(self):
+        scores = (
+            self.scores()
+            .with_row_index("index")
+            .with_columns(
+                pl.when(pl.col("index") == 0)
+                .then(float("inf"))
+                .otherwise(pl.col("y_true"))
+                .alias("y_true"),
+                pl.when(pl.col("index") == 1)
+                .then(float("nan"))
+                .otherwise(pl.col("y_pred"))
+                .alias("y_pred"),
+            )
+            .drop("index")
+        )
+        verdicts = evidence.nbm_benchmark_verdicts(scores, self.board())
+        assert verdicts["nbm_benchmark_slices"] == 2.0
+        assert verdicts["nbm_benchmark_nbm_mae"] < float("inf")
+        assert verdicts["nbm_benchmark_blend_mae"] < float("inf")
+
+    def test_each_issue_time_counts_as_a_case(self):
+        start = utc(2026, 6, 1)
+        rows = []
+        for index in range(8):
+            valid = start + timedelta(hours=index)
+            for issue in (1, 2) if index == 0 else (1,):
+                for method, prediction in (
+                    ("provider_nbm", 3.0),
+                    ("rival", 10.0 if issue == 2 else 2.0),
+                ):
+                    rows.append(
+                        {
+                            "method_id": method,
+                            "variable": "temp_c",
+                            "product": "hourly",
+                            "semantics": "inst",
+                            "lead_bucket": "0-1h",
+                            "lead_hours": 1.0,
+                            "issue_time": valid - timedelta(hours=issue),
+                            "valid_time": valid,
+                            "y_pred": prediction,
+                            "y_true": 0.0,
+                        }
+                    )
+        board = pl.DataFrame(
+            {
+                "method_id": ["provider_nbm", "rival"],
+                "variable": ["temp_c"] * 2,
+                "truth_semantics": ["inst"] * 2,
+                "lead_bucket": ["0-1h"] * 2,
+                "mae": [3.0, 3.0],
+                "n": [9, 9],
+                "coverage": [0.2, 1.0],
+                "n_valid_times": [8, 8],
+            }
+        )
+        verdicts = evidence.nbm_benchmark_verdicts(pl.DataFrame(rows), board)
+        assert verdicts["nbm_benchmark_nbm_mae"] == pytest.approx(3.0)
+        assert verdicts["nbm_benchmark_blend_mae"] == pytest.approx(26 / 9)
+
     def test_ineligible_rival_is_not_selected(self):
         board = self.board().with_columns(
             pl.when(

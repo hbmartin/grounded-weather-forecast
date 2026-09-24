@@ -1007,51 +1007,66 @@ _NBM_VERDICT_NAMES = (
 
 
 def _paired_nbm_rows(scores: pl.DataFrame, board: pl.DataFrame) -> pl.DataFrame:
-    """Best non-NBM pair per slice, measured only where that pair both scored."""
+    """Best eligible rival against NBM on their finite, pairwise-common cases."""
     from grounded_weather_forecast.reports.leaderboard import (  # noqa: PLC0415
         _with_default_semantics,
         eligible_board_rows,
-    )
-    from grounded_weather_forecast.reports.mcs import (  # noqa: PLC0415
-        collapsed_loss_frame,
     )
 
     normalized = _with_default_semantics(scores)
     keys = ("variable", "truth_semantics", "lead_bucket")
     rows: list[dict[str, object]] = []
     for variable, semantics, lead_bucket in board.select(keys).unique().iter_rows():
-        slice_board = eligible_board_rows(
-            board.filter(
-                (pl.col("variable") == variable)
-                & (pl.col("truth_semantics") == semantics)
-                & (pl.col("lead_bucket") == lead_bucket)
-            ).drop_nulls(["mae", "n"])
+        slice_board = board.filter(
+            (pl.col("variable") == variable)
+            & (pl.col("truth_semantics") == semantics)
+            & (pl.col("lead_bucket") == lead_bucket)
         )
         if NBM_BENCHMARK_METHOD not in set(slice_board["method_id"].to_list()):
             continue
+        rivals = eligible_board_rows(
+            slice_board.filter(pl.col("method_id") != NBM_BENCHMARK_METHOD).drop_nulls(
+                ["mae", "n"]
+            )
+        )
         methods = sorted(
-            str(method)
-            for method in slice_board["method_id"].unique().to_list()
-            if method != NBM_BENCHMARK_METHOD
+            str(method) for method in rivals["method_id"].unique().to_list()
         )
         slice_scores = normalized.filter(
             (pl.col("variable") == variable)
             & (pl.col("semantics") == semantics)
             & (pl.col("lead_bucket") == lead_bucket)
+            & pl.col("y_true").is_finite()
+            & pl.col("y_pred").is_finite()
+        )
+        nbm = slice_scores.filter(pl.col("method_id") == NBM_BENCHMARK_METHOD).select(
+            "issue_time", "valid_time", "y_true", pl.col("y_pred").alias("nbm_pred")
         )
         best: tuple[float, str, float, int] | None = None
         for method in methods:
-            built = collapsed_loss_frame(
-                slice_scores,
-                method_ids=(NBM_BENCHMARK_METHOD, method),
+            rival = slice_scores.filter(pl.col("method_id") == method).select(
+                "issue_time",
+                "valid_time",
+                "y_true",
+                pl.col("y_pred").alias("rival_pred"),
             )
-            if built is None:
+            paired = nbm.join(
+                rival,
+                on=["issue_time", "valid_time", "y_true"],
+                how="inner",
+            )
+            if paired.height < 8 or paired["valid_time"].n_unique() < 8:
                 continue
-            paired, _ = built
             contender = (
-                float(cast("float", paired[method].mean())),
+                float(
+                    cast(
+                        "float", (paired["rival_pred"] - paired["y_true"]).abs().mean()
+                    )
+                ),
                 method,
-                float(cast("float", paired[NBM_BENCHMARK_METHOD].mean())),
+                float(
+                    cast("float", (paired["nbm_pred"] - paired["y_true"]).abs().mean())
+                ),
                 paired.height,
             )
             if best is None or contender[:2] < best[:2]:
