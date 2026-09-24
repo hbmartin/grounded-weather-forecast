@@ -29,7 +29,14 @@ from grounded_weather_forecast.reports.operations import FRESHNESS_THRESHOLDS
 _MAX_POINTS = 60
 _MAX_SERIES = 8
 _CHANGES_ROWS = 10
-_RUNTIME_COMMANDS = ("build-dataset", "backtest", "report", "predict")
+_RUNTIME_COMMANDS = (
+    "build-dataset",
+    "backtest",
+    "report",
+    "predict",
+    "publish",
+    "truth-qc",
+)
 _RUNTIME_AMBER = 1.5
 _SUCCESS_AMBER = 0.8
 

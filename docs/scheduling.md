@@ -79,7 +79,7 @@ backtesting or serving methods that consume ensemble features.
   `INVOKE`; use `launchctl print` for the final exit status.
 - A degraded `publish` candidate and `maintain` finding no folds are **normal**
   early states. The candidate names its cause in `status_reason`; `publish`
-  preserves an existing parseable ready document byte-for-byte, or publishes
+  preserves a matching ready document issued within six hours byte-for-byte, or publishes
   and archives the degraded candidate on a cold start so an output still exists.
 - launchd `StartCalendarInterval` fires in **local time**; the 6-hourly
   ensemble job uses `StartInterval` (elapsed seconds) precisely so daylight
@@ -105,17 +105,21 @@ backtesting or serving methods that consume ensemble features.
 - `maintain` waits for `<dataset dir>/pipeline.lock` and holds it once across
   build → live backtest → report → truth-QC. Interactive mutators wait 60 s and
   exit `75` on contention. This prevents another command from slipping between
-  scheduled steps. `predict` and `publish` use the short `dataset.lock` only
-  while selecting and generating, so they cannot read a half-published dataset;
+  scheduled steps. `predict` and `publish` copy and validate the live dataset
+  under the short `dataset.lock`, then select and fit outside it;
   `ingest-ensembles` retains its independent store lock.
 - Every degraded candidate is eligible for automatic recovery, not only a
   code-identity mismatch. `publish` derives a signature from the reason plus
-  dataset/config/code identities and starts detached `recover` at most once per
+  config/code/recovery-profile identities and starts detached `recover` at most once per
   unchanged signature every six hours; a changed signature is immediately
   eligible. `recover` deduplicates concurrent requests, waits behind maintenance,
   rechecks readiness, then runs build → live backtest → report only if still
   degraded. State and output live in `artifacts/auto-restore.json` and
   `artifacts/auto-restore.log`.
+- Every `publish` attempt writes `artifacts/latest_publish_attempt.json`, so
+  alerts can show a degraded candidate even when an earlier ready document is
+  held. The local `active_release.json` tracks the document at `--out`; the
+  personal Git publisher may subsequently hold or fail to push that document.
 - Keep the Synoptic token out of the plist if you prefer: set
   `synoptic_token = "$SYNOPTIC_TOKEN"` in `config.toml` and provide the
   variable via `launchctl setenv SYNOPTIC_TOKEN ...` instead of the

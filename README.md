@@ -85,16 +85,16 @@ That works on day one. Everything else needs an archive with some history — se
 | `truth-qc` | cross-check truth against lapse-adjusted neighbors; fit the radiation-shield model | `--days` |
 | `ingest-ensembles` | poll the Open-Meteo Ensemble API for per-model spread features | `--models` |
 | `predict` | emit the current blended forecast as JSON | `--out` `--method` `--no-history` `--semantics` `--now` |
-| `publish` | safely publish an automatic forecast, holding the last ready document during degradation | `--out` `--semantics` |
-| `recover` | recheck degradation, then rebuild live evidence and reports when recovery is still needed | — |
+| `publish` | safely publish an automatic forecast, holding a matching ready document for up to six hours | `--out` `--semantics` `--recovery-methods` `--recovery-window` |
+| `recover` | recheck degradation, then rebuild live evidence and reports when recovery is still needed | `--semantics` `--methods` `--window` |
 | `prune-scores` | delete superseded scores files | `--dry-run` |
 
 Global: `--config PATH` (default `config.toml`), `--version`. Exit codes: `0` ok,
 `1` command failure, `2` config error, `75` lock contention (retry later).
 Pipeline mutators serialize on `<dataset dir>/pipeline.lock`;
 scheduled `maintain` waits for it and holds it across the whole transaction.
-`predict` and `publish` instead take the short `<dataset dir>/dataset.lock`
-while selecting and generating a forecast.
+`predict` and `publish` copy and validate the live dataset under the short
+`<dataset dir>/dataset.lock`, then select and fit outside it.
 
 **Full semantics for every flag — defaults, choices, what each command reads and
 writes — are in the
