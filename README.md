@@ -88,6 +88,7 @@ That works on day one. Everything else needs an archive with some history — se
 | `publish` | safely publish an automatic forecast, holding the last ready document during degradation | `--out` `--semantics` |
 | `recover` | recheck degradation, then rebuild live evidence and reports when recovery is still needed | — |
 | `prune-scores` | delete superseded scores files | `--dry-run` |
+| `uv run --group profiling python scripts/profile_memory.py -- <command>` | capture a command's memory allocations and write a peak-memory HTML report | `--output-dir` `--trace-python-allocators` `--no-native` `--no-report` |
 
 Global: `--config PATH` (default `config.toml`), `--version`. Exit codes: `0` ok,
 `1` command failure, `2` config error, `75` lock contention (retry later).

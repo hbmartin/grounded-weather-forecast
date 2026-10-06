@@ -78,6 +78,67 @@ Steady state is four crons — see [Scheduling](../scheduling.md).
 
 ---
 
+## Memory profiling with Memray
+
+From a source checkout, install the opt-in profiling dependencies once:
+
+```bash
+uv sync --locked --group profiling
+```
+
+Wrap any forecast CLI command without changing its application code:
+
+```bash
+uv run --locked --group profiling python scripts/profile_memory.py -- maintain
+uv run --locked --group profiling python scripts/profile_memory.py \
+  --trace-python-allocators -- --config config.toml backtest --source live
+```
+
+Arguments before `--` belong to the profiling wrapper; everything after it
+is passed unchanged to `grounded_weather_forecast.cli`. The wrapper preserves
+the application's working directory, stdout, stderr, and exit status. Profiling
+messages and report-generation output go to stderr. If the application succeeds
+but report generation fails, the wrapper exits `1` and retains the capture.
+Captures may still be incomplete after a hard kill or an out-of-memory crash.
+
+Each invocation creates a unique UTC-timestamped directory under
+`artifacts/memory/`, containing `capture.bin` and `peak.html`. The report shows
+allocation call paths contributing to peak tracked heap usage, rather than
+cumulative allocation volume or exact process RSS. Native C/C++ stack frames
+are enabled by default; symbol availability in macOS wheels can limit their
+detail. Individual small Python objects require `--trace-python-allocators`.
+
+| Wrapper flag | Default | Meaning |
+|---|---|---|
+| `--output-dir PATH` | `artifacts/memory` | parent directory for unique per-run directories; relative paths use the current working directory |
+| `--trace-python-allocators` | off | trace individual small Python allocations; increases runtime overhead and capture size |
+| `--no-native` | off | omit native stack frames while continuing to track native allocations |
+| `--no-report` | off | save only `capture.bin`; generate reports later |
+
+The profiling dependency group supports Memray's macOS/Linux environments and
+is not part of the application's runtime dependencies. Include `--group profiling`
+on each `uv run` so environment synchronization keeps Memray available.
+Existing schedules remain opt-in; see [Scheduling](../scheduling.md#profiling-a-scheduled-run).
+
+For later analysis, generate reports on the same machine as the capture,
+especially when native stacks are enabled. Replace `RUN_DIRECTORY` with the
+timestamped directory printed by the wrapper:
+
+```bash
+uv run --locked --group profiling memray summary RUN_DIRECTORY/capture.bin
+uv run --locked --group profiling memray flamegraph --temporal --no-web \
+  -o RUN_DIRECTORY/temporal.html RUN_DIRECTORY/capture.bin
+```
+
+Temporal reports let you focus on the memory peak within a selected time range.
+The `--leaks` reporter option means allocations not freed when tracking ended;
+it does not by itself prove that the application leaked memory. The generated
+files are ignored by Git; no captures are automatically deleted, so prune
+unneeded runs periodically. See the [Memray documentation](https://bloomberg.github.io/memray/)
+for report interpretation and profiling limitations.
+
+---
+
 ## `qc`
 
 > summarize station truth quality control
