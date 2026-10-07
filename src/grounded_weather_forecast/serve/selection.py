@@ -39,6 +39,14 @@ from grounded_weather_forecast.reports.winner_curse import should_retain_incumbe
 
 FALLBACK_METHOD = "equal_weight"
 _LIVE_KEY = ("product", "variable", "lead_bucket", "method_id")
+_EVALUATION_CONTEXT_COLUMNS = (
+    "source_kind",
+    "source_set_json",
+    "feature_set_json",
+    "window",
+    "code_version",
+    "config_fingerprint",
+)
 # How long a served row may still testify. A module constant rather than a
 # config field on purpose: a new field changes `repr(config)`, hence
 # `config_fingerprint`, which would invalidate every score and release once.
@@ -270,29 +278,37 @@ def _evaluation_contexts(
 ) -> tuple[dict[str, object], ...]:
     if not selected_scores:
         return ()
-    combined = pl.concat(selected_scores, how="diagonal_relaxed")
-    contexts: list[dict[str, object]] = []
-    for evaluation_key, frame in combined.partition_by(
-        "evaluation_id", as_dict=True
-    ).items():
-        contexts.append(
-            {
-                "evaluation_id": str(evaluation_key[0]),
-                "source_kind": str(frame["source_kind"][0]),
-                "source_set_json": str(frame["source_set_json"][0]),
-                "feature_set_json": str(frame["feature_set_json"][0]),
-                "semantics": {
-                    str(row["variable"]): str(row["semantics"])
-                    for row in frame.select("variable", "semantics")
-                    .unique()
-                    .iter_rows(named=True)
-                },
-                "window": str(frame["window"][0]),
-                "code_version": str(frame["code_version"][0]),
-                "config_fingerprint": str(frame["config_fingerprint"][0]),
-            }
+    contexts: dict[str, dict[str, object]] = {}
+    for frame in selected_scores:
+        # Keep one metadata row per evaluation before merging across slices;
+        # concatenating full scores replicates large, repeated JSON buffers.
+        summary = frame.group_by("evaluation_id", maintain_order=True).agg(
+            *(pl.col(column).first() for column in _EVALUATION_CONTEXT_COLUMNS),
+            pl.struct("variable", "semantics")
+            .unique(maintain_order=True)
+            .alias("semantic_pairs"),
         )
-    return tuple(sorted(contexts, key=lambda context: str(context["evaluation_id"])))
+        for row in summary.iter_rows(named=True):
+            evaluation_id = str(row["evaluation_id"])
+            context = contexts.setdefault(
+                evaluation_id,
+                {
+                    "evaluation_id": evaluation_id,
+                    **{
+                        column: str(row[column])
+                        for column in _EVALUATION_CONTEXT_COLUMNS
+                    },
+                    "semantics": {},
+                },
+            )
+            context_semantics = cast(dict[str, str], context["semantics"])
+            context_semantics.update(
+                {
+                    str(pair["variable"]): str(pair["semantics"])
+                    for pair in row["semantic_pairs"]
+                }
+            )
+    return tuple(contexts[key] for key in sorted(contexts))
 
 
 def _contexts_by_evaluation_id(
@@ -356,6 +372,8 @@ def _make_release(
     selections: Mapping[SliceKey, Selection],
     selected_scores: list[pl.DataFrame],
     dataset_id: str | None = None,
+    *,
+    evaluation_contexts: tuple[dict[str, object], ...],
 ) -> ModelRelease:
     evaluation_ids = tuple(
         sorted(
@@ -370,7 +388,7 @@ def _make_release(
         dataset=dataset_id or dataset_fingerprint(config),
         configuration=config_fingerprint(config),
         evaluation_ids=evaluation_ids,
-        evaluation_contexts=_evaluation_contexts(selected_scores),
+        evaluation_contexts=evaluation_contexts,
         training_cutoff=max(
             (frame["valid_time"].max() for frame in selected_scores), default=None
         ),
@@ -801,7 +819,13 @@ def select_methods(
             config, selections, evaluation_contexts
         ),
     )
-    release = _make_release(config, selections, selected_scores, current_dataset)
+    release = _make_release(
+        config,
+        selections,
+        selected_scores,
+        current_dataset,
+        evaluation_contexts=evaluation_contexts,
+    )
     release.write(config.artifacts_dir / "releases")
     return {
         key: replace(selected, release_id=release.release_id)

@@ -9,7 +9,9 @@ from conftest import synthetic_hourly_matrix, write_config
 from grounded_weather_forecast.backtest.engine import BacktestRequest, run_backtest
 from grounded_weather_forecast.backtest.scores import empty_scores
 from grounded_weather_forecast.contracts import hourly_variable
+from grounded_weather_forecast.metrics.dm import diebold_mariano
 from grounded_weather_forecast.reports.leaderboard import (
+    _dm_columns,
     aggregate_leaderboard,
     leaderboard,
     slice_winners,
@@ -333,3 +335,109 @@ class TestDmCollapsesPseudoReplication:
         # n still reports every scored row; only the DM test collapses
         n_replicated = replicated.filter(pl.col("method_id") == "challenger")["n"][0]
         assert n_replicated == 360
+
+
+class TestDmComparisonProjection:
+    @pytest.mark.parametrize(
+        ("product", "lead_lo", "horizon"),
+        [("hourly", 2.0, 3), ("daily", 48.0, 3), ("minutely", 0.05, 4)],
+    )
+    def test_wide_partial_cases_preserve_collapsed_losses(
+        self, product, lead_lo, horizon
+    ):
+        start = utc(2026, 3, 1)
+        rows = []
+        method_losses, reference_losses = [], []
+        for index in range(12):
+            paired_method, paired_reference = [], []
+            for replicate in range(2):
+                valid = start + timedelta(hours=index)
+                issue = valid - timedelta(hours=lead_lo + replicate / 2)
+                truth = 20.0 + index / 5
+                method_loss = 0.25 + index / 10 + replicate / 5
+                reference_loss = 1.0 + index * 0.03 + replicate / 10
+                method_null = (index, replicate) == (3, 0)
+                reference_null = (index, replicate) == (5, 1)
+                for method, available, prediction, method_truth in (
+                    (
+                        "candidate",
+                        index > 0,
+                        None if method_null else truth + method_loss,
+                        truth,
+                    ),
+                    (
+                        "reference",
+                        index < 11,
+                        None if reference_null else truth + reference_loss,
+                        999.0,  # Pairwise losses must use the candidate's truth.
+                    ),
+                ):
+                    if available:
+                        rows.append(
+                            {
+                                "method_id": method,
+                                "issue_time": issue,
+                                "valid_time": valid,
+                                "y_pred": prediction,
+                                "y_true": method_truth,
+                                "feature_set_json": json.dumps(["x" * 8192]),
+                                "quantiles_json": json.dumps([0.0] * 128),
+                            }
+                        )
+                if 0 < index < 11 and not method_null and not reference_null:
+                    paired_method.append(method_loss)
+                    paired_reference.append(reference_loss)
+            if paired_method:
+                method_losses.append(np.mean(paired_method))
+                reference_losses.append(np.mean(paired_reference))
+        scores = pl.DataFrame(rows)
+        method = scores.filter(pl.col("method_id") == "candidate")
+        skill, p_value = _dm_columns(scores, method, "reference", lead_lo, product)
+        method_loss = np.asarray(method_losses)
+        reference_loss = np.asarray(reference_losses)
+
+        assert skill == pytest.approx(
+            1.0 - method_loss.mean() / reference_loss.mean(), rel=1e-12, abs=1e-12
+        )
+        assert p_value == pytest.approx(
+            diebold_mariano(method_loss, reference_loss, horizon).p_value,
+            rel=1e-12,
+            abs=1e-12,
+        )
+
+    @pytest.mark.parametrize("case", ["missing", "no_overlap", "nulls", "zero_loss"])
+    def test_reference_edge_cases(self, case):
+        start = utc(2026, 3, 1)
+        candidate = pl.DataFrame(
+            {
+                "method_id": ["candidate"] * 12,
+                "issue_time": [start + timedelta(hours=i) for i in range(12)],
+                "valid_time": [start + timedelta(hours=i + 1) for i in range(12)],
+                "y_pred": [0.5 + i / 10 for i in range(12)],
+                "y_true": [0.0] * 12,
+                "feature_set_json": ["x" * 8192] * 12,
+            }
+        )
+        reference = candidate.with_columns(
+            pl.lit("other" if case == "missing" else "reference").alias("method_id"),
+            pl.lit(None if case == "nulls" else 0.0, dtype=pl.Float64).alias("y_pred"),
+        )
+        if case == "no_overlap":
+            reference = reference.with_columns(
+                pl.col("issue_time") + pl.duration(days=1)
+            )
+        result = _dm_columns(
+            pl.concat([candidate, reference]), candidate, "reference", 1.0, "hourly"
+        )
+
+        if case == "zero_loss":
+            assert result[0] is None
+            assert result[1] == pytest.approx(
+                diebold_mariano(
+                    candidate["y_pred"].to_numpy(), np.zeros(12), 2
+                ).p_value,
+                rel=1e-12,
+                abs=1e-12,
+            )
+        else:
+            assert result == (None, None)

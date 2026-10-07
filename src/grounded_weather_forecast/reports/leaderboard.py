@@ -231,12 +231,20 @@ def _dm_columns(
 
     Compared on pairwise-common cases only, then collapsed per valid_time.
     """
-    reference_scores = slice_scores.filter(pl.col("method_id") == reference)
+    comparison_columns = ("issue_time", "valid_time", "y_pred", "y_true")
+    # Score rows also carry large JSON payloads that are irrelevant to losses.
+    # Project before filtering or joining so those buffers never get copied.
+    reference_scores = (
+        slice_scores.select("method_id", *comparison_columns)
+        .filter(pl.col("method_id") == reference)
+        .drop("method_id")
+    )
     if reference_scores.is_empty():
         return None, None
     paired = (
-        method_scores.join(
-            reference_scores.select("issue_time", "valid_time", "y_pred", "y_true"),
+        method_scores.select(comparison_columns)
+        .join(
+            reference_scores,
             on=("issue_time", "valid_time"),
             how="inner",
             suffix="_ref",

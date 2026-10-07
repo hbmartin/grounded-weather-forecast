@@ -3,21 +3,26 @@ from datetime import UTC, datetime, timedelta
 
 import numpy as np
 import polars as pl
+import pytest
 from conftest import synthetic_hourly_matrix, utc, write_config
 
+import grounded_weather_forecast.evaluation as evaluation_module
 import grounded_weather_forecast.serve.selection as selection_module
 from grounded_weather_forecast.backtest.engine import BacktestRequest, run_backtest
 from grounded_weather_forecast.backtest.scores import (
     SCORES_SCHEMA,
+    empty_scores,
     load_scores,
     scores_path,
     write_scores,
 )
 from grounded_weather_forecast.contracts import TruthSemantics, hourly_variable
+from grounded_weather_forecast.evaluation import ModelRelease
 from grounded_weather_forecast.serve.selection import (
     FALLBACK_METHOD,
     Selection,
     _eligible_release_ids,
+    _evaluation_contexts,
     method_for,
     select_methods,
     selection_report,
@@ -45,6 +50,137 @@ def scored_config(tmp_path, extra=""):
     )
     write_scores(scores, scores_path(config.dataset.dir / "scores", "hourly", "live"))
     return config
+
+
+class TestEvaluationContexts:
+    @pytest.mark.parametrize("frames", [[], [empty_scores()], [empty_scores()] * 2])
+    def test_empty_inputs(self, frames):
+        assert _evaluation_contexts(frames) == ()
+
+    def test_merges_compact_metadata_in_first_encounter_order(self):
+        large_features = json.dumps(["x" * 8192])
+
+        def frame(evaluation, variable, semantics="inst", code="first"):
+            return pl.DataFrame(
+                {
+                    "evaluation_id": [evaluation] * 5,
+                    "source_kind": ["live"] * 5,
+                    "source_set_json": ['["nws"]'] * 5,
+                    "feature_set_json": [large_features] * 5,
+                    "variable": [variable] * 5,
+                    "semantics": [semantics] * 5,
+                    "window": ["expanding"] * 5,
+                    "code_version": [code] * 5,
+                    "config_fingerprint": ["config"] * 5,
+                    "y_pred": [1.0] * 5,
+                }
+            )
+
+        mixed = pl.concat([frame("b", "temp_c"), frame("a", "wind_speed_ms", "mean")])
+        contexts = _evaluation_contexts(
+            [
+                mixed,
+                frame("b", "humidity_pct", code="later"),
+                frame("b", "temp_c", code="later"),
+                mixed.clear(),
+            ]
+        )
+        common = {
+            "source_kind": "live",
+            "source_set_json": '["nws"]',
+            "feature_set_json": large_features,
+            "window": "expanding",
+            "code_version": "first",
+            "config_fingerprint": "config",
+        }
+
+        assert contexts == (
+            {"evaluation_id": "a", **common, "semantics": {"wind_speed_ms": "mean"}},
+            {
+                "evaluation_id": "b",
+                **common,
+                "semantics": {"temp_c": "inst", "humidity_pct": "inst"},
+            },
+        )
+
+    def test_release_preserves_contexts_cutoff_and_identity(
+        self, tmp_path, monkeypatch
+    ):
+        config = scored_config(
+            tmp_path, extra='\n[predict.methods]\n"hourly.temp_c" = "equal_weight"\n'
+        )
+        path = next((config.dataset.dir / "scores").glob("scores_*.parquet"))
+        scores = load_scores(path).with_columns(
+            pl.lit("dataset-fixed").alias("dataset_fingerprint"),
+            pl.lit("config-fixed").alias("config_fingerprint"),
+            pl.lit("code-fixed").alias("code_version"),
+            pl.lit("evaluation-fixed").alias("evaluation_id"),
+            pl.lit(json.dumps(["x" * 8192])).alias("feature_set_json"),
+        )
+        write_scores(scores, path)
+        monkeypatch.setattr(
+            selection_module, "dataset_fingerprint", lambda _: "dataset-fixed"
+        )
+        monkeypatch.setattr(
+            selection_module, "config_fingerprint", lambda _: "config-fixed"
+        )
+        monkeypatch.setattr(selection_module, "code_identity", lambda: "code-fixed")
+        fixed_time = utc(2026, 10, 6, 12)
+
+        class FixedDatetime(datetime):
+            @classmethod
+            def now(cls, tz=None):
+                return fixed_time if tz is None else fixed_time.astimezone(tz)
+
+        monkeypatch.setattr(evaluation_module, "datetime", FixedDatetime)
+        selected = select_methods(config, config.dataset.dir / "scores")
+        assert selected
+        assert all(
+            value.method_id == "equal_weight" and value.pinned
+            for value in selected.values()
+        )
+        context = {
+            "evaluation_id": "evaluation-fixed",
+            "source_kind": "live",
+            "source_set_json": scores["source_set_json"][0],
+            "feature_set_json": scores["feature_set_json"][0],
+            "semantics": {"temp_c": "inst"},
+            "window": "expanding",
+            "code_version": "code-fixed",
+            "config_fingerprint": "config-fixed",
+        }
+        cutoff = scores.filter(
+            pl.col("lead_bucket").is_in([key[2] for key in selected])
+        )["valid_time"].max()
+        expected = ModelRelease.create(
+            dataset="dataset-fixed",
+            configuration="config-fixed",
+            evaluation_ids=("evaluation-fixed",),
+            evaluation_contexts=(context,),
+            training_cutoff=cutoff,
+            selections={
+                ".".join(key): {
+                    "method_id": value.method_id,
+                    "reason": value.reason,
+                    "evaluation_id": "evaluation-fixed",
+                    "code_version": "code-fixed",
+                    "n": value.n,
+                    "mae": value.mae,
+                    "truth_semantics": value.truth_semantics,
+                    "retained": value.retained,
+                }
+                for key, value in selected.items()
+            },
+        )
+        release_path = config.artifacts_dir / "releases" / f"{expected.release_id}.json"
+        actual = json.loads(release_path.read_text())
+
+        assert {value.release_id for value in selected.values()} == {
+            expected.release_id
+        }
+        assert actual["evaluation_contexts"] == [context]
+        assert actual["training_cutoff"] == cutoff.isoformat()
+        assert actual["promoted_at"] == fixed_time.isoformat()
 
 
 class TestSelectMethods:
