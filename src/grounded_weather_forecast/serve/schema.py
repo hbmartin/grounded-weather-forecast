@@ -4,7 +4,7 @@ import json
 from dataclasses import asdict, dataclass, field
 from datetime import datetime
 
-SCHEMA_VERSION = 5
+SCHEMA_VERSION = 6
 
 
 @dataclass(frozen=True, slots=True)
@@ -19,6 +19,9 @@ class MinutelyPoint:
     pop: float | None = None
     methods: dict[str, str] = field(default_factory=dict)
     quantiles: dict[str, dict[str, float]] = field(default_factory=dict)
+    release_ids: dict[str, str] = field(default_factory=dict)
+    selection_reasons: dict[str, str] = field(default_factory=dict)
+    truth_semantics: dict[str, str] = field(default_factory=dict)
 
 
 @dataclass(frozen=True, slots=True)

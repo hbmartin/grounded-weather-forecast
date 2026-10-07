@@ -948,6 +948,19 @@ class TestMinutelyPromotedPlan:
 
         plan = _plan_from_selection(method_id, None)
         assert plan is not None
+        from dataclasses import replace
+
+        plan = replace(
+            plan,
+            selection=Selection(
+                method_id,
+                "promoted minutely",
+                n=30,
+                mae=1.0,
+                release_id="minute-release",
+                truth_semantics="inst",
+            ),
+        )
         return {"temp_c": dict.fromkeys(buckets, plan)}
 
     def test_promoted_tau_replaces_the_config_decay(self, la_config):
@@ -981,6 +994,9 @@ class TestMinutelyPromotedPlan:
         assert points[0].temp_c == pytest.approx(10.0)
         assert points[59].temp_c == pytest.approx(10.0)
         assert points[30].methods["temp_c"] == "minutely_persistence"
+        assert points[30].release_ids == {"temp_c": "minute-release"}
+        assert points[30].selection_reasons == {"temp_c": "promoted minutely"}
+        assert points[30].truth_semantics == {"temp_c": "inst"}
 
     def test_already_anchored_path_ignores_the_plan(self, la_config):
         from grounded_weather_forecast.serve.predict import minutely_product
@@ -996,6 +1012,8 @@ class TestMinutelyPromotedPlan:
         # identical to the no-plan anchored case: pure interpolation
         assert points[0].temp_c == pytest.approx(19.0 + 1.0 / 60.0, abs=0.001)
         assert points[0].methods["temp_c"] == "anchored_hourly_blend"
+        assert not points[0].release_ids
+        assert not points[0].selection_reasons
 
     def test_missing_observation_degrades_to_labeled_interp(self, la_config):
         from grounded_weather_forecast.serve.predict import minutely_product
@@ -1010,6 +1028,7 @@ class TestMinutelyPromotedPlan:
         )
         assert points[0].temp_c == pytest.approx(19.0 + 1.0 / 60.0, abs=0.001)
         assert points[0].methods["temp_c"] == "minutely_interp"
+        assert not points[0].release_ids
 
     def test_bucket_scoped_plan_leaves_other_buckets_on_the_fallback(self, la_config):
         from grounded_weather_forecast.serve.predict import minutely_product
@@ -1024,9 +1043,130 @@ class TestMinutelyPromotedPlan:
         assert points[0].methods["temp_c"] == "minutely_persistence"
         # minute 10 has no plan for its bucket: config-tau fallback label
         assert points[9].methods["temp_c"] == "anchored_hourly_blend"
+        assert points[0].release_ids == {"temp_c": "minute-release"}
+        assert not points[9].release_ids
+
+    def test_failed_fit_has_no_selected_release(self, la_config, monkeypatch):
+        import polars as pl
+        import grounded_weather_forecast.serve.predict as module
+
+        snapshot, blend, _ = self.setup_case()
+        monkeypatch.setattr(module, "_fitted_minutely_predictor", lambda *_: None)
+        selections = {
+            ("minutely", "temp_c", "0-5m"): Selection(
+                "minutely_ramp", "promoted", release_id="minute-release"
+            )
+        }
+        plans = module._minutely_plans(la_config, selections, pl.DataFrame())
+        assert plans is None
+        point = module.minutely_product(
+            snapshot, {"temp_c": blend}, la_config, plans=plans
+        )[0]
+        assert point.methods["temp_c"] == "anchored_hourly_blend"
+        assert not point.release_ids
+
+    def test_served_minutely_history_drives_guarded_replacement(
+        self, la_config, tmp_path
+    ):
+        from dataclasses import replace
+        from datetime import datetime
+        import polars as pl
+        from grounded_weather_forecast.serve.predict import minutely_product
+        from grounded_weather_forecast.serve.schema import Forecast
+        from grounded_weather_forecast.serve.history import append_history
+        from grounded_weather_forecast.reports.verification import verify_history
+        from grounded_weather_forecast.serve.selection import apply_live_gate
+
+        snapshot, blend, _ = self.setup_case()
+        truth_rows = []
+        path = tmp_path / "history.parquet"
+        for hour in range(6):
+            current = replace(
+                snapshot, issue_time=snapshot.issue_time + timedelta(hours=hour)
+            )
+            points = minutely_product(
+                current,
+                {"temp_c": blend},
+                la_config,
+                plans=self.plans("minutely_persistence"),
+            )
+            forecast = Forecast(
+                SCHEMA_VERSION,
+                current.issue_time.isoformat(),
+                0.0,
+                0.0,
+                "dataset",
+                [],
+                None,
+                points,
+                [],
+                [],
+            )
+            append_history(forecast, path)
+            truth_rows.extend(
+                {
+                    "ts": datetime.fromisoformat(point.valid_time),
+                    "temp_c": point.temp_c - 3.0,
+                }
+                for point in points
+            )
+        live = verify_history(
+            path, pl.DataFrame(), truth_minute=pl.DataFrame(truth_rows)
+        )
+        key = ("minutely", "temp_c", "0-5m")
+        selected = Selection(
+            "minutely_persistence",
+            "promoted",
+            n=30,
+            mae=1.0,
+            release_id="minute-release",
+        )
+        result = apply_live_gate(
+            {key: selected},
+            live,
+            factor=1.5,
+            min_n=24,
+            candidates={
+                key: (Selection("minutely_interp", "reference", n=30, mae=1.2),)
+            },
+            eligible_releases=frozenset({"minute-release"}),
+        )[key]
+        assert result.method_id == "minutely_interp"
+        assert "demoted minutely_persistence" in result.reason
 
 
 def replace_snapshot_observation(snapshot, observation):
     from dataclasses import replace
 
     return replace(snapshot, observation=observation)
+
+
+def test_minutely_release_list_preserves_hourly_daily_readiness(tmp_path):
+    config = build_fixture(tmp_path)
+    selections = {
+        ("minutely", "temp_c", bucket): Selection(
+            "minutely_interp",
+            "promoted",
+            release_id="minute-release",
+            truth_semantics="inst",
+        )
+        for bucket in ("0-5m", "5-15m", "15-30m", "30-45m", "45-60m")
+    }
+    forecast = predict(config, selections, now=NOW)
+    assert forecast.release_ids == ["minute-release"]
+    assert forecast.status == "degraded"
+    assert all("pop" not in point.release_ids for point in forecast.minutely)
+    raw = json.loads(forecast.to_json())
+    raw["schema_version"] = 5
+    for point in raw["minutely"]:
+        for key in ("release_ids", "selection_reasons", "truth_semantics"):
+            point.pop(key)
+    from grounded_weather_forecast.serve.schema import Forecast
+
+    old = Forecast.from_json(json.dumps(raw))
+    assert all(
+        not point.release_ids
+        and not point.selection_reasons
+        and not point.truth_semantics
+        for point in old.minutely
+    )

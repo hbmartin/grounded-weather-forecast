@@ -77,9 +77,11 @@ def forecast_to_rows(forecast: Forecast) -> pl.DataFrame:
                     "method_id": point.methods.get(variable, "native_or_anchored"),
                     "y_pred": value,
                     "dataset_fingerprint": forecast.dataset_fingerprint,
-                    "release_id": legacy_release,
-                    "selection_reason": None,
-                    "truth_semantics": TruthSemantics.INSTANTANEOUS.value,
+                    "release_id": point.release_ids.get(variable, legacy_release),
+                    "selection_reason": point.selection_reasons.get(variable),
+                    "truth_semantics": point.truth_semantics.get(
+                        variable, TruthSemantics.INSTANTANEOUS.value
+                    ),
                     "quantiles_json": _quantiles_json(point.quantiles.get(variable)),
                 }
             )
