@@ -330,7 +330,20 @@ def should_retain_incumbent(
         _with_default_semantics,
     )
 
-    slice_scores = _with_default_semantics(scores).filter(
+    columns = (
+        "product",
+        "variable",
+        "semantics",
+        "lead_bucket",
+        "method_id",
+        "issue_time",
+        "valid_time",
+        "y_pred",
+        "y_true",
+    )
+    slice_scores = _with_default_semantics(
+        scores.select([name for name in columns if name in scores.columns])
+    ).filter(
         (pl.col("product") == winner_row["product"])
         & (pl.col("variable") == winner_row["variable"])
         & (pl.col("lead_bucket") == winner_row["lead_bucket"])

@@ -1,4 +1,5 @@
 import json
+from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 
 import numpy as np
@@ -379,6 +380,7 @@ class TestMethodFor:
             dataset_fingerprint="dataset-r",
             release_id="release-r",
             code_version="0.4.0+implementation",
+            retained=True,
         )
 
         chosen = method_for(
@@ -390,6 +392,7 @@ class TestMethodFor:
         )
 
         assert chosen.pinned
+        assert not chosen.retained
         assert chosen.release_id == "release-r"
         assert chosen.evaluation_id == "eval-r"
         assert chosen.code_version == "0.4.0+implementation"
@@ -498,6 +501,15 @@ def test_release_eligibility_uses_implementation_not_promotion_age(tmp_path):
         (*key, "gbm")
     ] == frozenset({"release-old-but-active"})
     assert not _eligible_release_ids(config, changed, current_contexts)[(*key, "gbm")]
+    current_winner = {key: replace(matching[key], method_id="new-winner")}
+    candidate_cohorts = _eligible_release_ids(
+        config, current_winner, current_contexts, candidates={key: (matching[key],)}
+    )
+    assert candidate_cohorts[(*key, "new-winner")] == frozenset()
+    assert candidate_cohorts[(*key, "gbm")] == frozenset({"release-old-but-active"})
+    assert not _eligible_release_ids(
+        config, current_winner, current_contexts, candidates={key: (changed[key],)}
+    )[(*key, "gbm")]
 
 
 def test_release_eligibility_rejects_incompatible_evaluation_context(tmp_path):
@@ -997,8 +1009,16 @@ class TestIncumbentRetention:
         assert older is not None
         assert older[self.KEY].retained is False
 
-    def test_fallback_incumbent_is_never_retained(self, tmp_path, monkeypatch):
-        config = write_config(tmp_path)
+    @pytest.mark.parametrize(
+        "reference", ["equal_weight", "best_provider", "inverse_mse"]
+    )
+    def test_fallback_incumbent_is_never_retained(
+        self, tmp_path, monkeypatch, reference
+    ):
+        config = write_config(
+            tmp_path,
+            extra_toml=f'\n[promotion.references]\ntemp_c = ["{reference}"]\n',
+        )
         self._pin_fingerprints(monkeypatch)
         frame = near_tie_scores(utc(2026, 8, 2), "evaltwo", "cluster_equal_weight")
         board = selection_module.leaderboard(frame)
@@ -1012,7 +1032,7 @@ class TestIncumbentRetention:
             "gate": None,
         }
         kept = selection_module._retained_incumbent(
-            config, row, board, frame, (FALLBACK_METHOD, "inst"), "evaltwo"
+            config, row, board, frame, (reference, "inst"), "evaltwo"
         )
         assert kept is None
 
@@ -1060,7 +1080,9 @@ class TestPruneRaceResilience:
 
     def test_scan_retries_once_when_a_file_vanishes(self, tmp_path, monkeypatch):
         config = scored_config(tmp_path)
-        real = selection_module.load_scores
+        from grounded_weather_forecast.serve import score_scan
+
+        real = score_scan.scan_scores
         calls = {"count": 0}
 
         def flaky(path, **kwargs):
@@ -1069,7 +1091,7 @@ class TestPruneRaceResilience:
                 raise FileNotFoundError(path)
             return real(path, **kwargs)
 
-        monkeypatch.setattr(selection_module, "load_scores", flaky)
+        monkeypatch.setattr(score_scan, "scan_scores", flaky)
         frames = selection_module._compatible_scores(
             config, config.dataset.dir / "scores", None, None
         )
@@ -1084,7 +1106,9 @@ class TestPruneRaceResilience:
         def always_missing(path, **kwargs):
             raise FileNotFoundError(path)
 
-        monkeypatch.setattr(selection_module, "load_scores", always_missing)
+        from grounded_weather_forecast.serve import score_scan
+
+        monkeypatch.setattr(score_scan, "scan_scores", always_missing)
         frames = selection_module._compatible_scores(
             config, config.dataset.dir / "scores", None, None
         )
@@ -1096,7 +1120,9 @@ class TestPruneRaceResilience:
         def always_missing(path, **kwargs):
             raise FileNotFoundError(path)
 
-        monkeypatch.setattr(selection_module, "load_scores", always_missing)
+        from grounded_weather_forecast.serve import score_scan
+
+        monkeypatch.setattr(score_scan, "scan_scores", always_missing)
         reason = selection_module.no_evidence_reason(
             config, config.dataset.dir / "scores"
         )

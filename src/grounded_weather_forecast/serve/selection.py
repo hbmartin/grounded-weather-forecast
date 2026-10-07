@@ -17,8 +17,7 @@ from typing import cast
 
 import polars as pl
 
-from grounded_weather_forecast.backtest.scores import load_scores
-from grounded_weather_forecast.config import Config, PromotionConfig
+from grounded_weather_forecast.config import Config
 from grounded_weather_forecast.contracts import TruthSemantics
 from grounded_weather_forecast.evaluation import (
     ModelRelease,
@@ -37,8 +36,14 @@ from grounded_weather_forecast.reports.leaderboard import (
 )
 from grounded_weather_forecast.reports.winner_curse import should_retain_incumbent
 from grounded_weather_forecast.serve.evidence import (
-    ContextAccumulator,
     EvidenceSummary,
+)
+from grounded_weather_forecast.serve.score_scan import (
+    ScoreIdentity,
+    compatible_slices,
+)
+from grounded_weather_forecast.serve.score_scan import (
+    live_identity_sets as _live_identity_sets,
 )
 
 FALLBACK_METHOD = "equal_weight"
@@ -96,6 +101,23 @@ def _pins(config: Config) -> dict[tuple[str, str], str]:
     return pinned
 
 
+def _load_slices(
+    config: Config,
+    scores_dir: Path,
+    as_of: datetime | None,
+    semantics: Mapping[str, TruthSemantics] | None,
+    dataset_id: str | None = None,
+) -> dict[SliceKey, pl.DataFrame]:
+    identity = ScoreIdentity(
+        dataset_id or dataset_fingerprint(config),
+        config_fingerprint(config),
+        code_identity(),
+        as_of,
+        semantics,
+    )
+    return compatible_slices(scores_dir, identity, config.promotion)
+
+
 def _compatible_scores(
     config: Config,
     scores_dir: Path,
@@ -103,72 +125,8 @@ def _compatible_scores(
     semantics: Mapping[str, TruthSemantics] | None,
     dataset_id: str | None = None,
 ) -> list[pl.DataFrame]:
-    # Prune (which runs under the pipeline lock) can delete a file between
-    # this reader's glob and read — predict deliberately does not take that
-    # lock. A mixed pre/post-prune view must never mint a release, so retry
-    # the whole scan once against a consistent post-prune listing; skipping
-    # individual files is the second pass's last resort.
-    try:
-        return _scan_compatible_scores(
-            config, scores_dir, as_of, semantics, dataset_id, skip_missing=False
-        )
-    except FileNotFoundError:
-        return _scan_compatible_scores(
-            config, scores_dir, as_of, semantics, dataset_id, skip_missing=True
-        )
-
-
-def _scan_compatible_scores(
-    config: Config,
-    scores_dir: Path,
-    as_of: datetime | None,
-    semantics: Mapping[str, TruthSemantics] | None,
-    dataset_id: str | None = None,
-    *,
-    skip_missing: bool,
-) -> list[pl.DataFrame]:
-    current_dataset = dataset_id or dataset_fingerprint(config)
-    current_code = code_identity()
-    candidates: list[pl.DataFrame] = []
-    for path in sorted(scores_dir.glob("scores_*.parquet")):
-        try:
-            scores = load_scores(path)
-        except FileNotFoundError:
-            if not skip_missing:
-                raise
-            continue
-        if scores.is_empty() or set(scores["source_kind"].unique()) != {"live"}:
-            continue
-        required_identity = {
-            "dataset_fingerprint",
-            "config_fingerprint",
-            "evaluation_id",
-            "evaluation_created_at",
-            "code_version",
-            "source_set_json",
-            "feature_set_json",
-            "semantics",
-        }
-        if not required_identity <= set(scores.columns):
-            continue
-        scores = scores.filter(pl.col("dataset_fingerprint") == current_dataset)
-        scores = scores.filter(
-            pl.col("config_fingerprint") == config_fingerprint(config)
-        )
-        scores = scores.filter(pl.col("code_version") == current_code)
-        for variable, truth_semantics in (semantics or {}).items():
-            scores = scores.filter(
-                (pl.col("product") != "hourly")
-                | (pl.col("variable") != variable)
-                | (pl.col("semantics") == truth_semantics.value)
-            )
-        if as_of is not None:
-            scores = scores.filter(pl.col("evaluation_created_at") <= as_of)
-        if as_of is not None:
-            scores = scores.filter(pl.col("valid_time") <= as_of)
-        if not scores.is_empty():
-            candidates.append(scores)
-    return candidates
+    """Materialized newest complete slices; older numeric scores stay on disk."""
+    return list(_load_slices(config, scores_dir, as_of, semantics, dataset_id).values())
 
 
 def _pool_sibling_scores(
@@ -178,7 +136,7 @@ def _pool_sibling_scores(
 ) -> pl.DataFrame:
     """Widen a far daily slice's scores to its D3-10 pool siblings.
 
-    ``_newest_complete_slices`` partitions evidence per fine bucket, but the
+    The score scanner chooses evidence per fine bucket, but the
     pooled far-bucket gate can only pool what it can see — without the
     siblings of the same evaluation, serving would never reach the pooled
     promotions the report shows.
@@ -215,45 +173,6 @@ def _eprocess_store_for(
             code_identity(),
         )
     return cache[product]
-
-
-def _newest_complete_slices(
-    candidates: list[pl.DataFrame],
-    promotion: PromotionConfig | None = None,
-) -> dict[SliceKey, pl.DataFrame]:
-    """Newest atomic evaluation per slice containing every reference method."""
-    if not candidates:
-        return {}
-    contexts = ContextAccumulator()
-    for frame in candidates:
-        contexts.add(frame)
-    combined = pl.concat(candidates, how="diagonal_relaxed").filter(
-        ~pl.col("evaluation_id").is_in(contexts.invalid)
-    )
-    selected: dict[SliceKey, tuple[datetime, str, pl.DataFrame]] = {}
-    for evaluation_key, evaluation in combined.partition_by(
-        "evaluation_id", as_dict=True
-    ).items():
-        evaluation_id = str(evaluation_key[0])
-        created_at = evaluation["evaluation_created_at"].max()
-        if not isinstance(created_at, datetime):
-            continue
-        for slice_key, frame in evaluation.partition_by(
-            ["product", "variable", "lead_bucket"], as_dict=True
-        ).items():
-            methods = {str(method) for method in frame["method_id"].unique().to_list()}
-            references = gate_references(
-                str(slice_key[1]), promotion, product=str(slice_key[0])
-            )
-            if not set(references) <= methods:
-                continue
-            product, variable, lead_bucket = (str(part) for part in slice_key)
-            key: SliceKey = (product, variable, lead_bucket)
-            previous = selected.get(key)
-            marker = (created_at, evaluation_id)
-            if previous is None or marker > previous[:2]:
-                selected[key] = (created_at, evaluation_id, frame)
-    return {key: selected[key][2] for key in sorted(selected)}
 
 
 def _selection_payload(
@@ -756,11 +675,7 @@ def select_methods(
     current_dataset = dataset_id or dataset_fingerprint(config)
     pinned = _pins(config)
     selections: dict[SliceKey, Selection] = {}
-    compatible = _compatible_scores(
-        config, scores_dir, as_of, semantics, current_dataset
-    )
-    slices = _newest_complete_slices(compatible, config.promotion)
-    del compatible
+    slices = _load_slices(config, scores_dir, as_of, semantics, current_dataset)
     incumbents = _incumbent_methods(config)
     candidates: dict[SliceKey, tuple[Selection, ...]] = {}
     references = union_references(config.promotion)
@@ -805,6 +720,8 @@ def select_methods(
     evidence = EvidenceSummary.from_slices(
         slices, {key: selected.evaluation_id for key, selected in selections.items()}
     )
+    # Every replacement candidate comes from the same slice/evaluation, so
+    # changing the served method cannot change this release's evidence.
     selections = apply_live_gate(
         selections,
         _live_verification(config, datetime.now(tz=UTC)),
@@ -814,9 +731,6 @@ def select_methods(
         eligible_releases=_eligible_release_ids(
             config, selections, evidence.contexts, candidates=candidates
         ),
-    )
-    evidence = EvidenceSummary.from_slices(
-        slices, {key: selected.evaluation_id for key, selected in selections.items()}
     )
     release = _make_release(config, selections, evidence, current_dataset)
     release.write(config.artifacts_dir / "releases")
@@ -982,11 +896,11 @@ def apply_live_gate(
 ) -> dict[tuple[str, str, str], Selection]:
     """Close the self-verification loop: demote methods that underdeliver live.
 
-    A selected method whose realized served MAE is materially worse than its
-    backtest promise (``live_mae > factor * backtest_mae`` at ``n >= min_n``)
-    falls back to the reference method — the one failure a backtest can never
-    catch by itself. The verdict travels in the selection reason, so the
-    release ledger records every demotion.
+    A selected method whose realized served MAE exceeds its backtest promise
+    can move to an eligible reference only when the quality guard passes.
+    Current backtest error is a proxy; mature live reference error can veto
+    it. Failed gates with no qualified replacement keep serving and record
+    the blocked verdict in the release reason.
 
     Evidence is pooled across ``eligible_releases`` rather than matched to one
     release, mirroring ``ArtifactStore.load_latest_state``: identity that
@@ -1021,38 +935,6 @@ def apply_live_gate(
             dataset_fingerprint=selected.dataset_fingerprint,
         )
     return gated
-
-
-def _live_identity_sets(
-    scores_dir: Path, *, skip_missing: bool
-) -> tuple[bool, set[str], set[str], set[str]]:
-    """(any files found, live dataset / config / code identities on disk)."""
-    paths = sorted(scores_dir.glob("scores_*.parquet"))
-    live_datasets: set[str] = set()
-    live_configs: set[str] = set()
-    live_code_versions: set[str] = set()
-    for path in paths:
-        try:
-            scores = load_scores(path)
-        except FileNotFoundError:
-            if not skip_missing:
-                raise
-            continue
-        if scores.is_empty() or set(scores["source_kind"].unique()) != {"live"}:
-            continue
-        if "dataset_fingerprint" in scores.columns:
-            live_datasets |= {
-                str(value) for value in scores["dataset_fingerprint"].unique().to_list()
-            }
-        if "config_fingerprint" in scores.columns:
-            live_configs |= {
-                str(value) for value in scores["config_fingerprint"].unique().to_list()
-            }
-        if "code_version" in scores.columns:
-            live_code_versions |= {
-                str(value) for value in scores["code_version"].unique().to_list()
-            }
-    return bool(paths), live_datasets, live_configs, live_code_versions
 
 
 def no_evidence_reason(
@@ -1122,7 +1004,9 @@ def method_for(
                 else None
             )
             if found is not None and found.method_id == pinned:
-                return replace(found, reason="pinned in config", pinned=True)
+                return replace(
+                    found, reason="pinned in config", pinned=True, retained=False
+                )
             return Selection(pinned, reason="pinned in config", pinned=True)
     if lead_bucket is not None:
         found = selections.get((product, variable, lead_bucket))
