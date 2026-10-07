@@ -558,6 +558,7 @@ def _retained_incumbent(
     if (
         incumbent_method == str(winner_row["method_id"])
         or winner_row.get("gate") not in _RETENTION_GATES
+        or incumbent_method == FALLBACK_METHOD
         # A demoted slice's persisted method is already the fallback;
         # retaining it by name would outlast the demotion's own re-hearing.
         or incumbent_method

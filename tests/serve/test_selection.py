@@ -1010,14 +1010,20 @@ class TestIncumbentRetention:
         assert older[self.KEY].retained is False
 
     @pytest.mark.parametrize(
-        "reference", ["equal_weight", "best_provider", "inverse_mse"]
+        "reference,configured",
+        [
+            ("equal_weight", "equal_weight"),
+            ("equal_weight", "inverse_mse"),
+            ("best_provider", "best_provider"),
+            ("inverse_mse", "inverse_mse"),
+        ],
     )
     def test_fallback_incumbent_is_never_retained(
-        self, tmp_path, monkeypatch, reference
+        self, tmp_path, monkeypatch, reference, configured
     ):
         config = write_config(
             tmp_path,
-            extra_toml=f'\n[promotion.references]\ntemp_c = ["{reference}"]\n',
+            extra_toml=f'\n[promotion.references]\ntemp_c = ["{configured}"]\n',
         )
         self._pin_fingerprints(monkeypatch)
         frame = near_tie_scores(utc(2026, 8, 2), "evaltwo", "cluster_equal_weight")
