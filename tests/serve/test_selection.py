@@ -1101,3 +1101,126 @@ class TestPruneRaceResilience:
             config, config.dataset.dir / "scores"
         )
         assert "no live backtest evidence" in reason
+
+
+class TestPinnedEvidence:
+    @pytest.mark.parametrize(
+        "method,n,mae,evaluation",
+        [
+            ("best_provider", 30, 5.0, "eval"),
+            ("absent_method", 0, None, None),
+            ("sparse_method", 1, 2.0, "eval"),
+        ],
+    )
+    def test_pin_uses_own_statistics_and_skips_retention(
+        self, tmp_path, monkeypatch, method, n, mae, evaluation
+    ):
+        config = write_config(
+            tmp_path, extra_toml=f'\n[predict.methods]\n"hourly.temp_c" = "{method}"\n'
+        )
+        scores = near_tie_scores(utc(2026, 8, 1), "eval", "inverse_mse").with_columns(
+            (
+                pl.col("y_true")
+                + pl.when(pl.col("method_id") == "best_provider")
+                .then(5.0)
+                .otherwise(1.0)
+            ).alias("y_pred"),
+        )
+        sparse = scores.head(1).with_columns(
+            pl.lit("sparse_method").alias("method_id"),
+            (pl.col("y_true") + 2.0).alias("y_pred"),
+        )
+        write_scores(
+            pl.concat([scores, sparse]), tmp_path / "scores" / "scores_fixture.parquet"
+        )
+        TestIncumbentRetention()._pin_fingerprints(monkeypatch)
+
+        def unexpected(*args, **kwargs):
+            raise AssertionError("pins must skip retention")
+
+        monkeypatch.setattr(selection_module, "_retained_incumbent", unexpected)
+        selected = select_methods(config, tmp_path / "scores")[
+            ("hourly", "temp_c", "24-48h")
+        ]
+        assert (
+            selected.method_id,
+            selected.n,
+            selected.mae,
+            selected.evaluation_id,
+        ) == (method, n, mae, evaluation)
+        assert selected.pinned and not selected.retained
+        release = json.loads(
+            (
+                config.artifacts_dir / "releases" / f"{selected.release_id}.json"
+            ).read_text()
+        )
+        persisted = release["selections"]["hourly.temp_c.24-48h"]
+        assert (persisted["n"], persisted["mae"], persisted["retained"]) == (
+            n,
+            mae,
+            False,
+        )
+        if evaluation is None:
+            assert release["evaluation_ids"] == []
+            assert release["evaluation_contexts"] == []
+            assert release["training_cutoff"] is None
+
+
+class TestReferenceReplacementIntegration:
+    @pytest.mark.parametrize("product", ["hourly", "minutely"])
+    def test_uses_product_reference_class_and_persists_replacement(
+        self, tmp_path, monkeypatch, product
+    ):
+        config = write_config(
+            tmp_path,
+            extra_toml='\n[promotion.references]\ntemp_c = ["best_provider", "damped_grounded_equal_weight"]\n',
+        )
+        scores = near_tie_scores(utc(2026, 8, 1), "eval", "inverse_mse")
+        winner, reference, bucket = "inverse_mse", "best_provider", "24-48h"
+        if product == "minutely":
+            mapping = {
+                "inverse_mse": "minutely_anchor_full",
+                "cluster_equal_weight": "minutely_anchor_tau_1h",
+                "best_provider": "minutely_interp",
+                "equal_weight": "minutely_persistence",
+                "damped_grounded_equal_weight": "extra",
+            }
+            scores = scores.with_columns(
+                pl.col("method_id").replace(mapping),
+                pl.lit("minutely").alias("product"),
+                pl.lit("0-5m").alias("lead_bucket"),
+                pl.lit(0.05).alias("lead_hours"),
+            )
+            winner, reference, bucket = (
+                "minutely_anchor_full",
+                "minutely_interp",
+                "0-5m",
+            )
+        scores = scores.with_columns(
+            (
+                pl.col("y_true")
+                + pl.when(pl.col("method_id") == winner).then(1.0).otherwise(5.0)
+            ).alias("y_pred"),
+            pl.lit('["nws"]').alias("source_set_json"),
+        )
+        write_scores(scores, tmp_path / "scores" / "scores_fixture.parquet")
+        TestIncumbentRetention()._pin_fingerprints(monkeypatch)
+        key = (product, "temp_c", bucket)
+        first = select_methods(config, tmp_path / "scores")[key]
+        assert first.method_id == winner
+        live = pl.DataFrame(
+            {
+                "product": [product],
+                "variable": ["temp_c"],
+                "lead_bucket": [bucket],
+                "method_id": [winner],
+                "release_id": [first.release_id],
+                "n": [30],
+                "live_mae": [10.0],
+            }
+        )
+        monkeypatch.setattr(selection_module, "_live_verification", lambda *_: live)
+        replaced = select_methods(config, tmp_path / "scores")[key]
+        assert replaced.method_id == reference
+        assert replaced.mae == 5.0
+        assert "demoted" in replaced.reason

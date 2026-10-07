@@ -36,7 +36,10 @@ from grounded_weather_forecast.reports.leaderboard import (
     union_references,
 )
 from grounded_weather_forecast.reports.winner_curse import should_retain_incumbent
-from grounded_weather_forecast.serve.evidence import ContextAccumulator, EvidenceSummary
+from grounded_weather_forecast.serve.evidence import (
+    ContextAccumulator,
+    EvidenceSummary,
+)
 
 FALLBACK_METHOD = "equal_weight"
 _LIVE_KEY = ("product", "variable", "lead_bucket", "method_id")
@@ -480,6 +483,8 @@ def _eligible_release_ids(
     config: Config,
     selections: Mapping[SliceKey, Selection],
     evaluation_contexts: tuple[dict[str, object], ...] = (),
+    *,
+    candidates: Mapping[SliceKey, tuple[Selection, ...]] | None = None,
 ) -> EligibleReleases:
     """Release cohorts matching each selected method and evaluation context.
 
@@ -494,9 +499,14 @@ def _eligible_release_ids(
     Recency is applied to served rows rather than to immutable release creation
     times.
     """
-    eligible: dict[LiveKey, set[str]] = {
-        (*key, selected.method_id): set() for key, selected in selections.items()
+    choices = {
+        (*key, selected.method_id): selected for key, selected in selections.items()
     }
+    for key, references in (candidates or {}).items():
+        choices.update(
+            {(*key, reference.method_id): reference for reference in references}
+        )
+    eligible: dict[LiveKey, set[str]] = {key: set() for key in choices}
     current_contexts = _contexts_by_evaluation_id(evaluation_contexts)
     for raw in _compatible_releases(config, match_dataset=False):
         release_id = raw.get("release_id")
@@ -504,12 +514,12 @@ def _eligible_release_ids(
         if not isinstance(release_id, str) or not isinstance(raw_selections, dict):
             continue
         release_contexts = _contexts_by_evaluation_id(raw.get("evaluation_contexts"))
-        for key, selected in selections.items():
+        for live_key, selected in choices.items():
+            key = live_key[:3]
             raw_selected = raw_selections.get(".".join(key))
             if not isinstance(raw_selected, dict):
                 continue
             selection_mapping = cast(Mapping[str, object], raw_selected)
-            live_key = (*key, selected.method_id)
             current_context = current_contexts.get(selected.evaluation_id or "")
             release_context = release_contexts.get(
                 str(selection_mapping.get("evaluation_id") or "")
@@ -631,7 +641,12 @@ def _retained_incumbent(
         or winner_row.get("gate") not in _RETENTION_GATES
         # A demoted slice's persisted method is already the fallback;
         # retaining it by name would outlast the demotion's own re-hearing.
-        or incumbent_method == FALLBACK_METHOD
+        or incumbent_method
+        in gate_references(
+            str(winner_row["variable"]),
+            config.promotion,
+            product=str(winner_row["product"]),
+        )
     ):
         return None
     slice_semantics = str(frame["semantics"][0])
@@ -665,6 +680,68 @@ def _retained_incumbent(
     )
 
 
+def _selection_from_row(
+    row: Mapping[str, object],
+    frame: pl.DataFrame,
+    dataset: str,
+    reason: str,
+) -> Selection:
+    return Selection(
+        method_id=str(row["method_id"]),
+        reason=reason,
+        n=int(cast(int, row["n"])),
+        mae=float(cast(float, row["mae"])),
+        evaluation_id=str(frame["evaluation_id"][0]),
+        dataset_fingerprint=dataset,
+        code_version=str(frame["code_version"][0]),
+        truth_semantics=str(
+            row.get("truth_semantics") or frame["semantics"][0] or "inst"
+        ),
+    )
+
+
+def _pinned_selection(
+    method: str, board: pl.DataFrame, frame: pl.DataFrame, dataset: str
+) -> Selection:
+    rows = (
+        board.filter(pl.col("method_id") == method) if not board.is_empty() else board
+    )
+    selected = (
+        _selection_from_row(rows.row(0, named=True), frame, dataset, "pinned in config")
+        if not rows.is_empty()
+        else Selection(
+            method,
+            "pinned in config",
+            dataset_fingerprint=dataset,
+            code_version=str(frame["code_version"][0]),
+            truth_semantics=str(frame["semantics"][0] or "inst"),
+        )
+    )
+    return replace(selected, pinned=True, retained=False)
+
+
+def _reference_candidates(
+    key: SliceKey,
+    board: pl.DataFrame,
+    frame: pl.DataFrame,
+    config: Config,
+    dataset: str,
+) -> tuple[Selection, ...]:
+    references = gate_references(key[1], config.promotion, product=key[0])
+    eligible = eligible_board_rows(board)
+    return (
+        tuple(
+            _selection_from_row(row, frame, dataset, "reference fallback")
+            for method in references
+            for row in eligible.filter(pl.col("method_id") == method).iter_rows(
+                named=True
+            )
+        )
+        if not eligible.is_empty()
+        else ()
+    )
+
+
 def select_methods(
     config: Config,
     scores_dir: Path,
@@ -678,17 +755,21 @@ def select_methods(
         return _release_as_of(config, as_of, semantics) or {}
     current_dataset = dataset_id or dataset_fingerprint(config)
     pinned = _pins(config)
-    selections: dict[tuple[str, str, str], Selection] = {}
+    selections: dict[SliceKey, Selection] = {}
     compatible = _compatible_scores(
         config, scores_dir, as_of, semantics, current_dataset
     )
-    incumbents = _incumbent_methods(config)
     slices = _newest_complete_slices(compatible, config.promotion)
-    fallbacks: dict[SliceKey, Selection] = {}
+    del compatible
+    incumbents = _incumbent_methods(config)
+    candidates: dict[SliceKey, tuple[Selection, ...]] = {}
     references = union_references(config.promotion)
     eprocess_stores: dict[str, EProcessStore] = {}
     for key, frame in slices.items():
         board = leaderboard(frame, references=references)
+        if (method := pinned.get(key[:2])) is not None:
+            selections[key] = _pinned_selection(method, board, frame, current_dataset)
+            continue
         winners = slice_winners(
             board,
             scores=_pool_sibling_scores(key, frame, slices),
@@ -699,72 +780,39 @@ def select_methods(
         )
         if winners.is_empty():
             continue
-        evaluation_id = str(frame["evaluation_id"][0])
         row = winners.row(0, named=True)
         reason = "lowest backtest MAE among promotable common-case methods"
         if row.get("gate") == "pooled_D3-10":
             reason += " (gated on pooled D3-10 evidence)"
-        selections[key] = Selection(
-            method_id=str(row["method_id"]),
-            reason=reason,
-            n=int(row["n"]),
-            mae=float(row["mae"]),
-            evaluation_id=evaluation_id,
-            dataset_fingerprint=current_dataset,
-            code_version=str(frame["code_version"][0]),
-            truth_semantics=str(frame["semantics"][0]),
-        )
-        retained = _retained_incumbent(
-            config,
-            row,
-            board,
-            frame,
-            incumbents.get(key),
-            evaluation_id,
-            current_dataset,
-        )
-        if retained is not None:
-            selections[key] = retained
-        fallback_rows = board.filter(pl.col("method_id") == FALLBACK_METHOD).sort("mae")
-        if not fallback_rows.is_empty():
-            fallback = fallback_rows.row(0, named=True)
-            fallbacks[key] = Selection(
-                method_id=FALLBACK_METHOD,
-                reason="reference fallback",
-                n=int(fallback["n"]),
-                mae=float(fallback["mae"]),
-                evaluation_id=evaluation_id,
-                dataset_fingerprint=current_dataset,
-                code_version=str(frame["code_version"][0]),
-                truth_semantics=str(frame["semantics"][0]),
+        selected = _selection_from_row(row, frame, current_dataset, reason)
+        selections[key] = (
+            _retained_incumbent(
+                config,
+                row,
+                board,
+                frame,
+                incumbents.get(key),
+                str(frame["evaluation_id"][0]),
+                current_dataset,
             )
-    for (product, variable), method_id in pinned.items():
-        for key in [key for key in selections if key[:2] == (product, variable)]:
-            selections[key] = replace(
-                selections[key],
-                method_id=method_id,
-                reason="pinned in config",
-                pinned=True,
-            )
+            or selected
+        )
+        candidates[key] = _reference_candidates(
+            key, board, frame, config, current_dataset
+        )
     if not selections:
         return selections
     evidence = EvidenceSummary.from_slices(
         slices, {key: selected.evaluation_id for key, selected in selections.items()}
     )
-    evaluation_contexts = evidence.contexts
-    # Gate before minting the release. Stamping a prospective id first only
-    # ever orphaned it: a demotion rewrites `selections`, which the release
-    # hash covers, so the rows served under the acting release ended up
-    # attributed to an id that release does not have.
-    now = datetime.now(tz=UTC)
     selections = apply_live_gate(
         selections,
-        _live_verification(config, now),
+        _live_verification(config, datetime.now(tz=UTC)),
         factor=config.promotion.live_gap_factor,
         min_n=config.promotion.min_live_n,
-        fallbacks=fallbacks,
+        candidates=candidates,
         eligible_releases=_eligible_release_ids(
-            config, selections, evaluation_contexts
+            config, selections, evidence.contexts, candidates=candidates
         ),
     )
     evidence = EvidenceSummary.from_slices(
@@ -857,12 +905,7 @@ def _live_verdict(
     min_n: int,
 ) -> str | None:
     """The demotion reason for this slice, or ``None`` to leave it standing."""
-    if (
-        selected.method_id == FALLBACK_METHOD
-        or selected.pinned
-        or selected.mae is None
-        or not math.isfinite(selected.mae)
-    ):
+    if selected.pinned or selected.mae is None or not math.isfinite(selected.mae):
         return None
     product, variable, bucket = key
     measured = pooled.get((product, variable, bucket, selected.method_id))
@@ -877,19 +920,54 @@ def _live_verdict(
     )
 
 
+def _replacement_rank(
+    key: SliceKey,
+    candidate: Selection,
+    pooled: Mapping[LiveKey, tuple[int, float]],
+    winner_live_mae: float,
+    factor: float,
+    min_n: int,
+    order: int,
+) -> tuple[float, int, int] | None:
+    if (
+        candidate.mae is None
+        or not math.isfinite(candidate.mae)
+        or candidate.mae < 0
+        or candidate.mae >= winner_live_mae
+    ):
+        return None
+    score = candidate.mae
+    measured = pooled.get((*key, candidate.method_id))
+    if measured is not None and measured[0] >= min_n:
+        live_mae = measured[1]
+        if live_mae >= winner_live_mae or live_mae > factor * candidate.mae:
+            return None
+        score = max(score, live_mae)
+    return score, 0 if candidate.method_id == FALLBACK_METHOD else 1, order
+
+
 def _gate_fallback(
     key: SliceKey,
     selected: Selection,
-    fallbacks: Mapping[SliceKey, Selection] | None,
+    choices: tuple[Selection, ...],
+    pooled: Mapping[LiveKey, tuple[int, float]],
+    *,
+    factor: float,
+    min_n: int,
 ) -> Selection | None:
-    if fallbacks is not None:
-        return fallbacks.get(key)
-    return Selection(
-        FALLBACK_METHOD,
-        reason="reference fallback",
-        dataset_fingerprint=selected.dataset_fingerprint,
-        truth_semantics=selected.truth_semantics,
-    )
+    winner_live_mae = pooled[(*key, selected.method_id)][1]
+    ranked = [
+        (rank, candidate)
+        for order, candidate in enumerate(choices)
+        if candidate.method_id != selected.method_id
+        and (
+            rank := _replacement_rank(
+                key, candidate, pooled, winner_live_mae, factor, min_n, order
+            )
+        )
+        is not None
+    ]
+    return min(ranked, key=lambda pair: pair[0])[1] if ranked else None
 
 
 def apply_live_gate(
@@ -899,6 +977,7 @@ def apply_live_gate(
     factor: float,
     min_n: int,
     fallbacks: Mapping[SliceKey, Selection] | None = None,
+    candidates: Mapping[SliceKey, tuple[Selection, ...]] | None = None,
     eligible_releases: frozenset[str] | EligibleReleases | None = None,
 ) -> dict[tuple[str, str, str], Selection]:
     """Close the self-verification loop: demote methods that underdeliver live.
@@ -923,8 +1002,18 @@ def apply_live_gate(
         verdict = _live_verdict(pooled, key, selected, factor=factor, min_n=min_n)
         if verdict is None:
             continue
-        fallback = _gate_fallback(key, selected, fallbacks)
+        choices = (candidates or {}).get(key, ())
+        if fallbacks is not None and key in fallbacks:
+            choices = (*choices, fallbacks[key])
+        fallback = _gate_fallback(
+            key, selected, choices, pooled, factor=factor, min_n=min_n
+        )
         if fallback is None:
+            gated[key] = replace(
+                selected,
+                reason=verdict.replace("demoted", "live gate failed for", 1)
+                + "; replacement blocked: no reference passes quality guard",
+            )
             continue
         gated[key] = replace(
             fallback,
