@@ -63,6 +63,38 @@ backtesting or serving methods that consume ensemble features.
    `launchctl bootout "gui/$(id -u)/com.grounded-weather-forecast.predict"`;
    substitute any of the other three labels as needed.
 
+## Profiling a scheduled run
+
+The optional Memray wrapper records allocations from the start of a command,
+saves a unique capture for each invocation, and generates an HTML report after
+it finishes. Install it in the source checkout with
+`uv sync --locked --group profiling`. To invoke it unattended, use an absolute
+`uv` path and project directory:
+
+```bash
+__UV__ --directory __REPO__ run --locked --group profiling \
+  python scripts/profile_memory.py -- maintain
+```
+
+For the existing `maintain` or `predict` launchd templates, keep the shared
+launcher, mode, repository, environment, and schedule. In `ProgramArguments`,
+add `--group`, `profiling` to the `uv run` options and replace the
+`grounded-weather-forecast` executable argument with these three arguments:
+
+```xml
+<string>python</string>
+<string>scripts/profile_memory.py</string>
+<string>--</string>
+```
+
+Keep the existing forecast command and its arguments after the separator (for
+example, `maintain`, or `publish --out __OUT_JSON__`). Each value is a separate
+plist argument. Apply this only to jobs you want to profile; profiling adds
+runtime overhead and captures accumulate under `artifacts/memory/`.
+The wrapper's stderr log prints the capture and report paths. See the
+[CLI reference](reference/cli.md#memory-profiling-with-memray) for wrapper flags,
+exit behavior, and later analysis commands.
+
 ## Notes
 
 - The `maintain` and `predict` templates invoke a launcher copied to the

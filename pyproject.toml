@@ -89,6 +89,9 @@ docs = [
     "zensical>=0.0.50",
     "mkdocstrings[python]>=0.27.0",
 ]
+profiling = [
+    "memray>=1.20.0",
+]
 
 [tool.pytest.ini_options]
 pythonpath = ["src", "tests"]
