@@ -36,17 +36,10 @@ from grounded_weather_forecast.reports.leaderboard import (
     union_references,
 )
 from grounded_weather_forecast.reports.winner_curse import should_retain_incumbent
+from grounded_weather_forecast.serve.evidence import ContextAccumulator, EvidenceSummary
 
 FALLBACK_METHOD = "equal_weight"
 _LIVE_KEY = ("product", "variable", "lead_bucket", "method_id")
-_EVALUATION_CONTEXT_COLUMNS = (
-    "source_kind",
-    "source_set_json",
-    "feature_set_json",
-    "window",
-    "code_version",
-    "config_fingerprint",
-)
 # How long a served row may still testify. A module constant rather than a
 # config field on purpose: a new field changes `repr(config)`, hence
 # `config_fingerprint`, which would invalidate every score and release once.
@@ -228,7 +221,12 @@ def _newest_complete_slices(
     """Newest atomic evaluation per slice containing every reference method."""
     if not candidates:
         return {}
-    combined = pl.concat(candidates, how="diagonal_relaxed")
+    contexts = ContextAccumulator()
+    for frame in candidates:
+        contexts.add(frame)
+    combined = pl.concat(candidates, how="diagonal_relaxed").filter(
+        ~pl.col("evaluation_id").is_in(contexts.invalid)
+    )
     selected: dict[SliceKey, tuple[datetime, str, pl.DataFrame]] = {}
     for evaluation_key, evaluation in combined.partition_by(
         "evaluation_id", as_dict=True
@@ -271,44 +269,6 @@ def _selection_payload(
         }
         for key, selected in sorted(selections.items())
     }
-
-
-def _evaluation_contexts(
-    selected_scores: list[pl.DataFrame],
-) -> tuple[dict[str, object], ...]:
-    if not selected_scores:
-        return ()
-    contexts: dict[str, dict[str, object]] = {}
-    for frame in selected_scores:
-        # Keep one metadata row per evaluation before merging across slices;
-        # concatenating full scores replicates large, repeated JSON buffers.
-        summary = frame.group_by("evaluation_id", maintain_order=True).agg(
-            *(pl.col(column).first() for column in _EVALUATION_CONTEXT_COLUMNS),
-            pl.struct("variable", "semantics")
-            .unique(maintain_order=True)
-            .alias("semantic_pairs"),
-        )
-        for row in summary.iter_rows(named=True):
-            evaluation_id = str(row["evaluation_id"])
-            context = contexts.setdefault(
-                evaluation_id,
-                {
-                    "evaluation_id": evaluation_id,
-                    **{
-                        column: str(row[column])
-                        for column in _EVALUATION_CONTEXT_COLUMNS
-                    },
-                    "semantics": {},
-                },
-            )
-            context_semantics = cast(dict[str, str], context["semantics"])
-            context_semantics.update(
-                {
-                    str(pair["variable"]): str(pair["semantics"])
-                    for pair in row["semantic_pairs"]
-                }
-            )
-    return tuple(contexts[key] for key in sorted(contexts))
 
 
 def _contexts_by_evaluation_id(
@@ -370,28 +330,15 @@ def _evaluation_compatibility(
 def _make_release(
     config: Config,
     selections: Mapping[SliceKey, Selection],
-    selected_scores: list[pl.DataFrame],
+    evidence: EvidenceSummary,
     dataset_id: str | None = None,
-    *,
-    evaluation_contexts: tuple[dict[str, object], ...],
 ) -> ModelRelease:
-    evaluation_ids = tuple(
-        sorted(
-            {
-                selected.evaluation_id
-                for selected in selections.values()
-                if selected.evaluation_id is not None
-            }
-        )
-    )
     return ModelRelease.create(
         dataset=dataset_id or dataset_fingerprint(config),
         configuration=config_fingerprint(config),
-        evaluation_ids=evaluation_ids,
-        evaluation_contexts=evaluation_contexts,
-        training_cutoff=max(
-            (frame["valid_time"].max() for frame in selected_scores), default=None
-        ),
+        evaluation_ids=evidence.evaluation_ids,
+        evaluation_contexts=evidence.contexts,
+        training_cutoff=evidence.training_cutoff,
         selections=_selection_payload(selections),
     )
 
@@ -737,7 +684,6 @@ def select_methods(
     )
     incumbents = _incumbent_methods(config)
     slices = _newest_complete_slices(compatible, config.promotion)
-    selected_scores: list[pl.DataFrame] = []
     fallbacks: dict[SliceKey, Selection] = {}
     references = union_references(config.promotion)
     eprocess_stores: dict[str, EProcessStore] = {}
@@ -753,7 +699,6 @@ def select_methods(
         )
         if winners.is_empty():
             continue
-        selected_scores.append(frame)
         evaluation_id = str(frame["evaluation_id"][0])
         row = winners.row(0, named=True)
         reason = "lowest backtest MAE among promotable common-case methods"
@@ -803,7 +748,10 @@ def select_methods(
             )
     if not selections:
         return selections
-    evaluation_contexts = _evaluation_contexts(selected_scores)
+    evidence = EvidenceSummary.from_slices(
+        slices, {key: selected.evaluation_id for key, selected in selections.items()}
+    )
+    evaluation_contexts = evidence.contexts
     # Gate before minting the release. Stamping a prospective id first only
     # ever orphaned it: a demotion rewrites `selections`, which the release
     # hash covers, so the rows served under the acting release ended up
@@ -819,13 +767,10 @@ def select_methods(
             config, selections, evaluation_contexts
         ),
     )
-    release = _make_release(
-        config,
-        selections,
-        selected_scores,
-        current_dataset,
-        evaluation_contexts=evaluation_contexts,
+    evidence = EvidenceSummary.from_slices(
+        slices, {key: selected.evaluation_id for key, selected in selections.items()}
     )
+    release = _make_release(config, selections, evidence, current_dataset)
     release.write(config.artifacts_dir / "releases")
     return {
         key: replace(selected, release_id=release.release_id)

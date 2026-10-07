@@ -6,7 +6,6 @@ import polars as pl
 import pytest
 from conftest import synthetic_hourly_matrix, utc, write_config
 
-import grounded_weather_forecast.evaluation as evaluation_module
 import grounded_weather_forecast.serve.selection as selection_module
 from grounded_weather_forecast.backtest.engine import BacktestRequest, run_backtest
 from grounded_weather_forecast.backtest.scores import (
@@ -18,11 +17,13 @@ from grounded_weather_forecast.backtest.scores import (
 )
 from grounded_weather_forecast.contracts import TruthSemantics, hourly_variable
 from grounded_weather_forecast.evaluation import ModelRelease
+from grounded_weather_forecast.serve.evidence import (
+    evaluation_contexts as _evaluation_contexts,
+)
 from grounded_weather_forecast.serve.selection import (
     FALLBACK_METHOD,
     Selection,
     _eligible_release_ids,
-    _evaluation_contexts,
     method_for,
     select_methods,
     selection_report,
@@ -80,8 +81,8 @@ class TestEvaluationContexts:
         contexts = _evaluation_contexts(
             [
                 mixed,
-                frame("b", "humidity_pct", code="later"),
-                frame("b", "temp_c", code="later"),
+                frame("b", "humidity_pct"),
+                frame("b", "temp_c"),
                 mixed.clear(),
             ]
         )
@@ -94,6 +95,7 @@ class TestEvaluationContexts:
             "config_fingerprint": "config",
         }
 
+        assert list(contexts[1]["semantics"]) == ["temp_c", "humidity_pct"]
         assert contexts == (
             {"evaluation_id": "a", **common, "semantics": {"wind_speed_ms": "mean"}},
             {
@@ -106,81 +108,111 @@ class TestEvaluationContexts:
     def test_release_preserves_contexts_cutoff_and_identity(
         self, tmp_path, monkeypatch
     ):
-        config = scored_config(
-            tmp_path, extra='\n[predict.methods]\n"hourly.temp_c" = "equal_weight"\n'
+        config = write_config(tmp_path)
+        scores = near_tie_scores(
+            utc(2026, 8, 1), "evaluation-fixed", "inverse_mse"
+        ).with_columns(
+            (
+                pl.col("y_true")
+                + pl.when(pl.col("method_id") == "inverse_mse").then(1.0).otherwise(3.0)
+            ).alias("y_pred"),
+            pl.lit('["nws"]').alias("source_set_json"),
         )
-        path = next((config.dataset.dir / "scores").glob("scores_*.parquet"))
-        scores = load_scores(path).with_columns(
-            pl.lit("dataset-fixed").alias("dataset_fingerprint"),
-            pl.lit("config-fixed").alias("config_fingerprint"),
-            pl.lit("code-fixed").alias("code_version"),
-            pl.lit("evaluation-fixed").alias("evaluation_id"),
-            pl.lit(json.dumps(["x" * 8192])).alias("feature_set_json"),
-        )
-        write_scores(scores, path)
-        monkeypatch.setattr(
-            selection_module, "dataset_fingerprint", lambda _: "dataset-fixed"
-        )
-        monkeypatch.setattr(
-            selection_module, "config_fingerprint", lambda _: "config-fixed"
-        )
-        monkeypatch.setattr(selection_module, "code_identity", lambda: "code-fixed")
-        fixed_time = utc(2026, 10, 6, 12)
-
-        class FixedDatetime(datetime):
-            @classmethod
-            def now(cls, tz=None):
-                return fixed_time if tz is None else fixed_time.astimezone(tz)
-
-        monkeypatch.setattr(evaluation_module, "datetime", FixedDatetime)
-        selected = select_methods(config, config.dataset.dir / "scores")
-        assert selected
-        assert all(
-            value.method_id == "equal_weight" and value.pinned
-            for value in selected.values()
-        )
+        directory = tmp_path / "scores"
+        write_scores(scores, directory / "scores_fixture.parquet")
+        monkeypatch.setattr(selection_module, "dataset_fingerprint", lambda _: "ds1")
+        monkeypatch.setattr(selection_module, "config_fingerprint", lambda _: "cfg1")
+        monkeypatch.setattr(selection_module, "code_identity", lambda: "code1")
+        before = datetime.now(tz=UTC)
+        selected = select_methods(config, directory)
+        after = datetime.now(tz=UTC)
         context = {
             "evaluation_id": "evaluation-fixed",
             "source_kind": "live",
-            "source_set_json": scores["source_set_json"][0],
-            "feature_set_json": scores["feature_set_json"][0],
+            "source_set_json": '["nws"]',
+            "feature_set_json": "[]",
             "semantics": {"temp_c": "inst"},
             "window": "expanding",
-            "code_version": "code-fixed",
-            "config_fingerprint": "config-fixed",
+            "code_version": "code1",
+            "config_fingerprint": "cfg1",
         }
-        cutoff = scores.filter(
-            pl.col("lead_bucket").is_in([key[2] for key in selected])
-        )["valid_time"].max()
+        payload = {
+            "hourly.temp_c.24-48h": {
+                "method_id": "inverse_mse",
+                "reason": "lowest backtest MAE among promotable common-case methods",
+                "evaluation_id": "evaluation-fixed",
+                "code_version": "code1",
+                "n": 30,
+                "mae": 1.0,
+                "truth_semantics": "inst",
+                "retained": False,
+            }
+        }
         expected = ModelRelease.create(
-            dataset="dataset-fixed",
-            configuration="config-fixed",
+            dataset="ds1",
+            configuration="cfg1",
             evaluation_ids=("evaluation-fixed",),
             evaluation_contexts=(context,),
-            training_cutoff=cutoff,
-            selections={
-                ".".join(key): {
-                    "method_id": value.method_id,
-                    "reason": value.reason,
-                    "evaluation_id": "evaluation-fixed",
-                    "code_version": "code-fixed",
-                    "n": value.n,
-                    "mae": value.mae,
-                    "truth_semantics": value.truth_semantics,
-                    "retained": value.retained,
-                }
-                for key, value in selected.items()
-            },
+            training_cutoff=utc(2026, 7, 2, 5),
+            selections=payload,
         )
-        release_path = config.artifacts_dir / "releases" / f"{expected.release_id}.json"
-        actual = json.loads(release_path.read_text())
-
+        actual = json.loads(
+            (
+                config.artifacts_dir / "releases" / f"{expected.release_id}.json"
+            ).read_text()
+        )
         assert {value.release_id for value in selected.values()} == {
             expected.release_id
         }
         assert actual["evaluation_contexts"] == [context]
-        assert actual["training_cutoff"] == cutoff.isoformat()
-        assert actual["promoted_at"] == fixed_time.isoformat()
+        assert actual["selections"] == payload
+        assert actual["training_cutoff"] == "2026-07-02T05:00:00+00:00"
+        assert before <= datetime.fromisoformat(actual["promoted_at"]) <= after
+        assert select_methods(config, directory) == selected
+
+    def test_context_order_survives_release_serialization(self, tmp_path):
+        from dataclasses import asdict
+        from grounded_weather_forecast.serve.evidence import evaluation_contexts
+
+        scores = near_tie_scores(utc(2026, 8, 1), "eval", "inverse_mse")
+        contexts = evaluation_contexts([scores])
+        expected_context = {
+            "evaluation_id": "eval",
+            "source_kind": "live",
+            "source_set_json": "[]",
+            "feature_set_json": "[]",
+            "semantics": {"temp_c": "inst"},
+            "window": "expanding",
+            "code_version": "code1",
+            "config_fingerprint": "cfg1",
+        }
+        assert list(contexts[0]) == list(expected_context)
+        kwargs = dict(
+            dataset="ds1",
+            configuration="cfg1",
+            evaluation_ids=("eval",),
+            training_cutoff=None,
+            selections={},
+            promoted_at=utc(2026, 8, 1),
+        )
+        actual = ModelRelease.create(evaluation_contexts=contexts, **kwargs)
+        expected = ModelRelease.create(
+            evaluation_contexts=(expected_context,), **kwargs
+        )
+        path = actual.write(tmp_path)
+        assert actual.release_id == expected.release_id
+        assert path.read_text() == json.dumps(asdict(expected), indent=2)
+        assert actual.write(tmp_path).read_bytes() == path.read_bytes()
+
+    @pytest.mark.parametrize(
+        "column,value", [("semantics", "mean"), ("feature_set_json", '["other"]')]
+    )
+    def test_conflicting_evaluation_is_excluded(self, column, value, caplog):
+        scores = near_tie_scores(utc(2026, 8, 1), "eval", "inverse_mse")
+        changed = scores.with_columns(pl.lit(value).alias(column))
+        assert _evaluation_contexts([scores, changed]) == ()
+        assert "Ignoring conflicting evaluation evidence: eval" in caplog.text
+        assert _evaluation_contexts([pl.concat([scores, changed])]) == ()
 
 
 class TestSelectMethods:
