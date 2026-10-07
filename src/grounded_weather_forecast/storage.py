@@ -61,7 +61,6 @@ def locked_path(path: Path, timeout: float = -1) -> Iterator[None]:
 def _temporary_sibling(path: Path) -> Path:
     """Create an exclusive sibling using normal umask-derived permissions."""
     path.parent.mkdir(parents=True, exist_ok=True)
-    existing_mode = stat.S_IMODE(path.stat().st_mode) if path.exists() else None
     for _ in range(100):
         candidate = path.with_name(f".{path.name}.{secrets.token_hex(8)}.tmp")
         try:
@@ -73,11 +72,20 @@ def _temporary_sibling(path: Path) -> Path:
         except FileExistsError:  # pragma: no cover - cryptographic-name collision
             continue
         os.close(descriptor)
-        if existing_mode is not None:
-            candidate.chmod(existing_mode)
         return candidate
     msg = f"could not allocate a temporary sibling for {path}"
     raise FileExistsError(msg)
+
+
+def _preserve_mode(temporary: Path, destination: Path) -> None:
+    """Copy the destination mode only after the staged contents are written."""
+    if destination.exists():
+        temporary.chmod(stat.S_IMODE(destination.stat().st_mode))
+
+
+def output_target(path: Path) -> Path:
+    """Keep a caller's output symlink while replacing its target atomically."""
+    return path.resolve(strict=False) if path.is_symlink() else path
 
 
 def stage_parquet(frame: pl.DataFrame, path: Path) -> Path:
@@ -85,7 +93,8 @@ def stage_parquet(frame: pl.DataFrame, path: Path) -> Path:
     temporary = _temporary_sibling(path)
     try:
         frame.write_parquet(temporary)
-    except (Exception,):  # noqa: B013 - project style requires tuple clauses
+        _preserve_mode(temporary, path)
+    except (Exception, KeyboardInterrupt):
         temporary.unlink(missing_ok=True)
         raise
     return temporary
@@ -96,7 +105,8 @@ def stage_text(text: str, path: Path) -> Path:
     temporary = _temporary_sibling(path)
     try:
         temporary.write_text(text, encoding="utf-8")
-    except (Exception,):  # noqa: B013 - project style requires tuple clauses
+        _preserve_mode(temporary, path)
+    except (Exception, KeyboardInterrupt):
         temporary.unlink(missing_ok=True)
         raise
     return temporary

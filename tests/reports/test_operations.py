@@ -3,14 +3,19 @@
 import json
 import os
 import sqlite3
+from dataclasses import replace
 from datetime import timedelta
 
 import polars as pl
 import pytest
 from conftest import make_forecast_db, utc, write_config
 
+from grounded_weather_forecast.evaluation import (
+    activate_release,
+    activate_served_document,
+)
+from grounded_weather_forecast.serve.schema import Forecast
 from grounded_weather_forecast.reports import operations
-from grounded_weather_forecast.evaluation import activate_release
 from grounded_weather_forecast.reports.evidence import (
     EVALUATIONS_LEDGER,
     PIPELINE_LEDGER,
@@ -124,8 +129,10 @@ class TestFreshness:
             [
                 *(healthy_run(minutes_ago=30 + h * 60) for h in range(3)),
                 healthy_run(command="report", minutes_ago=100, exit_code=70),
-                # tolerated: live backtest exit 1 means "no folds yet"
-                healthy_run(command="backtest", minutes_ago=90, exit_code=1),
+                {
+                    **healthy_run(command="backtest", minutes_ago=90, exit_code=1),
+                    "failure_kind": "no_folds",
+                },
             ]
         )
         row, alarms = operations.freshness_row(config, frame, now=NOW)
@@ -133,6 +140,20 @@ class TestFreshness:
         assert row["failed_runs_24h"] == 1
         assert any("few predict runs (3/24h" in a for a in alarms)
         assert any("failed cli runs in 24h: 1" in a for a in alarms)
+
+    def test_unmarked_backtest_exit_one_and_exceptions_are_failures(self, tmp_path):
+        config = self.healthy_config(tmp_path)
+        frame = runs_frame(
+            [
+                healthy_run(command="backtest", minutes_ago=40, exit_code=1),
+                {
+                    **healthy_run(command="maintain", minutes_ago=30, exit_code=None),
+                    "error": "OSError",
+                },
+            ]
+        )
+        row, _alarms = operations.freshness_row(config, frame, now=NOW)
+        assert row["failed_runs_24h"] == 2
 
 
 def collector_with_leads(config):
@@ -548,6 +569,90 @@ class TestPruneScores:
         operations.prune_scores_files(config, dry_run=False, now=NOW)
 
         assert (scores_dir / "scores_hourly_live_expanding_e1.parquet").exists()
+
+    def test_empty_active_release_list_means_degraded_output(self, tmp_path):
+        config, scores_dir = self.seeded(tmp_path)
+        release = config.artifacts_dir / "releases" / "r1.json"
+        release.write_text(
+            json.dumps(
+                {
+                    "release_id": "r1",
+                    "promoted_at": (NOW - timedelta(days=30)).isoformat(),
+                    "evaluation_ids": ["e1"],
+                }
+            ),
+            encoding="utf-8",
+        )
+        output = tmp_path / "degraded.json"
+        output.write_text(
+            Forecast(
+                schema_version=5,
+                issued_at=NOW.isoformat(),
+                latitude=34.0,
+                longitude=-117.0,
+                dataset_fingerprint="dataset",
+                sources=[],
+                observation_at=None,
+                minutely=[],
+                hourly=[],
+                daily=[],
+                status="degraded",
+                release_ids=[],
+            ).to_json(),
+            encoding="utf-8",
+        )
+        activate_served_document(config.artifacts_dir, [], output)
+        operations.prune_scores_files(config, dry_run=False, now=NOW)
+        assert not (scores_dir / "scores_hourly_live_expanding_e1.parquet").exists()
+
+    def test_recent_held_ready_document_protects_release(self, tmp_path):
+        config, scores_dir = self.seeded(tmp_path)
+        release = config.artifacts_dir / "releases" / "r1.json"
+        release.write_text(
+            json.dumps(
+                {
+                    "release_id": "r1",
+                    "promoted_at": (NOW - timedelta(days=30)).isoformat(),
+                    "evaluation_ids": ["e1"],
+                }
+            ),
+            encoding="utf-8",
+        )
+        output = tmp_path / "degraded.json"
+        document = Forecast(
+            schema_version=5,
+            issued_at=NOW.isoformat(),
+            latitude=34.0,
+            longitude=-117.0,
+            dataset_fingerprint="dataset",
+            sources=[],
+            observation_at=None,
+            minutely=[],
+            hourly=[],
+            daily=[],
+            status="degraded",
+            release_ids=[],
+        )
+        output.write_text(document.to_json(), encoding="utf-8")
+        activate_served_document(config.artifacts_dir, [], output)
+        held = config.predict.history_path.parent / "served_forecasts" / "held.json"
+        held.parent.mkdir(parents=True, exist_ok=True)
+        held.write_text(
+            replace(document, status="ready", release_ids=["r1"]).to_json(),
+            encoding="utf-8",
+        )
+        os.utime(held, times=(NOW.timestamp(), NOW.timestamp()))
+        operations.prune_scores_files(config, dry_run=False, now=NOW)
+        assert (scores_dir / "scores_hourly_live_expanding_e1.parquet").exists()
+
+    def test_unreadable_recorded_output_suspends_pruning(self, tmp_path):
+        config, scores_dir = self.seeded(tmp_path)
+        activate_served_document(
+            config.artifacts_dir, ["r1"], tmp_path / "missing.json"
+        )
+        result = operations.prune_scores_files(config, dry_run=False, now=NOW)
+        assert not result.deleted
+        assert (scores_dir / "scores_hourly_live_expanding_e2.parquet").exists()
 
     @pytest.mark.parametrize("pointer_payload", [None, "{broken"])
     def test_missing_or_malformed_pointer_falls_back_to_newest_release(

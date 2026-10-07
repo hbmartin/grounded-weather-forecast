@@ -49,6 +49,7 @@ from grounded_weather_forecast.evaluation import (
     config_fingerprint,
 )
 from grounded_weather_forecast.reports import evidence
+from grounded_weather_forecast.serve.schema import Forecast
 
 _COLLECTOR_ERRORS = (OSError, ValueError, sqlite3.Error, pl.exceptions.PolarsError)
 
@@ -190,19 +191,22 @@ def _document_age(config: Config, now: datetime) -> float | None:
 
 
 def _run_counts(runs_frame: pl.DataFrame, now: datetime) -> tuple[int, int] | None:
-    """(ok predicts, failed commands) in 24h; None while the ledger is young."""
+    """(ok serving runs, failed runs) in 24h; None while the ledger is young."""
     if runs_frame.is_empty():
         return None
     recent = runs_frame.filter(pl.col("started_at") >= now - timedelta(hours=24))
-    predicts = recent.filter(
-        (pl.col("command") == "predict") & (pl.col("exit_code") == 0)
+    invocations = recent.filter(
+        pl.col("record_kind").is_null() | (pl.col("record_kind") == "invocation")
+    )
+    predicts = invocations.filter(
+        pl.col("command").is_in(["predict", "publish"]) & (pl.col("exit_code") == 0)
     ).height
-    # A live backtest exiting 1 means "no folds yet" and is tolerated by the
-    # maintenance job; counting it would alarm on every young archive.
-    failed = recent.filter(
-        pl.col("exit_code").is_not_null()
-        & (pl.col("exit_code") != 0)
-        & ~((pl.col("command") == "backtest") & (pl.col("exit_code") == 1))
+    failed = invocations.filter(
+        (
+            (pl.col("exit_code").is_not_null() & (pl.col("exit_code") != 0))
+            | pl.col("error").is_not_null()
+        )
+        & ~(pl.col("failure_kind") == "no_folds").fill_null(value=False)
     ).height
     return predicts, failed
 
@@ -881,7 +885,7 @@ class PruneResult:
     freed_mb: float
 
 
-def _protected_evaluations(config: Config, *, now: datetime) -> set[str]:
+def _protected_evaluations(config: Config, *, now: datetime) -> set[str] | None:
     """Evaluation ids referenced by the active or recent releases."""
     directory = config.artifacts_dir / "releases"
     horizon = now - timedelta(days=_PROTECT_RELEASE_DAYS)
@@ -897,23 +901,55 @@ def _protected_evaluations(config: Config, *, now: datetime) -> set[str]:
         release_id = str(release.get("release_id", path.stem))
         evaluations = {str(e) for e in release.get("evaluation_ids", [])}
         releases.append((release_id, promoted_at, evaluations))
-    if not releases:
-        return set()
-    active_id: str | None = None
+    active_ids: set[str] | None = None
     try:
         pointer = json.loads(
             active_release_path(config.artifacts_dir).read_text(encoding="utf-8")
         )
-        candidate = pointer.get("release_id")
-        if isinstance(candidate, str) and any(r[0] == candidate for r in releases):
-            active_id = candidate
+        if isinstance(pointer.get("release_ids"), list):
+            active_ids = {str(item) for item in pointer["release_ids"]}
+        else:
+            candidate = pointer.get("release_id")
+            if isinstance(candidate, str):
+                active_ids = {candidate}
+        output_path = pointer.get("output_path")
+        if isinstance(output_path, str):
+            try:
+                served = Forecast.from_json(
+                    Path(output_path).read_text(encoding="utf-8")
+                )
+            except (OSError, ValueError, TypeError, KeyError):
+                return None
+            active_ids = (active_ids or set()) | set(served.release_ids)
     except (OSError, ValueError, AttributeError):
         pass
-    if active_id is None:
-        active_id = max(releases, key=lambda release: (release[1], release[0]))[0]
+    if active_ids is None:
+        active_ids = (
+            {max(releases, key=lambda release: (release[1], release[0]))[0]}
+            if releases
+            else set()
+        )
+    # The personal publisher can hold a recent ready document after the local
+    # output has advanced to a degraded candidate. Keep its evidence too.
+    archived = config.predict.history_path.parent / "served_forecasts"
+    if archived.exists():
+        for path in archived.glob("*.json"):
+            try:
+                document = Forecast.from_json(path.read_text(encoding="utf-8"))
+                issued = datetime.fromisoformat(document.issued_at)
+            except (OSError, ValueError, TypeError, KeyError):
+                continue
+            if issued.tzinfo is None:
+                issued = issued.replace(tzinfo=UTC)
+            age = now - issued.astimezone(UTC)
+            if document.status == "ready" and timedelta(0) <= age <= timedelta(hours=6):
+                active_ids.update(document.release_ids)
+    known_ids = {release_id for release_id, _, _ in releases}
+    if not active_ids <= known_ids:
+        return None
     protected: set[str] = set()
     for release_id, promoted_at, evaluations in releases:
-        if release_id == active_id or promoted_at >= horizon:
+        if release_id in active_ids or promoted_at >= horizon:
             protected |= evaluations
     return protected
 
@@ -938,6 +974,13 @@ def prune_scores_files(
     scores_dir = config.dataset.dir / "scores"
     files = sorted(scores_dir.glob("scores_*.parquet")) if scores_dir.exists() else []
     protected = _protected_evaluations(config, now=moment)
+    if protected is None:
+        return PruneResult(
+            deleted=(),
+            kept=tuple(files),
+            skipped=("active served release could not be verified",),
+            freed_mb=0.0,
+        )
     try:
         cataloged = set(
             evidence.load_ledger(

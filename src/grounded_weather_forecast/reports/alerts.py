@@ -69,6 +69,7 @@ class AlertInputs:
     live_vs_backtest: pl.DataFrame = field(default_factory=pl.DataFrame)
     drift: Mapping[str, object] | None = None
     latest_status: tuple[str, str | None] | None = None
+    latest_publish_attempt: Mapping[str, object] | None = None
     releases: tuple[Mapping[str, object], ...] = ()
     observability_history: pl.DataFrame = field(default_factory=pl.DataFrame)
     archive_location: tuple[float, float] | None = None
@@ -189,15 +190,18 @@ def _provider_alerts(inputs: AlertInputs) -> tuple[Alert, ...]:
 def _serving_alerts(inputs: AlertInputs) -> tuple[Alert, ...]:
     alerts: list[Alert] = []
     refusal_threshold = "serve/predict.py::NoForecastDataError; runs ledger exit codes"
-    predicts = (
-        inputs.runs.filter(pl.col("command") == "predict")
-        if not inputs.runs.is_empty() and "command" in inputs.runs.columns
-        else pl.DataFrame()
-    )
+    predicts = pl.DataFrame()
+    if not inputs.runs.is_empty() and "command" in inputs.runs.columns:
+        predicts = inputs.runs.filter(pl.col("command").is_in(["predict", "publish"]))
+        if "record_kind" in predicts.columns:
+            predicts = predicts.filter(
+                pl.col("record_kind").is_null()
+                | (pl.col("record_kind") == "invocation")
+            )
     if predicts.is_empty():
         alerts.append(
             _not_evaluable(
-                "F", "serving-refused", "no predict runs recorded", refusal_threshold
+                "F", "serving-refused", "no serving runs recorded", refusal_threshold
             )
         )
     else:
@@ -211,7 +215,7 @@ def _serving_alerts(inputs: AlertInputs) -> tuple[Alert, ...]:
                     severity="red",
                     zone="F",
                     panel_id="serving-refused",
-                    message=f"last predict run failed: {failure}",
+                    message=f"last serving run failed: {failure}",
                     threshold=refusal_threshold,
                 )
             )
@@ -234,6 +238,21 @@ def _serving_alerts(inputs: AlertInputs) -> tuple[Alert, ...]:
                     threshold=status_threshold,
                 )
             )
+    attempt = inputs.latest_publish_attempt
+    if attempt is not None and attempt.get("action") == "held_last_good":
+        alerts.append(
+            Alert(
+                severity="amber",
+                zone="F",
+                panel_id="serving-degraded",
+                message=(
+                    "latest publish candidate degraded: "
+                    f"{attempt.get('status_reason') or 'no promoted release'} "
+                    f"({attempt.get('action') or 'unknown action'})"
+                ),
+                threshold="artifacts/latest_publish_attempt.json",
+            )
+        )
     return tuple(alerts)
 
 

@@ -63,12 +63,7 @@ class TestSelectMethods:
         assert all(c.evaluation_id for c in selections.values())
         assert all(c.release_id for c in selections.values())
         assert list((config.artifacts_dir / "releases").glob("*.json"))
-        active = json.loads(
-            (config.artifacts_dir / "active_release.json").read_text(encoding="utf-8")
-        )
-        assert active["release_id"] in {
-            choice.release_id for choice in selections.values()
-        }
+        assert not (config.artifacts_dir / "active_release.json").exists()
 
     def test_config_pin_overrides(self, tmp_path):
         config = scored_config(

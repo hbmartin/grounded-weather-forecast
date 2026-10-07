@@ -65,6 +65,7 @@ def _alert_inputs(ctx: DashboardContext, derived: Derived) -> AlertInputs:
         latest_status=(
             (forecast.status, forecast.status_reason) if forecast is not None else None
         ),
+        latest_publish_attempt=ctx.latest_publish_attempt,
         releases=ctx.releases,
         observability_history=ctx.observability_history,
         archive_location=ctx.archive_location,

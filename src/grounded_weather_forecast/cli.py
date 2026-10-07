@@ -24,6 +24,13 @@ HOURLY_DEFAULT_VARIABLES = (
 DAILY_DEFAULT_VARIABLES = "temp_max_c,temp_min_c,pop,precip_sum_mm"
 
 
+def _positive_int(value: str) -> int:
+    number = int(value)
+    if number <= 0:
+        raise argparse.ArgumentTypeError("must be a positive integer")
+    return number
+
+
 def _add_backtest_arguments(
     parser: argparse.ArgumentParser,
     *,
@@ -108,7 +115,7 @@ def build_parser() -> argparse.ArgumentParser:
     _add_backtest_arguments(maintain, include_source=False)
     maintain.add_argument(
         "--truth-qc-days",
-        type=int,
+        type=_positive_int,
         default=30,
         help="neighbor history window passed to truth-qc (default: 30)",
     )
@@ -237,6 +244,25 @@ def build_parser() -> argparse.ArgumentParser:
         choices=("auto", "inst", "mean"),
         default="auto",
         help="hourly truth semantics used when fitting (see backtest)",
+    )
+    publish.add_argument(
+        "--recovery-methods",
+        default="all",
+        help="methods to retrain during automatic recovery (default: all)",
+    )
+    publish.add_argument(
+        "--recovery-window",
+        choices=("expanding", "rolling"),
+        default="expanding",
+        help="backtest window used during automatic recovery",
+    )
+    recover = subparsers.choices["recover"]
+    recover.add_argument(
+        "--semantics", choices=("auto", "inst", "mean"), default="auto"
+    )
+    recover.add_argument("--methods", default="all")
+    recover.add_argument(
+        "--window", choices=("expanding", "rolling"), default="expanding"
     )
     return parser
 
@@ -716,39 +742,46 @@ def _forecast_document(
     now: datetime | None,
     lock_timeout: float | None = None,
 ) -> Forecast:
+    from grounded_weather_forecast.serve.dataset_snapshot import (  # noqa: PLC0415
+        load_live_snapshot,
+    )
     from grounded_weather_forecast.serve.predict import predict  # noqa: PLC0415
     from grounded_weather_forecast.serve.selection import (  # noqa: PLC0415
         select_methods,
     )
-    from grounded_weather_forecast.storage import dataset_lock  # noqa: PLC0415
 
     forced = None if method == "auto" else method
     if now is not None and now.tzinfo is None:
         now = now.replace(tzinfo=UTC)
     semantics = _semantics_by_variable(config, semantics_flag, HOURLY_VARIABLES)
-    with dataset_lock(config.dataset.dir, timeout=lock_timeout):
-        selections = (
-            select_methods(
-                config,
-                config.dataset.dir / "scores",
-                as_of=now,
-                semantics=semantics,
-            )
-            if not forced
-            else {}
-        )
-        return predict(
+    dataset = load_live_snapshot(config, lock_timeout=lock_timeout)
+    selections = (
+        select_methods(
             config,
-            selections,
-            now=now,
+            config.dataset.dir / "scores",
+            as_of=now,
             semantics=semantics,
-            force_method=forced,
+            dataset_id=dataset.fingerprint,
         )
+        if not forced
+        else {}
+    )
+    return predict(
+        config,
+        selections,
+        now=now,
+        semantics=semantics,
+        force_method=forced,
+        dataset_snapshot=dataset,
+    )
 
 
 def _cmd_predict(config: Config, args: argparse.Namespace) -> int:
     from filelock import Timeout  # noqa: PLC0415
 
+    from grounded_weather_forecast.evaluation import (  # noqa: PLC0415
+        activate_served_document,
+    )
     from grounded_weather_forecast.serve.history import append_history  # noqa: PLC0415
     from grounded_weather_forecast.serve.predict import (  # noqa: PLC0415
         NoForecastDataError,
@@ -756,6 +789,7 @@ def _cmd_predict(config: Config, args: argparse.Namespace) -> int:
     )
     from grounded_weather_forecast.storage import (  # noqa: PLC0415
         atomic_write_text,
+        output_target,
     )
 
     try:
@@ -781,7 +815,9 @@ def _cmd_predict(config: Config, args: argparse.Namespace) -> int:
         print(payload)
     else:
         out = Path(args.out)
-        atomic_write_text(payload, out)
+        target = output_target(out)
+        atomic_write_text(payload, target)
+        activate_served_document(config.artifacts_dir, document.release_ids, target)
         print(f"wrote {out}")
     if not args.no_history:
         added = append_history(document, config.predict.history_path)
@@ -793,16 +829,25 @@ def _cmd_predict(config: Config, args: argparse.Namespace) -> int:
 
 
 def _cmd_publish(config: Config, args: argparse.Namespace) -> int:
+    import polars as pl  # noqa: PLC0415
     from filelock import Timeout  # noqa: PLC0415
 
+    from grounded_weather_forecast.evaluation import (  # noqa: PLC0415
+        activate_served_document,
+    )
+    from grounded_weather_forecast.serve.dataset_snapshot import (  # noqa: PLC0415
+        DatasetIntegrityError,
+    )
     from grounded_weather_forecast.serve.predict import (  # noqa: PLC0415
         NoForecastDataError,
         UnsupportedMethodError,
     )
     from grounded_weather_forecast.serve.publish import (  # noqa: PLC0415
         publish_document,
+        record_publish_attempt,
         schedule_recovery,
     )
+    from grounded_weather_forecast.storage import output_target  # noqa: PLC0415
 
     try:
         document = _forecast_document(
@@ -811,30 +856,81 @@ def _cmd_publish(config: Config, args: argparse.Namespace) -> int:
             semantics_flag=args.semantics,
             now=None,
         )
-        outcome = publish_document(
-            document,
-            Path(args.out),
-            config.predict.history_path,
-        )
-        scheduled = schedule_recovery(
-            config,
-            Path(args.config),
-            document,
-        )
     except Timeout:
         print(
             "dataset publication is in progress; kept existing output", file=sys.stderr
         )
         return EXIT_CONTENTION
+    except (DatasetIntegrityError, pl.exceptions.PolarsError) as exc:
+        print(
+            f"cannot generate candidate: live dataset unreadable: {exc}",
+            file=sys.stderr,
+        )
+        try:
+            schedule_recovery(
+                config,
+                Path(args.config),
+                None,
+                reason="live dataset unreadable",
+                semantics=args.semantics,
+                methods=args.recovery_methods,
+                window=args.recovery_window,
+            )
+        except (OSError, ValueError) as recovery_exc:
+            print(f"could not schedule recovery: {recovery_exc}", file=sys.stderr)
+        return 1
     except (NoForecastDataError, UnsupportedMethodError, OSError, ValueError) as exc:
         print(f"cannot publish: {exc}", file=sys.stderr)
         return 1
+
+    destination = Path(args.out)
+    try:
+        outcome = publish_document(
+            document,
+            destination,
+            config.predict.history_path,
+        )
+    except (OSError, ValueError) as exc:
+        print(f"cannot publish: {exc}", file=sys.stderr)
+        return 1
+
+    problems: list[str] = []
+    if outcome.history_error:
+        problems.append(
+            f"document published but history failed: {outcome.history_error}"
+        )
+    for operation in (
+        lambda: activate_served_document(
+            config.artifacts_dir,
+            outcome.served_document.release_ids,
+            output_target(destination),
+        ),
+        lambda: record_publish_attempt(config, document, outcome, destination),
+    ):
+        try:
+            operation()
+        except (OSError, ValueError) as exc:
+            problems.append(f"publication metadata failed: {exc}")
+    scheduled = False
+    try:
+        scheduled = schedule_recovery(
+            config,
+            Path(args.config),
+            document,
+            semantics=args.semantics,
+            methods=args.recovery_methods,
+            window=args.recovery_window,
+        )
+    except (OSError, ValueError) as exc:
+        problems.append(f"document published but recovery scheduling failed: {exc}")
     print(f"publish: {outcome.action} -> {args.out}")
     if outcome.history_rows:
         print(f"appended {outcome.history_rows} rows to {config.predict.history_path}")
     if scheduled:
         print("scheduled detached recovery", file=sys.stderr)
-    return 0
+    for problem in problems:
+        print(problem, file=sys.stderr)
+    return 1 if problems else 0
 
 
 def _run_minutely_backtest(config: Config, args: argparse.Namespace) -> int | None:
@@ -974,6 +1070,8 @@ def _cmd_backtest(config: Config, args: argparse.Namespace) -> int:
         )
         if release_ids:
             print(f"promoted model release: {', '.join(release_ids)}")
+    if not total:
+        vars(args)["_failure_kind"] = "no_folds"
     return 0 if total else 1
 
 
@@ -1322,11 +1420,37 @@ def _cmd_prune_scores(config: Config, args: argparse.Namespace) -> int:
 
 
 def _run_pipeline_steps(
+    config: Config,
+    args: argparse.Namespace,
     steps: tuple[tuple[str, Callable[[], int]], ...],
+    *,
+    backtest_args: argparse.Namespace | None = None,
 ) -> int:
     for name, step in steps:
         print(f"pipeline step: {name}")
-        result = step()
+        started_at = datetime.now(tz=UTC)
+        result: int | None = None
+        try:
+            result = step()
+        finally:
+            kind = (
+                getattr(backtest_args or args, "_failure_kind", None)
+                if name.startswith("backtest")
+                else None
+            )
+            if kind:
+                vars(args)["_failure_kind"] = kind
+            stage = argparse.Namespace(**vars(args))
+            stage.command = name.split()[0]
+            _record_run(
+                config,
+                stage,
+                started_at=started_at,
+                exit_code=result,
+                record_kind="stage",
+                parent_run_id=_parent_run_id(args),
+                failure_kind=kind,
+            )
         if result:
             print(f"pipeline stopped: {name} exited {result}", file=sys.stderr)
             return result
@@ -1336,29 +1460,34 @@ def _run_pipeline_steps(
 def _cmd_maintain(config: Config, args: argparse.Namespace) -> int:
     truth_args = argparse.Namespace(days=args.truth_qc_days)
     return _run_pipeline_steps(
+        config,
+        args,
         (
             ("build-dataset", lambda: _cmd_build_dataset(config)),
             ("backtest --source live", lambda: _cmd_backtest(config, args)),
             ("report", lambda: _cmd_report(config)),
             ("truth-qc", lambda: _cmd_truth_qc(config, truth_args)),
-        )
+        ),
     )
 
 
-def _recovery_backtest_args() -> argparse.Namespace:
+def _recovery_backtest_args(args: argparse.Namespace) -> argparse.Namespace:
     return argparse.Namespace(
-        methods="all",
+        methods=args.methods,
         hourly_variables=HOURLY_DEFAULT_VARIABLES,
         daily_variables=DAILY_DEFAULT_VARIABLES,
         products="hourly,daily,minutely",
-        window="expanding",
+        window=args.window,
         source="live",
-        semantics="auto",
+        semantics=args.semantics,
     )
 
 
-def _recovery_needed(config: Config) -> bool:
+def _recovery_needed(config: Config, semantics: str = "auto") -> bool:
     """Re-run serving; valid selections can still yield no served release id."""
+    from grounded_weather_forecast.serve.dataset_snapshot import (  # noqa: PLC0415
+        DatasetIntegrityError,
+    )
     from grounded_weather_forecast.serve.predict import (  # noqa: PLC0415
         NoForecastDataError,
         UnsupportedMethodError,
@@ -1368,16 +1497,23 @@ def _recovery_needed(config: Config) -> bool:
         document = _forecast_document(
             config,
             method="auto",
-            semantics_flag="auto",
+            semantics_flag=semantics,
             now=None,
             lock_timeout=-1,
         )
-    except (NoForecastDataError, UnsupportedMethodError, OSError, ValueError):
+    except (
+        NoForecastDataError,
+        UnsupportedMethodError,
+        DatasetIntegrityError,
+        pl.exceptions.PolarsError,
+        OSError,
+        ValueError,
+    ):
         return True
     return document.status == "degraded"
 
 
-def _cmd_recover(config: Config) -> int:
+def _cmd_recover(config: Config, args: argparse.Namespace) -> int:
     from filelock import FileLock, Timeout  # noqa: PLC0415
 
     from grounded_weather_forecast.storage import pipeline_lock  # noqa: PLC0415
@@ -1388,16 +1524,22 @@ def _cmd_recover(config: Config) -> int:
             FileLock(config.artifacts_dir / "auto-restore.lock", timeout=0),
             pipeline_lock(config.dataset.dir, timeout=-1),
         ):
-            if not _recovery_needed(config):
+            if not _recovery_needed(config, args.semantics):
                 print("recovery no longer needed")
                 return 0
-            args = _recovery_backtest_args()
+            backtest_args = _recovery_backtest_args(args)
             return _run_pipeline_steps(
+                config,
+                args,
                 (
                     ("build-dataset", lambda: _cmd_build_dataset(config)),
-                    ("backtest --source live", lambda: _cmd_backtest(config, args)),
+                    (
+                        "backtest --source live",
+                        lambda: _cmd_backtest(config, backtest_args),
+                    ),
                     ("report", lambda: _cmd_report(config)),
-                )
+                ),
+                backtest_args=backtest_args,
             )
     except Timeout:
         print("another automatic recovery is already running", file=sys.stderr)
@@ -1476,7 +1618,7 @@ def _run_command(
         case "publish":
             return _cmd_publish(config, args)
         case "recover":
-            return _cmd_recover(config)
+            return _cmd_recover(config, args)
         case "prune-scores":
             return _cmd_prune_scores(config, args)
         case _:  # pragma: no cover - argparse enforces the choices
@@ -1490,9 +1632,20 @@ def _args_summary(args: argparse.Namespace) -> str:
     summary = {
         key: str(value) if isinstance(value, (Path, date, datetime)) else value
         for key, value in vars(args).items()
-        if key not in {"command", "config"} and value is not None
+        if key not in {"command", "config"}
+        and not key.startswith("_")
+        and value is not None
     }
     return json.dumps(summary, sort_keys=True)
+
+
+def _parent_run_id(args: argparse.Namespace) -> str | None:
+    started_at = getattr(args, "_run_started_at", None)
+    if started_at is None:
+        return None
+    from grounded_weather_forecast.runs import run_id_for  # noqa: PLC0415
+
+    return run_id_for(args.command, started_at)
 
 
 def _record_run(
@@ -1501,6 +1654,9 @@ def _record_run(
     *,
     started_at: datetime,
     exit_code: int | None,
+    record_kind: str = "invocation",
+    parent_run_id: str | None = None,
+    failure_kind: str | None = None,
 ) -> None:
     """Append this invocation to the run ledger; never raises."""
     try:
@@ -1532,6 +1688,9 @@ def _record_run(
             dataset_fingerprint=dataset_print,
             config_fingerprint=config_print,
             code_version=__version__,
+            record_kind=record_kind,
+            parent_run_id=parent_run_id,
+            failure_kind=failure_kind or getattr(args, "_failure_kind", None),
         )
         runs.append_run(record, runs.runs_path(config))
     except (Exception,):  # noqa: B013 - project style requires tuple clauses
@@ -1542,6 +1701,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     started_at = datetime.now(tz=UTC)
     parser = build_parser()
     args = parser.parse_args(argv)
+    vars(args)["_run_started_at"] = started_at
     try:
         config = load_config(args.config)
     except ConfigError as exc:

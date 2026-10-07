@@ -15,6 +15,7 @@ from conftest import (
     write_config,
 )
 
+import grounded_weather_forecast.dataset.matrix as matrix_module
 from grounded_weather_forecast.contracts import (
     MixedProvenanceError,
     Product,
@@ -42,10 +43,13 @@ from grounded_weather_forecast.dataset.providers import (
     read_hourly_long,
     read_run_completions,
 )
-from grounded_weather_forecast.storage import dataset_lock
-import grounded_weather_forecast.dataset.matrix as matrix_module
 from grounded_weather_forecast.dataset.snapshots import snapshot_times
 from grounded_weather_forecast.dataset.truth import truth_daily, truth_hourly
+from grounded_weather_forecast.storage import dataset_lock
+from grounded_weather_forecast.serve.dataset_snapshot import (
+    DatasetIntegrityError,
+    load_live_snapshot,
+)
 
 FETCH = "2026-03-22T11:30:00+00:00"
 ISSUE = utc(2026, 3, 22, 12, 0, 30)
@@ -365,6 +369,13 @@ class TestBuildDailyMatrix:
 
 
 class TestWriteDataset:
+    def test_snapshot_rejects_live_file_without_manifest(self, tmp_path):
+        config = write_config(tmp_path)
+        config.dataset.dir.mkdir(parents=True, exist_ok=True)
+        (config.dataset.dir / "truth_minute.parquet").write_bytes(b"partial")
+        with pytest.raises(DatasetIntegrityError, match="without a manifest"):
+            load_live_snapshot(config)
+
     def test_end_to_end(self, tmp_path):
         config = build_fixture(tmp_path)
         make_station_db(
@@ -401,6 +412,57 @@ class TestWriteDataset:
         first = write_dataset(config)
         second = write_dataset(config)
         assert first.fingerprint == second.fingerprint
+
+    def test_snapshot_rejects_corrupt_parquet_and_manifest_mismatch(self, tmp_path):
+        config = build_fixture(tmp_path)
+        make_station_db(
+            tmp_path / "station.db", [("2026-03-22 17:56:00", {"outTemp": 48.0})]
+        )
+        write_dataset(config)
+        assert load_live_snapshot(config).hourly.height == 2
+        matrix = matrix_path(config.dataset.dir, "hourly", "live")
+        matrix.write_bytes(b"invalid parquet")
+        with pytest.raises(DatasetIntegrityError, match="hourly_matrix differs"):
+            load_live_snapshot(config)
+
+    def test_snapshot_refuses_partial_dataset_publication(self, tmp_path, monkeypatch):
+        config = build_fixture(tmp_path)
+        make_station_db(
+            tmp_path / "station.db", [("2026-03-22 17:56:00", {"outTemp": 48.0})]
+        )
+        write_dataset(config)
+        paths = matrix_module.DatasetPaths.in_dir(config.dataset.dir)
+        original_replace = Path.replace
+        replacements = 0
+
+        def fail_after_first(path, target):
+            nonlocal replacements
+            replacements += 1
+            if replacements == 2:
+                raise OSError("injected publication failure")
+            return original_replace(path, target)
+
+        monkeypatch.setattr(Path, "replace", fail_after_first)
+        frames = {
+            name: (getattr(paths, name), pl.DataFrame({"new_generation": [1]}))
+            for name in (
+                "truth_minute",
+                "truth_hourly",
+                "truth_daily",
+                "forecasts_long",
+                "daily_long",
+                "minutely_long",
+                "hourly_matrix",
+                "daily_matrix",
+            )
+        }
+        with pytest.raises(OSError, match="injected publication failure"):
+            matrix_module._publish_dataset(
+                frames, paths.manifest, sources=("alpha",), snapshots=1
+            )
+        monkeypatch.setattr(Path, "replace", original_replace)
+        with pytest.raises(DatasetIntegrityError, match="differs"):
+            load_live_snapshot(config)
 
 
 class TestDatasetPublication:

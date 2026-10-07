@@ -50,6 +50,7 @@ class DashboardContext:
     unreadable_artifacts: tuple[str, ...] = ()
     history: pl.DataFrame | None = None
     latest_forecast: Forecast | None = None
+    latest_publish_attempt: Mapping[str, object] | None = None
     releases: tuple[Mapping[str, object], ...] = ()
     alignment: Mapping[str, object] | None = None
     drift: Mapping[str, object] | None = None
@@ -309,6 +310,11 @@ def collect_context(config: Config, *, now: datetime | None = None) -> Dashboard
         unreadable_scores=unreadable_scores,
         history=_history(config, unreadable),
         latest_forecast=_latest_forecast(config, unreadable),
+        latest_publish_attempt=_try_json(
+            config.artifacts_dir / "latest_publish_attempt.json",
+            unreadable,
+            label="artifacts/latest_publish_attempt.json",
+        ),
         releases=_releases(config, unreadable),
         alignment=_try_json(
             config.artifacts_dir / "alignment.json",

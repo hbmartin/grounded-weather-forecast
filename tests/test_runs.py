@@ -130,6 +130,9 @@ class TestRetention:
                 "dataset_fingerprint": ["f", "f"],
                 "config_fingerprint": ["c", "c"],
                 "code_version": ["0.4.0", "0.4.0"],
+                "record_kind": ["invocation", "invocation"],
+                "parent_run_id": [None, None],
+                "failure_kind": [None, None],
             },
             schema=RUNS_SCHEMA,
         )

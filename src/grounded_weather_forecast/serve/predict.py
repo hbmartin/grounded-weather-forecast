@@ -67,6 +67,7 @@ from grounded_weather_forecast.leads import (
     hourly_bucket,
     minutely_bucket,
 )
+from grounded_weather_forecast.serve.dataset_snapshot import LiveDatasetSnapshot
 from grounded_weather_forecast.serve.dressing import ResidualDresser, dress_variable
 from grounded_weather_forecast.serve.history import load_archived_forecast
 from grounded_weather_forecast.serve.observability import snapshot_observability
@@ -1034,6 +1035,7 @@ def _fitted_minutely_predictor(
     method_id: str,
     variable_name: str,
     hourly_train: pl.DataFrame,
+    minute_truth: pl.DataFrame | None = None,
 ) -> "MinutelyPathMethod | None":
     """Refit a promoted ramp/slope response on the as-of training data.
 
@@ -1063,13 +1065,16 @@ def _fitted_minutely_predictor(
     truth_file = config.dataset.dir / "truth_minute.parquet"
     truth_column = f"t__{variable_name}__inst"
     if (
-        not truth_file.exists()
+        (minute_truth is None and not truth_file.exists())
         or hourly_train.is_empty()
         or truth_column not in hourly_train.columns
     ):
         return None
     try:
-        grid = truth_minute_grid(pl.read_parquet(truth_file), [variable_name])
+        truth = (
+            minute_truth if minute_truth is not None else pl.read_parquet(truth_file)
+        )
+        grid = truth_minute_grid(truth, [variable_name])
         scored = hourly_train.filter(pl.col(truth_column).is_not_null())
         if scored.is_empty() or grid.is_empty():
             return None
@@ -1107,6 +1112,7 @@ def _minutely_plans(
     config: Config,
     selections: SelectionMap,
     hourly_train: pl.DataFrame,
+    minute_truth: pl.DataFrame | None = None,
 ) -> dict[str, dict[str, MinutelyPlan]] | None:
     """Promoted minutely constructions per (variable, minutely bucket).
 
@@ -1126,7 +1132,7 @@ def _minutely_plans(
                 cache_key = (found.method_id, name)
                 if cache_key not in fitted_cache:
                     fitted_cache[cache_key] = _fitted_minutely_predictor(
-                        config, found.method_id, name, hourly_train
+                        config, found.method_id, name, hourly_train, minute_truth
                     )
                 predictor = fitted_cache[cache_key]
             plan = _plan_from_selection(found.method_id, predictor)
@@ -1299,12 +1305,17 @@ def minutely_product(
 
 
 def _training_matrix(
-    config: Config, product: str, issue_time: datetime
+    config: Config,
+    product: str,
+    issue_time: datetime,
+    *,
+    frame: pl.DataFrame | None = None,
 ) -> pl.DataFrame:
-    path = matrix_path(config.dataset.dir, product, "live")
-    if not path.exists():
-        return pl.DataFrame()
-    frame = pl.read_parquet(path)
+    if frame is None:
+        path = matrix_path(config.dataset.dir, product, "live")
+        if not path.exists():
+            return pl.DataFrame()
+        frame = pl.read_parquet(path)
     if frame.is_empty():
         return frame
     known_at = (
@@ -1338,6 +1349,7 @@ def predict(
         TruthSemantics.INSTANTANEOUS
     ),
     force_method: str | None = None,
+    dataset_snapshot: LiveDatasetSnapshot | None = None,
 ) -> Forecast:
     """Assemble the whole forecast document for one issue time."""
     issue_time = (now or datetime.now(tz=UTC)).replace(second=0, microsecond=0)
@@ -1348,8 +1360,18 @@ def predict(
         if archived is not None:
             return archived
     snapshot = build_snapshot(config, issue_time)
-    hourly_train = _training_matrix(config, "hourly", issue_time)
-    daily_train = _training_matrix(config, "daily", issue_time)
+    hourly_train = _training_matrix(
+        config,
+        "hourly",
+        issue_time,
+        frame=dataset_snapshot.hourly if dataset_snapshot is not None else None,
+    )
+    daily_train = _training_matrix(
+        config,
+        "daily",
+        issue_time,
+        frame=dataset_snapshot.daily if dataset_snapshot is not None else None,
+    )
     hourly, hourly_blend = hourly_product(
         snapshot, hourly_train, selections, config, semantics, force_method
     )
@@ -1361,14 +1383,26 @@ def predict(
     release_ids = _served_release_ids(hourly, daily)
     degraded = not release_ids and force_method is None
     status_reason = (
-        no_evidence_reason(config, config.dataset.dir / "scores") if degraded else None
+        no_evidence_reason(
+            config,
+            config.dataset.dir / "scores",
+            dataset_id=dataset_snapshot.fingerprint
+            if dataset_snapshot is not None
+            else None,
+        )
+        if degraded
+        else None
     )
     return Forecast(
         schema_version=SCHEMA_VERSION,
         issued_at=issue_time.isoformat(),
         latitude=config.station.latitude,
         longitude=config.station.longitude,
-        dataset_fingerprint=dataset_fingerprint(config),
+        dataset_fingerprint=(
+            dataset_snapshot.fingerprint
+            if dataset_snapshot is not None
+            else dataset_fingerprint(config)
+        ),
         sources=list(matrix_sources(snapshot.hourly)),
         observation_at=snapshot.observation_at.isoformat()
         if snapshot.observation_at
@@ -1377,7 +1411,12 @@ def predict(
             snapshot,
             hourly_blend,
             config,
-            plans=_minutely_plans(config, selections, hourly_train),
+            plans=_minutely_plans(
+                config,
+                selections,
+                hourly_train,
+                dataset_snapshot.truth_minute if dataset_snapshot is not None else None,
+            ),
         ),
         hourly=hourly,
         daily=daily,
