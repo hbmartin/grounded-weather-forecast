@@ -218,7 +218,7 @@ This prints a JSON document with all three products. Trimmed:
 
 ```json
 {
-  "schema_version": 5,
+  "schema_version": 6,
   "issued_at": "2026-08-08T13:46:00+00:00",
   "latitude": 34.2768,
   "longitude": -117.1692,

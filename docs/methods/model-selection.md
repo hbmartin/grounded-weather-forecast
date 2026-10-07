@@ -280,9 +280,9 @@ method** when all of the following hold:
 
 1. today's winner was a true argmin pick (`gate` ∈ {∅, `eligibility`} — a
    gate-forced reference or pooled winner is never overridden);
-2. the incumbent is a *different* method, is **not** `equal_weight` (a demoted
-   slice's persisted method is already the fallback, and retaining it by name
-   would outlast the demotion's own 14-day re-hearing), and passes the
+2. the incumbent is a *different* method, is **not** `equal_weight` or a
+   configured safety-class reference (retaining a fallback by name would
+   outlast the demotion's own 14-day re-hearing), and passes the
    eligibility bar on the **current** board with the same truth semantics;
 3. $\overline{d} \le \texttt{\_RETENTION\_SE\_MULT} \times
    \widehat{SE}_{\text{boot}}(\overline{d})$, where
@@ -303,7 +303,11 @@ Consequence, documented deliberately: the release id becomes a function of
 (evidence, config, code, **previous release**) — path-dependent, but a fixed
 point under fixed evidence: re-running with the retained release as the
 previous one re-derives the same selections, hashes to the same id, and
-dedupes on write. Config pins override retention entirely.
+dedupes on write. Config pins override retention entirely: pinned slices skip
+the guard and always set `retained=False`. Their `n` and `mae` come from the
+pinned method's current board row, even when that row is below promotion
+eligibility. An absent
+pinned method has `n=0`, `mae=null`, and no evaluation attribution.
 
 `reports/eprocess.py::promotion_comparison` computes **both** rules on every
 report so the operator can watch them disagree, and
@@ -315,10 +319,10 @@ report so the operator can watch them disagree, and
 
 *Implemented in: `serve/selection.py::apply_live_gate`, `_live_verdict`*
 
-Promotion is not permanent. A release whose realized error exceeds its backtest
-error is demoted:
+Promotion is not permanent. An unpinned method whose realized error exceeds
+its backtest promise fails the live gate:
 
-$$\text{demote if } \quad \text{live\_mae} > \texttt{live\_gap\_factor} \times \text{backtest\_mae}
+$$\text{live gate fails if } \quad \text{live\_mae} > \texttt{live\_gap\_factor} \times \text{backtest\_mae}
 \quad \text{with } n \ge \texttt{min\_live\_n}$$
 
 `live_gap_factor = 1.5`, `min_live_n = 24`, evidence window
@@ -330,6 +334,27 @@ a day, while a 24–48 h forecast's truth arrives a day or two later, so no sing
 release ever accumulates 24 scored cases on its own. Without pooling the gate
 would never fire.
 
+Replacement candidates are eligible members of `gate_references`, including
+per-variable overrides and the minutely interpolation/persistence references.
+References themselves are monitored. The current method cannot replace itself.
+A candidate must have finite nonnegative backtest MAE **strictly below** the
+failing method's pooled live MAE. When the reference also has at least
+`min_live_n` compatible live cases, its live MAE must be strictly lower and
+must not exceed `live_gap_factor` times its own backtest MAE.
+
+Rank qualifying candidates by the larger of backtest and mature live MAE;
+without mature live evidence use backtest MAE. Exact ties prefer `equal_weight`,
+then configured reference order. Backtest qualification is an operational
+**proxy**, not a guarantee of better realized accuracy: methods can have
+served different recent cases. If none qualifies, keep the current method and
+statistics and persist `live gate failed` / `replacement blocked` in its
+reason. No unscored fallback is synthesized. Config pins remain exempt.
+
+Schema-6 minutely points carry the release and reason of the path construction
+actually used. History and verification retain that provenance, enabling
+prospective minutely live gating. Substituted/native paths and older minutely
+history cannot testify for a promoted construction they did not serve.
+
 ---
 
 ## 7. What all of this produces
@@ -340,3 +365,31 @@ fingerprints under which it was earned. Serving reads releases, not leaderboards
 a release whose fingerprints no longer match the live system is not used, and
 `predict` reports `status="degraded"` with `equal_weight` as the fallback rather
 than serving evidence it cannot vouch for.
+### Evidence consistency and memory
+
+*Implemented in: `serve/evidence.py`, `serve/score_scan.py`*
+
+Each evaluation must have one source/feature set, window, creation time, and
+identity, plus one semantics value per variable. Conflicting evaluations are
+logged and excluded as a whole, including fragments across files. Selection
+then considers the older complete evaluations. Contexts, evaluation IDs, and
+training cutoff travel together in one typed release-evidence summary.
+
+Selection first scans compact metadata and method-presence summaries, then
+materializes only the newest complete evaluation for each slice. Compatibility
+filters run in lazy Parquet scans; source provenance is checked before those
+filters. File disappearance/change retries the entire read once and excludes
+known incomplete evaluations. Degraded diagnosis reads only identity columns.
+
+Leaderboard and loss builders project required columns before partitions,
+filters, and joins, and reference frames are cached per slice. Polars generally
+shares long string payload buffers through these operations while allocating
+column views and numeric buffers; memory savings therefore depend on rows,
+columns, and retained buffers, not simply JSON string length. See the Polars
+StringView reference in [Bibliography](bibliography.md#3-operational-analogues)
+and the [selection benchmark](../research/selection-memory-2026-10-07.md).
+
+Deploying these source changes changes the code fingerprint and requires fresh
+compatible `backtest --source live` / `report` evidence. Existing artifacts
+remain intact. Attributed minutely live evidence accumulates from schema-6
+forecasts prospectively.

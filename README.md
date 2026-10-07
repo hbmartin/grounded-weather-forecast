@@ -84,11 +84,12 @@ That works on day one. Everything else needs an archive with some history — se
 | `backfill` | fetch archived forecasts into the synthetic supervised matrix | `--provider` `--models` `--start` `--end` `--chunk-days` |
 | `truth-qc` | cross-check truth against lapse-adjusted neighbors; fit the radiation-shield model | `--days` |
 | `ingest-ensembles` | poll the Open-Meteo Ensemble API for per-model spread features | `--models` |
-| `predict` | emit the current blended forecast as JSON | `--out` `--method` `--no-history` `--semantics` `--now` |
+| `predict` | emit schema-6 JSON with per-variable minutely release provenance | `--out` `--method` `--no-history` `--semantics` `--now` |
 | `publish` | safely publish an automatic forecast, holding a matching ready document for up to six hours | `--out` `--semantics` `--recovery-methods` `--recovery-window` |
 | `recover` | recheck degradation, then rebuild live evidence and reports when recovery is still needed | `--semantics` `--methods` `--window` |
 | `prune-scores` | delete superseded scores files | `--dry-run` |
 | `uv run --group profiling python scripts/profile_memory.py -- <command>` | capture a command's memory allocations and write a peak-memory HTML report | `--output-dir` `--trace-python-allocators` `--no-native` `--no-report` |
+| `uv run python scripts/benchmark_selection_memory.py` | compare full selection runs against a Git baseline in fresh processes | `--baseline` `--runs` `--evaluations` `--cases` |
 
 Global: `--config PATH` (default `config.toml`), `--version`. Exit codes: `0` ok,
 `1` command failure, `2` config error, `75` lock contention (retry later).
