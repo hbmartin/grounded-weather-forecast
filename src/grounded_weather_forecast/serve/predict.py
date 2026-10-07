@@ -1190,6 +1190,14 @@ def _apply_minutely_plan(
     return interpolated, "minutely_interp"
 
 
+def _minutely_provenance(
+    plan: MinutelyPlan | None, method: str, value: float | None
+) -> Selection | None:
+    if plan is None or plan.selection is None or value is None:
+        return None
+    return plan.selection if method == plan.selection.method_id else None
+
+
 def minutely_product(
     snapshot: Snapshot,
     hourly_blend: dict[str, VariableBlend],
@@ -1257,12 +1265,9 @@ def minutely_product(
             values[name] = _finite(interpolated, hourly_variable(name))
             applied[name] = method_label
             if (
-                plan is not None
-                and plan.selection is not None
-                and method_label == plan.selection.method_id
-                and values[name] is not None
-            ):
-                provenance[name] = plan.selection
+                selected := _minutely_provenance(plan, method_label, values[name])
+            ) is not None:
+                provenance[name] = selected
         temperature = values.get("temp_c")
         dew_point = values.get("dew_point_c")
         if temperature is not None and dew_point is not None:

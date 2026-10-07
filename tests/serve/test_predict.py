@@ -1066,18 +1066,72 @@ class TestMinutelyPromotedPlan:
         assert not point.release_ids
 
     def test_served_minutely_history_drives_guarded_replacement(
-        self, la_config, tmp_path
+        self, la_config, tmp_path, monkeypatch
     ):
         from dataclasses import replace
         from datetime import datetime
         import polars as pl
-        from grounded_weather_forecast.serve.predict import minutely_product
+        from grounded_weather_forecast.backtest.scores import (
+            SCORES_SCHEMA,
+            write_scores,
+        )
+        from grounded_weather_forecast.evaluation import (
+            code_identity,
+            config_fingerprint,
+        )
+        from grounded_weather_forecast.serve.predict import (
+            minutely_product,
+            _minutely_plans,
+        )
         from grounded_weather_forecast.serve.schema import Forecast
         from grounded_weather_forecast.serve.history import append_history
         from grounded_weather_forecast.reports.verification import verify_history
-        from grounded_weather_forecast.serve.selection import apply_live_gate
+        import grounded_weather_forecast.serve.selection as selection_module
 
         snapshot, blend, _ = self.setup_case()
+        key = ("minutely", "temp_c", "0-5m")
+        rows = [
+            {
+                "method_id": method,
+                "variable": "temp_c",
+                "product": "minutely",
+                "source_kind": "live",
+                "evaluation_id": "minute-eval",
+                "evaluation_created_at": snapshot.issue_time,
+                "dataset_fingerprint": "dataset",
+                "config_fingerprint": config_fingerprint(la_config),
+                "code_version": code_identity(),
+                "source_set_json": '["nws"]',
+                "feature_set_json": "[]",
+                "semantics": "inst",
+                "window": "expanding",
+                "issue_time": snapshot.issue_time - timedelta(hours=step + 1),
+                "valid_time": snapshot.issue_time
+                - timedelta(hours=step + 1)
+                + timedelta(minutes=1),
+                "lead_hours": 1 / 60,
+                "lead_bucket": "0-5m",
+                "y_pred": error,
+                "y_true": 0.0,
+            }
+            for method, error in (
+                ("minutely_persistence", 1.0),
+                ("minutely_interp", 1.2),
+            )
+            for step in range(30)
+        ]
+        scores_dir = tmp_path / "scores"
+        write_scores(
+            pl.DataFrame(rows, schema=SCORES_SCHEMA),
+            scores_dir / "scores_minute.parquet",
+        )
+        monkeypatch.setattr(
+            selection_module, "_live_verification", lambda *_: pl.DataFrame()
+        )
+        selections = select_methods(la_config, scores_dir, dataset_id="dataset")
+        selected = selections[key]
+        assert selected.method_id == "minutely_persistence"
+        plans = _minutely_plans(la_config, selections, pl.DataFrame())
         truth_rows = []
         path = tmp_path / "history.parquet"
         for hour in range(6):
@@ -1088,8 +1142,9 @@ class TestMinutelyPromotedPlan:
                 current,
                 {"temp_c": blend},
                 la_config,
-                plans=self.plans("minutely_persistence"),
+                plans=plans,
             )
+            assert points[0].release_ids == {"temp_c": selected.release_id}
             forecast = Forecast(
                 SCHEMA_VERSION,
                 current.issue_time.isoformat(),
@@ -1113,25 +1168,10 @@ class TestMinutelyPromotedPlan:
         live = verify_history(
             path, pl.DataFrame(), truth_minute=pl.DataFrame(truth_rows)
         )
-        key = ("minutely", "temp_c", "0-5m")
-        selected = Selection(
-            "minutely_persistence",
-            "promoted",
-            n=30,
-            mae=1.0,
-            release_id="minute-release",
-        )
-        result = apply_live_gate(
-            {key: selected},
-            live,
-            factor=1.5,
-            min_n=24,
-            candidates={
-                key: (Selection("minutely_interp", "reference", n=30, mae=1.2),)
-            },
-            eligible_releases=frozenset({"minute-release"}),
-        )[key]
+        monkeypatch.setattr(selection_module, "_live_verification", lambda *_: live)
+        result = select_methods(la_config, scores_dir, dataset_id="dataset")[key]
         assert result.method_id == "minutely_interp"
+        assert result.release_id != selected.release_id
         assert "demoted minutely_persistence" in result.reason
 
 
@@ -1152,6 +1192,9 @@ def test_minutely_release_list_preserves_hourly_daily_readiness(tmp_path):
         )
         for bucket in ("0-5m", "5-15m", "15-30m", "30-45m", "45-60m")
     }
+    selections[("minutely", "pop", "0-5m")] = Selection(
+        "minutely_anchor_full", "selected", release_id="unused-native-release"
+    )
     forecast = predict(config, selections, now=NOW)
     assert forecast.release_ids == ["minute-release"]
     assert forecast.status == "degraded"
