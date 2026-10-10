@@ -213,6 +213,13 @@ archive providers, keeping that provenance separate from live observations.
 
 ## `backtest`
 
+For the local launchd deployment, `docs/launchd/daily-maintenance.py` runs each
+maintenance stage in a fresh child process so a completed backtest releases
+its native allocator memory before report generation. The prediction wrapper
+uses the same process boundary. Both wrappers limit Polars to two threads and
+record `/usr/bin/time -l` peak memory and child exit status. A maintenance job
+lock prevents duplicate wrappers and concurrent automatic restore attempts.
+
 > rolling-origin backtest over the supervised matrices
 
 | Flag | Choices / type | Default | Meaning |

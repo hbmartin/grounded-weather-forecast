@@ -237,3 +237,20 @@ def test_identity_diagnosis_accepts_legacy_columns(tmp_path):
         set(),
     )
     assert select(tmp_path) == {}
+
+
+def test_large_repeated_context_is_compact_without_changing_score_values(tmp_path):
+    description = '["' + "feature" * 1_200 + '"]'
+    frame = pl.concat([scores()] * 1_024).with_columns(
+        pl.lit(description).alias("feature_set_json")
+    )
+    write_scores(frame, tmp_path / "scores_large.parquet")
+
+    actual = select(tmp_path)[KEY]
+
+    assert actual.height == frame.height
+    assert actual["feature_set_json"].unique().to_list() == [description]
+    assert actual["feature_set_json"].estimated_size() < actual.height * 8
+    assert actual.select("issue_time", "y_pred", "y_true").equals(
+        frame.select("issue_time", "y_pred", "y_true")
+    )

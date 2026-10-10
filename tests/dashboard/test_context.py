@@ -1,4 +1,5 @@
 import json
+import weakref
 from datetime import UTC, datetime
 
 import polars as pl
@@ -9,10 +10,33 @@ from conftest import (
     write_config,
 )
 
+from grounded_weather_forecast.dashboard import context
 from grounded_weather_forecast.dashboard.context import collect_context
 from grounded_weather_forecast.dataset.matrix import matrix_path
 
 NOW = datetime(2026, 7, 18, 12, 0, tzinfo=UTC)
+
+
+def test_score_archive_does_not_keep_decoded_frames_resident(tmp_path, monkeypatch):
+    config = write_config(tmp_path)
+    directory = config.dataset.dir / "scores"
+    directory.mkdir(parents=True)
+    for name in ("scores_old.parquet", "scores_new.parquet"):
+        (directory / name).touch()
+    decoded = []
+
+    def load(path):
+        frame = pl.DataFrame({"source_kind": ["live"], "path": [path.name]})
+        decoded.append(weakref.ref(frame))
+        return frame
+
+    monkeypatch.setattr(context, "load_scores", load)
+    frames, unreadable = context._score_frames(config, [])
+
+    assert len(frames) == 2
+    assert unreadable == ()
+    assert all(reference() is None for reference in decoded)
+    assert frames["scores_new"]["path"][0] == "scores_new.parquet"
 
 
 def test_bare_config_collects_all_absent_without_raising(tmp_path):

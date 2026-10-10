@@ -5,7 +5,7 @@ drives the corresponding panel's loud "not yet" state instead of an error.
 """
 
 import json
-from collections.abc import Mapping
+from collections.abc import Iterator, Mapping
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
@@ -30,7 +30,7 @@ from grounded_weather_forecast.serve.schema import Forecast
 
 @dataclass(frozen=True, slots=True)
 class DashboardContext:
-    """Everything the zone builders read; pure data, no I/O beyond here."""
+    """Everything zone builders read, including scores loaded on access here."""
 
     config: Config
     now: datetime
@@ -95,25 +95,47 @@ def _try_json(
     return loaded
 
 
+class ScoreFrames(Mapping[str, pl.DataFrame]):
+    """Load archive scores on access instead of retaining every evaluation.
+
+    Each file fits independently; their combined history can exceed RAM.
+    Every evaluation remains available to every dashboard panel.
+    """
+
+    def __init__(self, paths: dict[str, Path]) -> None:
+        self.paths = paths
+
+    def __getitem__(self, key: str) -> pl.DataFrame:
+        return load_scores(self.paths[key])
+
+    def __iter__(self) -> Iterator[str]:
+        return iter(self.paths)
+
+    def __len__(self) -> int:
+        return len(self.paths)
+
+
 def _score_frames(
     config: Config, failures: list[str]
-) -> tuple[dict[str, pl.DataFrame], tuple[str, ...]]:
+) -> tuple[Mapping[str, pl.DataFrame], tuple[str, ...]]:
     """Readable score frames, plus the stems that exist but cannot be read.
 
     A file that is present but corrupt is *not* the same as a young archive
     with no file at all; the second return value keeps them distinguishable
     so zones can say "unreadable" instead of "not enough data yet".
     """
-    frames: dict[str, pl.DataFrame] = {}
+    paths: dict[str, Path] = {}
     unreadable: list[str] = []
     scores_dir = config.dataset.dir / "scores"
     for path in sorted(scores_dir.glob("scores_*.parquet")):
         try:
-            frames[path.stem] = load_scores(path)
+            frame = load_scores(path)
+            paths[path.stem] = path
+            del frame
         except (OSError, MixedProvenanceError, pl.exceptions.PolarsError):
             unreadable.append(path.stem)
             failures.append(f"dataset/scores/{path.name}")
-    return frames, tuple(unreadable)
+    return ScoreFrames(paths), tuple(unreadable)
 
 
 def _latest_forecast(config: Config, failures: list[str]) -> Forecast | None:

@@ -55,6 +55,12 @@ requires deleting a guard rather than forgetting one. Attempting to pool raises
 
 ### `data/scores/`
 
+Score readers stream Parquet data and encode repeated provenance text as
+categories in memory. Numeric scores, quantiles, and the on-disk schema stay
+unchanged. Serving partitions selected evidence in batches of 65,536 rows;
+the dashboard loads archived evaluations on access rather than retaining the
+entire archive in RAM.
+
 ```
 scores_{product}_{kind}_{window}_{evaluation_id}.parquet
 ```

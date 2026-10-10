@@ -8,6 +8,7 @@ from typing import cast
 
 import polars as pl
 
+from grounded_weather_forecast.backtest.scores import scan_score_file
 from grounded_weather_forecast.config import PromotionConfig
 from grounded_weather_forecast.contracts import MixedProvenanceError, TruthSemantics
 from grounded_weather_forecast.reports.leaderboard import gate_references
@@ -147,12 +148,17 @@ class EvaluationCatalog:
 
 def scan_scores(path: Path) -> pl.LazyFrame:
     """One seam for lock-free reads and deterministic prune-race tests."""
-    return pl.scan_parquet(path)
+    return scan_score_file(path)
 
 
 def _live_scan(path: Path) -> pl.LazyFrame | None:
     scan = scan_scores(path)
-    kinds = set(scan.select("source_kind").unique().collect()["source_kind"].to_list())
+    kinds = set(
+        scan.select("source_kind")
+        .unique()
+        .collect(engine="streaming")["source_kind"]
+        .to_list()
+    )
     if len(kinds) > 1:
         raise MixedProvenanceError(
             f"scores at {path} mix source kinds {sorted(map(str, kinds))}"
@@ -166,7 +172,11 @@ def _catalog_file(
     scan = _live_scan(path)
     if scan is None or not set(_SCORE_COLUMNS) <= set(scan.collect_schema().names()):
         return
-    probe = scan.select("evaluation_id", *_IDENTITY_COLUMNS).unique().collect()
+    probe = (
+        scan.select("evaluation_id", *_IDENTITY_COLUMNS)
+        .unique()
+        .collect(engine="streaming")
+    )
     catalog.add_identities(probe)
     matches = probe.filter(
         (pl.col("dataset_fingerprint") == identity.dataset)
@@ -181,7 +191,7 @@ def _catalog_file(
         scan.filter(identity.predicate())
         .group_by(*_METADATA_COLUMNS, maintain_order=True)
         .agg(pl.col("method_id").unique().alias("methods"), pl.len().alias("n"))
-        .collect()
+        .collect(engine="streaming")
     )
     catalog.add_summary(path, summary, identity)
 
@@ -236,13 +246,32 @@ def _materialize(
             scan = _live_scan(path)
             if scan is None:
                 raise EvidenceChangedError(f"source provenance changed: {path}")
-            frame = (
+            batches = (
                 scan.filter(identity.predicate() & predicate)
                 .select(*_SCORE_COLUMNS)
-                .collect()
+                .collect_batches(chunk_size=65_536, engine="streaming")
             )
+            path_fragments: dict[SliceKey, list[pl.DataFrame]] = {
+                evidence.key: [] for evidence in evidence_rows
+            }
+            for batch in batches:
+                partitions = batch.partition_by(
+                    "evaluation_id", *_SLICE_COLUMNS, as_dict=True
+                )
+                for evidence in evidence_rows:
+                    if (
+                        part := partitions.get((evidence.evaluation_id, *evidence.key))
+                    ) is not None:
+                        path_fragments[evidence.key].append(part)
             for evidence in evidence_rows:
-                fragment = frame.filter(_slice_predicate(evidence))
+                pieces = path_fragments[evidence.key]
+                fragment = (
+                    pl.concat(pieces)
+                    if pieces
+                    else pl.DataFrame(schema=scan.collect_schema()).select(
+                        *_SCORE_COLUMNS
+                    )
+                )
                 if not _fragment_valid(fragment, evidence, path, catalog):
                     raise EvidenceChangedError(f"evaluation fragment changed: {path}")
                 fragments[evidence.key].append(fragment)
@@ -330,7 +359,9 @@ def live_identity_sets(
                 name for name in _IDENTITY_COLUMNS if name in scan.collect_schema()
             ]
             probe = (
-                scan.select(columns).unique().collect() if columns else pl.DataFrame()
+                scan.select(columns).unique().collect(engine="streaming")
+                if columns
+                else pl.DataFrame()
             )
             for name in columns:
                 identities[name].update(str(value) for value in probe[name])

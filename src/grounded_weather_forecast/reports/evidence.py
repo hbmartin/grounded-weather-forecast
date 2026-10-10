@@ -597,6 +597,9 @@ def quality_rows(
                 pl.len().cast(pl.Int64).alias("recent_n"),
             )
             .rename({"semantics": "truth_semantics"})
+            # Stored scores use compact categories; the small report board
+            # and ledger keep their public string schema.
+            .with_columns(pl.col(identity).cast(pl.String))
         )
     return (
         rows.join(recent, on=identity, how="left")
