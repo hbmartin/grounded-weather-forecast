@@ -221,15 +221,19 @@ def _provider_nulls(ctx: DashboardContext) -> Panel:
 
 def _provenance(ctx: DashboardContext) -> Panel:
     kinds: dict[str, set[str]] = {}
-    frames = {
-        "hourly matrix (live)": ctx.hourly_matrix,
-        "hourly matrix (synthetic)": ctx.synthetic_hourly,
-        **{f"scores {stem}": frame for stem, frame in ctx.score_frames.items()},
-    }
-    for name, frame in frames.items():
+    matrices = (
+        ("hourly matrix (live)", ctx.hourly_matrix),
+        ("hourly matrix (synthetic)", ctx.synthetic_hourly),
+    )
+    for name, frame in matrices:
         if frame is None or frame.is_empty() or "source_kind" not in frame.columns:
             continue
         kinds[name] = {str(value) for value in frame["source_kind"].unique()}
+    for stem, frame in ctx.score_frames.items():
+        if not frame.is_empty() and "source_kind" in frame.columns:
+            kinds[f"scores {stem}"] = {
+                str(value) for value in frame["source_kind"].unique()
+            }
     if not kinds:
         return empty_panel(
             "b4",

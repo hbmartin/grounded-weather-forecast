@@ -1,4 +1,5 @@
 import json
+from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 
 import numpy as np
@@ -6,7 +7,6 @@ import polars as pl
 import pytest
 from conftest import synthetic_hourly_matrix, utc, write_config
 
-import grounded_weather_forecast.evaluation as evaluation_module
 import grounded_weather_forecast.serve.selection as selection_module
 from grounded_weather_forecast.backtest.engine import BacktestRequest, run_backtest
 from grounded_weather_forecast.backtest.scores import (
@@ -18,11 +18,13 @@ from grounded_weather_forecast.backtest.scores import (
 )
 from grounded_weather_forecast.contracts import TruthSemantics, hourly_variable
 from grounded_weather_forecast.evaluation import ModelRelease
+from grounded_weather_forecast.serve.evidence import (
+    evaluation_contexts as _evaluation_contexts,
+)
 from grounded_weather_forecast.serve.selection import (
     FALLBACK_METHOD,
     Selection,
     _eligible_release_ids,
-    _evaluation_contexts,
     method_for,
     select_methods,
     selection_report,
@@ -80,8 +82,8 @@ class TestEvaluationContexts:
         contexts = _evaluation_contexts(
             [
                 mixed,
-                frame("b", "humidity_pct", code="later"),
-                frame("b", "temp_c", code="later"),
+                frame("b", "humidity_pct"),
+                frame("b", "temp_c"),
                 mixed.clear(),
             ]
         )
@@ -94,6 +96,7 @@ class TestEvaluationContexts:
             "config_fingerprint": "config",
         }
 
+        assert list(contexts[1]["semantics"]) == ["temp_c", "humidity_pct"]
         assert contexts == (
             {"evaluation_id": "a", **common, "semantics": {"wind_speed_ms": "mean"}},
             {
@@ -106,81 +109,111 @@ class TestEvaluationContexts:
     def test_release_preserves_contexts_cutoff_and_identity(
         self, tmp_path, monkeypatch
     ):
-        config = scored_config(
-            tmp_path, extra='\n[predict.methods]\n"hourly.temp_c" = "equal_weight"\n'
+        config = write_config(tmp_path)
+        scores = near_tie_scores(
+            utc(2026, 8, 1), "evaluation-fixed", "inverse_mse"
+        ).with_columns(
+            (
+                pl.col("y_true")
+                + pl.when(pl.col("method_id") == "inverse_mse").then(1.0).otherwise(3.0)
+            ).alias("y_pred"),
+            pl.lit('["nws"]').alias("source_set_json"),
         )
-        path = next((config.dataset.dir / "scores").glob("scores_*.parquet"))
-        scores = load_scores(path).with_columns(
-            pl.lit("dataset-fixed").alias("dataset_fingerprint"),
-            pl.lit("config-fixed").alias("config_fingerprint"),
-            pl.lit("code-fixed").alias("code_version"),
-            pl.lit("evaluation-fixed").alias("evaluation_id"),
-            pl.lit(json.dumps(["x" * 8192])).alias("feature_set_json"),
-        )
-        write_scores(scores, path)
-        monkeypatch.setattr(
-            selection_module, "dataset_fingerprint", lambda _: "dataset-fixed"
-        )
-        monkeypatch.setattr(
-            selection_module, "config_fingerprint", lambda _: "config-fixed"
-        )
-        monkeypatch.setattr(selection_module, "code_identity", lambda: "code-fixed")
-        fixed_time = utc(2026, 10, 6, 12)
-
-        class FixedDatetime(datetime):
-            @classmethod
-            def now(cls, tz=None):
-                return fixed_time if tz is None else fixed_time.astimezone(tz)
-
-        monkeypatch.setattr(evaluation_module, "datetime", FixedDatetime)
-        selected = select_methods(config, config.dataset.dir / "scores")
-        assert selected
-        assert all(
-            value.method_id == "equal_weight" and value.pinned
-            for value in selected.values()
-        )
+        directory = tmp_path / "scores"
+        write_scores(scores, directory / "scores_fixture.parquet")
+        monkeypatch.setattr(selection_module, "dataset_fingerprint", lambda _: "ds1")
+        monkeypatch.setattr(selection_module, "config_fingerprint", lambda _: "cfg1")
+        monkeypatch.setattr(selection_module, "code_identity", lambda: "code1")
+        before = datetime.now(tz=UTC)
+        selected = select_methods(config, directory)
+        after = datetime.now(tz=UTC)
         context = {
             "evaluation_id": "evaluation-fixed",
             "source_kind": "live",
-            "source_set_json": scores["source_set_json"][0],
-            "feature_set_json": scores["feature_set_json"][0],
+            "source_set_json": '["nws"]',
+            "feature_set_json": "[]",
             "semantics": {"temp_c": "inst"},
             "window": "expanding",
-            "code_version": "code-fixed",
-            "config_fingerprint": "config-fixed",
+            "code_version": "code1",
+            "config_fingerprint": "cfg1",
         }
-        cutoff = scores.filter(
-            pl.col("lead_bucket").is_in([key[2] for key in selected])
-        )["valid_time"].max()
+        payload = {
+            "hourly.temp_c.24-48h": {
+                "method_id": "inverse_mse",
+                "reason": "lowest backtest MAE among promotable common-case methods",
+                "evaluation_id": "evaluation-fixed",
+                "code_version": "code1",
+                "n": 30,
+                "mae": 1.0,
+                "truth_semantics": "inst",
+                "retained": False,
+            }
+        }
         expected = ModelRelease.create(
-            dataset="dataset-fixed",
-            configuration="config-fixed",
+            dataset="ds1",
+            configuration="cfg1",
             evaluation_ids=("evaluation-fixed",),
             evaluation_contexts=(context,),
-            training_cutoff=cutoff,
-            selections={
-                ".".join(key): {
-                    "method_id": value.method_id,
-                    "reason": value.reason,
-                    "evaluation_id": "evaluation-fixed",
-                    "code_version": "code-fixed",
-                    "n": value.n,
-                    "mae": value.mae,
-                    "truth_semantics": value.truth_semantics,
-                    "retained": value.retained,
-                }
-                for key, value in selected.items()
-            },
+            training_cutoff=utc(2026, 7, 2, 5),
+            selections=payload,
         )
-        release_path = config.artifacts_dir / "releases" / f"{expected.release_id}.json"
-        actual = json.loads(release_path.read_text())
-
+        actual = json.loads(
+            (
+                config.artifacts_dir / "releases" / f"{expected.release_id}.json"
+            ).read_text()
+        )
         assert {value.release_id for value in selected.values()} == {
             expected.release_id
         }
         assert actual["evaluation_contexts"] == [context]
-        assert actual["training_cutoff"] == cutoff.isoformat()
-        assert actual["promoted_at"] == fixed_time.isoformat()
+        assert actual["selections"] == payload
+        assert actual["training_cutoff"] == "2026-07-02T05:00:00+00:00"
+        assert before <= datetime.fromisoformat(actual["promoted_at"]) <= after
+        assert select_methods(config, directory) == selected
+
+    def test_context_order_survives_release_serialization(self, tmp_path):
+        from dataclasses import asdict
+        from grounded_weather_forecast.serve.evidence import evaluation_contexts
+
+        scores = near_tie_scores(utc(2026, 8, 1), "eval", "inverse_mse")
+        contexts = evaluation_contexts([scores])
+        expected_context = {
+            "evaluation_id": "eval",
+            "source_kind": "live",
+            "source_set_json": "[]",
+            "feature_set_json": "[]",
+            "semantics": {"temp_c": "inst"},
+            "window": "expanding",
+            "code_version": "code1",
+            "config_fingerprint": "cfg1",
+        }
+        assert list(contexts[0]) == list(expected_context)
+        kwargs = dict(
+            dataset="ds1",
+            configuration="cfg1",
+            evaluation_ids=("eval",),
+            training_cutoff=None,
+            selections={},
+            promoted_at=utc(2026, 8, 1),
+        )
+        actual = ModelRelease.create(evaluation_contexts=contexts, **kwargs)
+        expected = ModelRelease.create(
+            evaluation_contexts=(expected_context,), **kwargs
+        )
+        path = actual.write(tmp_path)
+        assert actual.release_id == expected.release_id
+        assert path.read_text() == json.dumps(asdict(expected), indent=2)
+        assert actual.write(tmp_path).read_bytes() == path.read_bytes()
+
+    @pytest.mark.parametrize(
+        "column,value", [("semantics", "mean"), ("feature_set_json", '["other"]')]
+    )
+    def test_conflicting_evaluation_is_excluded(self, column, value, caplog):
+        scores = near_tie_scores(utc(2026, 8, 1), "eval", "inverse_mse")
+        changed = scores.with_columns(pl.lit(value).alias(column))
+        assert _evaluation_contexts([scores, changed]) == ()
+        assert "Ignoring conflicting evaluation evidence: eval" in caplog.text
+        assert _evaluation_contexts([pl.concat([scores, changed])]) == ()
 
 
 class TestSelectMethods:
@@ -347,6 +380,7 @@ class TestMethodFor:
             dataset_fingerprint="dataset-r",
             release_id="release-r",
             code_version="0.4.0+implementation",
+            retained=True,
         )
 
         chosen = method_for(
@@ -358,6 +392,7 @@ class TestMethodFor:
         )
 
         assert chosen.pinned
+        assert not chosen.retained
         assert chosen.release_id == "release-r"
         assert chosen.evaluation_id == "eval-r"
         assert chosen.code_version == "0.4.0+implementation"
@@ -466,6 +501,15 @@ def test_release_eligibility_uses_implementation_not_promotion_age(tmp_path):
         (*key, "gbm")
     ] == frozenset({"release-old-but-active"})
     assert not _eligible_release_ids(config, changed, current_contexts)[(*key, "gbm")]
+    current_winner = {key: replace(matching[key], method_id="new-winner")}
+    candidate_cohorts = _eligible_release_ids(
+        config, current_winner, current_contexts, candidates={key: (matching[key],)}
+    )
+    assert candidate_cohorts[(*key, "new-winner")] == frozenset()
+    assert candidate_cohorts[(*key, "gbm")] == frozenset({"release-old-but-active"})
+    assert not _eligible_release_ids(
+        config, current_winner, current_contexts, candidates={key: (changed[key],)}
+    )[(*key, "gbm")]
 
 
 def test_release_eligibility_rejects_incompatible_evaluation_context(tmp_path):
@@ -965,8 +1009,22 @@ class TestIncumbentRetention:
         assert older is not None
         assert older[self.KEY].retained is False
 
-    def test_fallback_incumbent_is_never_retained(self, tmp_path, monkeypatch):
-        config = write_config(tmp_path)
+    @pytest.mark.parametrize(
+        "reference,configured",
+        [
+            ("equal_weight", "equal_weight"),
+            ("equal_weight", "inverse_mse"),
+            ("best_provider", "best_provider"),
+            ("inverse_mse", "inverse_mse"),
+        ],
+    )
+    def test_fallback_incumbent_is_never_retained(
+        self, tmp_path, monkeypatch, reference, configured
+    ):
+        config = write_config(
+            tmp_path,
+            extra_toml=f'\n[promotion.references]\ntemp_c = ["{configured}"]\n',
+        )
         self._pin_fingerprints(monkeypatch)
         frame = near_tie_scores(utc(2026, 8, 2), "evaltwo", "cluster_equal_weight")
         board = selection_module.leaderboard(frame)
@@ -980,7 +1038,7 @@ class TestIncumbentRetention:
             "gate": None,
         }
         kept = selection_module._retained_incumbent(
-            config, row, board, frame, (FALLBACK_METHOD, "inst"), "evaltwo"
+            config, row, board, frame, (reference, "inst"), "evaltwo"
         )
         assert kept is None
 
@@ -1028,7 +1086,9 @@ class TestPruneRaceResilience:
 
     def test_scan_retries_once_when_a_file_vanishes(self, tmp_path, monkeypatch):
         config = scored_config(tmp_path)
-        real = selection_module.load_scores
+        from grounded_weather_forecast.serve import score_scan
+
+        real = score_scan.scan_scores
         calls = {"count": 0}
 
         def flaky(path, **kwargs):
@@ -1037,7 +1097,7 @@ class TestPruneRaceResilience:
                 raise FileNotFoundError(path)
             return real(path, **kwargs)
 
-        monkeypatch.setattr(selection_module, "load_scores", flaky)
+        monkeypatch.setattr(score_scan, "scan_scores", flaky)
         frames = selection_module._compatible_scores(
             config, config.dataset.dir / "scores", None, None
         )
@@ -1052,7 +1112,9 @@ class TestPruneRaceResilience:
         def always_missing(path, **kwargs):
             raise FileNotFoundError(path)
 
-        monkeypatch.setattr(selection_module, "load_scores", always_missing)
+        from grounded_weather_forecast.serve import score_scan
+
+        monkeypatch.setattr(score_scan, "scan_scores", always_missing)
         frames = selection_module._compatible_scores(
             config, config.dataset.dir / "scores", None, None
         )
@@ -1064,8 +1126,133 @@ class TestPruneRaceResilience:
         def always_missing(path, **kwargs):
             raise FileNotFoundError(path)
 
-        monkeypatch.setattr(selection_module, "load_scores", always_missing)
+        from grounded_weather_forecast.serve import score_scan
+
+        monkeypatch.setattr(score_scan, "scan_scores", always_missing)
         reason = selection_module.no_evidence_reason(
             config, config.dataset.dir / "scores"
         )
         assert "no live backtest evidence" in reason
+
+
+class TestPinnedEvidence:
+    @pytest.mark.parametrize(
+        "method,n,mae,evaluation",
+        [
+            ("best_provider", 30, 5.0, "eval"),
+            ("absent_method", 0, None, None),
+            ("sparse_method", 1, 2.0, "eval"),
+        ],
+    )
+    def test_pin_uses_own_statistics_and_skips_retention(
+        self, tmp_path, monkeypatch, method, n, mae, evaluation
+    ):
+        config = write_config(
+            tmp_path, extra_toml=f'\n[predict.methods]\n"hourly.temp_c" = "{method}"\n'
+        )
+        scores = near_tie_scores(utc(2026, 8, 1), "eval", "inverse_mse").with_columns(
+            (
+                pl.col("y_true")
+                + pl.when(pl.col("method_id") == "best_provider")
+                .then(5.0)
+                .otherwise(1.0)
+            ).alias("y_pred"),
+        )
+        sparse = scores.head(1).with_columns(
+            pl.lit("sparse_method").alias("method_id"),
+            (pl.col("y_true") + 2.0).alias("y_pred"),
+        )
+        write_scores(
+            pl.concat([scores, sparse]), tmp_path / "scores" / "scores_fixture.parquet"
+        )
+        TestIncumbentRetention()._pin_fingerprints(monkeypatch)
+
+        def unexpected(*args, **kwargs):
+            raise AssertionError("pins must skip retention")
+
+        monkeypatch.setattr(selection_module, "_retained_incumbent", unexpected)
+        selected = select_methods(config, tmp_path / "scores")[
+            ("hourly", "temp_c", "24-48h")
+        ]
+        assert (
+            selected.method_id,
+            selected.n,
+            selected.mae,
+            selected.evaluation_id,
+        ) == (method, n, mae, evaluation)
+        assert selected.pinned and not selected.retained
+        release = json.loads(
+            (
+                config.artifacts_dir / "releases" / f"{selected.release_id}.json"
+            ).read_text()
+        )
+        persisted = release["selections"]["hourly.temp_c.24-48h"]
+        assert (persisted["n"], persisted["mae"], persisted["retained"]) == (
+            n,
+            mae,
+            False,
+        )
+        if evaluation is None:
+            assert release["evaluation_ids"] == []
+            assert release["evaluation_contexts"] == []
+            assert release["training_cutoff"] is None
+
+
+class TestReferenceReplacementIntegration:
+    @pytest.mark.parametrize("product", ["hourly", "minutely"])
+    def test_uses_product_reference_class_and_persists_replacement(
+        self, tmp_path, monkeypatch, product
+    ):
+        config = write_config(
+            tmp_path,
+            extra_toml='\n[promotion.references]\ntemp_c = ["best_provider", "damped_grounded_equal_weight"]\n',
+        )
+        scores = near_tie_scores(utc(2026, 8, 1), "eval", "inverse_mse")
+        winner, reference, bucket = "inverse_mse", "best_provider", "24-48h"
+        if product == "minutely":
+            mapping = {
+                "inverse_mse": "minutely_anchor_full",
+                "cluster_equal_weight": "minutely_anchor_tau_1h",
+                "best_provider": "minutely_interp",
+                "equal_weight": "minutely_persistence",
+                "damped_grounded_equal_weight": "extra",
+            }
+            scores = scores.with_columns(
+                pl.col("method_id").replace(mapping),
+                pl.lit("minutely").alias("product"),
+                pl.lit("0-5m").alias("lead_bucket"),
+                pl.lit(0.05).alias("lead_hours"),
+            )
+            winner, reference, bucket = (
+                "minutely_anchor_full",
+                "minutely_interp",
+                "0-5m",
+            )
+        scores = scores.with_columns(
+            (
+                pl.col("y_true")
+                + pl.when(pl.col("method_id") == winner).then(1.0).otherwise(5.0)
+            ).alias("y_pred"),
+            pl.lit('["nws"]').alias("source_set_json"),
+        )
+        write_scores(scores, tmp_path / "scores" / "scores_fixture.parquet")
+        TestIncumbentRetention()._pin_fingerprints(monkeypatch)
+        key = (product, "temp_c", bucket)
+        first = select_methods(config, tmp_path / "scores")[key]
+        assert first.method_id == winner
+        live = pl.DataFrame(
+            {
+                "product": [product],
+                "variable": ["temp_c"],
+                "lead_bucket": [bucket],
+                "method_id": [winner],
+                "release_id": [first.release_id],
+                "n": [30],
+                "live_mae": [10.0],
+            }
+        )
+        monkeypatch.setattr(selection_module, "_live_verification", lambda *_: live)
+        replaced = select_methods(config, tmp_path / "scores")[key]
+        assert replaced.method_id == reference
+        assert replaced.mae == 5.0
+        assert "demoted" in replaced.reason

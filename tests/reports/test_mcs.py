@@ -405,5 +405,91 @@ class TestSelectionFlagsDriveBehaviour:
             self._live(),
             factor=1.5,
             min_n=24,
+            fallbacks={
+                ("hourly", "temp_c", "24-48h"): Selection(
+                    "equal_weight", "reference", n=40, mae=1.0
+                )
+            },
         )
         assert gated[("hourly", "temp_c", "24-48h")].method_id == "equal_weight"
+
+
+class TestGuardedReplacement:
+    KEY = ("hourly", "temp_c", "24-48h")
+
+    def gate(self, candidates=(), reference_live=None, method="winner"):
+        live = [
+            {
+                "product": self.KEY[0],
+                "variable": self.KEY[1],
+                "lead_bucket": self.KEY[2],
+                "method_id": method,
+                "release_id": "release",
+                "n": 30,
+                "live_mae": 3.0,
+            }
+        ]
+        for name, (n, error) in (reference_live or {}).items():
+            live.append(live[0] | {"method_id": name, "n": n, "live_mae": error})
+        return apply_live_gate(
+            {self.KEY: Selection(method, "winner", n=30, mae=1.0)},
+            pl.DataFrame(live),
+            factor=1.5,
+            min_n=24,
+            candidates={self.KEY: candidates},
+        )[self.KEY]
+
+    @pytest.mark.parametrize(
+        "error", [None, float("nan"), float("inf"), -1.0, 3.0, 4.0]
+    )
+    def test_unscored_or_worse_reference_blocks_replacement(self, error):
+        result = self.gate((Selection("reference", "reference", mae=error),))
+        assert result.method_id == "winner"
+        assert result.mae == 1.0
+        assert "live gate failed" in result.reason
+        assert "replacement blocked" in result.reason
+
+    def test_missing_reference_is_recorded(self):
+        assert "replacement blocked" in self.gate().reason
+
+    @pytest.mark.parametrize("live", [3.0, 1.6])
+    def test_mature_bad_live_reference_is_vetoed(self, live):
+        result = self.gate(
+            (Selection("reference", "reference", mae=1.0),), {"reference": (24, live)}
+        )
+        assert result.method_id == "winner"
+
+    def test_immature_reference_uses_backtest_proxy(self):
+        result = self.gate(
+            (Selection("reference", "reference", mae=1.0),), {"reference": (23, 8.0)}
+        )
+        assert result.method_id == "reference"
+
+    def test_ranks_by_conservative_live_or_backtest_error(self):
+        result = self.gate(
+            (
+                Selection("a", "reference", mae=1.5),
+                Selection("b", "reference", mae=1.3),
+            ),
+            {"a": (30, 1.7)},
+        )
+        assert result.method_id == "b"
+
+    def test_exact_tie_prefers_equal_weight_then_reference_order(self):
+        a, b, equal = (
+            Selection(name, "reference", mae=1.2) for name in ("a", "b", "equal_weight")
+        )
+        assert self.gate((a, b, equal)).method_id == "equal_weight"
+        assert self.gate((b, a)).method_id == "b"
+
+    def test_reference_method_can_be_replaced_by_another_reference(self):
+        result = self.gate(
+            (Selection("best_provider", "reference", mae=1.2),), method="equal_weight"
+        )
+        assert result.method_id == "best_provider"
+
+    def test_same_method_is_not_a_replacement(self):
+        assert (
+            self.gate((Selection("winner", "reference", mae=1.0),)).method_id
+            == "winner"
+        )

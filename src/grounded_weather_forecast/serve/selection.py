@@ -17,8 +17,7 @@ from typing import cast
 
 import polars as pl
 
-from grounded_weather_forecast.backtest.scores import load_scores
-from grounded_weather_forecast.config import Config, PromotionConfig
+from grounded_weather_forecast.config import Config
 from grounded_weather_forecast.contracts import TruthSemantics
 from grounded_weather_forecast.evaluation import (
     ModelRelease,
@@ -36,17 +35,19 @@ from grounded_weather_forecast.reports.leaderboard import (
     union_references,
 )
 from grounded_weather_forecast.reports.winner_curse import should_retain_incumbent
+from grounded_weather_forecast.serve.evidence import (
+    EvidenceSummary,
+)
+from grounded_weather_forecast.serve.score_scan import (
+    ScoreIdentity,
+    compatible_slices,
+)
+from grounded_weather_forecast.serve.score_scan import (
+    live_identity_sets as _live_identity_sets,
+)
 
 FALLBACK_METHOD = "equal_weight"
 _LIVE_KEY = ("product", "variable", "lead_bucket", "method_id")
-_EVALUATION_CONTEXT_COLUMNS = (
-    "source_kind",
-    "source_set_json",
-    "feature_set_json",
-    "window",
-    "code_version",
-    "config_fingerprint",
-)
 # How long a served row may still testify. A module constant rather than a
 # config field on purpose: a new field changes `repr(config)`, hence
 # `config_fingerprint`, which would invalidate every score and release once.
@@ -100,6 +101,23 @@ def _pins(config: Config) -> dict[tuple[str, str], str]:
     return pinned
 
 
+def _load_slices(
+    config: Config,
+    scores_dir: Path,
+    as_of: datetime | None,
+    semantics: Mapping[str, TruthSemantics] | None,
+    dataset_id: str | None = None,
+) -> dict[SliceKey, pl.DataFrame]:
+    identity = ScoreIdentity(
+        dataset_id or dataset_fingerprint(config),
+        config_fingerprint(config),
+        code_identity(),
+        as_of,
+        semantics,
+    )
+    return compatible_slices(scores_dir, identity, config.promotion)
+
+
 def _compatible_scores(
     config: Config,
     scores_dir: Path,
@@ -107,72 +125,8 @@ def _compatible_scores(
     semantics: Mapping[str, TruthSemantics] | None,
     dataset_id: str | None = None,
 ) -> list[pl.DataFrame]:
-    # Prune (which runs under the pipeline lock) can delete a file between
-    # this reader's glob and read — predict deliberately does not take that
-    # lock. A mixed pre/post-prune view must never mint a release, so retry
-    # the whole scan once against a consistent post-prune listing; skipping
-    # individual files is the second pass's last resort.
-    try:
-        return _scan_compatible_scores(
-            config, scores_dir, as_of, semantics, dataset_id, skip_missing=False
-        )
-    except FileNotFoundError:
-        return _scan_compatible_scores(
-            config, scores_dir, as_of, semantics, dataset_id, skip_missing=True
-        )
-
-
-def _scan_compatible_scores(
-    config: Config,
-    scores_dir: Path,
-    as_of: datetime | None,
-    semantics: Mapping[str, TruthSemantics] | None,
-    dataset_id: str | None = None,
-    *,
-    skip_missing: bool,
-) -> list[pl.DataFrame]:
-    current_dataset = dataset_id or dataset_fingerprint(config)
-    current_code = code_identity()
-    candidates: list[pl.DataFrame] = []
-    for path in sorted(scores_dir.glob("scores_*.parquet")):
-        try:
-            scores = load_scores(path)
-        except FileNotFoundError:
-            if not skip_missing:
-                raise
-            continue
-        if scores.is_empty() or set(scores["source_kind"].unique()) != {"live"}:
-            continue
-        required_identity = {
-            "dataset_fingerprint",
-            "config_fingerprint",
-            "evaluation_id",
-            "evaluation_created_at",
-            "code_version",
-            "source_set_json",
-            "feature_set_json",
-            "semantics",
-        }
-        if not required_identity <= set(scores.columns):
-            continue
-        scores = scores.filter(pl.col("dataset_fingerprint") == current_dataset)
-        scores = scores.filter(
-            pl.col("config_fingerprint") == config_fingerprint(config)
-        )
-        scores = scores.filter(pl.col("code_version") == current_code)
-        for variable, truth_semantics in (semantics or {}).items():
-            scores = scores.filter(
-                (pl.col("product") != "hourly")
-                | (pl.col("variable") != variable)
-                | (pl.col("semantics") == truth_semantics.value)
-            )
-        if as_of is not None:
-            scores = scores.filter(pl.col("evaluation_created_at") <= as_of)
-        if as_of is not None:
-            scores = scores.filter(pl.col("valid_time") <= as_of)
-        if not scores.is_empty():
-            candidates.append(scores)
-    return candidates
+    """Materialized newest complete slices; older numeric scores stay on disk."""
+    return list(_load_slices(config, scores_dir, as_of, semantics, dataset_id).values())
 
 
 def _pool_sibling_scores(
@@ -182,7 +136,7 @@ def _pool_sibling_scores(
 ) -> pl.DataFrame:
     """Widen a far daily slice's scores to its D3-10 pool siblings.
 
-    ``_newest_complete_slices`` partitions evidence per fine bucket, but the
+    The score scanner chooses evidence per fine bucket, but the
     pooled far-bucket gate can only pool what it can see — without the
     siblings of the same evaluation, serving would never reach the pooled
     promotions the report shows.
@@ -221,40 +175,6 @@ def _eprocess_store_for(
     return cache[product]
 
 
-def _newest_complete_slices(
-    candidates: list[pl.DataFrame],
-    promotion: PromotionConfig | None = None,
-) -> dict[SliceKey, pl.DataFrame]:
-    """Newest atomic evaluation per slice containing every reference method."""
-    if not candidates:
-        return {}
-    combined = pl.concat(candidates, how="diagonal_relaxed")
-    selected: dict[SliceKey, tuple[datetime, str, pl.DataFrame]] = {}
-    for evaluation_key, evaluation in combined.partition_by(
-        "evaluation_id", as_dict=True
-    ).items():
-        evaluation_id = str(evaluation_key[0])
-        created_at = evaluation["evaluation_created_at"].max()
-        if not isinstance(created_at, datetime):
-            continue
-        for slice_key, frame in evaluation.partition_by(
-            ["product", "variable", "lead_bucket"], as_dict=True
-        ).items():
-            methods = {str(method) for method in frame["method_id"].unique().to_list()}
-            references = gate_references(
-                str(slice_key[1]), promotion, product=str(slice_key[0])
-            )
-            if not set(references) <= methods:
-                continue
-            product, variable, lead_bucket = (str(part) for part in slice_key)
-            key: SliceKey = (product, variable, lead_bucket)
-            previous = selected.get(key)
-            marker = (created_at, evaluation_id)
-            if previous is None or marker > previous[:2]:
-                selected[key] = (created_at, evaluation_id, frame)
-    return {key: selected[key][2] for key in sorted(selected)}
-
-
 def _selection_payload(
     selections: Mapping[SliceKey, Selection],
 ) -> dict[str, dict[str, object]]:
@@ -271,44 +191,6 @@ def _selection_payload(
         }
         for key, selected in sorted(selections.items())
     }
-
-
-def _evaluation_contexts(
-    selected_scores: list[pl.DataFrame],
-) -> tuple[dict[str, object], ...]:
-    if not selected_scores:
-        return ()
-    contexts: dict[str, dict[str, object]] = {}
-    for frame in selected_scores:
-        # Keep one metadata row per evaluation before merging across slices;
-        # concatenating full scores replicates large, repeated JSON buffers.
-        summary = frame.group_by("evaluation_id", maintain_order=True).agg(
-            *(pl.col(column).first() for column in _EVALUATION_CONTEXT_COLUMNS),
-            pl.struct("variable", "semantics")
-            .unique(maintain_order=True)
-            .alias("semantic_pairs"),
-        )
-        for row in summary.iter_rows(named=True):
-            evaluation_id = str(row["evaluation_id"])
-            context = contexts.setdefault(
-                evaluation_id,
-                {
-                    "evaluation_id": evaluation_id,
-                    **{
-                        column: str(row[column])
-                        for column in _EVALUATION_CONTEXT_COLUMNS
-                    },
-                    "semantics": {},
-                },
-            )
-            context_semantics = cast(dict[str, str], context["semantics"])
-            context_semantics.update(
-                {
-                    str(pair["variable"]): str(pair["semantics"])
-                    for pair in row["semantic_pairs"]
-                }
-            )
-    return tuple(contexts[key] for key in sorted(contexts))
 
 
 def _contexts_by_evaluation_id(
@@ -370,28 +252,15 @@ def _evaluation_compatibility(
 def _make_release(
     config: Config,
     selections: Mapping[SliceKey, Selection],
-    selected_scores: list[pl.DataFrame],
+    evidence: EvidenceSummary,
     dataset_id: str | None = None,
-    *,
-    evaluation_contexts: tuple[dict[str, object], ...],
 ) -> ModelRelease:
-    evaluation_ids = tuple(
-        sorted(
-            {
-                selected.evaluation_id
-                for selected in selections.values()
-                if selected.evaluation_id is not None
-            }
-        )
-    )
     return ModelRelease.create(
         dataset=dataset_id or dataset_fingerprint(config),
         configuration=config_fingerprint(config),
-        evaluation_ids=evaluation_ids,
-        evaluation_contexts=evaluation_contexts,
-        training_cutoff=max(
-            (frame["valid_time"].max() for frame in selected_scores), default=None
-        ),
+        evaluation_ids=evidence.evaluation_ids,
+        evaluation_contexts=evidence.contexts,
+        training_cutoff=evidence.training_cutoff,
         selections=_selection_payload(selections),
     )
 
@@ -533,6 +402,8 @@ def _eligible_release_ids(
     config: Config,
     selections: Mapping[SliceKey, Selection],
     evaluation_contexts: tuple[dict[str, object], ...] = (),
+    *,
+    candidates: Mapping[SliceKey, tuple[Selection, ...]] | None = None,
 ) -> EligibleReleases:
     """Release cohorts matching each selected method and evaluation context.
 
@@ -547,9 +418,14 @@ def _eligible_release_ids(
     Recency is applied to served rows rather than to immutable release creation
     times.
     """
-    eligible: dict[LiveKey, set[str]] = {
-        (*key, selected.method_id): set() for key, selected in selections.items()
+    choices = {
+        (*key, selected.method_id): selected for key, selected in selections.items()
     }
+    for key, references in (candidates or {}).items():
+        choices.update(
+            {(*key, reference.method_id): reference for reference in references}
+        )
+    eligible: dict[LiveKey, set[str]] = {key: set() for key in choices}
     current_contexts = _contexts_by_evaluation_id(evaluation_contexts)
     for raw in _compatible_releases(config, match_dataset=False):
         release_id = raw.get("release_id")
@@ -557,12 +433,12 @@ def _eligible_release_ids(
         if not isinstance(release_id, str) or not isinstance(raw_selections, dict):
             continue
         release_contexts = _contexts_by_evaluation_id(raw.get("evaluation_contexts"))
-        for key, selected in selections.items():
+        for live_key, selected in choices.items():
+            key = live_key[:3]
             raw_selected = raw_selections.get(".".join(key))
             if not isinstance(raw_selected, dict):
                 continue
             selection_mapping = cast(Mapping[str, object], raw_selected)
-            live_key = (*key, selected.method_id)
             current_context = current_contexts.get(selected.evaluation_id or "")
             release_context = release_contexts.get(
                 str(selection_mapping.get("evaluation_id") or "")
@@ -682,9 +558,15 @@ def _retained_incumbent(
     if (
         incumbent_method == str(winner_row["method_id"])
         or winner_row.get("gate") not in _RETENTION_GATES
+        or incumbent_method == FALLBACK_METHOD
         # A demoted slice's persisted method is already the fallback;
         # retaining it by name would outlast the demotion's own re-hearing.
-        or incumbent_method == FALLBACK_METHOD
+        or incumbent_method
+        in gate_references(
+            str(winner_row["variable"]),
+            config.promotion,
+            product=str(winner_row["product"]),
+        )
     ):
         return None
     slice_semantics = str(frame["semantics"][0])
@@ -718,6 +600,68 @@ def _retained_incumbent(
     )
 
 
+def _selection_from_row(
+    row: Mapping[str, object],
+    frame: pl.DataFrame,
+    dataset: str,
+    reason: str,
+) -> Selection:
+    return Selection(
+        method_id=str(row["method_id"]),
+        reason=reason,
+        n=int(cast(int, row["n"])),
+        mae=float(cast(float, row["mae"])),
+        evaluation_id=str(frame["evaluation_id"][0]),
+        dataset_fingerprint=dataset,
+        code_version=str(frame["code_version"][0]),
+        truth_semantics=str(
+            row.get("truth_semantics") or frame["semantics"][0] or "inst"
+        ),
+    )
+
+
+def _pinned_selection(
+    method: str, board: pl.DataFrame, frame: pl.DataFrame, dataset: str
+) -> Selection:
+    rows = (
+        board.filter(pl.col("method_id") == method) if not board.is_empty() else board
+    )
+    selected = (
+        _selection_from_row(rows.row(0, named=True), frame, dataset, "pinned in config")
+        if not rows.is_empty()
+        else Selection(
+            method,
+            "pinned in config",
+            dataset_fingerprint=dataset,
+            code_version=str(frame["code_version"][0]),
+            truth_semantics=str(frame["semantics"][0] or "inst"),
+        )
+    )
+    return replace(selected, pinned=True, retained=False)
+
+
+def _reference_candidates(
+    key: SliceKey,
+    board: pl.DataFrame,
+    frame: pl.DataFrame,
+    config: Config,
+    dataset: str,
+) -> tuple[Selection, ...]:
+    references = gate_references(key[1], config.promotion, product=key[0])
+    eligible = eligible_board_rows(board)
+    return (
+        tuple(
+            _selection_from_row(row, frame, dataset, "reference fallback")
+            for method in references
+            for row in eligible.filter(pl.col("method_id") == method).iter_rows(
+                named=True
+            )
+        )
+        if not eligible.is_empty()
+        else ()
+    )
+
+
 def select_methods(
     config: Config,
     scores_dir: Path,
@@ -731,18 +675,17 @@ def select_methods(
         return _release_as_of(config, as_of, semantics) or {}
     current_dataset = dataset_id or dataset_fingerprint(config)
     pinned = _pins(config)
-    selections: dict[tuple[str, str, str], Selection] = {}
-    compatible = _compatible_scores(
-        config, scores_dir, as_of, semantics, current_dataset
-    )
+    selections: dict[SliceKey, Selection] = {}
+    slices = _load_slices(config, scores_dir, as_of, semantics, current_dataset)
     incumbents = _incumbent_methods(config)
-    slices = _newest_complete_slices(compatible, config.promotion)
-    selected_scores: list[pl.DataFrame] = []
-    fallbacks: dict[SliceKey, Selection] = {}
+    candidates: dict[SliceKey, tuple[Selection, ...]] = {}
     references = union_references(config.promotion)
     eprocess_stores: dict[str, EProcessStore] = {}
     for key, frame in slices.items():
         board = leaderboard(frame, references=references)
+        if (method := pinned.get(key[:2])) is not None:
+            selections[key] = _pinned_selection(method, board, frame, current_dataset)
+            continue
         winners = slice_winners(
             board,
             scores=_pool_sibling_scores(key, frame, slices),
@@ -753,79 +696,44 @@ def select_methods(
         )
         if winners.is_empty():
             continue
-        selected_scores.append(frame)
-        evaluation_id = str(frame["evaluation_id"][0])
         row = winners.row(0, named=True)
         reason = "lowest backtest MAE among promotable common-case methods"
         if row.get("gate") == "pooled_D3-10":
             reason += " (gated on pooled D3-10 evidence)"
-        selections[key] = Selection(
-            method_id=str(row["method_id"]),
-            reason=reason,
-            n=int(row["n"]),
-            mae=float(row["mae"]),
-            evaluation_id=evaluation_id,
-            dataset_fingerprint=current_dataset,
-            code_version=str(frame["code_version"][0]),
-            truth_semantics=str(frame["semantics"][0]),
-        )
-        retained = _retained_incumbent(
-            config,
-            row,
-            board,
-            frame,
-            incumbents.get(key),
-            evaluation_id,
-            current_dataset,
-        )
-        if retained is not None:
-            selections[key] = retained
-        fallback_rows = board.filter(pl.col("method_id") == FALLBACK_METHOD).sort("mae")
-        if not fallback_rows.is_empty():
-            fallback = fallback_rows.row(0, named=True)
-            fallbacks[key] = Selection(
-                method_id=FALLBACK_METHOD,
-                reason="reference fallback",
-                n=int(fallback["n"]),
-                mae=float(fallback["mae"]),
-                evaluation_id=evaluation_id,
-                dataset_fingerprint=current_dataset,
-                code_version=str(frame["code_version"][0]),
-                truth_semantics=str(frame["semantics"][0]),
+        selected = _selection_from_row(row, frame, current_dataset, reason)
+        selections[key] = (
+            _retained_incumbent(
+                config,
+                row,
+                board,
+                frame,
+                incumbents.get(key),
+                str(frame["evaluation_id"][0]),
+                current_dataset,
             )
-    for (product, variable), method_id in pinned.items():
-        for key in [key for key in selections if key[:2] == (product, variable)]:
-            selections[key] = replace(
-                selections[key],
-                method_id=method_id,
-                reason="pinned in config",
-                pinned=True,
-            )
+            or selected
+        )
+        candidates[key] = _reference_candidates(
+            key, board, frame, config, current_dataset
+        )
     if not selections:
         return selections
-    evaluation_contexts = _evaluation_contexts(selected_scores)
-    # Gate before minting the release. Stamping a prospective id first only
-    # ever orphaned it: a demotion rewrites `selections`, which the release
-    # hash covers, so the rows served under the acting release ended up
-    # attributed to an id that release does not have.
-    now = datetime.now(tz=UTC)
+    evidence = EvidenceSummary.from_slices(
+        slices, {key: selected.evaluation_id for key, selected in selections.items()}
+    )
+    # Every replacement candidate comes from the same slice/evaluation, so
+    # changing the served method cannot change this release's evidence.
     selections = apply_live_gate(
         selections,
-        _live_verification(config, now),
+        _live_verification(config, datetime.now(tz=UTC)),
         factor=config.promotion.live_gap_factor,
         min_n=config.promotion.min_live_n,
-        fallbacks=fallbacks,
+        candidates=candidates,
         eligible_releases=_eligible_release_ids(
-            config, selections, evaluation_contexts
+            config, selections, evidence.contexts, candidates=candidates
         ),
     )
-    release = _make_release(
-        config,
-        selections,
-        selected_scores,
-        current_dataset,
-        evaluation_contexts=evaluation_contexts,
-    )
+    release = _make_release(config, selections, evidence, current_dataset)
     release.write(config.artifacts_dir / "releases")
     return {
         key: replace(selected, release_id=release.release_id)
@@ -912,12 +820,7 @@ def _live_verdict(
     min_n: int,
 ) -> str | None:
     """The demotion reason for this slice, or ``None`` to leave it standing."""
-    if (
-        selected.method_id == FALLBACK_METHOD
-        or selected.pinned
-        or selected.mae is None
-        or not math.isfinite(selected.mae)
-    ):
+    if selected.pinned or selected.mae is None or not math.isfinite(selected.mae):
         return None
     product, variable, bucket = key
     measured = pooled.get((product, variable, bucket, selected.method_id))
@@ -932,19 +835,54 @@ def _live_verdict(
     )
 
 
+def _replacement_rank(
+    key: SliceKey,
+    candidate: Selection,
+    pooled: Mapping[LiveKey, tuple[int, float]],
+    winner_live_mae: float,
+    factor: float,
+    min_n: int,
+    order: int,
+) -> tuple[float, int, int] | None:
+    if (
+        candidate.mae is None
+        or not math.isfinite(candidate.mae)
+        or candidate.mae < 0
+        or candidate.mae >= winner_live_mae
+    ):
+        return None
+    score = candidate.mae
+    measured = pooled.get((*key, candidate.method_id))
+    if measured is not None and measured[0] >= min_n:
+        live_mae = measured[1]
+        if live_mae >= winner_live_mae or live_mae > factor * candidate.mae:
+            return None
+        score = max(score, live_mae)
+    return score, 0 if candidate.method_id == FALLBACK_METHOD else 1, order
+
+
 def _gate_fallback(
     key: SliceKey,
     selected: Selection,
-    fallbacks: Mapping[SliceKey, Selection] | None,
+    choices: tuple[Selection, ...],
+    pooled: Mapping[LiveKey, tuple[int, float]],
+    *,
+    factor: float,
+    min_n: int,
 ) -> Selection | None:
-    if fallbacks is not None:
-        return fallbacks.get(key)
-    return Selection(
-        FALLBACK_METHOD,
-        reason="reference fallback",
-        dataset_fingerprint=selected.dataset_fingerprint,
-        truth_semantics=selected.truth_semantics,
-    )
+    winner_live_mae = pooled[(*key, selected.method_id)][1]
+    ranked = [
+        (rank, candidate)
+        for order, candidate in enumerate(choices)
+        if candidate.method_id != selected.method_id
+        and (
+            rank := _replacement_rank(
+                key, candidate, pooled, winner_live_mae, factor, min_n, order
+            )
+        )
+        is not None
+    ]
+    return min(ranked, key=lambda pair: pair[0])[1] if ranked else None
 
 
 def apply_live_gate(
@@ -954,15 +892,16 @@ def apply_live_gate(
     factor: float,
     min_n: int,
     fallbacks: Mapping[SliceKey, Selection] | None = None,
+    candidates: Mapping[SliceKey, tuple[Selection, ...]] | None = None,
     eligible_releases: frozenset[str] | EligibleReleases | None = None,
 ) -> dict[tuple[str, str, str], Selection]:
     """Close the self-verification loop: demote methods that underdeliver live.
 
-    A selected method whose realized served MAE is materially worse than its
-    backtest promise (``live_mae > factor * backtest_mae`` at ``n >= min_n``)
-    falls back to the reference method — the one failure a backtest can never
-    catch by itself. The verdict travels in the selection reason, so the
-    release ledger records every demotion.
+    A selected method whose realized served MAE exceeds its backtest promise
+    can move to an eligible reference only when the quality guard passes.
+    Current backtest error is a proxy; mature live reference error can veto
+    it. Failed gates with no qualified replacement keep serving and record
+    the blocked verdict in the release reason.
 
     Evidence is pooled across ``eligible_releases`` rather than matched to one
     release, mirroring ``ArtifactStore.load_latest_state``: identity that
@@ -978,8 +917,18 @@ def apply_live_gate(
         verdict = _live_verdict(pooled, key, selected, factor=factor, min_n=min_n)
         if verdict is None:
             continue
-        fallback = _gate_fallback(key, selected, fallbacks)
+        choices = (candidates or {}).get(key, ())
+        if fallbacks is not None and key in fallbacks:
+            choices = (*choices, fallbacks[key])
+        fallback = _gate_fallback(
+            key, selected, choices, pooled, factor=factor, min_n=min_n
+        )
         if fallback is None:
+            gated[key] = replace(
+                selected,
+                reason=verdict.replace("demoted", "live gate failed for", 1)
+                + "; replacement blocked: no reference passes quality guard",
+            )
             continue
         gated[key] = replace(
             fallback,
@@ -987,38 +936,6 @@ def apply_live_gate(
             dataset_fingerprint=selected.dataset_fingerprint,
         )
     return gated
-
-
-def _live_identity_sets(
-    scores_dir: Path, *, skip_missing: bool
-) -> tuple[bool, set[str], set[str], set[str]]:
-    """(any files found, live dataset / config / code identities on disk)."""
-    paths = sorted(scores_dir.glob("scores_*.parquet"))
-    live_datasets: set[str] = set()
-    live_configs: set[str] = set()
-    live_code_versions: set[str] = set()
-    for path in paths:
-        try:
-            scores = load_scores(path)
-        except FileNotFoundError:
-            if not skip_missing:
-                raise
-            continue
-        if scores.is_empty() or set(scores["source_kind"].unique()) != {"live"}:
-            continue
-        if "dataset_fingerprint" in scores.columns:
-            live_datasets |= {
-                str(value) for value in scores["dataset_fingerprint"].unique().to_list()
-            }
-        if "config_fingerprint" in scores.columns:
-            live_configs |= {
-                str(value) for value in scores["config_fingerprint"].unique().to_list()
-            }
-        if "code_version" in scores.columns:
-            live_code_versions |= {
-                str(value) for value in scores["code_version"].unique().to_list()
-            }
-    return bool(paths), live_datasets, live_configs, live_code_versions
 
 
 def no_evidence_reason(
@@ -1088,7 +1005,9 @@ def method_for(
                 else None
             )
             if found is not None and found.method_id == pinned:
-                return replace(found, reason="pinned in config", pinned=True)
+                return replace(
+                    found, reason="pinned in config", pinned=True, retained=False
+                )
             return Selection(pinned, reason="pinned in config", pinned=True)
     if lead_bucket is not None:
         found = selections.get((product, variable, lead_bucket))

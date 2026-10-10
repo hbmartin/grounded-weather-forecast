@@ -1,9 +1,9 @@
-# Forecast JSON (schema v5)
+# Forecast JSON (schema v6)
 
 The document `predict` emits. This is the system's integration surface — if you
 are consuming forecasts from another program, this page is the contract.
 
-*Implemented in: `serve/schema.py`, `SCHEMA_VERSION = 5`*
+*Implemented in: `serve/schema.py`, `SCHEMA_VERSION = 6`*
 
 ```bash
 grounded-weather-forecast predict --out forecast.json
@@ -37,7 +37,7 @@ everything it needs.
 
 | Field | Type | Meaning |
 |---|---|---|
-| `schema_version` | int | `5`. Check it. |
+| `schema_version` | int | `6`. Check it. |
 | `issued_at` | ISO 8601 | the information boundary — nothing after this instant informed the document |
 | `latitude`, `longitude` | float | station location |
 | `timezone` | IANA name | defines `date_local` in the daily block |
@@ -53,8 +53,13 @@ everything it needs.
 
 ### `status`
 
-`"ready"` means every served method was chosen by a promoted release matching the
-current dataset, config, and code fingerprints.
+With automatic selection, `"ready"` means an hourly or daily value carries a
+promoted release matching current dataset, config, and code fingerprints. Check each variable's
+`release_ids` for its own attribution. A minutely promotion alone does not
+change document readiness.
+
+Explicit `--method` runs keep their existing `"ready"` status and can have
+empty release attribution.
 
 `"degraded"` means it was not, and the system fell back to `equal_weight`. The
 forecast is still usable — an ungrounded equal-weight blend is a reasonable
@@ -192,6 +197,9 @@ A flatter shape, because the minutely product serves a fixed variable set.
 | `temp_c`, `humidity_pct`, `dew_point_c`, `wind_speed_ms`, `precip_intensity_mmh`, `pop` | float or `null` | the forecast |
 | `methods` | `{variable: method_id}` | the promoted path construction, per variable |
 | `quantiles` | `{variable: {level: value}}` | when available |
+| `release_ids` | `{variable: release_id}` | the release selecting the method actually used |
+| `selection_reasons` | `{variable: str}` | the selected method's reason, including blocked live replacements |
+| `truth_semantics` | `{variable: "inst"}` | truth target for the attributed selection |
 
 `precip_intensity_mmh` is an **intensity** (mm/hour), not an accumulation — the
 only place the units differ from the hourly block.
@@ -199,6 +207,14 @@ only place the units differ from the hourly block.
 `methods` here names a minutely path construction (`minutely_interp`,
 `minutely_persistence`, `minutely_anchor_tau_1h`, …) rather than a blender. See
 [Methods: combination §8](../methods/combination.md#8-minutely-path-constructions).
+
+The provenance dictionaries are optional in older documents and default to
+empty. A selected minutely method receives release attribution only when it
+actually runs. Already-anchored hourly paths, missing-observation substitution,
+failed fitted responses, and native precipitation paths do not inherit an
+unused minutely selection's release. The top-level release list includes all
+attributed hourly, daily, and minutely values. Historical minutely rows without
+provenance remain unattributed; schema 6 does not reconstruct their release.
 
 ---
 

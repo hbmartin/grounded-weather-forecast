@@ -127,8 +127,25 @@ def write_scores(scores: pl.DataFrame, path: Path) -> None:
     atomic_write_parquet(scores, path)
 
 
+def scan_score_file(path: Path) -> pl.LazyFrame:
+    """Decode repeated provenance as categories before retaining score rows.
+
+    Feature descriptions can be kilobytes long and repeat tens of millions of
+    times. Categorizing them in the streaming scan keeps one copy per value,
+    rather than retaining the Parquet decoder's string buffers for every row.
+    Numeric scores and per-case quantiles retain their original types.
+    """
+    scan = pl.scan_parquet(path, parallel="none", low_memory=True)
+    categorical = [
+        name
+        for name, dtype in scan.collect_schema().items()
+        if dtype == pl.String and name != "quantiles_json"
+    ]
+    return scan.with_columns(pl.col(categorical).cast(pl.Categorical))
+
+
 def load_scores(path: Path, *, allow_mixed: bool = False) -> pl.DataFrame:
-    scores = pl.read_parquet(path)
+    scores = scan_score_file(path).collect(engine="streaming")
     kinds = scores["source_kind"].unique().to_list()
     if len(kinds) > 1 and not allow_mixed:
         msg = f"scores at {path} mix source kinds {sorted(map(str, kinds))}"

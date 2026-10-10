@@ -226,19 +226,22 @@ def _dm_columns(
     reference: str,
     lead_lo: float,
     product: str,
+    *,
+    reference_scores: pl.DataFrame | None = None,
 ) -> tuple[float | None, float | None]:
     """Skill and DM p-value of a method against one reference method.
 
     Compared on pairwise-common cases only, then collapsed per valid_time.
     """
     comparison_columns = ("issue_time", "valid_time", "y_pred", "y_true")
-    # Score rows also carry large JSON payloads that are irrelevant to losses.
-    # Project before filtering or joining so those buffers never get copied.
-    reference_scores = (
-        slice_scores.select("method_id", *comparison_columns)
-        .filter(pl.col("method_id") == reference)
-        .drop("method_id")
-    )
+    # Projection avoids unnecessary column/view allocations. Long string
+    # payload buffers are normally shared by Polars gathers and joins.
+    if reference_scores is None:
+        reference_scores = (
+            slice_scores.select("method_id", "issue_time", "valid_time", "y_pred")
+            .filter(pl.col("method_id") == reference)
+            .drop("method_id")
+        )
     if reference_scores.is_empty():
         return None, None
     paired = (
@@ -283,6 +286,21 @@ def leaderboard(
     references: tuple[str, ...] = DEFAULT_REFERENCES,
 ) -> pl.DataFrame:
     """Per (product, variable, lead bucket, method): every reported view."""
+    columns = (
+        "product",
+        "variable",
+        "semantics",
+        "lead_bucket",
+        "method_id",
+        "issue_time",
+        "valid_time",
+        "lead_hours",
+        "y_pred",
+        "y_true",
+        "quantile_levels_json",
+        "quantiles_json",
+    )
+    scores = scores.select([name for name in columns if name in scores.columns])
     scores = _with_default_semantics(scores)
     # A row without finite truth is not a score case for any method. Current
     # runners drop these rows at the source, but historical persisted frames
@@ -314,6 +332,15 @@ def leaderboard(
         n_total = slice_scores.select(cases).unique().height
         lead_lo = float(np.min(slice_scores["lead_hours"].to_numpy()))
         tolerance = CONSUMER_TOLERANCES.get(variable)
+        reference_input = slice_scores.select(
+            "method_id", "issue_time", "valid_time", "y_pred"
+        )
+        reference_frames = {
+            reference: reference_input.filter(pl.col("method_id") == reference).drop(
+                "method_id"
+            )
+            for reference in references
+        }
         for method_id in methods:
             # Each method is scored on its own non-null cases; only the DM
             # comparison inside _dm_columns restricts to pairwise-common ones.
@@ -355,6 +382,7 @@ def leaderboard(
                         reference,
                         lead_lo,
                         product,
+                        reference_scores=reference_frames[reference],
                     )
                 )
                 row[f"skill_vs_{reference}"] = skill

@@ -1003,6 +1003,7 @@ class MinutelyPlan:
     persistence: bool = False
     interp_only: bool = False
     predictor: "MinutelyPathMethod | None" = None  # fitted, refit as-of
+    selection: Selection | None = None
 
 
 def _plan_from_selection(
@@ -1137,7 +1138,7 @@ def _minutely_plans(
                 predictor = fitted_cache[cache_key]
             plan = _plan_from_selection(found.method_id, predictor)
             if plan is not None:
-                per_bucket[bucket.label] = plan
+                per_bucket[bucket.label] = replace(plan, selection=found)
         if per_bucket:
             plans[name] = per_bucket
     return plans or None
@@ -1189,6 +1190,14 @@ def _apply_minutely_plan(
     return interpolated, "minutely_interp"
 
 
+def _minutely_provenance(
+    plan: MinutelyPlan | None, method: str, value: float | None
+) -> Selection | None:
+    if plan is None or plan.selection is None or value is None:
+        return None
+    return plan.selection if method == plan.selection.method_id else None
+
+
 def minutely_product(
     snapshot: Snapshot,
     hourly_blend: dict[str, VariableBlend],
@@ -1217,6 +1226,7 @@ def minutely_product(
         bucket_label = minutely_bucket(lead)
         values: dict[str, float | None] = {}
         applied: dict[str, str] = {}
+        provenance: dict[str, Selection] = {}
         for name in _MINUTELY_VARIABLES:
             blend = hourly_blend.get(name)
             if blend is None or not np.isfinite(blend.point).any():
@@ -1254,6 +1264,10 @@ def minutely_product(
                 )
             values[name] = _finite(interpolated, hourly_variable(name))
             applied[name] = method_label
+            if (
+                selected := _minutely_provenance(plan, method_label, values[name])
+            ) is not None:
+                provenance[name] = selected
         temperature = values.get("temp_c")
         dew_point = values.get("dew_point_c")
         if temperature is not None and dew_point is not None:
@@ -1285,6 +1299,18 @@ def minutely_product(
                 wind_speed_ms=values.get("wind_speed_ms"),
                 precip_intensity_mmh=finite_intensity,
                 pop=finite_pop,
+                release_ids={
+                    name: selected.release_id
+                    for name, selected in provenance.items()
+                    if selected.release_id is not None
+                },
+                selection_reasons={
+                    name: selected.reason for name, selected in provenance.items()
+                },
+                truth_semantics={
+                    name: selected.truth_semantics or "inst"
+                    for name, selected in provenance.items()
+                },
                 methods={
                     **{
                         name: applied.get(name, "anchored_hourly_blend")
@@ -1329,13 +1355,15 @@ def _training_matrix(
 
 
 def _served_release_ids(
-    hourly: list[HourlyPoint], daily: list[DailyPoint]
+    hourly: list[HourlyPoint],
+    daily: list[DailyPoint],
+    minutely: list[MinutelyPoint] | None = None,
 ) -> list[str]:
     """Release ids present on predictions that were actually emitted."""
     return sorted(
         {
             release_id
-            for point in (*hourly, *daily)
+            for point in (*hourly, *daily, *(minutely or []))
             for release_id in point.release_ids.values()
         }
     )
@@ -1393,6 +1421,18 @@ def predict(
         if degraded
         else None
     )
+    minutely = minutely_product(
+        snapshot,
+        hourly_blend,
+        config,
+        plans=_minutely_plans(
+            config,
+            selections,
+            hourly_train,
+            dataset_snapshot.truth_minute if dataset_snapshot is not None else None,
+        ),
+    )
+    release_ids = _served_release_ids(hourly, daily, minutely)
     return Forecast(
         schema_version=SCHEMA_VERSION,
         issued_at=issue_time.isoformat(),
@@ -1407,17 +1447,7 @@ def predict(
         observation_at=snapshot.observation_at.isoformat()
         if snapshot.observation_at
         else None,
-        minutely=minutely_product(
-            snapshot,
-            hourly_blend,
-            config,
-            plans=_minutely_plans(
-                config,
-                selections,
-                hourly_train,
-                dataset_snapshot.truth_minute if dataset_snapshot is not None else None,
-            ),
-        ),
+        minutely=minutely,
         hourly=hourly,
         daily=daily,
         timezone=config.station.timezone,

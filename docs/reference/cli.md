@@ -138,6 +138,30 @@ files are ignored by Git; no captures are automatically deleted, so prune
 unneeded runs periodically. See the [Memray documentation](https://bloomberg.github.io/memray/)
 for report interpretation and profiling limitations.
 
+### Selection memory benchmark
+
+From a source checkout, compare complete `select_methods` runs against the
+original PR #46 implementation:
+
+```bash
+uv run python scripts/benchmark_selection_memory.py \
+  --baseline a4ec76d --runs 3 --evaluations 12 --cases 4000
+```
+
+| Benchmark flag | Default | Meaning |
+|---|---|---|
+| `--baseline REF` | `a4ec76d` | local Git revision whose `src` tree is extracted for comparison |
+| `--runs N` | `3` | fresh processes per variant and scenario; minimum three |
+| `--evaluations N` | `12` | positive count of evaluation files per scenario |
+| `--cases N` | `4000` | positive cases per method in each large evaluation; the sole compatible evaluation in the mostly-incompatible scenario has 80 |
+
+Fixtures and release artifacts stay in a temporary directory. Each worker
+uses the same Python environment and its designated source tree. JSON lines
+report median process peak RSS, min/max spread, runtime, and individual
+samples. The runner verifies that selection payload hashes agree across all
+variants and repetitions. No memory threshold is enforced in CI. See the
+[dated results](../research/selection-memory-2026-10-07.md) for scope and measurements.
+
 ---
 
 ## `qc`
@@ -188,6 +212,13 @@ archive providers, keeping that provenance separate from live observations.
 ---
 
 ## `backtest`
+
+For the local launchd deployment, `docs/launchd/daily-maintenance.py` runs each
+maintenance stage in a fresh child process so a completed backtest releases
+its native allocator memory before report generation. The prediction wrapper
+uses the same process boundary. Both wrappers limit Polars to two threads and
+record `/usr/bin/time -l` peak memory and child exit status. A maintenance job
+lock prevents duplicate wrappers and concurrent automatic restore attempts.
 
 > rolling-origin backtest over the supervised matrices
 
@@ -371,8 +402,16 @@ apparent diversity without adding information.
 | `--recovery-window` | `expanding` \| `rolling` | `expanding` | window passed to detached recovery backtest |
 | `--now` | ISO datetime (UTC) | now | issue as of this instant instead of now |
 
-Emits a schema v5 `Forecast` document — see
+Emits a schema v6 `Forecast` document — see
 [Forecast JSON](forecast-json.md) for the field-by-field reference.
+
+Automatic selection uses each configured safety class for guarded live
+replacement, including minutely references. A failed live gate keeps serving
+its current method when no reference passes the quality guard and records
+`replacement blocked` in its selection reason. Config pins bypass retention
+and live replacement; their statistics belong to the pinned method or are
+absent when it has no compatible evidence. Minutely history attributes a
+release only when its selected method actually produced the value.
 
 **`--now` is the reproducibility flag.** It reissues a forecast from an archived
 snapshot, which is how you reproduce something the system served last Tuesday.

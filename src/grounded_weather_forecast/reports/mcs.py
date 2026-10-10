@@ -121,7 +121,9 @@ def collapsed_loss_frame(
     ``valid_time`` column is kept so sequential consumers can dedupe against
     a cursor.
     """
-    frame = slice_scores.drop_nulls("y_pred")
+    frame = slice_scores.select(
+        "method_id", "issue_time", "valid_time", "y_pred", "y_true"
+    ).drop_nulls("y_pred")
     if method_ids is not None:
         frame = frame.filter(pl.col("method_id").is_in(method_ids))
     methods = tuple(sorted(frame["method_id"].unique().to_list()))

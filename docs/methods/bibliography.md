@@ -138,3 +138,4 @@ papers and are kept separate so the bibliography above stays a literature claim.
 | **PRISM** elevation-layer logic | `dataset/neighbors.py` |
 | **MADIS / GHCN / ECMWF station blacklisting** | `dataset/truth_qc.py` |
 | **ForecastAdvisor / ForecastWatch** | The consumer analogue this system strictly dominates for one location — it scores per hour, to 10 days, with proper scoring rules, against your actual backyard. |
+| **[Polars StringView storage](https://pola.rs/posts/polars-string-type/)** | Column projection and shared-payload memory behavior in `serve/score_scan.py`, `reports/leaderboard.py`, and `reports/mcs.py`; an implementation reference rather than a statistical accuracy claim. |
