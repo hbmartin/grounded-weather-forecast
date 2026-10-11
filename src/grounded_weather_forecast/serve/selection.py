@@ -35,14 +35,12 @@ from grounded_weather_forecast.reports.leaderboard import (
     union_references,
 )
 from grounded_weather_forecast.reports.winner_curse import should_retain_incumbent
-from grounded_weather_forecast.serve.evidence import (
-    EvidenceSummary,
-)
-from grounded_weather_forecast.serve.score_scan import (
+from grounded_weather_forecast.serve.evidence import EvidenceSummary
+
+from grounded_weather_forecast.serve.score_scan import (  # isort: skip
     ScoreIdentity,
+    ScoreScanResult,
     compatible_slices,
-)
-from grounded_weather_forecast.serve.score_scan import (
     live_identity_sets as _live_identity_sets,
 )
 
@@ -101,13 +99,13 @@ def _pins(config: Config) -> dict[tuple[str, str], str]:
     return pinned
 
 
-def _load_slices(
+def _load_evidence(
     config: Config,
     scores_dir: Path,
     as_of: datetime | None,
     semantics: Mapping[str, TruthSemantics] | None,
     dataset_id: str | None = None,
-) -> dict[SliceKey, pl.DataFrame]:
+) -> ScoreScanResult:
     identity = ScoreIdentity(
         dataset_id or dataset_fingerprint(config),
         config_fingerprint(config),
@@ -116,17 +114,6 @@ def _load_slices(
         semantics,
     )
     return compatible_slices(scores_dir, identity, config.promotion)
-
-
-def _compatible_scores(
-    config: Config,
-    scores_dir: Path,
-    as_of: datetime | None,
-    semantics: Mapping[str, TruthSemantics] | None,
-    dataset_id: str | None = None,
-) -> list[pl.DataFrame]:
-    """Materialized newest complete slices; older numeric scores stay on disk."""
-    return list(_load_slices(config, scores_dir, as_of, semantics, dataset_id).values())
 
 
 def _pool_sibling_scores(
@@ -676,7 +663,8 @@ def select_methods(
     current_dataset = dataset_id or dataset_fingerprint(config)
     pinned = _pins(config)
     selections: dict[SliceKey, Selection] = {}
-    slices = _load_slices(config, scores_dir, as_of, semantics, current_dataset)
+    scanned = _load_evidence(config, scores_dir, as_of, semantics, current_dataset)
+    slices = scanned.slices
     incumbents = _incumbent_methods(config)
     candidates: dict[SliceKey, tuple[Selection, ...]] = {}
     references = union_references(config.promotion)
@@ -718,8 +706,10 @@ def select_methods(
         )
     if not selections:
         return selections
-    evidence = EvidenceSummary.from_slices(
-        slices, {key: selected.evaluation_id for key, selected in selections.items()}
+    evidence = EvidenceSummary.from_contexts(
+        scanned.contexts,
+        scanned.cutoffs,
+        {key: selected.evaluation_id for key, selected in selections.items()},
     )
     # Every replacement candidate comes from the same slice/evaluation, so
     # changing the served method cannot change this release's evidence.
@@ -908,6 +898,8 @@ def apply_live_gate(
     rotates with data volume cannot be a precondition for scoring, or the
     slices that most need watching are the ones that never get watched.
     ``None`` means no ledger filter — every release-tagged row is eligible.
+    ``fallbacks`` is a compatibility adapter: its scored candidates obey the
+    same quality guard as ``candidates``; unscored fallbacks are rejected.
     """
     pooled = _pooled_live_skill(live, eligible_releases)
     if not pooled:
@@ -948,7 +940,7 @@ def no_evidence_reason(
     like a cold start unless it is named. The distinction decides the fix:
     keep polling, or just re-run the backtest.
     """
-    # Same prune-vs-reader retry as _compatible_scores: one clean re-scan
+    # Retry the identity diagnosis once against a fresh directory listing
     # before tolerating missing files, so the diagnosis never reflects a
     # half-pruned directory.
     try:

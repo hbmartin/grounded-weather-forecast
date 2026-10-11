@@ -221,14 +221,14 @@ def test_report_skips_any_self_verification_failure(
 
     monkeypatch.setattr(
         "grounded_weather_forecast.backtest.scores.load_scores",
-        lambda _path: scores,
+        lambda _path, **_kwargs: scores,
     )
     # dashboard.context binds load_scores at import; patching through the
     # string target imports it NOW so the mock cannot become its permanent
     # module-level binding when this test is the first to touch it.
     monkeypatch.setattr(
         "grounded_weather_forecast.dashboard.context.load_scores",
-        lambda _path: scores,
+        lambda _path, **_kwargs: scores,
     )
     monkeypatch.setattr(
         "grounded_weather_forecast.reports.leaderboard.leaderboard",

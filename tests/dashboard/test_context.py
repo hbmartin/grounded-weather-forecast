@@ -25,18 +25,18 @@ def test_score_archive_does_not_keep_decoded_frames_resident(tmp_path, monkeypat
         (directory / name).touch()
     decoded = []
 
-    def load(path):
+    def load(path, **kwargs):
         frame = pl.DataFrame({"source_kind": ["live"], "path": [path.name]})
         decoded.append(weakref.ref(frame))
         return frame
 
     monkeypatch.setattr(context, "load_scores", load)
-    frames, unreadable = context._score_frames(config, [])
+    frames, unreadable = context._score_summaries(config, [])
 
     assert len(frames) == 2
     assert unreadable == ()
     assert all(reference() is None for reference in decoded)
-    assert frames["scores_new"]["path"][0] == "scores_new.parquet"
+    assert frames["scores_new"].source_kinds == frozenset({"live"})
 
 
 def test_bare_config_collects_all_absent_without_raising(tmp_path):
@@ -45,7 +45,7 @@ def test_bare_config_collects_all_absent_without_raising(tmp_path):
     assert ctx.truth_minute is None
     assert ctx.truth_hourly is None
     assert ctx.hourly_matrix is None
-    assert ctx.score_frames == {}
+    assert ctx.score_summaries == {}
     assert ctx.history is None
     assert ctx.latest_forecast is None
     assert ctx.releases == ()

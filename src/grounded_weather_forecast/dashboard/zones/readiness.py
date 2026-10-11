@@ -24,9 +24,9 @@ def _issue_span_days(matrix: pl.DataFrame) -> float:
 
 def _fold_count(ctx: DashboardContext) -> int:
     origins: set[object] = set()
-    for stem, frame in ctx.score_frames.items():
-        if "_live" in stem and "fold_origin" in frame.columns:
-            origins.update(frame["fold_origin"].unique().to_list())
+    for stem, summary in ctx.score_summaries.items():
+        if "_live" in stem:
+            origins.update(summary.fold_origins)
     return len(origins)
 
 

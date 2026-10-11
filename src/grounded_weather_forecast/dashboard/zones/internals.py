@@ -327,9 +327,8 @@ def _rankings_panel(ctx: DashboardContext) -> Panel:
         None,
     )
     fold_origins: set[object] = set()
-    for frame in ctx.score_frames.values():
-        if "fold_origin" in frame.columns and not frame.is_empty():
-            fold_origins.update(frame["fold_origin"].unique().to_list())
+    for summary in ctx.score_summaries.values():
+        fold_origins.update(summary.fold_origins)
     stats = (
         (Stat("backtested fold origins", str(len(fold_origins))),)
         if fold_origins

@@ -1,0 +1,1090 @@
+diff --git a/src/grounded_weather_forecast/backtest/scores.py b/src/grounded_weather_forecast/backtest/scores.py
+index 5629b46..dad3e78 100644
+--- a/src/grounded_weather_forecast/backtest/scores.py
++++ b/src/grounded_weather_forecast/backtest/scores.py
+@@ -127,7 +127,7 @@ def write_scores(scores: pl.DataFrame, path: Path) -> None:
+     atomic_write_parquet(scores, path)
+
+
+-def scan_score_file(path: Path) -> pl.LazyFrame:
++def scan_score_file(path: Path, *, compact: bool = True) -> pl.LazyFrame:
+     """Decode repeated provenance as categories before retaining score rows.
+
+     Feature descriptions can be kilobytes long and repeat tens of millions of
+@@ -136,6 +136,8 @@ def scan_score_file(path: Path) -> pl.LazyFrame:
+     Numeric scores and per-case quantiles retain their original types.
+     """
+     scan = pl.scan_parquet(path, parallel="none", low_memory=True)
++    if not compact:
++        return scan
+     categorical = [
+         name
+         for name, dtype in scan.collect_schema().items()
+@@ -144,8 +146,11 @@ def scan_score_file(path: Path) -> pl.LazyFrame:
+     return scan.with_columns(pl.col(categorical).cast(pl.Categorical))
+
+
+-def load_scores(path: Path, *, allow_mixed: bool = False) -> pl.DataFrame:
+-    scores = scan_score_file(path).collect(engine="streaming")
++def load_scores(
++    path: Path, *, allow_mixed: bool = False, compact: bool = False
++) -> pl.DataFrame:
++    """Read score values with their stored types, or opt into compact categories."""
++    scores = scan_score_file(path, compact=compact).collect(engine="streaming")
+     kinds = scores["source_kind"].unique().to_list()
+     if len(kinds) > 1 and not allow_mixed:
+         msg = f"scores at {path} mix source kinds {sorted(map(str, kinds))}"
+diff --git a/src/grounded_weather_forecast/cli.py b/src/grounded_weather_forecast/cli.py
+index d427f29..8fcabe2 100644
+--- a/src/grounded_weather_forecast/cli.py
++++ b/src/grounded_weather_forecast/cli.py
+@@ -1148,7 +1148,7 @@ def _cmd_report(config: Config) -> int:
+     eprocess_stores: dict[str, EProcessStore] = {}
+     for path in score_files:
+         try:
+-            scores = load_scores(path)
++            scores = load_scores(path, compact=True)
+         except FileNotFoundError:
+             # The pipeline lock keeps prune out of a running report; this
+             # guard covers deletion by anything outside that lock's scope.
+diff --git a/src/grounded_weather_forecast/dashboard/context.py b/src/grounded_weather_forecast/dashboard/context.py
+index b8508ad..d82625f 100644
+--- a/src/grounded_weather_forecast/dashboard/context.py
++++ b/src/grounded_weather_forecast/dashboard/context.py
+@@ -5,7 +5,7 @@ drives the corresponding panel's loud "not yet" state instead of an error.
+ """
+
+ import json
+-from collections.abc import Iterator, Mapping
++from collections.abc import Mapping
+ from dataclasses import dataclass, field
+ from datetime import UTC, datetime
+ from pathlib import Path
+@@ -15,8 +15,13 @@ import polars as pl
+ from grounded_weather_forecast.backtest.scores import load_scores
+ from grounded_weather_forecast.config import Config
+ from grounded_weather_forecast.contracts import MixedProvenanceError
++from grounded_weather_forecast.dashboard.score_summary import (
++    ScoreSummary,
++    summarize_scores,
++)
+ from grounded_weather_forecast.dataset.matrix import DatasetPaths, matrix_path
+ from grounded_weather_forecast.dataset.providers import read_latest_archive_location
++from grounded_weather_forecast.reports.eprocess import EProcessStore
+ from grounded_weather_forecast.runs import RUNS_SCHEMA, read_runs, runs_path
+ from grounded_weather_forecast.serve.history import load_history
+ from grounded_weather_forecast.serve.observability import (
+@@ -30,7 +35,7 @@ from grounded_weather_forecast.serve.schema import Forecast
+
+ @dataclass(frozen=True, slots=True)
+ class DashboardContext:
+-    """Everything zone builders read, including scores loaded on access here."""
++    """Everything zone builders read, with score summaries computed during collection."""
+
+     config: Config
+     now: datetime
+@@ -42,7 +47,7 @@ class DashboardContext:
+     hourly_matrix: pl.DataFrame | None = None
+     daily_matrix: pl.DataFrame | None = None
+     synthetic_hourly: pl.DataFrame | None = None
+-    score_frames: Mapping[str, pl.DataFrame] = field(default_factory=dict)
++    score_summaries: Mapping[str, ScoreSummary] = field(default_factory=dict)
+     unreadable_scores: tuple[str, ...] = ()
+     # Artifacts that exist but could not be read. A missing file is a young
+     # archive; a corrupt or permission-denied one is a fault, and collapsing
+@@ -95,47 +100,23 @@ def _try_json(
+     return loaded
+
+
+-class ScoreFrames(Mapping[str, pl.DataFrame]):
+-    """Load archive scores on access instead of retaining every evaluation.
+-
+-    Each file fits independently; their combined history can exceed RAM.
+-    Every evaluation remains available to every dashboard panel.
+-    """
+-
+-    def __init__(self, paths: dict[str, Path]) -> None:
+-        self.paths = paths
+-
+-    def __getitem__(self, key: str) -> pl.DataFrame:
+-        return load_scores(self.paths[key])
+-
+-    def __iter__(self) -> Iterator[str]:
+-        return iter(self.paths)
+-
+-    def __len__(self) -> int:
+-        return len(self.paths)
+-
+-
+-def _score_frames(
++def _score_summaries(
+     config: Config, failures: list[str]
+-) -> tuple[Mapping[str, pl.DataFrame], tuple[str, ...]]:
+-    """Readable score frames, plus the stems that exist but cannot be read.
+-
+-    A file that is present but corrupt is *not* the same as a young archive
+-    with no file at all; the second return value keeps them distinguishable
+-    so zones can say "unreadable" instead of "not enough data yet".
+-    """
+-    paths: dict[str, Path] = {}
++) -> tuple[Mapping[str, ScoreSummary], tuple[str, ...]]:
++    """Decode each evaluation once and retain only small dashboard summaries."""
++    summaries: dict[str, ScoreSummary] = {}
+     unreadable: list[str] = []
+-    scores_dir = config.dataset.dir / "scores"
+-    for path in sorted(scores_dir.glob("scores_*.parquet")):
++    stores: dict[str, EProcessStore] = {}
++    for path in sorted((config.dataset.dir / "scores").glob("scores_*.parquet")):
+         try:
+-            frame = load_scores(path)
+-            paths[path.stem] = path
+-            del frame
++            frame = load_scores(path, compact=True)
+         except (OSError, MixedProvenanceError, pl.exceptions.PolarsError):
+             unreadable.append(path.stem)
+             failures.append(f"dataset/scores/{path.name}")
+-    return ScoreFrames(paths), tuple(unreadable)
++            continue
++        summaries[path.stem] = summarize_scores(config, path.stem, frame, stores)
++        del frame
++    return summaries, tuple(unreadable)
+
+
+ def _latest_forecast(config: Config, failures: list[str]) -> Forecast | None:
+@@ -291,7 +272,7 @@ def _evidence_history(config: Config, failures: list[str]) -> dict[str, pl.DataF
+ def collect_context(config: Config, *, now: datetime | None = None) -> DashboardContext:
+     paths = DatasetPaths.in_dir(config.dataset.dir)
+     unreadable: list[str] = []
+-    score_frames, unreadable_scores = _score_frames(config, unreadable)
++    score_summaries, unreadable_scores = _score_summaries(config, unreadable)
+     hourly_live = matrix_path(config.dataset.dir, "hourly", "live")
+     daily_live = matrix_path(config.dataset.dir, "daily", "live")
+     hourly_synthetic = matrix_path(config.dataset.dir, "hourly", "synthetic")
+@@ -328,7 +309,7 @@ def collect_context(config: Config, *, now: datetime | None = None) -> Dashboard
+             unreadable,
+             label=f"dataset/{hourly_synthetic.name}",
+         ),
+-        score_frames=score_frames,
++        score_summaries=score_summaries,
+         unreadable_scores=unreadable_scores,
+         history=_history(config, unreadable),
+         latest_forecast=_latest_forecast(config, unreadable),
+diff --git a/src/grounded_weather_forecast/dashboard/derive.py b/src/grounded_weather_forecast/dashboard/derive.py
+index d7c28e2..d55d220 100644
+--- a/src/grounded_weather_forecast/dashboard/derive.py
++++ b/src/grounded_weather_forecast/dashboard/derive.py
+@@ -1,8 +1,7 @@
+ """Shared derived frames computed once per dashboard build.
+
+-Everything here reuses the existing reports functions on the frames the
+-context collector loaded; zone builders and the alert evaluator both consume
+-the results so nothing is computed twice.
++Score statistics come from the collector's compact summaries. Verification
++and correlation are derived here once for zone builders and alert evaluation.
+ """
+
+ from collections.abc import Mapping
+@@ -10,42 +9,17 @@ from dataclasses import dataclass, field
+
+ import polars as pl
+
+-from grounded_weather_forecast.config import Config
+ from grounded_weather_forecast.contracts import (
+     TruthSemantics,
+     finite_number,
+     hourly_variable,
+ )
+ from grounded_weather_forecast.dashboard.context import DashboardContext
+-from grounded_weather_forecast.evaluation import code_identity, config_fingerprint
+ from grounded_weather_forecast.reports.correlation import error_correlation
+-from grounded_weather_forecast.reports.eprocess import EProcessStore
+-from grounded_weather_forecast.reports.leaderboard import (
+-    leaderboard,
+-    slice_winners,
+-    union_references,
+-)
+ from grounded_weather_forecast.reports.verification import (
+     compare_to_backtest,
+     verify_history,
+ )
+-from grounded_weather_forecast.reports.winner_curse import winner_curse_adjusted
+-
+-
+-def _eprocess_store(
+-    config: Config, stem: str, cache: dict[str, EProcessStore]
+-) -> EProcessStore | None:
+-    """Read-only wealth for the seq_mcs rule; ``report`` is the only writer."""
+-    if config.promotion.rule != "seq_mcs" or "_live" not in stem:
+-        return None
+-    product = stem.split("_")[1] if "_" in stem else stem
+-    if product not in cache:
+-        cache[product] = EProcessStore.load(
+-            config.artifacts_dir / "eprocess" / f"{product}_live.json",
+-            config_fingerprint(config),
+-            code_identity(),
+-        )
+-    return cache[product]
+
+
+ @dataclass(frozen=True, slots=True)
+@@ -87,41 +61,21 @@ def _k_eff(correlation: pl.DataFrame) -> float | None:
+
+
+ def derive(ctx: DashboardContext) -> Derived:
+-    boards: dict[str, pl.DataFrame] = {}
+-    winners: dict[str, pl.DataFrame] = {}
+-    eprocess_stores: dict[str, EProcessStore] = {}
+-    live_stem: str | None = None
+-    # A live stem that fails to score is "unusable", not "absent" — record it
+-    # before any early exit so zone F cannot mistake it for a young archive.
+-    live_unusable = any("_live" in stem for stem in ctx.unreadable_scores)
+-    for stem, scores in ctx.score_frames.items():
+-        is_live = "_live" in stem
+-        if scores.is_empty():
+-            continue
+-        try:
+-            board = leaderboard(
+-                scores, references=union_references(ctx.config.promotion)
+-            )
+-            # The dashboard never writes e-process state; under the seq_mcs
+-            # rule it reads the report-persisted wealth like serving does.
+-            winners[stem] = winner_curse_adjusted(
+-                slice_winners(
+-                    board,
+-                    scores=scores,
+-                    rule=ctx.config.promotion.rule,
+-                    alpha=ctx.config.promotion.alpha,
+-                    promotion=ctx.config.promotion,
+-                    eprocess_store=_eprocess_store(ctx.config, stem, eprocess_stores),
+-                ),
+-                scores,
+-                promotion=ctx.config.promotion,
+-            )
+-            boards[stem] = board
+-        except (ValueError, pl.exceptions.PolarsError):
+-            live_unusable = live_unusable or is_live
+-            continue
+-        if is_live and live_stem is None:
+-            live_stem = stem
++    boards = {
++        stem: summary.board
++        for stem, summary in ctx.score_summaries.items()
++        if summary.board is not None
++    }
++    winners = {
++        stem: summary.winners
++        for stem, summary in ctx.score_summaries.items()
++        if summary.winners is not None
++    }
++    live_stem = next((stem for stem in boards if "_live" in stem), None)
++    live_unusable = any("_live" in stem for stem in ctx.unreadable_scores) or any(
++        "_live" in stem and summary.unusable
++        for stem, summary in ctx.score_summaries.items()
++    )
+
+     verification = pl.DataFrame()
+     if (
+diff --git a/src/grounded_weather_forecast/dashboard/zones/data_trust.py b/src/grounded_weather_forecast/dashboard/zones/data_trust.py
+index 075f1cf..cbc44bb 100644
+--- a/src/grounded_weather_forecast/dashboard/zones/data_trust.py
++++ b/src/grounded_weather_forecast/dashboard/zones/data_trust.py
+@@ -229,11 +229,9 @@ def _provenance(ctx: DashboardContext) -> Panel:
+         if frame is None or frame.is_empty() or "source_kind" not in frame.columns:
+             continue
+         kinds[name] = {str(value) for value in frame["source_kind"].unique()}
+-    for stem, frame in ctx.score_frames.items():
+-        if not frame.is_empty() and "source_kind" in frame.columns:
+-            kinds[f"scores {stem}"] = {
+-                str(value) for value in frame["source_kind"].unique()
+-            }
++    for stem, summary in ctx.score_summaries.items():
++        if summary.source_kinds:
++            kinds[f"scores {stem}"] = set(summary.source_kinds)
+     if not kinds:
+         return empty_panel(
+             "b4",
+diff --git a/src/grounded_weather_forecast/dashboard/zones/evaluation.py b/src/grounded_weather_forecast/dashboard/zones/evaluation.py
+index ca46c11..f1fff48 100644
+--- a/src/grounded_weather_forecast/dashboard/zones/evaluation.py
++++ b/src/grounded_weather_forecast/dashboard/zones/evaluation.py
+@@ -1,8 +1,5 @@
+ """Zone D: evaluation — the leaderboard made operational."""
+
+-import json
+-
+-import numpy as np
+ import polars as pl
+
+ from grounded_weather_forecast.dashboard.charts import (
+@@ -16,16 +13,13 @@ from grounded_weather_forecast.dashboard.context import DashboardContext
+ from grounded_weather_forecast.dashboard.copy import PANEL_COPY, ZONE_INTROS
+ from grounded_weather_forecast.dashboard.derive import Derived
+ from grounded_weather_forecast.dashboard.model import Panel, Stat, TableSpec, Zone
++from grounded_weather_forecast.dashboard.score_summary import ScoreSummary
+ from grounded_weather_forecast.dashboard.zones.common import empty_panel, fmt
+ from grounded_weather_forecast.leads import (
+     DAILY_BUCKET_LABELS,
+     HOURLY_BUCKET_LABELS,
+     MINUTELY_BUCKET_LABELS,
+ )
+-from grounded_weather_forecast.metrics.probabilistic import (
+-    pit_from_quantiles,
+-    reliability_bins,
+-)
+ from grounded_weather_forecast.reports.leaderboard import (
+     CONSUMER_TOLERANCES,
+     DEFAULT_REFERENCES,
+@@ -208,47 +202,13 @@ def _correlation_panel(derived: Derived) -> Panel:
+     )
+
+
+-def _pit_values(scores: pl.DataFrame) -> np.ndarray:
+-    needed = {"quantiles_json", "quantile_levels_json", "y_true"}
+-    if not needed <= set(scores.columns):
+-        return np.empty(0)
+-    usable = scores.filter(
+-        pl.col("quantiles_json").is_not_null() & pl.col("y_true").is_not_null()
+-    )
+-    if usable.is_empty():
+-        return np.empty(0)
+-    groups: dict[str, list[tuple[list[float], float]]] = {}
+-    for row in usable.iter_rows(named=True):
+-        try:
+-            quantiles = json.loads(row["quantiles_json"])
+-        except (TypeError, ValueError):
+-            continue
+-        if not isinstance(quantiles, list) or any(q is None for q in quantiles):
+-            continue
+-        key = str(row["quantile_levels_json"])
+-        groups.setdefault(key, []).append((quantiles, float(row["y_true"])))
+-    if not groups:
+-        return np.empty(0)
+-    key, entries = max(groups.items(), key=lambda item: len(item[1]))
+-    try:
+-        levels = tuple(float(level) for level in json.loads(key))
+-    except (TypeError, ValueError):
+-        return np.empty(0)
+-    quantile_matrix = np.asarray([entry[0] for entry in entries], dtype=np.float64)
+-    truths = np.asarray([entry[1] for entry in entries], dtype=np.float64)
+-    if quantile_matrix.shape[1] != len(levels):
+-        return np.empty(0)
+-    return pit_from_quantiles(truths, quantile_matrix, levels)
+-
+-
+-def _calibration_panel(stem: str, scores: pl.DataFrame, board: pl.DataFrame) -> Panel:
++def _calibration_panel(stem: str, summary: ScoreSummary, board: pl.DataFrame) -> Panel:
+     probabilistic = (
+         board.filter(pl.col("crps").is_not_null())
+         if ("crps" in board.columns)
+         else pl.DataFrame()
+     )
+-    pit = _pit_values(scores)
+-    if probabilistic.is_empty() and pit.size == 0:
++    if probabilistic.is_empty() and summary.pit_rows == 0:
+         return empty_panel(
+             "d5",
+             "d5",
+@@ -273,16 +233,15 @@ def _calibration_panel(stem: str, scores: pl.DataFrame, board: pl.DataFrame) ->
+             if value is not None:
+                 stats.append(Stat(label, fmt(float(str(value)), 3)))
+     chart = None
+-    if pit.size:
+-        counts, _edges = np.histogram(pit, bins=10, range=(0.0, 1.0))
++    if summary.pit_rows:
+         labels = [f"{i / 10:.1f}–{(i + 1) / 10:.1f}" for i in range(10)]
+         chart = histogram(
+             labels,
+-            [int(count) for count in counts],
++            list(summary.pit_counts),
+             y_label="rows",
+             label="PIT",
+         )
+-        stats.append(Stat("PIT rows", str(pit.size)))
++        stats.append(Stat("PIT rows", str(summary.pit_rows)))
+     return Panel(
+         panel_id=f"d5-{stem}",
+         title=f"Calibration — {stem.removeprefix('scores_')}",
+@@ -298,26 +257,11 @@ def _calibration_panel(stem: str, scores: pl.DataFrame, board: pl.DataFrame) ->
+     )
+
+
+-def _reliability_panel(stem: str, scores: pl.DataFrame) -> Panel | None:
+-    pop = scores.filter(
+-        (pl.col("variable") == "pop")
+-        & pl.col("y_pred").is_not_null()
+-        & pl.col("y_true").is_not_null()
+-    )
+-    if pop.height < 20:
+-        return None
+-    forecast = pop["y_pred"].to_numpy().astype(np.float64)
+-    occurred = pop["y_true"].to_numpy().astype(np.float64)
+-    bins = reliability_bins(forecast, occurred).filter(pl.col("count") > 0)
+-    points: list[tuple[float, float]] = []
+-    counts: list[int] = []
+-    for row in bins.iter_rows(named=True):
+-        if row["forecast_mean"] is None or row["observed_freq"] is None:
+-            continue
+-        points.append((float(row["forecast_mean"]), float(row["observed_freq"])))
+-        counts.append(int(row["count"]))
+-    if not points:
++def _reliability_panel(stem: str, summary: ScoreSummary) -> Panel | None:
++    if not summary.reliability:
+         return None
++    points = [(forecast, frequency) for forecast, frequency, _ in summary.reliability]
++    counts = [count for _, _, count in summary.reliability]
+     return Panel(
+         panel_id=f"d5r-{stem}",
+         title=f"PoP reliability — {stem.removeprefix('scores_')}",
+@@ -342,7 +286,7 @@ def build(ctx: DashboardContext, derived: Derived) -> Zone:
+             )
+         )
+     for stem, board in derived.boards.items():
+-        scores = ctx.score_frames[stem]
++        summary = ctx.score_summaries[stem]
+         panels.append(_board_panel(stem, board))
+         winners = derived.winners.get(stem)
+         if winners is not None:
+@@ -356,8 +300,8 @@ def build(ctx: DashboardContext, derived: Derived) -> Zone:
+             )
+         if (baseline := _baseline_panel(stem, board)) is not None:
+             panels.append(baseline)
+-        panels.append(_calibration_panel(stem, scores, board))
+-        if (reliability := _reliability_panel(stem, scores)) is not None:
++        panels.append(_calibration_panel(stem, summary, board))
++        if (reliability := _reliability_panel(stem, summary)) is not None:
+             panels.append(reliability)
+     panels.append(_correlation_panel(derived))
+     return Zone(
+diff --git a/src/grounded_weather_forecast/dashboard/zones/internals.py b/src/grounded_weather_forecast/dashboard/zones/internals.py
+index 3369456..ac4d958 100644
+--- a/src/grounded_weather_forecast/dashboard/zones/internals.py
++++ b/src/grounded_weather_forecast/dashboard/zones/internals.py
+@@ -327,9 +327,8 @@ def _rankings_panel(ctx: DashboardContext) -> Panel:
+         None,
+     )
+     fold_origins: set[object] = set()
+-    for frame in ctx.score_frames.values():
+-        if "fold_origin" in frame.columns and not frame.is_empty():
+-            fold_origins.update(frame["fold_origin"].unique().to_list())
++    for summary in ctx.score_summaries.values():
++        fold_origins.update(summary.fold_origins)
+     stats = (
+         (Stat("backtested fold origins", str(len(fold_origins))),)
+         if fold_origins
+diff --git a/src/grounded_weather_forecast/dashboard/zones/readiness.py b/src/grounded_weather_forecast/dashboard/zones/readiness.py
+index 5cf19b6..e3d44c4 100644
+--- a/src/grounded_weather_forecast/dashboard/zones/readiness.py
++++ b/src/grounded_weather_forecast/dashboard/zones/readiness.py
+@@ -24,9 +24,9 @@ def _issue_span_days(matrix: pl.DataFrame) -> float:
+
+ def _fold_count(ctx: DashboardContext) -> int:
+     origins: set[object] = set()
+-    for stem, frame in ctx.score_frames.items():
+-        if "_live" in stem and "fold_origin" in frame.columns:
+-            origins.update(frame["fold_origin"].unique().to_list())
++    for stem, summary in ctx.score_summaries.items():
++        if "_live" in stem:
++            origins.update(summary.fold_origins)
+     return len(origins)
+
+
+diff --git a/src/grounded_weather_forecast/serve/dressing.py b/src/grounded_weather_forecast/serve/dressing.py
+index aecb7f0..d914180 100644
+--- a/src/grounded_weather_forecast/serve/dressing.py
++++ b/src/grounded_weather_forecast/serve/dressing.py
+@@ -9,7 +9,7 @@ being hidden by a symmetric band. A finite-sample split-conformal rank rule
+ keeps thin cells honest; a bucket below the floor borrows the
+ variable-global pool, and when even that is thin the row stays undressed.
+
+-Provenance guards mirror ``serve.selection._compatible_scores``: only live
++Provenance guards mirror ``serve.score_scan.compatible_slices``: only live
+ rows whose dataset/config fingerprints and code identity match the running
+ process may contribute, and only the newest evaluation is pooled — the
+ expanding backtest re-scores overlapping folds, so pooling across
+diff --git a/src/grounded_weather_forecast/serve/evidence.py b/src/grounded_weather_forecast/serve/evidence.py
+index f78e167..590551b 100644
+--- a/src/grounded_weather_forecast/serve/evidence.py
++++ b/src/grounded_weather_forecast/serve/evidence.py
+@@ -15,7 +15,7 @@ CONTEXT_COLUMNS = (
+     "code_version",
+     "config_fingerprint",
+ )
+-_IDENTITY_COLUMNS = ("dataset_fingerprint", "evaluation_created_at")
++_CONTEXT_IDENTITY_COLUMNS = ("dataset_fingerprint", "evaluation_created_at")
+ _LOGGER = logging.getLogger(__name__)
+
+
+@@ -52,7 +52,9 @@ class ContextAccumulator:
+         self.invalid.add(evaluation_id)
+
+     def add(self, frame: pl.DataFrame) -> None:
+-        identity_columns = [name for name in _IDENTITY_COLUMNS if name in frame.columns]
++        identity_columns = [
++            name for name in _CONTEXT_IDENTITY_COLUMNS if name in frame.columns
++        ]
+         compact = frame.select(
+             "evaluation_id",
+             *CONTEXT_COLUMNS,
+@@ -108,24 +110,33 @@ class EvidenceSummary:
+     training_cutoff: datetime | None
+
+     @classmethod
+-    def from_slices(
++    def from_contexts(
+         cls,
+-        slices: Mapping[tuple[str, str, str], pl.DataFrame],
++        contexts: Mapping[str, EvaluationContext],
++        cutoffs: Mapping[tuple[str, str, str], datetime | None],
+         evaluations: Mapping[tuple[str, str, str], str | None],
+     ) -> "EvidenceSummary":
+-        frames = [
+-            slices[key]
++        attributed = {
++            key: evaluation_id
+             for key, evaluation_id in sorted(evaluations.items())
+             if evaluation_id is not None
+-        ]
+-        cutoffs = [frame["valid_time"].max() for frame in frames]
++        }
++        projected: dict[str, EvaluationContext] = {}
++        for key, evaluation_id in attributed.items():
++            context = contexts[evaluation_id]
++            selected = projected.setdefault(
++                evaluation_id, EvaluationContext(context.metadata, context.identity)
++            )
++            selected.semantics[key[1]] = context.semantics[key[1]]
+         return cls(
+-            evaluation_ids=tuple(
+-                sorted({value for value in evaluations.values() if value is not None})
+-            ),
+-            contexts=evaluation_contexts(frames),
++            evaluation_ids=tuple(sorted(projected)),
++            contexts=tuple(projected[key].payload(key) for key in sorted(projected)),
+             training_cutoff=max(
+-                (value for value in cutoffs if isinstance(value, datetime)),
++                (
++                    value
++                    for key in attributed
++                    if isinstance(value := cutoffs[key], datetime)
++                ),
+                 default=None,
+             ),
+         )
+diff --git a/src/grounded_weather_forecast/serve/score_scan.py b/src/grounded_weather_forecast/serve/score_scan.py
+index 3982dbf..1189099 100644
+--- a/src/grounded_weather_forecast/serve/score_scan.py
++++ b/src/grounded_weather_forecast/serve/score_scan.py
+@@ -12,11 +12,17 @@ from grounded_weather_forecast.backtest.scores import scan_score_file
+ from grounded_weather_forecast.config import PromotionConfig
+ from grounded_weather_forecast.contracts import MixedProvenanceError, TruthSemantics
+ from grounded_weather_forecast.reports.leaderboard import gate_references
+-from grounded_weather_forecast.serve.evidence import CONTEXT_COLUMNS, ContextAccumulator
++from grounded_weather_forecast.serve.evidence import (
++    CONTEXT_COLUMNS,
++    ContextAccumulator,
++    EvaluationContext,
++)
+
+ type SliceKey = tuple[str, str, str]
+ _SLICE_COLUMNS = ("product", "variable", "lead_bucket")
+-_IDENTITY_COLUMNS = ("dataset_fingerprint", "config_fingerprint", "code_version")
++_FINGERPRINT_COLUMNS = ("dataset_fingerprint", "config_fingerprint", "code_version")
++MAX_SCORE_SCAN_ATTEMPTS = 3
++SCORE_BATCH_ROWS = 65_536
+ _METADATA_COLUMNS = (
+     "evaluation_id",
+     *CONTEXT_COLUMNS,
+@@ -54,21 +60,45 @@ class ScoreIdentity:
+     as_of: datetime | None = None
+     semantics: Mapping[str, TruthSemantics] | None = None
+
+-    def predicate(self) -> pl.Expr:
+-        predicate = (
++    def fingerprint_predicate(self) -> pl.Expr:
++        return (
+             (pl.col("dataset_fingerprint") == self.dataset)
+             & (pl.col("config_fingerprint") == self.configuration)
+             & (pl.col("code_version") == self.code)
+         )
++
++    def predicate(self) -> pl.Expr:
++        predicate = self.fingerprint_predicate()
+         if self.as_of is not None:
+             predicate &= (pl.col("evaluation_created_at") <= self.as_of) & (
+                 pl.col("valid_time") <= self.as_of
+             )
+         return predicate
+
++    def semantics_predicate(self) -> pl.Expr:
++        predicate = pl.lit(True)  # noqa: FBT003 -- expression literal, not a flag
++        for variable, semantic in (self.semantics or {}).items():
++            predicate &= (
++                (pl.col("product") != "hourly")
++                | (pl.col("variable") != variable)
++                | (pl.col("semantics").fill_null("inst") == semantic.value)
++            )
++        return predicate
++
+     def accepts(self, product: str, variable: str, semantic: object) -> bool:
+         expected = (self.semantics or {}).get(variable)
+-        return product != "hourly" or expected is None or semantic == expected.value
++        return (
++            product != "hourly"
++            or expected is None
++            or (semantic or "inst") == expected.value
++        )
++
++
++@dataclass(frozen=True, slots=True)
++class ScoreScanResult:
++    slices: Mapping[SliceKey, pl.DataFrame] = field(default_factory=dict)
++    contexts: Mapping[str, EvaluationContext] = field(default_factory=dict)
++    cutoffs: Mapping[SliceKey, datetime | None] = field(default_factory=dict)
+
+
+ @dataclass(slots=True)
+@@ -91,11 +121,13 @@ class EvaluationCatalog:
+     contexts: ContextAccumulator = field(default_factory=ContextAccumulator)
+     identities: dict[str, tuple[str, ...]] = field(default_factory=dict)
+     slices: dict[tuple[str, SliceKey], SliceEvidence] = field(default_factory=dict)
++    path_evaluations: dict[Path, frozenset[str]] = field(default_factory=dict)
+
+-    def add_identities(self, probe: pl.DataFrame) -> None:
++    def add_identities(self, path: Path, probe: pl.DataFrame) -> None:
++        self.path_evaluations[path] = frozenset(str(e) for e in probe["evaluation_id"])
+         for row in probe.iter_rows(named=True):
+             evaluation = str(row["evaluation_id"])
+-            identity = tuple(str(row[name]) for name in _IDENTITY_COLUMNS)
++            identity = tuple(str(row[name]) for name in _FINGERPRINT_COLUMNS)
+             previous = self.identities.get(evaluation)
+             if previous is not None and previous != identity:
+                 self.contexts.reject(evaluation)
+@@ -163,7 +195,13 @@ def _live_scan(path: Path) -> pl.LazyFrame | None:
+         raise MixedProvenanceError(
+             f"scores at {path} mix source kinds {sorted(map(str, kinds))}"
+         )
+-    return scan if kinds == {"live"} else None
++    return (
++        scan.with_columns(pl.col("semantics").fill_null("inst"))
++        if kinds == {"live"} and "semantics" in scan.collect_schema()
++        else scan
++        if kinds == {"live"}
++        else None
++    )
+
+
+ def _catalog_file(
+@@ -173,16 +211,12 @@ def _catalog_file(
+     if scan is None or not set(_SCORE_COLUMNS) <= set(scan.collect_schema().names()):
+         return
+     probe = (
+-        scan.select("evaluation_id", *_IDENTITY_COLUMNS)
++        scan.select("evaluation_id", *_FINGERPRINT_COLUMNS)
+         .unique()
+         .collect(engine="streaming")
+     )
+-    catalog.add_identities(probe)
+-    matches = probe.filter(
+-        (pl.col("dataset_fingerprint") == identity.dataset)
+-        & (pl.col("config_fingerprint") == identity.configuration)
+-        & (pl.col("code_version") == identity.code)
+-    )
++    catalog.add_identities(path, probe)
++    matches = probe.filter(identity.fingerprint_predicate())
+     if matches.is_empty():
+         return
+     # Aggregate inside the lazy scan: only small metadata/method summaries
+@@ -230,9 +264,7 @@ def _materialize(
+     catalog: EvaluationCatalog,
+     selected: Mapping[SliceKey, SliceEvidence],
+     identity: ScoreIdentity,
+-    *,
+-    skip_missing: bool,
+-) -> dict[SliceKey, pl.DataFrame] | None:
++) -> dict[SliceKey, pl.DataFrame]:
+     by_path: dict[Path, list[SliceEvidence]] = {}
+     for evidence in selected.values():
+         for path in evidence.fragments:
+@@ -247,9 +279,11 @@ def _materialize(
+             if scan is None:
+                 raise EvidenceChangedError(f"source provenance changed: {path}")
+             batches = (
+-                scan.filter(identity.predicate() & predicate)
++                scan.filter(
++                    identity.predicate() & identity.semantics_predicate() & predicate
++                )
+                 .select(*_SCORE_COLUMNS)
+-                .collect_batches(chunk_size=65_536, engine="streaming")
++                .collect_batches(chunk_size=SCORE_BATCH_ROWS, engine="streaming")
+             )
+             path_fragments: dict[SliceKey, list[pl.DataFrame]] = {
+                 evidence.key: [] for evidence in evidence_rows
+@@ -276,21 +310,9 @@ def _materialize(
+                     raise EvidenceChangedError(f"evaluation fragment changed: {path}")
+                 fragments[evidence.key].append(fragment)
+         except (FileNotFoundError, EvidenceChangedError) as error:
+-            affected = frozenset(
+-                evidence.evaluation_id
+-                for evidence in catalog.slices.values()
+-                if path in evidence.fragments
+-            )
+-            if not skip_missing:
+-                raise EvidenceChangedError(str(error), affected) from error
+-            # A missing fragment invalidates its entire evaluation, including
+-            # other slices. The caller can then choose an older complete run.
+-            catalog.contexts.invalid.update(
+-                evidence.evaluation_id
+-                for evidence in catalog.slices.values()
+-                if path in evidence.fragments
+-            )
+-            return None
++            raise EvidenceChangedError(
++                str(error), catalog.path_evaluations[path]
++            ) from error
+     return {
+         key: pl.concat(frames, how="diagonal_relaxed").with_columns(
+             pl.col("semantics").fill_null("inst")
+@@ -304,59 +326,59 @@ def _scan_once(
+     identity: ScoreIdentity,
+     promotion: PromotionConfig,
+     *,
+-    skip_missing: bool,
+     excluded: frozenset[str] = frozenset(),
+-) -> dict[SliceKey, pl.DataFrame]:
++) -> ScoreScanResult:
+     catalog = EvaluationCatalog()
+     catalog.contexts.invalid.update(excluded)
+     for path in sorted(scores_dir.glob("scores_*.parquet")):
+         try:
+             _catalog_file(catalog, path, identity)
+-        except FileNotFoundError:
+-            if not skip_missing:
+-                raise
+-            # No metadata means we cannot identify the vanished evaluation.
+-            # Fail closed instead of assembling an unknowably partial run.
+-            return {}
+-    while selected := catalog.newest(promotion):
+-        if (
+-            frames := _materialize(
+-                catalog, selected, identity, skip_missing=skip_missing
+-            )
+-        ) is not None:
+-            return frames
+-    return {}
++        except FileNotFoundError as error:
++            raise EvidenceChangedError(
++                str(error), catalog.path_evaluations.get(path, frozenset())
++            ) from error
++    selected = catalog.newest(promotion)
++    if not selected:
++        return ScoreScanResult()
++    frames = _materialize(catalog, selected, identity)
++    cutoffs = {
++        key: value if isinstance(value := frame["valid_time"].max(), datetime) else None
++        for key, frame in frames.items()
++    }
++    evaluations = {evidence.evaluation_id for evidence in selected.values()}
++    return ScoreScanResult(
++        frames,
++        {key: catalog.contexts.contexts[key] for key in sorted(evaluations)},
++        cutoffs,
++    )
+
+
+ def compatible_slices(
+     scores_dir: Path, identity: ScoreIdentity, promotion: PromotionConfig
+-) -> dict[SliceKey, pl.DataFrame]:
+-    try:
+-        return _scan_once(scores_dir, identity, promotion, skip_missing=False)
+-    except EvidenceChangedError as error:
+-        return _scan_once(
+-            scores_dir,
+-            identity,
+-            promotion,
+-            skip_missing=True,
+-            excluded=error.evaluations,
+-        )
+-    except FileNotFoundError:
+-        return _scan_once(scores_dir, identity, promotion, skip_missing=True)
++) -> ScoreScanResult:
++    excluded: frozenset[str] = frozenset()
++    for _ in range(MAX_SCORE_SCAN_ATTEMPTS):
++        try:
++            return _scan_once(scores_dir, identity, promotion, excluded=excluded)
++        except EvidenceChangedError as error:
++            excluded |= error.evaluations
++        except FileNotFoundError:
++            continue
++    return ScoreScanResult()
+
+
+ def live_identity_sets(
+     scores_dir: Path, *, skip_missing: bool
+ ) -> tuple[bool, set[str], set[str], set[str]]:
+     paths = sorted(scores_dir.glob("scores_*.parquet"))
+-    identities: dict[str, set[str]] = {name: set() for name in _IDENTITY_COLUMNS}
++    identities: dict[str, set[str]] = {name: set() for name in _FINGERPRINT_COLUMNS}
+     for path in paths:
+         try:
+             scan = _live_scan(path)
+             if scan is None:
+                 continue
+             columns = [
+-                name for name in _IDENTITY_COLUMNS if name in scan.collect_schema()
++                name for name in _FINGERPRINT_COLUMNS if name in scan.collect_schema()
+             ]
+             probe = (
+                 scan.select(columns).unique().collect(engine="streaming")
+diff --git a/src/grounded_weather_forecast/serve/selection.py b/src/grounded_weather_forecast/serve/selection.py
+index bc006bc..20ecfaa 100644
+--- a/src/grounded_weather_forecast/serve/selection.py
++++ b/src/grounded_weather_forecast/serve/selection.py
+@@ -35,14 +35,12 @@ from grounded_weather_forecast.reports.leaderboard import (
+     union_references,
+ )
+ from grounded_weather_forecast.reports.winner_curse import should_retain_incumbent
+-from grounded_weather_forecast.serve.evidence import (
+-    EvidenceSummary,
+-)
+-from grounded_weather_forecast.serve.score_scan import (
++from grounded_weather_forecast.serve.evidence import EvidenceSummary
++
++from grounded_weather_forecast.serve.score_scan import (  # isort: skip
+     ScoreIdentity,
++    ScoreScanResult,
+     compatible_slices,
+-)
+-from grounded_weather_forecast.serve.score_scan import (
+     live_identity_sets as _live_identity_sets,
+ )
+
+@@ -101,13 +99,13 @@ def _pins(config: Config) -> dict[tuple[str, str], str]:
+     return pinned
+
+
+-def _load_slices(
++def _load_evidence(
+     config: Config,
+     scores_dir: Path,
+     as_of: datetime | None,
+     semantics: Mapping[str, TruthSemantics] | None,
+     dataset_id: str | None = None,
+-) -> dict[SliceKey, pl.DataFrame]:
++) -> ScoreScanResult:
+     identity = ScoreIdentity(
+         dataset_id or dataset_fingerprint(config),
+         config_fingerprint(config),
+@@ -118,17 +116,6 @@ def _load_slices(
+     return compatible_slices(scores_dir, identity, config.promotion)
+
+
+-def _compatible_scores(
+-    config: Config,
+-    scores_dir: Path,
+-    as_of: datetime | None,
+-    semantics: Mapping[str, TruthSemantics] | None,
+-    dataset_id: str | None = None,
+-) -> list[pl.DataFrame]:
+-    """Materialized newest complete slices; older numeric scores stay on disk."""
+-    return list(_load_slices(config, scores_dir, as_of, semantics, dataset_id).values())
+-
+-
+ def _pool_sibling_scores(
+     key: SliceKey,
+     frame: pl.DataFrame,
+@@ -676,7 +663,8 @@ def select_methods(
+     current_dataset = dataset_id or dataset_fingerprint(config)
+     pinned = _pins(config)
+     selections: dict[SliceKey, Selection] = {}
+-    slices = _load_slices(config, scores_dir, as_of, semantics, current_dataset)
++    scanned = _load_evidence(config, scores_dir, as_of, semantics, current_dataset)
++    slices = scanned.slices
+     incumbents = _incumbent_methods(config)
+     candidates: dict[SliceKey, tuple[Selection, ...]] = {}
+     references = union_references(config.promotion)
+@@ -718,8 +706,10 @@ def select_methods(
+         )
+     if not selections:
+         return selections
+-    evidence = EvidenceSummary.from_slices(
+-        slices, {key: selected.evaluation_id for key, selected in selections.items()}
++    evidence = EvidenceSummary.from_contexts(
++        scanned.contexts,
++        scanned.cutoffs,
++        {key: selected.evaluation_id for key, selected in selections.items()},
+     )
+     # Every replacement candidate comes from the same slice/evaluation, so
+     # changing the served method cannot change this release's evidence.
+@@ -908,6 +898,8 @@ def apply_live_gate(
+     rotates with data volume cannot be a precondition for scoring, or the
+     slices that most need watching are the ones that never get watched.
+     ``None`` means no ledger filter — every release-tagged row is eligible.
++    ``fallbacks`` is a compatibility adapter: its scored candidates obey the
++    same quality guard as ``candidates``; unscored fallbacks are rejected.
+     """
+     pooled = _pooled_live_skill(live, eligible_releases)
+     if not pooled:
+@@ -948,7 +940,7 @@ def no_evidence_reason(
+     like a cold start unless it is named. The distinction decides the fix:
+     keep polling, or just re-run the backtest.
+     """
+-    # Same prune-vs-reader retry as _compatible_scores: one clean re-scan
++    # Retry the identity diagnosis once against a fresh directory listing
+     # before tolerating missing files, so the diagnosis never reflects a
+     # half-pruned directory.
+     try:
+diff --git a/src/grounded_weather_forecast/dashboard/score_summary.py b/src/grounded_weather_forecast/dashboard/score_summary.py
+new file mode 100644
+index 0000000..8a6eda6
+--- /dev/null
++++ b/src/grounded_weather_forecast/dashboard/score_summary.py
+@@ -0,0 +1,149 @@
++"""Small dashboard score summaries; full frames live only during collection."""
++
++import json
++from dataclasses import dataclass
++
++import numpy as np
++import polars as pl
++
++from grounded_weather_forecast.config import Config
++from grounded_weather_forecast.evaluation import code_identity, config_fingerprint
++from grounded_weather_forecast.metrics.probabilistic import (
++    pit_from_quantiles,
++    reliability_bins,
++)
++from grounded_weather_forecast.reports.eprocess import EProcessStore
++from grounded_weather_forecast.reports.leaderboard import (
++    leaderboard,
++    slice_winners,
++    union_references,
++)
++from grounded_weather_forecast.reports.winner_curse import winner_curse_adjusted
++
++
++@dataclass(frozen=True, slots=True)
++class ScoreSummary:
++    source_kinds: frozenset[str]
++    fold_origins: frozenset[object]
++    board: pl.DataFrame | None = None
++    winners: pl.DataFrame | None = None
++    pit_counts: tuple[int, ...] = ()
++    pit_rows: int = 0
++    reliability: tuple[tuple[float, float, int], ...] = ()
++    unusable: bool = False
++
++
++def _eprocess_store(
++    config: Config, stem: str, cache: dict[str, EProcessStore]
++) -> EProcessStore | None:
++    """Read-only wealth for the seq_mcs rule; ``report`` is the only writer."""
++    if config.promotion.rule != "seq_mcs" or "_live" not in stem:
++        return None
++    product = stem.split("_")[1] if "_" in stem else stem
++    if product not in cache:
++        cache[product] = EProcessStore.load(
++            config.artifacts_dir / "eprocess" / f"{product}_live.json",
++            config_fingerprint(config),
++            code_identity(),
++        )
++    return cache[product]
++
++
++def pit_values(scores: pl.DataFrame) -> np.ndarray:
++    needed = {"quantiles_json", "quantile_levels_json", "y_true"}
++    if not needed <= set(scores.columns):
++        return np.empty(0)
++    usable = scores.filter(
++        pl.col("quantiles_json").is_not_null() & pl.col("y_true").is_not_null()
++    )
++    if usable.is_empty():
++        return np.empty(0)
++    groups: dict[str, list[tuple[list[float], float]]] = {}
++    for row in usable.iter_rows(named=True):
++        try:
++            quantiles = json.loads(row["quantiles_json"])
++        except (TypeError, ValueError):
++            continue
++        if not isinstance(quantiles, list) or any(q is None for q in quantiles):
++            continue
++        key = str(row["quantile_levels_json"])
++        groups.setdefault(key, []).append((quantiles, float(row["y_true"])))
++    if not groups:
++        return np.empty(0)
++    key, entries = max(groups.items(), key=lambda item: len(item[1]))
++    try:
++        levels = tuple(float(level) for level in json.loads(key))
++    except (TypeError, ValueError):
++        return np.empty(0)
++    quantile_matrix = np.asarray([entry[0] for entry in entries], dtype=np.float64)
++    truths = np.asarray([entry[1] for entry in entries], dtype=np.float64)
++    if quantile_matrix.shape[1] != len(levels):
++        return np.empty(0)
++    return pit_from_quantiles(truths, quantile_matrix, levels)
++
++
++def reliability_summary(scores: pl.DataFrame) -> tuple[tuple[float, float, int], ...]:
++    if not {"variable", "y_pred", "y_true"} <= set(scores.columns):
++        return ()
++    pop = scores.filter(
++        (pl.col("variable") == "pop")
++        & pl.col("y_pred").is_not_null()
++        & pl.col("y_true").is_not_null()
++    )
++    if pop.height < 20:
++        return ()
++    bins = reliability_bins(
++        pop["y_pred"].to_numpy().astype(np.float64),
++        pop["y_true"].to_numpy().astype(np.float64),
++    ).filter(pl.col("count") > 0)
++    return tuple(
++        (float(row["forecast_mean"]), float(row["observed_freq"]), int(row["count"]))
++        for row in bins.iter_rows(named=True)
++        if row["forecast_mean"] is not None and row["observed_freq"] is not None
++    )
++
++
++def summarize_scores(
++    config: Config, stem: str, scores: pl.DataFrame, stores: dict[str, EProcessStore]
++) -> ScoreSummary:
++    kinds = (
++        frozenset(str(value) for value in scores["source_kind"].unique())
++        if "source_kind" in scores.columns and not scores.is_empty()
++        else frozenset()
++    )
++    folds = (
++        frozenset(scores["fold_origin"].unique())
++        if "fold_origin" in scores.columns and not scores.is_empty()
++        else frozenset()
++    )
++    if scores.is_empty():
++        return ScoreSummary(kinds, folds)
++    try:
++        board = leaderboard(scores, references=union_references(config.promotion))
++        winners = winner_curse_adjusted(
++            slice_winners(
++                board,
++                scores=scores,
++                rule=config.promotion.rule,
++                alpha=config.promotion.alpha,
++                promotion=config.promotion,
++                eprocess_store=_eprocess_store(config, stem, stores),
++            ),
++            scores,
++            promotion=config.promotion,
++        )
++        pit = pit_values(scores)
++        counts = (
++            tuple(
++                int(value) for value in np.histogram(pit, bins=10, range=(0.0, 1.0))[0]
++            )
++            if pit.size
++            else ()
++        )
++        reliability = reliability_summary(scores)
++    except (OSError, ValueError, pl.exceptions.PolarsError):
++        # Readable metadata remains useful even when statistical scoring fails.
++        return ScoreSummary(kinds, folds, unusable=True)
++    return ScoreSummary(
++        kinds, folds, board, winners, counts, int(pit.size), reliability
++    )

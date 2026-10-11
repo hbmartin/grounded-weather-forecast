@@ -1,8 +1,7 @@
 """Shared derived frames computed once per dashboard build.
 
-Everything here reuses the existing reports functions on the frames the
-context collector loaded; zone builders and the alert evaluator both consume
-the results so nothing is computed twice.
+Score statistics come from the collector's compact summaries. Verification
+and correlation are derived here once for zone builders and alert evaluation.
 """
 
 from collections.abc import Mapping
@@ -10,42 +9,17 @@ from dataclasses import dataclass, field
 
 import polars as pl
 
-from grounded_weather_forecast.config import Config
 from grounded_weather_forecast.contracts import (
     TruthSemantics,
     finite_number,
     hourly_variable,
 )
 from grounded_weather_forecast.dashboard.context import DashboardContext
-from grounded_weather_forecast.evaluation import code_identity, config_fingerprint
 from grounded_weather_forecast.reports.correlation import error_correlation
-from grounded_weather_forecast.reports.eprocess import EProcessStore
-from grounded_weather_forecast.reports.leaderboard import (
-    leaderboard,
-    slice_winners,
-    union_references,
-)
 from grounded_weather_forecast.reports.verification import (
     compare_to_backtest,
     verify_history,
 )
-from grounded_weather_forecast.reports.winner_curse import winner_curse_adjusted
-
-
-def _eprocess_store(
-    config: Config, stem: str, cache: dict[str, EProcessStore]
-) -> EProcessStore | None:
-    """Read-only wealth for the seq_mcs rule; ``report`` is the only writer."""
-    if config.promotion.rule != "seq_mcs" or "_live" not in stem:
-        return None
-    product = stem.split("_")[1] if "_" in stem else stem
-    if product not in cache:
-        cache[product] = EProcessStore.load(
-            config.artifacts_dir / "eprocess" / f"{product}_live.json",
-            config_fingerprint(config),
-            code_identity(),
-        )
-    return cache[product]
 
 
 @dataclass(frozen=True, slots=True)
@@ -87,41 +61,21 @@ def _k_eff(correlation: pl.DataFrame) -> float | None:
 
 
 def derive(ctx: DashboardContext) -> Derived:
-    boards: dict[str, pl.DataFrame] = {}
-    winners: dict[str, pl.DataFrame] = {}
-    eprocess_stores: dict[str, EProcessStore] = {}
-    live_stem: str | None = None
-    # A live stem that fails to score is "unusable", not "absent" — record it
-    # before any early exit so zone F cannot mistake it for a young archive.
-    live_unusable = any("_live" in stem for stem in ctx.unreadable_scores)
-    for stem, scores in ctx.score_frames.items():
-        is_live = "_live" in stem
-        if scores.is_empty():
-            continue
-        try:
-            board = leaderboard(
-                scores, references=union_references(ctx.config.promotion)
-            )
-            # The dashboard never writes e-process state; under the seq_mcs
-            # rule it reads the report-persisted wealth like serving does.
-            winners[stem] = winner_curse_adjusted(
-                slice_winners(
-                    board,
-                    scores=scores,
-                    rule=ctx.config.promotion.rule,
-                    alpha=ctx.config.promotion.alpha,
-                    promotion=ctx.config.promotion,
-                    eprocess_store=_eprocess_store(ctx.config, stem, eprocess_stores),
-                ),
-                scores,
-                promotion=ctx.config.promotion,
-            )
-            boards[stem] = board
-        except (ValueError, pl.exceptions.PolarsError):
-            live_unusable = live_unusable or is_live
-            continue
-        if is_live and live_stem is None:
-            live_stem = stem
+    boards = {
+        stem: summary.board
+        for stem, summary in ctx.score_summaries.items()
+        if summary.board is not None
+    }
+    winners = {
+        stem: summary.winners
+        for stem, summary in ctx.score_summaries.items()
+        if summary.winners is not None
+    }
+    live_stem = next((stem for stem in boards if "_live" in stem), None)
+    live_unusable = any("_live" in stem for stem in ctx.unreadable_scores) or any(
+        "_live" in stem and summary.unusable
+        for stem, summary in ctx.score_summaries.items()
+    )
 
     verification = pl.DataFrame()
     if (

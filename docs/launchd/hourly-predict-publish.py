@@ -23,8 +23,6 @@ empty as well do we decline to publish at all, so that a bad render can never
 strip files the branch is already serving.
 """
 
-import atexit
-import fcntl
 import json
 import os
 import socket
@@ -43,87 +41,64 @@ HERE = Path.home() / "Library/Application Support/grounded-weather-forecast"
 # so it runs under that project rather than this one. uv is also the binary
 # holding the TCC grant for /Volumes/ExtStor.
 UV = "/opt/homebrew/bin/uv"
-os.environ.setdefault("POLARS_MAX_THREADS", "2")
-os.environ.setdefault("PYTHONUNBUFFERED", "1")
 STATION_REPO = "/Volumes/ExtStor/weather/ambientweather2sqlite"
 STATION_SCRIPT = HERE / "publish_station.py"
 STAGED = HERE / "staged"
 STATION_TIMEOUT_S = 180
-STARTED = time.monotonic()
-EXIT_CODE = 1
 
 
 def timestamp() -> str:
     return datetime.now(UTC).isoformat()
 
 
-def log_finish() -> None:
-    print(
-        f"{timestamp()} END mode=predict pid={os.getpid()} "
-        f"duration_s={time.monotonic() - STARTED:.1f} exit={EXIT_CODE}",
-        flush=True,
-    )
-
-
-atexit.register(log_finish)
-print(
-    f"{timestamp()} START mode=predict pid={os.getpid()} ppid={os.getppid()} "
-    f"cwd={Path.cwd()} host={socket.gethostname()} project={REPO} "
-    f"forecast={OUT}",
-    flush=True,
-)
-
-# predict resolves config.predict.history_path relative to the working
-# directory, so this must happen before the CLI is imported or the
-# self-verification history lands somewhere else entirely.
-os.chdir(REPO)
-print(f"{timestamp()} PROJECT_CWD cwd={Path.cwd()}", flush=True)
-sys.path.insert(0, str(HERE))
-
-
 # --config is a global flag: passing it after the subcommand is an argparse
 # error, which is exactly how every scheduled run between 2026-07-27 and
 # 2026-08-03 died silently.
-predict_started = time.monotonic()
-print(f"{timestamp()} == predict ==", flush=True)
-try:
-    code = subprocess.run(  # noqa: S603 -- fixed binary and predict arguments
-        [
-            "/usr/bin/time",
-            "-l",
-            UV,
-            "--directory",
-            REPO,
-            "run",
-            "--locked",
-            "--project",
-            REPO,
-            "grounded-weather-forecast",
-            "--config",
-            CONFIG,
-            "predict",
-            "--out",
-            OUT,
-        ],
-        check=False,
-    ).returncode
-    if code < 0:
-        code = 128 - code
-except SystemExit as exc:
-    code = exc.code if isinstance(exc.code, int) else 1
-except Exception as exc:  # report and skip publishing, never traceback out
-    print(f"predict crashed: {exc!r}", flush=True)
-    code = 70
+def run_predict() -> int:
+    predict_started = time.monotonic()
+    print(f"{timestamp()} == predict ==", flush=True)
+    try:
+        code = subprocess.run(  # noqa: S603 -- fixed binary and predict arguments
+            [
+                "/usr/bin/time",
+                "-l",
+                UV,
+                "--directory",
+                REPO,
+                "run",
+                "--locked",
+                "--project",
+                REPO,
+                "grounded-weather-forecast",
+                "--config",
+                CONFIG,
+                "predict",
+                "--out",
+                OUT,
+            ],
+            check=False,
+        ).returncode
+        if code < 0:
+            code = 128 - code
+    except SystemExit as exc:
+        code = exc.code if isinstance(exc.code, int) else 1
+    except Exception as exc:  # report and skip publishing, never traceback out
+        print(f"predict crashed: {exc!r}", flush=True)
+        code = 70
 
-print(
-    f"{timestamp()} == predict exited {code} "
-    f"duration_s={time.monotonic() - predict_started:.1f} ==",
-    flush=True,
-)
-if code != 0:
-    print("not publishing; the previously published document keeps serving", flush=True)
-    EXIT_CODE = 1
-    sys.exit(1)
+    print(
+        f"{timestamp()} == predict exited {code} "
+        f"duration_s={time.monotonic() - predict_started:.1f} ==",
+        flush=True,
+    )
+    if code != 0:
+        print(
+            "not publishing; the previously published document keeps serving",
+            flush=True,
+        )
+        return 1
+    return 0
+
 
 RESTORE_LOG = HERE / "auto-restore.log"
 
@@ -133,22 +108,18 @@ def maybe_spawn_restore() -> None:
 
     Only the "implementation changed" reason is restorable by a cycle:
     dataset/config-fingerprint changes resolve at the next 06:30 build, and
-    cold starts have nothing to restore. The CLI's pipeline lock makes a
-    second spawn exit 75 (EX_TEMPFAIL) instead of racing, so at most one
-    restore runs however many hourly fires see the degraded document. The
-    maintenance wrapper also holds the job lock across all child stages.
+    cold starts have nothing to restore. The maintenance child acquires the
+    job lock across all stages and skips duplicate jobs, so at most one
+    restore runs however many hourly fires see the degraded document. Each
+    child stage retains the CLI's pipeline lock as well.
     Publish still proceeds immediately; hold-last-good bridges the window.
     """
     try:
         document = json.loads(Path(OUT).read_text(encoding="utf-8"))
     except (OSError, ValueError):
         return
-    with (HERE / "maintenance-job.lock").open("a") as maintenance_lock:
-        try:
-            fcntl.flock(maintenance_lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except BlockingIOError:
-            print("maintenance is active; skipping automatic restore", flush=True)
-            return
+    if not isinstance(document, dict):
+        return
     reason = str(document.get("status_reason") or "")
     if document.get("status") != "degraded" or "implementation changed" not in reason:
         return
@@ -179,9 +150,6 @@ def maybe_spawn_restore() -> None:
             env=env,
         )
     print(f"auto-restore spawned pid={process.pid} (see auto-restore.log)", flush=True)
-
-
-maybe_spawn_restore()
 
 
 def render_station() -> int:
@@ -216,41 +184,71 @@ def render_station() -> int:
     return result.returncode
 
 
-station_started = time.monotonic()
-print(f"{timestamp()} == station ==", flush=True)
-station_code = render_station()
-print(
-    f"{timestamp()} == station exited {station_code} "
-    f"duration_s={time.monotonic() - station_started:.1f} ==",
-    flush=True,
-)
-staged_documents = sorted(STAGED.glob("*.json")) if STAGED.is_dir() else []
-
-if station_code != 0:
-    print(f"station render exited {station_code}", flush=True)
-    if not staged_documents:
-        # Publishing now would push a tree with no station files, deleting any
-        # the branch already serves. Leave the branch exactly as it is.
-        print("no staged documents; not publishing at all this cycle", flush=True)
-        EXIT_CODE = 1
-        sys.exit(1)
+def publish() -> int:
+    station_started = time.monotonic()
+    print(f"{timestamp()} == station ==", flush=True)
+    station_code = render_station()
     print(
-        f"republishing {len(staged_documents)} staged document(s) from the last run",
+        f"{timestamp()} == station exited {station_code} "
+        f"duration_s={time.monotonic() - station_started:.1f} ==",
         flush=True,
     )
+    staged_documents = sorted(STAGED.glob("*.json")) if STAGED.is_dir() else []
 
-import publish_forecast  # noqa: E402
+    if station_code != 0:
+        print(f"station render exited {station_code}", flush=True)
+        if not staged_documents:
+            # Publishing now would push a tree with no station files, deleting any
+            # the branch already serves. Leave the branch exactly as it is.
+            print("no staged documents; not publishing at all this cycle", flush=True)
+            return 1
+        print(
+            f"republishing {len(staged_documents)} staged document(s) from the last run",
+            flush=True,
+        )
 
-publish_started = time.monotonic()
-print(f"{timestamp()} == publish ==", flush=True)
-# Degraded documents (every code-identity change causes one until the restore
-# cycle finishes) hold the last ready document for up to 6h instead of swapping
-# the public forecast's character for the integration window.
-source = publish_forecast.choose_source(Path(OUT))
-EXIT_CODE = publish_forecast.run(source=source, include_dir=STAGED)
-print(
-    f"{timestamp()} == publish exited {EXIT_CODE} "
-    f"duration_s={time.monotonic() - publish_started:.1f} ==",
-    flush=True,
-)
-sys.exit(EXIT_CODE)
+    import publish_forecast  # noqa: PLC0415 -- installed publisher is on the runtime path
+
+    publish_started = time.monotonic()
+    print(f"{timestamp()} == publish ==", flush=True)
+    # Degraded documents (every code-identity change causes one until the restore
+    # cycle finishes) hold the last ready document for up to 6h instead of swapping
+    # the public forecast's character for the integration window.
+    source = publish_forecast.choose_source(Path(OUT))
+    exit_code = publish_forecast.run(source=source, include_dir=STAGED)
+    print(
+        f"{timestamp()} == publish exited {exit_code} "
+        f"duration_s={time.monotonic() - publish_started:.1f} ==",
+        flush=True,
+    )
+    return exit_code
+
+
+def main() -> int:
+    os.environ.setdefault("POLARS_MAX_THREADS", "2")
+    os.environ.setdefault("PYTHONUNBUFFERED", "1")
+    started = time.monotonic()
+    code = 1
+    print(
+        f"{timestamp()} START mode=predict pid={os.getpid()} ppid={os.getppid()} cwd={Path.cwd()} host={socket.gethostname()} project={REPO} forecast={OUT}",
+        flush=True,
+    )
+    try:
+        # History paths must resolve from the project before invoking the CLI.
+        os.chdir(REPO)
+        print(f"{timestamp()} PROJECT_CWD cwd={Path.cwd()}", flush=True)
+        sys.path.insert(0, str(HERE))
+        if run_predict() != 0:
+            return 1
+        maybe_spawn_restore()
+        code = publish()
+        return code  # noqa: RET504 -- finally logs the actual exit status
+    finally:
+        print(
+            f"{timestamp()} END mode=predict pid={os.getpid()} duration_s={time.monotonic() - started:.1f} exit={code}",
+            flush=True,
+        )
+
+
+if __name__ == "__main__":
+    sys.exit(main())

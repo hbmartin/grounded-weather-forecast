@@ -63,6 +63,28 @@ backtesting or serving methods that consume ensemble features.
    `launchctl bootout "gui/$(id -u)/com.grounded-weather-forecast.predict"`;
    substitute any of the other three labels as needed.
 
+## Standalone Python wrappers
+
+The standalone Python wrappers in `docs/launchd/daily-maintenance.py` and
+`hourly-predict-publish.py` run only through guarded `main()` entry points.
+Importing them does not change the environment or working directory, register
+exit logging, or execute jobs. Their entry points default `POLARS_MAX_THREADS`
+to **2** and log the job's start/end and exit status.
+
+The daily wrapper holds `maintenance-job.lock` across its child stages using
+a context manager, releasing it on early returns and exceptions. Concurrent
+maintenance or restore jobs skip as duplicates. A successful daily run writes
+`last-maintenance`; a fresh stamp skips catch-up for **20 hours**. Restore runs
+leave that stamp untouched, and a failed report skips score pruning.
+
+The hourly wrapper checks whether a degraded document says `implementation
+changed` before starting detached restore maintenance. The restore child
+acquires the job lock itself; the hourly eligibility check does not probe it.
+Healthy hourly checks therefore cannot prevent a daily job from acquiring its
+lock. Publication continues while restoration runs, retaining the existing
+last-good behavior. Installing updated wrappers and refreshing compatible live
+evidence are deployment steps: source changes alter the code fingerprint.
+
 ## Profiling a scheduled run
 
 The optional Memray wrapper records allocations from the start of a command,

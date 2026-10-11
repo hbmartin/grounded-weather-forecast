@@ -12,11 +12,17 @@ from grounded_weather_forecast.backtest.scores import scan_score_file
 from grounded_weather_forecast.config import PromotionConfig
 from grounded_weather_forecast.contracts import MixedProvenanceError, TruthSemantics
 from grounded_weather_forecast.reports.leaderboard import gate_references
-from grounded_weather_forecast.serve.evidence import CONTEXT_COLUMNS, ContextAccumulator
+from grounded_weather_forecast.serve.evidence import (
+    CONTEXT_COLUMNS,
+    ContextAccumulator,
+    EvaluationContext,
+)
 
 type SliceKey = tuple[str, str, str]
 _SLICE_COLUMNS = ("product", "variable", "lead_bucket")
-_IDENTITY_COLUMNS = ("dataset_fingerprint", "config_fingerprint", "code_version")
+_FINGERPRINT_COLUMNS = ("dataset_fingerprint", "config_fingerprint", "code_version")
+MAX_SCORE_SCAN_ATTEMPTS = 3
+SCORE_BATCH_ROWS = 65_536
 _METADATA_COLUMNS = (
     "evaluation_id",
     *CONTEXT_COLUMNS,
@@ -54,21 +60,45 @@ class ScoreIdentity:
     as_of: datetime | None = None
     semantics: Mapping[str, TruthSemantics] | None = None
 
-    def predicate(self) -> pl.Expr:
-        predicate = (
+    def fingerprint_predicate(self) -> pl.Expr:
+        return (
             (pl.col("dataset_fingerprint") == self.dataset)
             & (pl.col("config_fingerprint") == self.configuration)
             & (pl.col("code_version") == self.code)
         )
+
+    def predicate(self) -> pl.Expr:
+        predicate = self.fingerprint_predicate()
         if self.as_of is not None:
             predicate &= (pl.col("evaluation_created_at") <= self.as_of) & (
                 pl.col("valid_time") <= self.as_of
             )
         return predicate
 
+    def semantics_predicate(self) -> pl.Expr:
+        predicate = pl.lit(True)  # noqa: FBT003 -- expression literal, not a flag
+        for variable, semantic in (self.semantics or {}).items():
+            predicate &= (
+                (pl.col("product") != "hourly")
+                | (pl.col("variable") != variable)
+                | (pl.col("semantics").fill_null("inst") == semantic.value)
+            )
+        return predicate
+
     def accepts(self, product: str, variable: str, semantic: object) -> bool:
         expected = (self.semantics or {}).get(variable)
-        return product != "hourly" or expected is None or semantic == expected.value
+        return (
+            product != "hourly"
+            or expected is None
+            or (semantic or "inst") == expected.value
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class ScoreScanResult:
+    slices: Mapping[SliceKey, pl.DataFrame] = field(default_factory=dict)
+    contexts: Mapping[str, EvaluationContext] = field(default_factory=dict)
+    cutoffs: Mapping[SliceKey, datetime | None] = field(default_factory=dict)
 
 
 @dataclass(slots=True)
@@ -91,11 +121,13 @@ class EvaluationCatalog:
     contexts: ContextAccumulator = field(default_factory=ContextAccumulator)
     identities: dict[str, tuple[str, ...]] = field(default_factory=dict)
     slices: dict[tuple[str, SliceKey], SliceEvidence] = field(default_factory=dict)
+    path_evaluations: dict[Path, frozenset[str]] = field(default_factory=dict)
 
-    def add_identities(self, probe: pl.DataFrame) -> None:
+    def add_identities(self, path: Path, probe: pl.DataFrame) -> None:
+        self.path_evaluations[path] = frozenset(str(e) for e in probe["evaluation_id"])
         for row in probe.iter_rows(named=True):
             evaluation = str(row["evaluation_id"])
-            identity = tuple(str(row[name]) for name in _IDENTITY_COLUMNS)
+            identity = tuple(str(row[name]) for name in _FINGERPRINT_COLUMNS)
             previous = self.identities.get(evaluation)
             if previous is not None and previous != identity:
                 self.contexts.reject(evaluation)
@@ -163,7 +195,13 @@ def _live_scan(path: Path) -> pl.LazyFrame | None:
         raise MixedProvenanceError(
             f"scores at {path} mix source kinds {sorted(map(str, kinds))}"
         )
-    return scan if kinds == {"live"} else None
+    return (
+        scan.with_columns(pl.col("semantics").fill_null("inst"))
+        if kinds == {"live"} and "semantics" in scan.collect_schema()
+        else scan
+        if kinds == {"live"}
+        else None
+    )
 
 
 def _catalog_file(
@@ -173,16 +211,12 @@ def _catalog_file(
     if scan is None or not set(_SCORE_COLUMNS) <= set(scan.collect_schema().names()):
         return
     probe = (
-        scan.select("evaluation_id", *_IDENTITY_COLUMNS)
+        scan.select("evaluation_id", *_FINGERPRINT_COLUMNS)
         .unique()
         .collect(engine="streaming")
     )
-    catalog.add_identities(probe)
-    matches = probe.filter(
-        (pl.col("dataset_fingerprint") == identity.dataset)
-        & (pl.col("config_fingerprint") == identity.configuration)
-        & (pl.col("code_version") == identity.code)
-    )
+    catalog.add_identities(path, probe)
+    matches = probe.filter(identity.fingerprint_predicate())
     if matches.is_empty():
         return
     # Aggregate inside the lazy scan: only small metadata/method summaries
@@ -230,9 +264,7 @@ def _materialize(
     catalog: EvaluationCatalog,
     selected: Mapping[SliceKey, SliceEvidence],
     identity: ScoreIdentity,
-    *,
-    skip_missing: bool,
-) -> dict[SliceKey, pl.DataFrame] | None:
+) -> dict[SliceKey, pl.DataFrame]:
     by_path: dict[Path, list[SliceEvidence]] = {}
     for evidence in selected.values():
         for path in evidence.fragments:
@@ -247,9 +279,11 @@ def _materialize(
             if scan is None:
                 raise EvidenceChangedError(f"source provenance changed: {path}")
             batches = (
-                scan.filter(identity.predicate() & predicate)
+                scan.filter(
+                    identity.predicate() & identity.semantics_predicate() & predicate
+                )
                 .select(*_SCORE_COLUMNS)
-                .collect_batches(chunk_size=65_536, engine="streaming")
+                .collect_batches(chunk_size=SCORE_BATCH_ROWS, engine="streaming")
             )
             path_fragments: dict[SliceKey, list[pl.DataFrame]] = {
                 evidence.key: [] for evidence in evidence_rows
@@ -276,21 +310,9 @@ def _materialize(
                     raise EvidenceChangedError(f"evaluation fragment changed: {path}")
                 fragments[evidence.key].append(fragment)
         except (FileNotFoundError, EvidenceChangedError) as error:
-            affected = frozenset(
-                evidence.evaluation_id
-                for evidence in catalog.slices.values()
-                if path in evidence.fragments
-            )
-            if not skip_missing:
-                raise EvidenceChangedError(str(error), affected) from error
-            # A missing fragment invalidates its entire evaluation, including
-            # other slices. The caller can then choose an older complete run.
-            catalog.contexts.invalid.update(
-                evidence.evaluation_id
-                for evidence in catalog.slices.values()
-                if path in evidence.fragments
-            )
-            return None
+            raise EvidenceChangedError(
+                str(error), catalog.path_evaluations[path]
+            ) from error
     return {
         key: pl.concat(frames, how="diagonal_relaxed").with_columns(
             pl.col("semantics").fill_null("inst")
@@ -304,59 +326,59 @@ def _scan_once(
     identity: ScoreIdentity,
     promotion: PromotionConfig,
     *,
-    skip_missing: bool,
     excluded: frozenset[str] = frozenset(),
-) -> dict[SliceKey, pl.DataFrame]:
+) -> ScoreScanResult:
     catalog = EvaluationCatalog()
     catalog.contexts.invalid.update(excluded)
     for path in sorted(scores_dir.glob("scores_*.parquet")):
         try:
             _catalog_file(catalog, path, identity)
-        except FileNotFoundError:
-            if not skip_missing:
-                raise
-            # No metadata means we cannot identify the vanished evaluation.
-            # Fail closed instead of assembling an unknowably partial run.
-            return {}
-    while selected := catalog.newest(promotion):
-        if (
-            frames := _materialize(
-                catalog, selected, identity, skip_missing=skip_missing
-            )
-        ) is not None:
-            return frames
-    return {}
+        except FileNotFoundError as error:
+            raise EvidenceChangedError(
+                str(error), catalog.path_evaluations.get(path, frozenset())
+            ) from error
+    selected = catalog.newest(promotion)
+    if not selected:
+        return ScoreScanResult()
+    frames = _materialize(catalog, selected, identity)
+    cutoffs = {
+        key: value if isinstance(value := frame["valid_time"].max(), datetime) else None
+        for key, frame in frames.items()
+    }
+    evaluations = {evidence.evaluation_id for evidence in selected.values()}
+    return ScoreScanResult(
+        frames,
+        {key: catalog.contexts.contexts[key] for key in sorted(evaluations)},
+        cutoffs,
+    )
 
 
 def compatible_slices(
     scores_dir: Path, identity: ScoreIdentity, promotion: PromotionConfig
-) -> dict[SliceKey, pl.DataFrame]:
-    try:
-        return _scan_once(scores_dir, identity, promotion, skip_missing=False)
-    except EvidenceChangedError as error:
-        return _scan_once(
-            scores_dir,
-            identity,
-            promotion,
-            skip_missing=True,
-            excluded=error.evaluations,
-        )
-    except FileNotFoundError:
-        return _scan_once(scores_dir, identity, promotion, skip_missing=True)
+) -> ScoreScanResult:
+    excluded: frozenset[str] = frozenset()
+    for _ in range(MAX_SCORE_SCAN_ATTEMPTS):
+        try:
+            return _scan_once(scores_dir, identity, promotion, excluded=excluded)
+        except EvidenceChangedError as error:
+            excluded |= error.evaluations
+        except FileNotFoundError:
+            continue
+    return ScoreScanResult()
 
 
 def live_identity_sets(
     scores_dir: Path, *, skip_missing: bool
 ) -> tuple[bool, set[str], set[str], set[str]]:
     paths = sorted(scores_dir.glob("scores_*.parquet"))
-    identities: dict[str, set[str]] = {name: set() for name in _IDENTITY_COLUMNS}
+    identities: dict[str, set[str]] = {name: set() for name in _FINGERPRINT_COLUMNS}
     for path in paths:
         try:
             scan = _live_scan(path)
             if scan is None:
                 continue
             columns = [
-                name for name in _IDENTITY_COLUMNS if name in scan.collect_schema()
+                name for name in _FINGERPRINT_COLUMNS if name in scan.collect_schema()
             ]
             probe = (
                 scan.select(columns).unique().collect(engine="streaming")
