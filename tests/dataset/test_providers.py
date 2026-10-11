@@ -1,4 +1,5 @@
 import sqlite3
+from datetime import timedelta
 
 import pytest
 from conftest import make_forecast_db, utc, write_config
@@ -33,6 +34,58 @@ class TestSourceSlug:
 
 
 class TestReadHourlyLong:
+    @pytest.mark.parametrize("model", ["best_match", "ecmwf_ifs025"])
+    def test_open_meteo_rain_end_times_become_hour_starts_without_moving_states(
+        self, tmp_path, la_config, model
+    ):
+        one_run_db(
+            tmp_path,
+            [
+                {
+                    "provider": "open_meteo",
+                    "model": model,
+                    "fetched_at": FETCH,
+                    "hourly": [
+                        (
+                            VALID,
+                            {
+                                "temperature": 8.0,
+                                "precipitation": 2.0,
+                                "precipitation_probability": 0.7,
+                            },
+                        ),
+                        (
+                            VALID + timedelta(hours=2),
+                            {
+                                "temperature": 10.0,
+                                "precipitation": 4.0,
+                                "precipitation_probability": 0.9,
+                            },
+                        ),
+                    ],
+                },
+                {
+                    "provider": "nws",
+                    "fetched_at": FETCH,
+                    "hourly": [(VALID, {"precipitation": 3.0})],
+                },
+            ],
+        )
+        frame = read_hourly_long(la_config.forecasts)
+        native = frame.filter(frame["source"] == source_slug("open_meteo", model))
+        first = native.row(0, named=True)
+        assert first["valid_time"] == VALID - timedelta(hours=1)
+        assert first["lead_hours"] == 5.0
+        assert first["precip_mm"] == 2.0
+        assert first["pop"] == 0.7
+        assert first["temp_c"] is None
+        states = native.filter(native["temp_c"].is_not_null())
+        assert states["valid_time"].to_list() == [VALID, VALID + timedelta(hours=2)]
+        assert states["temp_c"].to_list() == [8.0, 10.0]
+        assert states["precip_mm"].to_list() == [None, None]
+        assert native["precip_mm"].sum() == 6.0
+        assert frame.filter(frame["source"] == "nws")["valid_time"][0] == VALID
+
     def test_lead_recomputed_from_iso_fetched_at(self, tmp_path, la_config):
         one_run_db(
             tmp_path,

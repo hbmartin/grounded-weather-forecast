@@ -413,6 +413,17 @@ and live replacement; their statistics belong to the pinned method or are
 absent when it has no compatible evidence. Minutely history attributes a
 release only when its selected method actually produced the value.
 
+Automatic rainfall uses the uncalibrated provider mean when its lead bucket has
+fewer than five distinct wet training days. Minute coverage is filled from the
+hourly path where necessary; hourly and daily amounts and probabilities receive
+containment checks, including station-measured rain today. Adjusted fields carry
+their own provenance and discard inherited model quantiles and release IDs.
+Open-Meteo's hourly rain fields are aligned from interval-end timestamps to
+hour starts; its minute rates preserve the reported quarter-hour amounts.
+`--method` bypasses the rain evidence guard and hourly/daily reconciliation for
+controlled experiments; native minute interpolation and coverage fallback still
+apply. See [Rainfall coherence](../methods/precipitation.md#6-coherence).
+
 **`--now` is the reproducibility flag.** It reissues a forecast from an archived
 snapshot, which is how you reproduce something the system served last Tuesday.
 

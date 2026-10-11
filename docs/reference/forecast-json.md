@@ -181,8 +181,12 @@ Typical variables: `temp_max_c`, `temp_min_c`, `pop`, `precip_sum_mm`.
 Daily extremes are their own supervised targets, not aggregates of the hourly
 path — so a daily max need not equal the max of the hourly block, and that is
 intentional ([ADR 0002](../adr/0002-anchored-nowcast-instead-of-temporal-disaggregation.md)).
-The precipitation *sum* is linear and is coherent with the hourly path by
-construction.
+Automatic daily rainfall equals the hourly sum for a complete future local day.
+For partial days it is at least the known hourly accumulation, plus today's
+observed rain and the minute prefix before the first future hour. Its method and
+reason distinguish an exact sum from a lower bound. Daily PoP is at least the
+largest contained hourly PoP; measurable rain already observed today sets its
+occurrence to 100%. See [Rainfall coherence](../methods/precipitation.md#6-coherence).
 
 ---
 
@@ -202,7 +206,13 @@ A flatter shape, because the minutely product serves a fixed variable set.
 | `truth_semantics` | `{variable: "inst"}` | truth target for the attributed selection |
 
 `precip_intensity_mmh` is an **intensity** (mm/hour), not an accumulation — the
-only place the units differ from the hourly block.
+only place the units differ from the hourly block. Divide by 60 for the one-minute
+interval ending at `valid_time`. Latest native paths are interpolated inside
+their support across gaps of at most 15 minutes. Open-Meteo's preceding
+15-minute accumulations instead use constant rates over each reported interval
+to conserve their amounts. Its hourly rain fields are aligned to interval
+starts during archive reading. Outside native coverage, an
+available hourly rate/PoP supplies a named `hourly_rainfall_fallback`.
 
 `methods` here names a minutely path construction (`minutely_interp`,
 `minutely_persistence`, `minutely_anchor_tau_1h`, …) rather than a blender. See

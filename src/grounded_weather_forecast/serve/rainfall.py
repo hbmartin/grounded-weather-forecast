@@ -1,0 +1,299 @@
+"""Causal wet-evidence guards and reconciliation of precipitation products."""
+
+import math
+from collections import defaultdict
+from dataclasses import replace
+from datetime import date, datetime, timedelta
+from itertools import pairwise
+from zoneinfo import ZoneInfo
+
+import polars as pl
+
+from grounded_weather_forecast.leads import daily_bucket, hourly_bucket
+from grounded_weather_forecast.serve.schema import (
+    DailyPoint,
+    HourlyPoint,
+    MinutelyPoint,
+)
+from grounded_weather_forecast.serve.selection import Selection
+from grounded_weather_forecast.timeutil import local_day_start_utc
+
+MIN_WET_DAYS = 5
+MAX_NATIVE_GAP = timedelta(minutes=15)
+RAIN_VARIABLES = frozenset({"pop", "precip_mm", "precip_sum_mm"})
+
+
+def rainfall_selections(
+    train: pl.DataFrame,
+    chosen: list[Selection],
+    buckets: list[str | None],
+    *,
+    daily: bool,
+    timezone: str,
+) -> list[Selection]:
+    """Repeated vintages of one storm cannot qualify a dry-season rain fit."""
+    counts: dict[str | None, set[object]] = defaultdict(set)
+    if "t__pop" in train.columns:
+        wet = train.filter(pl.col("t__pop").is_finite() & (pl.col("t__pop") >= 0.5))
+        columns = (
+            ("lead_days", "forecast_date") if daily else ("lead_hours", "valid_time")
+        )
+        for row in wet.select(columns).iter_rows(named=True):
+            bucket = (
+                daily_bucket(row["lead_days"])
+                if daily
+                else hourly_bucket(row["lead_hours"])
+            )
+            day = (
+                row["forecast_date"]
+                if daily
+                else row["valid_time"].astimezone(ZoneInfo(timezone)).date()
+            )
+            counts[bucket].add(day)
+    return [
+        Selection(
+            "equal_weight",
+            reason=f"rainfall fallback: {len(counts[bucket])} wet local days in {bucket}; need {MIN_WET_DAYS}; uncalibrated provider mean; original selection: {selection.reason}",
+            degraded=True,
+            truth_semantics=selection.truth_semantics,
+        )
+        if len(counts[bucket]) < MIN_WET_DAYS and not selection.pinned
+        else selection
+        for selection, bucket in zip(chosen, buckets, strict=True)
+    ]
+
+
+def native_rainfall(
+    frame: pl.DataFrame,
+) -> dict[datetime, tuple[float | None, float | None]]:
+    """Densify each latest native path inside its support, then average sources."""
+    if frame.is_empty():
+        return {}
+    latest = frame.filter(
+        pl.col("fetched_at") == pl.col("fetched_at").max().over("source")
+    )
+    values: dict[datetime, list[list[float]]] = defaultdict(lambda: [[], []])
+    for source in latest.partition_by("source"):
+        source_name = str(source["source"][0])
+        interval_rate = source_name == "open_meteo" or source_name.startswith(
+            "open_meteo_"
+        )
+        rows = (
+            source.sort("valid_time")
+            .unique("valid_time", keep="last", maintain_order=True)
+            .to_dicts()
+        )
+        for field, name in enumerate(("precip_intensity_mmh", "pop")):
+            usable = [
+                (r["valid_time"], _finite(r[name], probability=field == 1))
+                for r in rows
+            ]
+            usable = [(t, v) for t, v in usable if v is not None]
+            for t, value in usable:
+                # The adapter converted a preceding-15-minute sum to mm/hour.
+                # Constant disaggregation preserves that sum exactly.
+                offsets = range(15) if interval_rate and field == 0 else range(1)
+                for offset in offsets:
+                    values[t - timedelta(minutes=offset)][field].append(value)
+            if interval_rate and field == 0:
+                continue
+            for (left, a), (right, b) in pairwise(usable):
+                gap = right - left
+                if gap > MAX_NATIVE_GAP:
+                    continue
+                t = left + timedelta(minutes=1)
+                while t < right:
+                    fraction = (t - left) / gap
+                    values[t][field].append(a + fraction * (b - a))
+                    t += timedelta(minutes=1)
+    return {
+        t: (
+            sum(fields[0]) / len(fields[0]) if fields[0] else None,
+            sum(fields[1]) / len(fields[1]) if fields[1] else None,
+        )
+        for t, fields in values.items()
+    }
+
+
+def _finite(value: float | None, *, probability: bool = False) -> float | None:
+    if value is None or not math.isfinite(value):
+        return None
+    return min(1.0, max(0.0, value)) if probability else max(0.0, value)
+
+
+def _set_rain(
+    point: HourlyPoint | DailyPoint,
+    variable: str,
+    value: float,
+    method: str,
+    reason: str,
+) -> None:
+    previous = point.selection_reasons.get(variable)
+    point.values[variable] = value
+    point.methods[variable] = method
+    point.selection_reasons[variable] = (
+        f"{reason}; original selection: {previous}" if previous else reason
+    )
+    # The original distribution/release did not produce this reconciled value.
+    point.quantiles.pop(variable, None)
+    point.quantiles_source.pop(variable, None)
+    point.release_ids.pop(variable, None)
+
+
+def fill_minutely_rain(
+    minutely: list[MinutelyPoint], hourly: list[HourlyPoint]
+) -> None:
+    """Use an explicitly attributed hourly fallback outside native support."""
+    if not hourly:
+        return
+    hours = [(datetime.fromisoformat(p.valid_time), p) for p in hourly]
+    for index, original in enumerate(minutely):
+        minute = original
+        valid = datetime.fromisoformat(minute.valid_time)
+        eligible = [(t, p) for t, p in hours if t < valid <= t + timedelta(hours=1)]
+        if not eligible and hours[0][0] - timedelta(hours=1) < valid <= hours[0][0]:
+            eligible = [hours[0]]
+        if not eligible:
+            continue
+        point = eligible[0][1]
+        for field, variable in (("precip_intensity_mmh", "precip_mm"), ("pop", "pop")):
+            if getattr(minute, field) is not None:
+                continue
+            value = _finite(point.values.get(variable), probability=variable == "pop")
+            if value is not None:
+                minute = replace(minute, **{field: value})
+                minute.methods[field] = "hourly_rainfall_fallback"
+                minute.selection_reasons[field] = (
+                    "native minute coverage ended; hourly rain rate/probability"
+                )
+        minutely[index] = minute
+
+
+def reconcile_hourly_rain(
+    hourly: list[HourlyPoint], minutely: list[MinutelyPoint]
+) -> None:
+    """A parent hour contains at least its forecast minute accumulation."""
+    for hour in hourly:
+        start = datetime.fromisoformat(hour.valid_time)
+        minutes = [
+            m
+            for m in minutely
+            if start
+            < datetime.fromisoformat(m.valid_time)
+            <= start + timedelta(hours=1)
+        ]
+        amount = sum(
+            m.precip_intensity_mmh / 60.0
+            for m in minutes
+            if m.precip_intensity_mmh is not None
+        )
+        probability = max((m.pop for m in minutes if m.pop is not None), default=0.0)
+        for variable, floor in (("precip_mm", amount), ("pop", probability)):
+            old = _finite(hour.values.get(variable), probability=variable == "pop")
+            if floor > 0.0 and (old is None or floor > old + 1e-12):
+                _set_rain(
+                    hour,
+                    variable,
+                    floor,
+                    "minutely_rainfall_floor",
+                    "parent hour reconciled to contained minute forecasts; probability uses max, without independence assumptions",
+                )
+
+
+def _complete_day(hours: list[HourlyPoint], start: datetime, end: datetime) -> bool:
+    expected = {
+        start + timedelta(hours=i)
+        for i in range(int((end - start).total_seconds() / 3600))
+    }
+    return {datetime.fromisoformat(h.valid_time) for h in hours} == expected and all(
+        _finite(h.values.get("precip_mm")) is not None for h in hours
+    )
+
+
+def _today_prefix(
+    minutely: list[MinutelyPoint],
+    hours: list[HourlyPoint],
+    issue_time: datetime,
+    end: datetime,
+) -> float:
+    first_hour = min((datetime.fromisoformat(h.valid_time) for h in hours), default=end)
+    return sum(
+        m.precip_intensity_mmh / 60.0
+        for m in minutely
+        if m.precip_intensity_mmh is not None
+        and issue_time < datetime.fromisoformat(m.valid_time) <= min(first_hour, end)
+    )
+
+
+def _daily_probability(
+    point: DailyPoint, hours: list[HourlyPoint], *, observed: bool
+) -> None:
+    probability = (
+        1.0
+        if observed
+        else max(
+            (_finite(h.values.get("pop"), probability=True) or 0.0 for h in hours),
+            default=0.0,
+        )
+    )
+    old_pop = _finite(point.values.get("pop"), probability=True)
+    if probability > (old_pop or 0.0) + 1e-12:
+        _set_rain(
+            point,
+            "pop",
+            probability,
+            "observed_daily_occurrence"
+            if observed
+            else "hourly_rainfall_probability_floor",
+            "measurable rain already observed in this local calendar day"
+            if observed
+            else "daily probability at least the largest contained hourly probability; hours are not assumed independent",
+        )
+
+
+def reconcile_daily_rain(
+    daily: list[DailyPoint],
+    hourly: list[HourlyPoint],
+    minutely: list[MinutelyPoint],
+    *,
+    issue_time: datetime,
+    timezone: str,
+    observed_today_mm: float | None,
+    threshold_mm: float,
+) -> None:
+    """Exact sums for complete local days; explicit lower bounds otherwise."""
+    zone = ZoneInfo(timezone)
+    today = issue_time.astimezone(zone).date()
+    for point in daily:
+        day = date.fromisoformat(point.date_local)
+        start, end = (
+            local_day_start_utc(day, timezone),
+            local_day_start_utc(day + timedelta(days=1), timezone),
+        )
+        hours = [
+            h for h in hourly if start <= datetime.fromisoformat(h.valid_time) < end
+        ]
+        amounts = [_finite(h.values.get("precip_mm")) for h in hours]
+        complete = _complete_day(hours, start, end)
+        total = sum(v for v in amounts if v is not None)
+        if day == today:
+            total += observed_today_mm or 0.0
+            total += _today_prefix(minutely, hours, issue_time, end)
+        old = _finite(point.values.get("precip_sum_mm"))
+        if complete or total > (old or 0.0) + 1e-12:
+            _set_rain(
+                point,
+                "precip_sum_mm",
+                total,
+                "hourly_rainfall_sum" if complete else "rainfall_accumulation_floor",
+                "sum of complete local-day hourly path"
+                if complete
+                else "at least observed rain today plus remaining hourly/minute rain; partial coverage is a lower bound",
+            )
+        _daily_probability(
+            point,
+            hours,
+            observed=day == today
+            and observed_today_mm is not None
+            and observed_today_mm >= threshold_mm,
+        )

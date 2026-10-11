@@ -60,6 +60,7 @@ from grounded_weather_forecast.dataset.matrix import (
     to_supervised_slice,
 )
 from grounded_weather_forecast.dataset.providers import read_forecast_archive
+from grounded_weather_forecast.dataset.truth import observed_rainfall
 from grounded_weather_forecast.evaluation import dataset_fingerprint
 from grounded_weather_forecast.leads import (
     MINUTELY_BUCKETS,
@@ -71,6 +72,14 @@ from grounded_weather_forecast.serve.dataset_snapshot import LiveDatasetSnapshot
 from grounded_weather_forecast.serve.dressing import ResidualDresser, dress_variable
 from grounded_weather_forecast.serve.history import load_archived_forecast
 from grounded_weather_forecast.serve.observability import snapshot_observability
+from grounded_weather_forecast.serve.rainfall import (
+    RAIN_VARIABLES,
+    fill_minutely_rain,
+    native_rainfall,
+    rainfall_selections,
+    reconcile_daily_rain,
+    reconcile_hourly_rain,
+)
 from grounded_weather_forecast.serve.recalibration import (
     QuantileRecalibrator,
     recalibrate_variable,
@@ -181,13 +190,19 @@ def build_snapshot(config: Config, issue_time: datetime) -> Snapshot:
             pl.col("fetched_at")
             > issue_time - timedelta(hours=config.forecasts.max_forecast_age_hours)
         )
-        & (pl.col("valid_time") > issue_time)
+    )
+    # A source's older vintage cannot fill holes after its latest native path ends.
+    minutely = minutely.filter(
+        pl.col("fetched_at") == pl.col("fetched_at").max().over("source")
+    ).filter(
+        (pl.col("valid_time") > issue_time - timedelta(minutes=15))
         & (
             pl.col("valid_time")
-            <= issue_time + timedelta(minutes=MINUTELY_HORIZON_MINUTES)
+            <= issue_time + timedelta(minutes=MINUTELY_HORIZON_MINUTES + 15)
         )
     )
     observation, observation_at = _latest_observation(causal_minute, issue_time)
+    observation.update(observed_rainfall(causal_minute, issue_time, config))
     if hourly.is_empty() and daily.is_empty():
         msg = (
             f"no provider forecast within {config.forecasts.max_forecast_age_hours}h "
@@ -446,6 +461,14 @@ def _blend_variable(
         )
         for selection in chosen
     ]
+    if variable.name in RAIN_VARIABLES and force_method is None:
+        chosen = rainfall_selections(
+            train,
+            chosen,
+            _lead_buckets(predict_frame, daily=daily),
+            daily=daily,
+            timezone=config.station.timezone,
+        )
     fitted = _fit_methods(
         train,
         predict_frame,
@@ -504,6 +527,14 @@ def _blend_variable(
                 quantiles,
                 quantile_sources,
             )
+    for index, selection in enumerate(chosen):
+        if variable.name in RAIN_VARIABLES and selection.degraded:
+            quantiles[index] = {}
+    if quantile_sources is not None:
+        quantile_sources = tuple(
+            None if variable.name in RAIN_VARIABLES and selection.degraded else source
+            for selection, source in zip(chosen, quantile_sources, strict=True)
+        )
     return VariableBlend(
         point=point,
         methods=[selection.method_id for selection in chosen],
@@ -901,24 +932,11 @@ def _anchor_weight(minutes_ahead: int, tau_hours: float) -> float:
     return 0.0 if weight < 0.05 else weight
 
 
-def _minutely_precip(snapshot: Snapshot) -> dict[datetime, tuple[float, float]]:
+def _minutely_precip(
+    snapshot: Snapshot,
+) -> dict[datetime, tuple[float | None, float | None]]:
     """Availability-weighted mean of providers' native minutely precipitation."""
-    if snapshot.minutely.is_empty():
-        return {}
-    latest = (
-        snapshot.minutely.sort("fetched_at")
-        .group_by("source", "valid_time")
-        .last()
-        .group_by("valid_time")
-        .agg(
-            pl.col("precip_intensity_mmh").mean().alias("intensity"),
-            pl.col("pop").mean().alias("pop"),
-        )
-    )
-    return {
-        row["valid_time"]: (row["intensity"], row["pop"])
-        for row in latest.iter_rows(named=True)
-    }
+    return native_rainfall(snapshot.minutely)
 
 
 def _now_forecast(leads: np.ndarray, path: np.ndarray) -> float:
@@ -1408,19 +1426,6 @@ def predict(
         if not snapshot.daily.is_empty()
         else []
     )
-    release_ids = _served_release_ids(hourly, daily)
-    degraded = not release_ids and force_method is None
-    status_reason = (
-        no_evidence_reason(
-            config,
-            config.dataset.dir / "scores",
-            dataset_id=dataset_snapshot.fingerprint
-            if dataset_snapshot is not None
-            else None,
-        )
-        if degraded
-        else None
-    )
     minutely = minutely_product(
         snapshot,
         hourly_blend,
@@ -1431,6 +1436,30 @@ def predict(
             hourly_train,
             dataset_snapshot.truth_minute if dataset_snapshot is not None else None,
         ),
+    )
+    fill_minutely_rain(minutely, hourly)
+    if force_method is None:
+        reconcile_hourly_rain(hourly, minutely)
+        reconcile_daily_rain(
+            daily,
+            hourly,
+            minutely,
+            issue_time=issue_time,
+            timezone=config.station.timezone,
+            observed_today_mm=snapshot.observation.get("rain_observed_today_mm"),
+            threshold_mm=config.dataset.pop_threshold_mm,
+        )
+    degraded = not _served_release_ids(hourly, daily) and force_method is None
+    status_reason = (
+        no_evidence_reason(
+            config,
+            config.dataset.dir / "scores",
+            dataset_id=dataset_snapshot.fingerprint
+            if dataset_snapshot is not None
+            else None,
+        )
+        if degraded
+        else None
     )
     release_ids = _served_release_ids(hourly, daily, minutely)
     return Forecast(

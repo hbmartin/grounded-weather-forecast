@@ -182,7 +182,7 @@ def _read_hourly_long(
         )
         .rename(dict(HOURLY_COLUMN_MAP))
     )
-    return dedupe_long(
+    canonical = dedupe_long(
         decorated,
         "valid_time",
         (
@@ -194,6 +194,46 @@ def _read_hourly_long(
             "lead_hours",
             *HOURLY_COLUMN_MAP.values(),
         ),
+    )
+    return _align_hourly_rain(canonical)
+
+
+def _align_hourly_rain(frame: pl.DataFrame) -> pl.DataFrame:
+    """Open-Meteo rain labels end the interval; canonical hours start it.
+
+    Move only rain amount and PoP. Instantaneous state variables retain their
+    timestamps, and a missing adjacent state hour must not erase known rain.
+    """
+    open_meteo = pl.col("source").str.starts_with("open_meteo_") | (
+        pl.col("source") == "open_meteo"
+    )
+    native = frame.filter(open_meteo)
+    if native.is_empty():
+        return frame
+    rain_fields = ("precip_mm", "pop")
+    keys = ("run_id", "source", "source_kind", "fetched_at", "valid_time")
+    rain = (
+        native.filter(
+            pl.any_horizontal(pl.col(name).is_not_null() for name in rain_fields)
+        )
+        .select(
+            *keys,
+            *rain_fields,
+        )
+        .with_columns(pl.col("valid_time") - pl.duration(hours=1))
+    )
+    aligned = (
+        native.drop(*rain_fields)
+        .join(rain, on=list(keys), how="full", coalesce=True)
+        .with_columns(
+            (
+                (pl.col("valid_time") - pl.col("fetched_at")).dt.total_seconds()
+                / _SECONDS_PER_HOUR
+            ).alias("lead_hours")
+        )
+    )
+    return pl.concat([frame.filter(~open_meteo), aligned.select(frame.columns)]).sort(
+        "source", "fetched_at", "valid_time"
     )
 
 
