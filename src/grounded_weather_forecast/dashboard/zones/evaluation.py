@@ -1,8 +1,5 @@
 """Zone D: evaluation — the leaderboard made operational."""
 
-import json
-
-import numpy as np
 import polars as pl
 
 from grounded_weather_forecast.dashboard.charts import (
@@ -16,15 +13,12 @@ from grounded_weather_forecast.dashboard.context import DashboardContext
 from grounded_weather_forecast.dashboard.copy import PANEL_COPY, ZONE_INTROS
 from grounded_weather_forecast.dashboard.derive import Derived
 from grounded_weather_forecast.dashboard.model import Panel, Stat, TableSpec, Zone
+from grounded_weather_forecast.dashboard.score_summary import ScoreSummary
 from grounded_weather_forecast.dashboard.zones.common import empty_panel, fmt
 from grounded_weather_forecast.leads import (
     DAILY_BUCKET_LABELS,
     HOURLY_BUCKET_LABELS,
     MINUTELY_BUCKET_LABELS,
-)
-from grounded_weather_forecast.metrics.probabilistic import (
-    pit_from_quantiles,
-    reliability_bins,
 )
 from grounded_weather_forecast.reports.leaderboard import (
     CONSUMER_TOLERANCES,
@@ -208,47 +202,13 @@ def _correlation_panel(derived: Derived) -> Panel:
     )
 
 
-def _pit_values(scores: pl.DataFrame) -> np.ndarray:
-    needed = {"quantiles_json", "quantile_levels_json", "y_true"}
-    if not needed <= set(scores.columns):
-        return np.empty(0)
-    usable = scores.filter(
-        pl.col("quantiles_json").is_not_null() & pl.col("y_true").is_not_null()
-    )
-    if usable.is_empty():
-        return np.empty(0)
-    groups: dict[str, list[tuple[list[float], float]]] = {}
-    for row in usable.iter_rows(named=True):
-        try:
-            quantiles = json.loads(row["quantiles_json"])
-        except (TypeError, ValueError):
-            continue
-        if not isinstance(quantiles, list) or any(q is None for q in quantiles):
-            continue
-        key = str(row["quantile_levels_json"])
-        groups.setdefault(key, []).append((quantiles, float(row["y_true"])))
-    if not groups:
-        return np.empty(0)
-    key, entries = max(groups.items(), key=lambda item: len(item[1]))
-    try:
-        levels = tuple(float(level) for level in json.loads(key))
-    except (TypeError, ValueError):
-        return np.empty(0)
-    quantile_matrix = np.asarray([entry[0] for entry in entries], dtype=np.float64)
-    truths = np.asarray([entry[1] for entry in entries], dtype=np.float64)
-    if quantile_matrix.shape[1] != len(levels):
-        return np.empty(0)
-    return pit_from_quantiles(truths, quantile_matrix, levels)
-
-
-def _calibration_panel(stem: str, scores: pl.DataFrame, board: pl.DataFrame) -> Panel:
+def _calibration_panel(stem: str, summary: ScoreSummary, board: pl.DataFrame) -> Panel:
     probabilistic = (
         board.filter(pl.col("crps").is_not_null())
         if ("crps" in board.columns)
         else pl.DataFrame()
     )
-    pit = _pit_values(scores)
-    if probabilistic.is_empty() and pit.size == 0:
+    if probabilistic.is_empty() and summary.pit_rows == 0:
         return empty_panel(
             "d5",
             "d5",
@@ -273,16 +233,15 @@ def _calibration_panel(stem: str, scores: pl.DataFrame, board: pl.DataFrame) -> 
             if value is not None:
                 stats.append(Stat(label, fmt(float(str(value)), 3)))
     chart = None
-    if pit.size:
-        counts, _edges = np.histogram(pit, bins=10, range=(0.0, 1.0))
+    if summary.pit_rows:
         labels = [f"{i / 10:.1f}–{(i + 1) / 10:.1f}" for i in range(10)]
         chart = histogram(
             labels,
-            [int(count) for count in counts],
+            list(summary.pit_counts),
             y_label="rows",
             label="PIT",
         )
-        stats.append(Stat("PIT rows", str(pit.size)))
+        stats.append(Stat("PIT rows", str(summary.pit_rows)))
     return Panel(
         panel_id=f"d5-{stem}",
         title=f"Calibration — {stem.removeprefix('scores_')}",
@@ -298,26 +257,11 @@ def _calibration_panel(stem: str, scores: pl.DataFrame, board: pl.DataFrame) -> 
     )
 
 
-def _reliability_panel(stem: str, scores: pl.DataFrame) -> Panel | None:
-    pop = scores.filter(
-        (pl.col("variable") == "pop")
-        & pl.col("y_pred").is_not_null()
-        & pl.col("y_true").is_not_null()
-    )
-    if pop.height < 20:
+def _reliability_panel(stem: str, summary: ScoreSummary) -> Panel | None:
+    if not summary.reliability:
         return None
-    forecast = pop["y_pred"].to_numpy().astype(np.float64)
-    occurred = pop["y_true"].to_numpy().astype(np.float64)
-    bins = reliability_bins(forecast, occurred).filter(pl.col("count") > 0)
-    points: list[tuple[float, float]] = []
-    counts: list[int] = []
-    for row in bins.iter_rows(named=True):
-        if row["forecast_mean"] is None or row["observed_freq"] is None:
-            continue
-        points.append((float(row["forecast_mean"]), float(row["observed_freq"])))
-        counts.append(int(row["count"]))
-    if not points:
-        return None
+    points = [(forecast, frequency) for forecast, frequency, _ in summary.reliability]
+    counts = [count for _, _, count in summary.reliability]
     return Panel(
         panel_id=f"d5r-{stem}",
         title=f"PoP reliability — {stem.removeprefix('scores_')}",
@@ -342,7 +286,7 @@ def build(ctx: DashboardContext, derived: Derived) -> Zone:
             )
         )
     for stem, board in derived.boards.items():
-        scores = ctx.score_frames[stem]
+        summary = ctx.score_summaries[stem]
         panels.append(_board_panel(stem, board))
         winners = derived.winners.get(stem)
         if winners is not None:
@@ -356,8 +300,8 @@ def build(ctx: DashboardContext, derived: Derived) -> Zone:
             )
         if (baseline := _baseline_panel(stem, board)) is not None:
             panels.append(baseline)
-        panels.append(_calibration_panel(stem, scores, board))
-        if (reliability := _reliability_panel(stem, scores)) is not None:
+        panels.append(_calibration_panel(stem, summary, board))
+        if (reliability := _reliability_panel(stem, summary)) is not None:
             panels.append(reliability)
     panels.append(_correlation_panel(derived))
     return Zone(

@@ -1,5 +1,10 @@
 # Selection memory benchmark (2026-10-07)
 
+These are **historical** measurements of `9511279`, using default thread
+settings. They do not describe the final score-reader implementation. See the
+[2026-10-10 comparison against reviewed head `6a4933f`](score-readers-2026-10-10.md)
+for final source results with `POLARS_MAX_THREADS=2` and dashboard/report workloads.
+
 Complete `select_methods` runs use less peak process memory on both fixtures
 after the score-scanning and evidence fixes. Median peak RSS fell **10.7%** on
 many compatible evaluations and **12.0%** on mostly incompatible evaluations.

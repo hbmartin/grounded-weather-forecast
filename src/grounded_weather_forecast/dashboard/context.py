@@ -5,7 +5,7 @@ drives the corresponding panel's loud "not yet" state instead of an error.
 """
 
 import json
-from collections.abc import Iterator, Mapping
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
@@ -15,8 +15,13 @@ import polars as pl
 from grounded_weather_forecast.backtest.scores import load_scores
 from grounded_weather_forecast.config import Config
 from grounded_weather_forecast.contracts import MixedProvenanceError
+from grounded_weather_forecast.dashboard.score_summary import (
+    ScoreSummary,
+    summarize_scores,
+)
 from grounded_weather_forecast.dataset.matrix import DatasetPaths, matrix_path
 from grounded_weather_forecast.dataset.providers import read_latest_archive_location
+from grounded_weather_forecast.reports.eprocess import EProcessStore
 from grounded_weather_forecast.runs import RUNS_SCHEMA, read_runs, runs_path
 from grounded_weather_forecast.serve.history import load_history
 from grounded_weather_forecast.serve.observability import (
@@ -30,7 +35,7 @@ from grounded_weather_forecast.serve.schema import Forecast
 
 @dataclass(frozen=True, slots=True)
 class DashboardContext:
-    """Everything zone builders read, including scores loaded on access here."""
+    """Everything zone builders read, with score summaries computed during collection."""
 
     config: Config
     now: datetime
@@ -42,7 +47,7 @@ class DashboardContext:
     hourly_matrix: pl.DataFrame | None = None
     daily_matrix: pl.DataFrame | None = None
     synthetic_hourly: pl.DataFrame | None = None
-    score_frames: Mapping[str, pl.DataFrame] = field(default_factory=dict)
+    score_summaries: Mapping[str, ScoreSummary] = field(default_factory=dict)
     unreadable_scores: tuple[str, ...] = ()
     # Artifacts that exist but could not be read. A missing file is a young
     # archive; a corrupt or permission-denied one is a fault, and collapsing
@@ -95,47 +100,23 @@ def _try_json(
     return loaded
 
 
-class ScoreFrames(Mapping[str, pl.DataFrame]):
-    """Load archive scores on access instead of retaining every evaluation.
-
-    Each file fits independently; their combined history can exceed RAM.
-    Every evaluation remains available to every dashboard panel.
-    """
-
-    def __init__(self, paths: dict[str, Path]) -> None:
-        self.paths = paths
-
-    def __getitem__(self, key: str) -> pl.DataFrame:
-        return load_scores(self.paths[key])
-
-    def __iter__(self) -> Iterator[str]:
-        return iter(self.paths)
-
-    def __len__(self) -> int:
-        return len(self.paths)
-
-
-def _score_frames(
+def _score_summaries(
     config: Config, failures: list[str]
-) -> tuple[Mapping[str, pl.DataFrame], tuple[str, ...]]:
-    """Readable score frames, plus the stems that exist but cannot be read.
-
-    A file that is present but corrupt is *not* the same as a young archive
-    with no file at all; the second return value keeps them distinguishable
-    so zones can say "unreadable" instead of "not enough data yet".
-    """
-    paths: dict[str, Path] = {}
+) -> tuple[Mapping[str, ScoreSummary], tuple[str, ...]]:
+    """Decode each evaluation once and retain only small dashboard summaries."""
+    summaries: dict[str, ScoreSummary] = {}
     unreadable: list[str] = []
-    scores_dir = config.dataset.dir / "scores"
-    for path in sorted(scores_dir.glob("scores_*.parquet")):
+    stores: dict[str, EProcessStore] = {}
+    for path in sorted((config.dataset.dir / "scores").glob("scores_*.parquet")):
         try:
-            frame = load_scores(path)
-            paths[path.stem] = path
-            del frame
+            frame = load_scores(path, compact=True)
         except (OSError, MixedProvenanceError, pl.exceptions.PolarsError):
             unreadable.append(path.stem)
             failures.append(f"dataset/scores/{path.name}")
-    return ScoreFrames(paths), tuple(unreadable)
+            continue
+        summaries[path.stem] = summarize_scores(config, path.stem, frame, stores)
+        del frame
+    return summaries, tuple(unreadable)
 
 
 def _latest_forecast(config: Config, failures: list[str]) -> Forecast | None:
@@ -291,7 +272,7 @@ def _evidence_history(config: Config, failures: list[str]) -> dict[str, pl.DataF
 def collect_context(config: Config, *, now: datetime | None = None) -> DashboardContext:
     paths = DatasetPaths.in_dir(config.dataset.dir)
     unreadable: list[str] = []
-    score_frames, unreadable_scores = _score_frames(config, unreadable)
+    score_summaries, unreadable_scores = _score_summaries(config, unreadable)
     hourly_live = matrix_path(config.dataset.dir, "hourly", "live")
     daily_live = matrix_path(config.dataset.dir, "daily", "live")
     hourly_synthetic = matrix_path(config.dataset.dir, "hourly", "synthetic")
@@ -328,7 +309,7 @@ def collect_context(config: Config, *, now: datetime | None = None) -> Dashboard
             unreadable,
             label=f"dataset/{hourly_synthetic.name}",
         ),
-        score_frames=score_frames,
+        score_summaries=score_summaries,
         unreadable_scores=unreadable_scores,
         history=_history(config, unreadable),
         latest_forecast=_latest_forecast(config, unreadable),

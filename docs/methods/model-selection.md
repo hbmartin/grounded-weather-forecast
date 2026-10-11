@@ -350,6 +350,10 @@ served different recent cases. If none qualifies, keep the current method and
 statistics and persist `live gate failed` / `replacement blocked` in its
 reason. No unscored fallback is synthesized. Config pins remain exempt.
 
+`apply_live_gate(fallbacks=...)` remains a compatibility adapter: its candidates
+must pass the same scored quality guard as `replacement_candidates`. Supplying
+an unscored fallback does not make it eligible.
+
 Schema-6 minutely points carry the release and reason of the path construction
 actually used. History and verification retain that provenance, enabling
 prospective minutely live gating. Substituted/native paths and older minutely
@@ -373,13 +377,27 @@ Each evaluation must have one source/feature set, window, creation time, and
 identity, plus one semantics value per variable. Conflicting evaluations are
 logged and excluded as a whole, including fragments across files. Selection
 then considers the older complete evaluations. Contexts, evaluation IDs, and
-training cutoff travel together in one typed release-evidence summary.
+training cutoff travel together in one typed release-evidence summary. Null
+semantics normalize to `inst` in both scan phases. Context conflicts are
+validated before requested-semantics filtering; fragment counts and decoded
+rows use the same normalized eligibility rule.
 
 Selection first scans compact metadata and method-presence summaries, then
 materializes only the newest complete evaluation for each slice. Compatibility
 filters run in lazy Parquet scans; source provenance is checked before those
-filters. File disappearance/change retries the entire read once and excludes
-known incomplete evaluations. Degraded diagnosis reads only identity columns.
+filters. `SCORE_BATCH_ROWS = 65_536` bounds each materialization batch.
+`MAX_SCORE_SCAN_ATTEMPTS = 3` bounds complete catalog/materialization attempts.
+File disappearance/change restarts from a fresh listing and excludes every
+known affected evaluation across all slices, carrying those exclusions into
+later attempts. Unknown catalog disappearances also restart; evaluation
+identity is read from columns rather than inferred from filenames. Exhausting
+the budget returns no evidence. Degraded diagnosis reads only identity columns.
+
+The scan returns selected slices, validated evaluation contexts, and each
+slice's maximum valid time. Release evidence reuses those contexts and cutoffs
+only for selections with evaluation attribution, projecting semantics to their
+selected variables in deterministic order. It does not scan retained score
+frames again to reconstruct contexts.
 
 Leaderboard and loss builders project required columns before partitions,
 filters, and joins, and reference frames are cached per slice. Polars generally
@@ -387,7 +405,7 @@ shares long string payload buffers through these operations while allocating
 column views and numeric buffers; memory savings therefore depend on rows,
 columns, and retained buffers, not simply JSON string length. See the Polars
 StringView reference in [Bibliography](bibliography.md#3-operational-analogues)
-and the [selection benchmark](../research/selection-memory-2026-10-07.md).
+and the [final score-reader benchmark](../research/score-readers-2026-10-10.md).
 
 Deploying these source changes changes the code fingerprint and requires fresh
 compatible `backtest --source live` / `report` evidence. Existing artifacts

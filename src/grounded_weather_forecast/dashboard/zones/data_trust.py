@@ -229,11 +229,9 @@ def _provenance(ctx: DashboardContext) -> Panel:
         if frame is None or frame.is_empty() or "source_kind" not in frame.columns:
             continue
         kinds[name] = {str(value) for value in frame["source_kind"].unique()}
-    for stem, frame in ctx.score_frames.items():
-        if not frame.is_empty() and "source_kind" in frame.columns:
-            kinds[f"scores {stem}"] = {
-                str(value) for value in frame["source_kind"].unique()
-            }
+    for stem, summary in ctx.score_summaries.items():
+        if summary.source_kinds:
+            kinds[f"scores {stem}"] = set(summary.source_kinds)
     if not kinds:
         return empty_panel(
             "b4",

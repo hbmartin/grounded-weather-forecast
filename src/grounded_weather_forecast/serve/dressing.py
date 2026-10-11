@@ -9,7 +9,7 @@ being hidden by a symmetric band. A finite-sample split-conformal rank rule
 keeps thin cells honest; a bucket below the floor borrows the
 variable-global pool, and when even that is thin the row stays undressed.
 
-Provenance guards mirror ``serve.selection._compatible_scores``: only live
+Provenance guards mirror ``serve.score_scan.compatible_slices``: only live
 rows whose dataset/config fingerprints and code identity match the running
 process may contribute, and only the newest evaluation is pooled — the
 expanding backtest re-scores overlapping folds, so pooling across

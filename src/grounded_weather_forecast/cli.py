@@ -1148,7 +1148,7 @@ def _cmd_report(config: Config) -> int:
     eprocess_stores: dict[str, EProcessStore] = {}
     for path in score_files:
         try:
-            scores = load_scores(path)
+            scores = load_scores(path, compact=True)
         except FileNotFoundError:
             # The pipeline lock keeps prune out of a running report; this
             # guard covers deletion by anything outside that lock's scope.

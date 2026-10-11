@@ -15,7 +15,7 @@ CONTEXT_COLUMNS = (
     "code_version",
     "config_fingerprint",
 )
-_IDENTITY_COLUMNS = ("dataset_fingerprint", "evaluation_created_at")
+_CONTEXT_IDENTITY_COLUMNS = ("dataset_fingerprint", "evaluation_created_at")
 _LOGGER = logging.getLogger(__name__)
 
 
@@ -52,7 +52,9 @@ class ContextAccumulator:
         self.invalid.add(evaluation_id)
 
     def add(self, frame: pl.DataFrame) -> None:
-        identity_columns = [name for name in _IDENTITY_COLUMNS if name in frame.columns]
+        identity_columns = [
+            name for name in _CONTEXT_IDENTITY_COLUMNS if name in frame.columns
+        ]
         compact = frame.select(
             "evaluation_id",
             *CONTEXT_COLUMNS,
@@ -108,24 +110,33 @@ class EvidenceSummary:
     training_cutoff: datetime | None
 
     @classmethod
-    def from_slices(
+    def from_contexts(
         cls,
-        slices: Mapping[tuple[str, str, str], pl.DataFrame],
+        contexts: Mapping[str, EvaluationContext],
+        cutoffs: Mapping[tuple[str, str, str], datetime | None],
         evaluations: Mapping[tuple[str, str, str], str | None],
     ) -> "EvidenceSummary":
-        frames = [
-            slices[key]
+        attributed = {
+            key: evaluation_id
             for key, evaluation_id in sorted(evaluations.items())
             if evaluation_id is not None
-        ]
-        cutoffs = [frame["valid_time"].max() for frame in frames]
+        }
+        projected: dict[str, EvaluationContext] = {}
+        for key, evaluation_id in attributed.items():
+            context = contexts[evaluation_id]
+            selected = projected.setdefault(
+                evaluation_id, EvaluationContext(context.metadata, context.identity)
+            )
+            selected.semantics[key[1]] = context.semantics[key[1]]
         return cls(
-            evaluation_ids=tuple(
-                sorted({value for value in evaluations.values() if value is not None})
-            ),
-            contexts=evaluation_contexts(frames),
+            evaluation_ids=tuple(sorted(projected)),
+            contexts=tuple(projected[key].payload(key) for key in sorted(projected)),
             training_cutoff=max(
-                (value for value in cutoffs if isinstance(value, datetime)),
+                (
+                    value
+                    for key in attributed
+                    if isinstance(value := cutoffs[key], datetime)
+                ),
                 default=None,
             ),
         )

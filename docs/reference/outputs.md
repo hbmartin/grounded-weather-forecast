@@ -55,11 +55,20 @@ requires deleting a guard rather than forgetting one. Attempting to pool raises
 
 ### `data/scores/`
 
-Score readers stream Parquet data and encode repeated provenance text as
-categories in memory. Numeric scores, quantiles, and the on-disk schema stay
-unchanged. Serving partitions selected evidence in batches of 65,536 rows;
-the dashboard loads archived evaluations on access rather than retaining the
-entire archive in RAM.
+`backtest.scores.load_scores(path)` preserves the stored types, including
+String columns, so callers can concatenate scores vertically or join to
+String keys. `load_scores(path, compact=True)` encodes repeated text as
+categories in memory. Report, dashboard, and selection readers use compact
+decoding; numeric scores, per-case quantiles, and the on-disk schema stay
+unchanged. Both modes reject mixed provenance unless `allow_mixed=True`.
+
+Readers use `parallel="none", low_memory=True` and streaming collection.
+Serving partitions selected evidence in batches of `SCORE_BATCH_ROWS = 65_536`
+rows. The dashboard collects each archived file once, sequentially, retaining
+leaderboards, winners, calibration bins, provenance, and fold metadata, then
+releases its full frame before loading the next file. Rendering uses these
+summaries without reopening score files. A complete `report` has a separate
+score-processing pass, for two full decodes per file overall.
 
 ```
 scores_{product}_{kind}_{window}_{evaluation_id}.parquet

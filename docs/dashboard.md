@@ -23,6 +23,23 @@ Every panel carries its own explanatory prose (what it shows, why an
 operator cares, and where its thresholds come from) in a collapsible
 *about this panel* block, so the reference below stays brief.
 
+## Score collection
+
+*Implemented in: `dashboard/context.py`, `dashboard/score_summary.py`*
+
+Each score file is decoded once in a sequential collection pass using compact
+column types. The collector derives its leaderboard, winners, ten-bin PIT
+histogram, PoP reliability bins, provenance, and fold metadata, then releases
+the full frame before opening the next file. Zone builders consume the retained
+summaries without score-file I/O. A standalone dashboard therefore needs one
+full decode per file; `report` needs two including its separate processing pass.
+
+Files deleted before collection are absent. Decode failures during collection
+appear in unreadable-artifact reporting. When statistical derivation fails,
+readable provenance and fold metadata remain available while the leaderboard
+is marked unusable. Deleting files after summarization does not interrupt
+rendering.
+
 ## Zone reference
 
 **A — Liveness & freshness.** The latest served document's status

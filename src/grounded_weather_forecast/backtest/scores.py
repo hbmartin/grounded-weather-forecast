@@ -127,7 +127,7 @@ def write_scores(scores: pl.DataFrame, path: Path) -> None:
     atomic_write_parquet(scores, path)
 
 
-def scan_score_file(path: Path) -> pl.LazyFrame:
+def scan_score_file(path: Path, *, compact: bool = True) -> pl.LazyFrame:
     """Decode repeated provenance as categories before retaining score rows.
 
     Feature descriptions can be kilobytes long and repeat tens of millions of
@@ -136,6 +136,8 @@ def scan_score_file(path: Path) -> pl.LazyFrame:
     Numeric scores and per-case quantiles retain their original types.
     """
     scan = pl.scan_parquet(path, parallel="none", low_memory=True)
+    if not compact:
+        return scan
     categorical = [
         name
         for name, dtype in scan.collect_schema().items()
@@ -144,8 +146,11 @@ def scan_score_file(path: Path) -> pl.LazyFrame:
     return scan.with_columns(pl.col(categorical).cast(pl.Categorical))
 
 
-def load_scores(path: Path, *, allow_mixed: bool = False) -> pl.DataFrame:
-    scores = scan_score_file(path).collect(engine="streaming")
+def load_scores(
+    path: Path, *, allow_mixed: bool = False, compact: bool = False
+) -> pl.DataFrame:
+    """Read score values with their stored types, or opt into compact categories."""
+    scores = scan_score_file(path, compact=compact).collect(engine="streaming")
     kinds = scores["source_kind"].unique().to_list()
     if len(kinds) > 1 and not allow_mixed:
         msg = f"scores at {path} mix source kinds {sorted(map(str, kinds))}"

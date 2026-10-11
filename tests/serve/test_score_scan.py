@@ -4,10 +4,18 @@ import polars as pl
 import pytest
 from conftest import utc
 
-from grounded_weather_forecast.backtest.scores import SCORES_SCHEMA, write_scores
+from grounded_weather_forecast.backtest.scores import (
+    SCORES_SCHEMA,
+    load_scores,
+    write_scores,
+)
 from grounded_weather_forecast.config import PromotionConfig
 from grounded_weather_forecast.contracts import MixedProvenanceError, TruthSemantics
 from grounded_weather_forecast.serve import score_scan
+from grounded_weather_forecast.serve.evidence import (
+    EvidenceSummary,
+    evaluation_contexts,
+)
 
 IDENTITY = score_scan.ScoreIdentity("dataset", "config", "code")
 KEY = ("hourly", "temp_c", "1-3h")
@@ -56,7 +64,7 @@ def scores(
 
 
 def select(directory, identity=IDENTITY):
-    return score_scan.compatible_slices(directory, identity, PromotionConfig())
+    return score_scan.compatible_slices(directory, identity, PromotionConfig()).slices
 
 
 def test_evaluation_split_across_files_is_atomic(tmp_path):
@@ -85,7 +93,7 @@ def test_multiple_evaluations_per_file_and_equal_time_order(tmp_path):
 
 
 @pytest.mark.parametrize(
-    "column,value",
+    ("column", "value"),
     [
         ("semantics", "mean"),
         ("source_set_json", '["other"]'),
@@ -177,7 +185,7 @@ def test_vanished_selected_fragment_cannot_mint_partial_evaluation(
 
 
 @pytest.mark.parametrize(
-    "column,value",
+    ("column", "value"),
     [("feature_set_json", '["changed"]'), ("method_id", "challenger")],
 )
 def test_replaced_fragment_retries_without_mixing_evidence(
@@ -254,3 +262,152 @@ def test_large_repeated_context_is_compact_without_changing_score_values(tmp_pat
     assert actual.select("issue_time", "y_pred", "y_true").equals(
         frame.select("issue_time", "y_pred", "y_true")
     )
+
+
+@pytest.mark.parametrize("compact", [False, True])
+def test_loader_types_values_and_provenance(tmp_path, compact):
+    frame = scores()
+    path = tmp_path / "scores_eval.parquet"
+    write_scores(frame, path)
+    assert load_scores(path).schema == SCORES_SCHEMA
+    loaded = load_scores(path, compact=compact)
+    assert loaded.cast(SCORES_SCHEMA).equals(frame)
+    if not compact:
+        assert loaded.schema == SCORES_SCHEMA
+        assert pl.concat([frame, loaded]).height == 2 * frame.height
+        assert (
+            loaded.join(
+                pl.DataFrame({"method_id": ["equal_weight"]}), on="method_id"
+            ).height
+            == 8
+        )
+    else:
+        assert loaded.schema["method_id"] == pl.Categorical
+        assert loaded.schema["quantiles_json"] == pl.String
+    write_scores(
+        pl.concat(
+            [frame, frame.with_columns(pl.lit("synthetic").alias("source_kind"))]
+        ),
+        path,
+    )
+    with pytest.raises(MixedProvenanceError):
+        load_scores(path, compact=compact)
+    assert (
+        load_scores(path, compact=compact, allow_mixed=True).height == 2 * frame.height
+    )
+
+
+def test_null_semantics_are_instantaneous_in_both_scan_passes(tmp_path):
+    frame = scores()
+    frame = pl.concat(
+        [
+            frame,
+            frame.head(1).with_columns(
+                pl.lit(None, dtype=pl.String).alias("semantics")
+            ),
+        ]
+    )
+    write_scores(frame, tmp_path / "scores_eval.parquet")
+    identity = score_scan.ScoreIdentity(
+        "dataset", "config", "code", semantics={"temp_c": TruthSemantics.INSTANTANEOUS}
+    )
+    selected = select(tmp_path, identity)[KEY]
+    assert selected.height == frame.height
+    assert selected["semantics"].unique().to_list() == ["inst"]
+
+
+def test_two_catalog_disappearances_recover_from_fresh_listing(tmp_path, monkeypatch):
+    paths = [tmp_path / f"scores_{name}.parquet" for name in ("a", "b", "c")]
+    for index, path in enumerate(paths):
+        write_scores(scores(str(index), index + 1), path)
+    real = score_scan.scan_scores
+    vanished = []
+
+    def scan(path):
+        if path in paths[:2] and path not in vanished:
+            vanished.append(path)
+            path.unlink()
+        return real(path)
+
+    monkeypatch.setattr(score_scan, "scan_scores", scan)
+    assert select(tmp_path)[KEY]["evaluation_id"][0] == "2"
+    assert len(vanished) == 2
+
+
+def test_persistent_catalog_failure_exhausts_exact_retry_budget(tmp_path, monkeypatch):
+    path = tmp_path / "scores_arbitrary.parquet"
+    write_scores(scores(), path)
+    calls = []
+
+    def missing(path):
+        calls.append(path)
+        raise FileNotFoundError(path)
+
+    monkeypatch.setattr(score_scan, "scan_scores", missing)
+    assert select(tmp_path) == {}
+    assert len(calls) == score_scan.MAX_SCORE_SCAN_ATTEMPTS == 3
+
+
+def test_reused_contexts_and_cutoffs_only_attribute_selected_variables(tmp_path):
+    original = scores()
+    unrelated = original.with_columns(
+        pl.lit("humidity_pct").alias("variable"),
+        pl.col("valid_time") + timedelta(days=100),
+    )
+    write_scores(pl.concat([original, unrelated]), tmp_path / "scores_eval.parquet")
+    result = score_scan.compatible_slices(tmp_path, IDENTITY, PromotionConfig())
+    evidence = EvidenceSummary.from_contexts(
+        result.contexts,
+        result.cutoffs,
+        {KEY: "eval", ("hourly", "humidity_pct", "1-3h"): None},
+    )
+    assert evidence.contexts == evaluation_contexts([original])
+    assert evidence.evaluation_ids == ("eval",)
+    assert evidence.training_cutoff == original["valid_time"].max()
+
+
+def test_missing_multi_evaluation_file_excludes_all_affected_slices(
+    tmp_path, monkeypatch
+):
+    second_key = ("hourly", "temp_c", "3-6h")
+    humidity_key = ("hourly", "humidity_pct", "1-3h")
+    old = scores("old")
+    write_scores(
+        pl.concat(
+            [
+                old,
+                old.with_columns(pl.lit("3-6h").alias("lead_bucket")),
+                old.with_columns(pl.lit("humidity_pct").alias("variable")),
+            ]
+        ),
+        tmp_path / "scores_old.parquet",
+    )
+    disappearing = tmp_path / "scores_unrelated_name.parquet"
+    write_scores(
+        pl.concat(
+            [
+                scores("first", 2),
+                scores("second", 2).with_columns(pl.lit("3-6h").alias("lead_bucket")),
+            ]
+        ),
+        disappearing,
+    )
+    write_scores(
+        scores("first", 2).with_columns(pl.lit("humidity_pct").alias("variable")),
+        tmp_path / "scores_surviving_fragment.parquet",
+    )
+    real = score_scan.scan_scores
+    calls = 0
+
+    def scan(path):
+        nonlocal calls
+        if path == disappearing:
+            calls += 1
+            if calls == 2:
+                path.unlink()
+        return real(path)
+
+    monkeypatch.setattr(score_scan, "scan_scores", scan)
+    result = select(tmp_path)
+    assert set(result) == {KEY, second_key, humidity_key}
+    assert all(frame["evaluation_id"][0] == "old" for frame in result.values())

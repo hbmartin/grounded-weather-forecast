@@ -1098,10 +1098,10 @@ class TestPruneRaceResilience:
             return real(path, **kwargs)
 
         monkeypatch.setattr(score_scan, "scan_scores", flaky)
-        frames = selection_module._compatible_scores(
+        frames = selection_module._load_evidence(
             config, config.dataset.dir / "scores", None, None
         )
-        assert frames  # the clean second pass recovered the evidence
+        assert frames.slices  # the clean second pass recovered the evidence
         assert calls["count"] >= 2
 
     def test_second_pass_tolerates_persistently_missing_files(
@@ -1115,10 +1115,10 @@ class TestPruneRaceResilience:
         from grounded_weather_forecast.serve import score_scan
 
         monkeypatch.setattr(score_scan, "scan_scores", always_missing)
-        frames = selection_module._compatible_scores(
+        frames = selection_module._load_evidence(
             config, config.dataset.dir / "scores", None, None
         )
-        assert frames == []
+        assert frames.slices == {}
 
     def test_no_evidence_reason_survives_vanishing_files(self, tmp_path, monkeypatch):
         config = scored_config(tmp_path)
