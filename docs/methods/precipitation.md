@@ -210,6 +210,7 @@ temperature.
 
 *Implemented in: `serve/rainfall.py::RainfallTimeline`; `serve/rainfall.py::RainfallEffects`;
 `serve/predict.py::_point_fields`; `serve/predict.py::_blend_variable`;
+`serve/diagnostics.py::FitDiagnostics`; `serve/selection.py::no_evidence_reason`;
 `dataset/truth.py::observed_rainfall`;
 `dataset/providers.py::align_hourly_rain`; `dataset/matrix.py`;
 `dataset/ensembles.py::ensemble_features`*
@@ -292,12 +293,17 @@ cannot. A cold-start blend with no scoreable training truth clears release IDs
 and guard-loss bookkeeping, even when providers supply finite values.
 Null normalized points omit inherited quantiles and their source; source labels
 require usable emitted quantiles. Internal `FitDiagnostics` separately records
-a promoted selection whose fit has no scoreable history, capturing the selection
-after method/semantics validation and before rainfall guards. This diagnostic
-also covers a method that returns no blend. It is not a rainfall effect and is
-not serialized. Archive absence and identity mismatches keep their precedence;
-when identities match, the document names unavailable fitting. Otherwise it
-states that no promoted release produced a finite hourly/daily forecast, rather
+unavailable promoted fits by product, variable, and truth semantics, capturing
+the selection after method/semantics validation and before rainfall guards.
+Small before/after truth counts distinguish missing/empty training matrices,
+missing provider forecast columns, finite truth excluded by the causal cutoff,
+and no finite truth. Waiting alone can resolve causal exclusion; a rebuild is
+not automatically required. The diagnostic also covers methods returning no
+blend, retains no training-frame references, and is not serialized. It remains
+separate from rainfall effects. Archive absence and identity mismatches keep
+their precedence; when identities match, the document names only the unavailable
+fits, without claiming that all training or every forecast is unavailable.
+Otherwise it states that no promoted release produced a finite hourly/daily forecast, rather
 than asserting that no slice passed promotion gates.
 Prediction-local `RainfallEffects` records a wet-day guard only
 when it replaces a release-bearing selection on a fitted blend for a finite emitted field, and

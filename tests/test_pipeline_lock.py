@@ -3,6 +3,7 @@
 from concurrent.futures import ThreadPoolExecutor
 from concurrent.futures import TimeoutError as FutureTimeoutError
 from contextlib import contextmanager
+from datetime import UTC, datetime, timedelta
 from threading import Event
 
 import pytest
@@ -245,7 +246,27 @@ def test_neighbor_fetch_failure_still_refreshes_real_report(
     config.artifacts_dir.mkdir(parents=True)
     artifact = config.artifacts_dir / "truth_qc.json"
     if previous_artifact:
-        artifact.write_text('{"schema_version": 3, "drift_reason": "previous verdict"}')
+        import json
+
+        artifact.write_text(
+            json.dumps(
+                {
+                    "schema_version": 3,
+                    "generated_at": (
+                        datetime.now(tz=UTC) - timedelta(hours=1)
+                    ).isoformat(),
+                    "drift_reason": "previous verdict",
+                    "drift_verdict": {
+                        "exceeded": False,
+                        "latched": False,
+                        "reason": "previous quiet verdict",
+                        "series": [
+                            {"date": "2026-10-10", "difference": 0.1, "cusum": 0.2}
+                        ],
+                    },
+                }
+            )
+        )
     original = artifact.read_bytes() if previous_artifact else None
     directory = config.dataset.dir / "scores"
     directory.mkdir(parents=True)
@@ -288,15 +309,45 @@ def test_neighbor_fetch_failure_still_refreshes_real_report(
         evidence.EVALUATIONS_LEDGER.schema,
     ).is_empty()
     ctx = collect_context(config)
+    from grounded_weather_forecast.dashboard.zones.data_trust import _truth_cross_check
+
+    panel = _truth_cross_check(ctx)
+    assert panel.status == "amber"
+    assert "latest truth-QC refresh failed" in (panel.intro or panel.empty_reason)
     if previous_artifact:
         assert ctx.truth_qc["drift_reason"] == "previous verdict"
         assert artifact.read_bytes() == original
+        assert panel.chart is not None
+        assert "previous quiet verdict" in panel.intro
     else:
         assert ctx.truth_qc is None
         assert not artifact.exists()
     stages = ctx.runs.filter(pl.col("record_kind") == "stage")
     assert stages["exit_code"].to_list() == [0, 0, 1, 0]
     assert "neighbor HTTP unavailable" in capsys.readouterr().out
+    # A real subsequent standalone refresh supersedes the failed stage.
+    checks = neighbors.NeighborChecks(
+        daily_drift=pl.DataFrame(),
+        rolling_correlation=pl.DataFrame(),
+        comparison=pl.DataFrame(),
+        drift_alert=None,
+        correlation_alert=None,
+        n_neighbors=0,
+        overlap_hours=0,
+        drift_reason="no overlap",
+        correlation_reason="no overlap",
+    )
+    monkeypatch.setattr(
+        neighbors, "fetch_neighbor_checks", lambda *_args, **_kwargs: checks
+    )
+    assert main(["--config", str(tmp_path / "config.toml"), "truth-qc"]) == 0
+    refreshed = _truth_cross_check(collect_context(config))
+    assert refreshed.status == "info"
+    assert "failed" not in refreshed.intro
+    assert any(
+        stat.label == "refreshed" and stat.value != "unknown"
+        for stat in refreshed.stats
+    )
 
 
 def test_maintain_runs_truth_qc_before_partial_report_failure(

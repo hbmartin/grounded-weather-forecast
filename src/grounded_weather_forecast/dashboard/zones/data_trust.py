@@ -21,6 +21,7 @@ from grounded_weather_forecast.dashboard.model import (
     TableSpec,
     Zone,
 )
+from grounded_weather_forecast.dashboard.truth_qc import truth_qc_freshness
 from grounded_weather_forecast.dashboard.zones.common import empty_panel
 
 _CALENDAR_DAYS = 45
@@ -269,13 +270,16 @@ def _mapping(value: object) -> dict[str, object]:
 def _truth_cross_check(ctx: DashboardContext) -> Panel:
     payload = _mapping(ctx.truth_qc)
     verdict = _mapping(payload.get("drift_verdict"))
+    freshness = truth_qc_freshness(ctx)
     if not payload or not verdict:
         return empty_panel(
             "b5",
             "b5",
             "Station truth cross-check",
-            "info",
-            "no truth-qc artifact yet — the nightly truth-qc cron writes it",
+            "amber" if freshness.warnings else "info",
+            "; ".join(freshness.warnings)
+            if freshness.warnings
+            else "no truth-qc artifact yet — the nightly truth-qc cron writes it",
         )
     series = verdict.get("series")
     rows = series if isinstance(series, list) else []
@@ -296,6 +300,8 @@ def _truth_cross_check(ctx: DashboardContext) -> Panel:
         if exceeded is None
         else "ok"
     )
+    if freshness.warnings and status != "red":
+        status = "amber"
     stats = (
         Stat(
             "verdict",
@@ -305,6 +311,13 @@ def _truth_cross_check(ctx: DashboardContext) -> Panel:
         Stat("streak", str(verdict.get("streak", 0))),
         Stat("days used", str(verdict.get("days_used", 0))),
         Stat("inversion days excluded", str(verdict.get("inversion_days_excluded", 0))),
+        Stat("refreshed", freshness.refreshed),
+        Stat("verdict age", freshness.age, "amber" if freshness.warnings else "ok"),
+        *(
+            (Stat("failed refresh", freshness.failed_attempt, "amber"),)
+            if freshness.failed_attempt is not None
+            else ()
+        ),
     )
     chart = None
     if labels and any(value is not None for value in differences):
@@ -322,7 +335,11 @@ def _truth_cross_check(ctx: DashboardContext) -> Panel:
         title="Station truth cross-check",
         status=status,
         copy=PANEL_COPY["b5"],
-        intro=str(verdict.get("reason", "")),
+        intro="; ".join(
+            part
+            for part in (str(verdict.get("reason", "")), *freshness.warnings)
+            if part
+        ),
         stats=stats,
         chart=chart,
     )

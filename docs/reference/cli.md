@@ -278,6 +278,9 @@ When truth-QC succeeds, report uses its refreshed artifact. A failed refresh
 leaves the previous `truth_qc.json` unchanged, so report may use an older verdict
 or have no verdict yet. Check the run ledger for the truth-QC stage result; a
 completed report or refreshed dashboard does not mean maintenance succeeded.
+The cross-check panel shows retained verdict freshness and the latest failed
+refresh: amber after failure, beyond 48 hours, or when refresh time is unknown;
+a latched drift verdict stays red. Successful refreshes clear older failures.
 
 ---
 
@@ -407,6 +410,12 @@ the difference series, attributes any break, and fits the
 $S/(1+u)$ radiation-shield error model.
 
 **Writes** `artifacts/truth_qc.json` (schema version 3) and `reports/truth_qc.md`.
+New artifacts include UTC ISO `generated_at`. The dashboard uses it for the
+48-hour freshness warning, with a conservative date-only fallback for older
+`drift_verdict.as_of_date` records. Undated or invalid refresh times show amber;
+filesystem mtime does not establish freshness. These warnings do not alter
+quarantine or the drift latch. Handled neighbor-fetch failures preserve the
+previous artifact and return failure; unexpected exceptions still propagate.
 
 The drift verdict is **latched**: three consecutive days above threshold are
 required before quarantine. Rejects `--days <= 0`; returns `0` with no evaluable
@@ -489,9 +498,14 @@ A blend with no scoreable training truth clears all release and guard-loss
 attribution. Native rainfall filling a null field later does not change that
 cold-start diagnosis. When live evidence identities match but a promoted
 selection cannot be fitted from scoreable training history, the reason names
-that fitting failure. Other compatible-evidence cases say no promoted release
-produced a finite hourly/daily forecast, without asserting that promotion never
-occurred. Null points omit quantiles and their source; a source is emitted only
+the affected product, variable, semantics, and observed cause. Missing/empty
+matrices require building; missing forecast columns require archived forecasts;
+absent finite truth requires waiting for valid truth and incorporating it.
+Finite truth excluded by the issue-time cutoff calls for polling and can become
+eligible without rebuilding. The message describes some unavailable fits, not
+every cause of degradation. Other compatible-evidence cases say no promoted
+release produced a finite hourly/daily forecast, without asserting that promotion
+never occurred. Null points omit quantiles and their source; a source is emitted only
 with usable quantiles. See the
 [FAQ](../faq.md#why-does-my-forecast-say-degraded).
 

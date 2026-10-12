@@ -518,6 +518,7 @@ def test_zone_b_truth_cross_check_latched_verdict_is_red(tmp_path):
 
 def test_zone_b_truth_cross_check_quiet_verdict_is_ok(tmp_path):
     payload = {
+        "generated_at": NOW.isoformat(),
         "drift_verdict": {
             "latched": False,
             "exceeded": False,
@@ -527,7 +528,7 @@ def test_zone_b_truth_cross_check_quiet_verdict_is_ok(tmp_path):
             "inversion_days_excluded": 0,
             "reason": "snht statistic 2.1 on 28 screened days",
             "series": [],
-        }
+        },
     }
     panel = _truth_cross_check_panel(tmp_path, payload)
     assert panel.status == "ok"

@@ -79,6 +79,10 @@ leave that stamp untouched, and a failed report skips score pruning.
 
 CLI `maintain` also runs truth-QC before report. Build/backtest failures stop the
 pipeline, while a handled truth-QC failure permits report under the same lock.
+The cross-check panel shows the retained verdict’s refresh time: amber after
+a failed refresh, beyond 48 hours (two nightly cycles), or when freshness is
+unknown. A latched drift verdict remains red; refreshing the dashboard does not
+refresh the underlying QC verdict.
 Maintenance returns the first nonzero stage result after reporting. Failed QC
 refreshes preserve the previous artifact and remain in the run ledger; a fresh
 dashboard can therefore contain an older QC verdict. Unexpected exceptions

@@ -137,6 +137,12 @@ class TestQcCommand:
         # first week, and the run ledger would record it as a real fault.
         assert code == 0
         assert artifact["schema_version"] == 3
+        from datetime import datetime
+
+        assert (
+            datetime.fromisoformat(artifact["generated_at"]).utcoffset().total_seconds()
+            == 0
+        )
         assert artifact["drift_alert"] is None
         assert artifact["correlation_alert"] is None
         assert artifact["shield_alert"] is None

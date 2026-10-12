@@ -8,7 +8,7 @@ never to silence.
 
 import json
 import math
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from contextlib import suppress
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime, timedelta
@@ -38,6 +38,10 @@ from grounded_weather_forecast.reports.leaderboard import (
     union_references,
 )
 from grounded_weather_forecast.reports.winner_curse import should_retain_incumbent
+from grounded_weather_forecast.serve.diagnostics import (
+    FitFailure,
+    describe_fit_failures,
+)
 from grounded_weather_forecast.serve.evidence import EvidenceSummary
 
 from grounded_weather_forecast.serve.score_scan import (  # isort: skip
@@ -933,6 +937,7 @@ def no_evidence_reason(
     *,
     dataset_id: str | None = None,
     promoted_fit_unavailable: bool = False,
+    fit_failures: Sequence[FitFailure] = (),
 ) -> str:
     """Why serving is degraded: cold start vs invalidated evidence.
 
@@ -981,10 +986,13 @@ def no_evidence_reason(
             "implementation changed since the last backtest; re-run "
             "`backtest --source live` then `report`"
         )
+    if fit_failures:
+        return describe_fit_failures(fit_failures)
     if promoted_fit_unavailable:
         return (
-            "compatible promoted selections could not be fitted: no scoreable "
-            "training history; rebuild the dataset once truth is available"
+            "at least one compatible promoted selection could not be fitted "
+            "from training available at issuance; keep polling, and rebuild "
+            "only when newly available truth has not yet been incorporated"
         )
     return (
         "live evidence exists but no promoted release produced a finite hourly "

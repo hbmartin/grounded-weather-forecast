@@ -82,7 +82,7 @@ That works on day one. Everything else needs an archive with some history — se
 | `report` | leaderboards, evidence ledgers, and dashboard; skip missing scores, show read faults and return nonzero after partial output; one load per file with `mcs`/`legacy` | — |
 | `alignment` | study truth semantics per provider; write the alignment artifact | — |
 | `backfill` | fetch archived forecasts into the synthetic supervised matrix | `--provider` `--models` `--start` `--end` `--chunk-days` |
-| `truth-qc` | cross-check truth against lapse-adjusted neighbors; fit the radiation-shield model | `--days` |
+| `truth-qc` | write timestamped neighbor/shield checks; dashboard warns on failed refresh, age over 48 hours, or unknown freshness | `--days` |
 | `ingest-ensembles` | poll the Open-Meteo Ensemble API for per-model spread features | `--models` |
 | `predict` | emit schema-6 JSON with rainfall budget conservation and release attribution only on finite values; `--method` bypasses automatic rain safeguards for experiments | `--out` `--method` `--no-history` `--semantics` `--now` |
 | `publish` | safely publish an automatic forecast, holding a matching ready document for up to six hours | `--out` `--semantics` `--recovery-methods` `--recovery-window` |
@@ -99,6 +99,11 @@ Build and backtest failures stop maintenance immediately. A handled truth-QC
 failure still permits report, which may use the previous QC artifact; the failed
 refresh stays in the run ledger and maintenance returns the first nonzero stage
 result. A refreshed dashboard therefore does not imply successful maintenance.
+The truth cross-check panel retains the available verdict and chart, showing amber
+after a failed QC refresh, beyond 48 hours, or when refresh time is unknown; a
+latched drift verdict remains red. Serving diagnoses name affected promoted
+variables and distinguish causally excluded training from missing matrices or
+invalid truth. Waiting can resolve the causal cutoff without a rebuild.
 `predict` and `publish` copy and validate the live dataset under the short
 `<dataset dir>/dataset.lock`, then select and fit outside it.
 
