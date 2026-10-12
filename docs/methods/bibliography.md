@@ -80,7 +80,7 @@ Three sections, kept deliberately separate:
 | Tashman, L. J. (2000). Out-of-sample tests of forecasting accuracy: an analysis and review. *IJF* 16(4), 437–450. | `backtest/splits.py` |
 | Hansen, P. R., Lunde, A. & Nason, J. M. (2011). The model confidence set. *Econometrica* 79(2), 453–497. | `reports/mcs.py::model_confidence_set` |
 | Künsch, H. R. (1989); Politis, D. N. & Romano, J. P. (1992). Moving/circular block bootstrap. | `reports/mcs.py::_block_indices` |
-| Ville, J. (1939). *Étude critique de la notion de collectif.* | `reports/eprocess.py`; `leaderboard._seq_gate` |
+| Ville, J. (1939). *Étude critique de la notion de collectif.* | `reports/eprocess.py`; `leaderboard._seq_gate`; `product_eprocess_store` centralizes read-only loading while callers retain rule policy. |
 | Waudby-Smith, I. & Ramdas, A. Estimating means of bounded random variables by betting. *JRSS-B*. | `reports/eprocess.py::EProcessStore.update_pair` |
 | Cutkosky, A. & Orabona, F. — online Newton step lineage for the bet sizing. | `reports/eprocess.py` — `_ONS_RATE` |
 | Benjamini, Y. & Hochberg, Y. (1995). Controlling the false discovery rate. *JRSS-B* 57(1), 289–300. | `reports/leaderboard.py::_benjamini_hochberg` |
@@ -140,4 +140,4 @@ papers and are kept separate so the bibliography above stays a literature claim.
 | **PRISM** elevation-layer logic | `dataset/neighbors.py` |
 | **MADIS / GHCN / ECMWF station blacklisting** | `dataset/truth_qc.py` |
 | **ForecastAdvisor / ForecastWatch** | The consumer analogue this system strictly dominates for one location — it scores per hour, to 10 days, with proper scoring rules, against your actual backyard. |
-| **[Polars StringView storage](https://pola.rs/posts/polars-string-type/)** | Column projection and shared-payload memory behavior in `backtest/scores.py`, `serve/score_scan.py`, `dashboard/score_summary.py`, `reports/leaderboard.py`, and `reports/mcs.py`; an implementation reference rather than a statistical accuracy claim. |
+| **[Polars StringView storage](https://pola.rs/posts/polars-string-type/)** | Column projection and shared-payload memory behavior in `backtest/scores.py`, `serve/score_scan.py`, `dashboard/score_summary.py`, `reports/leaderboard.py`, and `reports/mcs.py`; report/dashboard share completed summaries and release full frames before the next file. An implementation reference rather than a statistical accuracy claim. |

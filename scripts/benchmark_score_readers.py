@@ -2,6 +2,8 @@
 
 All report/artifact writes stay inside temporary directories. Each measurement
 runs in a fresh process. Source-tree hashes identify uncommitted implementations.
+``full_load_calls`` counts eager score-loader invocations, excluding projected
+Parquet scans and batches used by selection.
 """
 
 # Workers must select their immutable source tree before importing the package.
@@ -219,7 +221,7 @@ def worker(source: Path, fixtures: Path, workload: str, policy: str) -> dict:
             "peak_rss_mib": peak / (1024**2 if sys.platform == "darwin" else 1024),
             "payload_sha256": digest_payload(payload),
             "rendered_sha256": rendered_digest,
-            "full_decodes": len(reads),
+            "full_load_calls": len(reads),
             "python": platform.python_version(),
             "polars": pl.__version__,
             "payload": payload,
@@ -246,7 +248,7 @@ def summarize(records: list[dict]) -> list[dict]:
                 "seconds_range": [min(seconds), max(seconds)],
                 "peak_rss_median_mib": statistics.median(rss),
                 "peak_rss_range_mib": [min(rss), max(rss)],
-                "full_decodes": sorted({record["full_decodes"] for record in group}),
+                "full_load_calls": sorted({record["full_load_calls"] for record in group}),
                 "payload_sha256": group[0]["payload_sha256"],
             }
         )
@@ -404,7 +406,7 @@ def main() -> None:
     parser.add_argument(
         "--output",
         type=Path,
-        default=Path("docs/research/score-readers-2026-10-10.jsonl"),
+        default=Path("docs/research/score-readers-2026-10-11.jsonl"),
     )
     parser.add_argument("--worker", action="store_true", help=argparse.SUPPRESS)
     parser.add_argument("--source", type=Path, help=argparse.SUPPRESS)

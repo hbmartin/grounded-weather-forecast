@@ -261,7 +261,7 @@ def test_report_skips_any_self_verification_failure(
     )
     monkeypatch.setattr(
         "grounded_weather_forecast.dashboard.write_dashboard",
-        lambda _config: tmp_path / "dashboard.html",
+        lambda _config, **_kwargs: tmp_path / "dashboard.html",
     )
 
     def maybe_fail(stage, result):

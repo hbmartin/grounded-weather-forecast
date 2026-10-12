@@ -16,6 +16,7 @@ from grounded_weather_forecast.dashboard.context import (
 )
 from grounded_weather_forecast.dashboard.derive import Derived, derive
 from grounded_weather_forecast.dashboard.html import render_page
+from grounded_weather_forecast.dashboard.score_summary import ScoreSummary
 from grounded_weather_forecast.dashboard.zones import ALL_ZONES
 from grounded_weather_forecast.reports.alerts import AlertInputs, evaluate_alerts
 
@@ -175,9 +176,14 @@ def _forecast_payload(ctx: DashboardContext) -> dict[str, object] | None:
     return document
 
 
-def write_dashboard(config: Config, *, now: datetime | None = None) -> Path:
-    """Collect artifacts, evaluate alerts, render, and write dashboard.html."""
-    ctx = collect_context(config, now=now)
+def write_dashboard(
+    config: Config,
+    *,
+    now: datetime | None = None,
+    score_summaries: Mapping[str, ScoreSummary] | None = None,
+) -> Path:
+    """Write dashboard.html, optionally reusing a complete score-summary snapshot."""
+    ctx = collect_context(config, now=now, score_summaries=score_summaries)
     derived = derive(ctx)
     zones = tuple(build(ctx, derived) for build in ALL_ZONES)
     alerts = evaluate_alerts(_alert_inputs(ctx, derived))

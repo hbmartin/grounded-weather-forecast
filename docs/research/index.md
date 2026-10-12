@@ -21,4 +21,5 @@ system changes.
 | [Week 2 provider diagnostic](week2-provider-diagnostic-2026-08-04.md) | 2026-08-04 | Data-driven diagnostic: horizon census, `temp_c` and `humidity_pct` error by lead bin, findings and the actions taken. |
 | [Selection memory benchmark](selection-memory-2026-10-07.md) | 2026-10-07 | Fresh-process selection measurements against PR #46's original implementation, with fixture sizes, RSS spread, and runtime. |
 | [Score-reader benchmark](score-readers-2026-10-10.md) | 2026-10-10 | Final source against reviewed head `6a4933f`: both selection fixtures, populated dashboard and full report, three decoder policies, immutable inputs, raw samples, and payload checks. |
+| [Score fallback and report reuse](score-readers-2026-10-11.md) | 2026-10-11 | Correctness and report-summary reuse against `4019cc6`: 24 → 12 full load calls under `mcs`, equivalent report tables/charts, local calibration warnings, and retained final-wealth readback under `seq_mcs`. |
 | [Cross-cutting summary](summary.md) | — | Synthesis across the three: trade-offs between method families, pushback specific to this project, and what to decide up front. |

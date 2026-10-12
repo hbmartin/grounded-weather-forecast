@@ -128,12 +128,15 @@ def write_scores(scores: pl.DataFrame, path: Path) -> None:
 
 
 def scan_score_file(path: Path, *, compact: bool = True) -> pl.LazyFrame:
-    """Decode repeated provenance as categories before retaining score rows.
+    """Scan stored scores, categorizing repeated text when ``compact=True``.
 
     Feature descriptions can be kilobytes long and repeat tens of millions of
     times. Categorizing them in the streaming scan keeps one copy per value,
     rather than retaining the Parquet decoder's string buffers for every row.
     Numeric scores and per-case quantiles retain their original types.
+    With ``compact=False``, all columns retain their stored types. The scan
+    defaults to compact storage; ``load_scores`` defaults to stored types for
+    compatibility with existing joins and concatenations.
     """
     scan = pl.scan_parquet(path, parallel="none", low_memory=True)
     if not compact:

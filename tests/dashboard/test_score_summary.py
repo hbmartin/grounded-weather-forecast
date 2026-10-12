@@ -1,15 +1,45 @@
+import json
+import re
 import weakref
+from dataclasses import fields, replace
+from datetime import timedelta
 
 import polars as pl
 import pytest
-from conftest import synthetic_hourly_matrix, write_config
-from serve.test_score_scan import scores
+from conftest import synthetic_hourly_matrix, utc, write_config
+from score_fixtures import scores
 
+from grounded_weather_forecast.backtest import scores as score_module
 from grounded_weather_forecast.backtest.scores import load_scores, write_scores
-from grounded_weather_forecast.dashboard import context, score_summary, writer
+from grounded_weather_forecast.cli import _cmd_report
+from grounded_weather_forecast.dashboard import (
+    context,
+    score_summary,
+    write_dashboard,
+    writer,
+)
 from grounded_weather_forecast.dashboard.derive import derive
 from grounded_weather_forecast.dashboard.zones import data_trust, evaluation, readiness
 from grounded_weather_forecast.dataset.matrix import matrix_path
+from grounded_weather_forecast.reports import render
+
+
+def assert_same_summary(actual, expected):
+    for field in fields(expected):
+        left, right = getattr(actual, field.name), getattr(expected, field.name)
+        if isinstance(right, pl.DataFrame):
+            assert left.equals(right), field.name
+        else:
+            assert left == right, field.name
+
+
+def dashboard_charts(path):
+    match = re.search(
+        r'<script[^>]*id="dashboard-data"[^>]*>(.*?)</script>',
+        path.read_text(),
+        re.DOTALL,
+    )
+    return json.loads(match.group(1))["charts"]
 
 
 def score_archive(tmp_path, count=3):
@@ -195,3 +225,236 @@ def test_calibration_failures_are_independent_local_warnings(
         )
     else:
         assert summary.reliability == ((0.5, 1.0, 32),)
+
+
+@pytest.mark.parametrize("provided", [("board",), ("winners",), ("board", "winners")])
+def test_precomputed_statistics_bypass_their_derivation(
+    tmp_path, monkeypatch, provided
+):
+    config = write_config(tmp_path)
+    frame = scores()
+    expected = score_summary.summarize_scores(config, "scores_hourly_live", frame, {})
+
+    def unexpected(*_args, **_kwargs):
+        pytest.fail("supplied statistics were recomputed")
+
+    if "board" in provided:
+        monkeypatch.setattr(score_summary, "leaderboard", unexpected)
+    if "winners" in provided:
+        monkeypatch.setattr(score_summary, "slice_winners", unexpected)
+        monkeypatch.setattr(score_summary, "winner_curse_adjusted", unexpected)
+    actual = score_summary.summarize_scores(
+        config,
+        "scores_hourly_live",
+        frame,
+        {},
+        **{name: getattr(expected, name) for name in provided},
+    )
+    assert_same_summary(actual, expected)
+
+
+@pytest.mark.parametrize("empty", [False, True])
+def test_supplied_snapshot_bypasses_score_reads_but_collects_other_artifacts(
+    tmp_path, monkeypatch, empty
+):
+    config, paths = score_archive(tmp_path, count=1)
+    snapshot = {} if empty else dict(context.collect_context(config).score_summaries)
+    if not empty:
+        paths[0].unlink()
+    (config.dataset.dir / "manifest.json").write_text('{"fingerprint": "collected"}')
+
+    def unexpected(*_args, **_kwargs):
+        pytest.fail("a supplied score snapshot reopened score files")
+
+    monkeypatch.setattr(context, "load_scores", unexpected)
+    collected = context.collect_context(config, score_summaries=snapshot)
+    assert collected.manifest == {"fingerprint": "collected"}
+    assert collected.unreadable_scores == ()
+    assert set(collected.score_summaries) == set(snapshot)
+    snapshot.clear()
+    assert bool(collected.score_summaries) == (not empty)
+    text = writer.write_dashboard(
+        config, score_summaries=collected.score_summaries
+    ).read_text()
+    assert ("Leaderboard — hourly_live_expanding_eval0" in text) == (not empty)
+
+
+@pytest.mark.parametrize("rule", ["mcs", "legacy"])
+@pytest.mark.parametrize("scenario", ["live", "synthetic", "pooled_daily", "empty"])
+def test_report_reuses_equivalent_summaries_and_releases_each_frame(
+    tmp_path, monkeypatch, rule, scenario
+):
+    config, paths = score_archive(tmp_path, count=2)
+    config = replace(config, promotion=replace(config.promotion, rule=rule))
+    matrix_path(config.dataset.dir, "hourly", "live").unlink()
+    for path in paths:
+        frame = load_scores(path)
+        if scenario == "synthetic":
+            frame = frame.with_columns(pl.lit("synthetic").alias("source_kind"))
+            destination = path.with_name(path.name.replace("_live_", "_synthetic_"))
+            path.unlink()
+        elif scenario == "pooled_daily":
+            frame = frame.with_columns(
+                pl.lit("daily").alias("product"),
+                pl.lit("temp_max_c").alias("variable"),
+                pl.when(pl.col("lead_hours") == 1.0)
+                .then(
+                    pl.when(pl.col("valid_time").dt.hour() <= 4)
+                    .then(pl.lit("D3-4"))
+                    .otherwise(pl.lit("D5-7"))
+                )
+                .otherwise(pl.col("lead_bucket"))
+                .alias("lead_bucket"),
+            )
+            destination = path.with_name(path.name.replace("_hourly_", "_daily_"))
+            path.unlink()
+        else:
+            destination = path
+            if scenario == "empty":
+                frame = frame.clear()
+        write_scores(frame, destination)
+    paths = sorted((config.dataset.dir / "scores").glob("*.parquet"))
+    decoded, calls, snapshots = [], [], []
+
+    def load(path, **kwargs):
+        assert all(reference() is None for reference in decoded)
+        frame = load_scores(path, **kwargs)
+        calls.append(path)
+        decoded.append(weakref.ref(frame))
+        return frame
+
+    def dashboard(config, *, score_summaries):
+        snapshots.append(score_summaries)
+        return writer.write_dashboard(
+            config, now=utc(2026, 8, 5), score_summaries=score_summaries
+        )
+
+    monkeypatch.setattr(score_module, "load_scores", load)
+    monkeypatch.setattr(context, "load_scores", load)
+    monkeypatch.setattr(
+        "grounded_weather_forecast.dashboard.write_dashboard", dashboard
+    )
+    with monkeypatch.context() as guard:
+
+        def unexpected(*_args, **_kwargs):
+            pytest.fail("dashboard recomputed report statistics")
+
+        for stage in ("leaderboard", "slice_winners", "winner_curse_adjusted"):
+            guard.setattr(score_summary, stage, unexpected)
+        assert _cmd_report(config) == 0
+    assert calls == paths
+    assert all(reference() is None for reference in decoded)
+    assert set(snapshots[0]) == {path.stem for path in paths}
+    cached_charts = dashboard_charts(config.reports_dir / "dashboard.html")
+    independent = context.collect_context(config, now=utc(2026, 8, 5))
+    for stem, summary in snapshots[0].items():
+        assert_same_summary(summary, independent.score_summaries[stem])
+        if scenario == "pooled_daily" and rule == "mcs":
+            assert summary.winners.height == 2
+            assert summary.winners["gate"].unique().to_list() == ["pooled_D3-10"]
+        if summary.board is not None:
+            assert not any(
+                column.startswith(("bh_", "ebh_")) for column in summary.board.columns
+            )
+    assert cached_charts == dashboard_charts(
+        write_dashboard(config, now=utc(2026, 8, 5))
+    )
+    for path in paths:
+        path.unlink()
+    assert (
+        dashboard_charts(
+            writer.write_dashboard(
+                config, now=utc(2026, 8, 5), score_summaries=snapshots[0]
+            )
+        )
+        == cached_charts
+    )
+
+
+def test_sequential_report_dashboard_uses_final_persisted_wealth(tmp_path, monkeypatch):
+    config, paths = score_archive(tmp_path, count=2)
+    config = replace(
+        config, promotion=replace(config.promotion, rule="seq_mcs", alpha=0.01)
+    )
+    matrix_path(config.dataset.dir, "hourly", "live").unlink()
+    old = scores("old").with_columns(
+        pl.when(pl.col("method_id") == "challenger")
+        .then(1.0)
+        .otherwise(4.0)
+        .alias("y_pred")
+    )
+    newer = pl.concat(
+        [
+            old.with_columns(
+                pl.lit("newer").alias("evaluation_id"),
+                pl.lit(utc(2026, 8, 2)).alias("evaluation_created_at"),
+                pl.col("issue_time") + timedelta(hours=8 + index * 8),
+                pl.col("valid_time") + timedelta(hours=8 + index * 8),
+            )
+            for index in range(8)
+        ]
+    )
+    write_scores(old, paths[0])
+    write_scores(newer, paths[1])
+    report_winners, snapshots, calls = {}, [], []
+    real_report = render.write_markdown_report
+
+    def report(directory, name, title, sections):
+        for label, frame in sections:
+            if label == "Per-slice winners":
+                report_winners[name] = frame
+        return real_report(directory, name, title, sections)
+
+    def dashboard(config, *, score_summaries):
+        snapshots.append(score_summaries)
+        return writer.write_dashboard(config, score_summaries=score_summaries)
+
+    def load(path, **kwargs):
+        calls.append(path)
+        return load_scores(path, **kwargs)
+
+    monkeypatch.setattr(render, "write_markdown_report", report)
+    monkeypatch.setattr(
+        "grounded_weather_forecast.dashboard.write_dashboard", dashboard
+    )
+    monkeypatch.setattr(score_module, "load_scores", load)
+    monkeypatch.setattr(context, "load_scores", load)
+    assert _cmd_report(config) == 0
+    assert snapshots == [None]
+    assert calls == paths + paths
+    assert (
+        report_winners[paths[0].stem.replace("scores_", "leaderboard_")]["method_id"][0]
+        != "challenger"
+    )
+    wealth_path = config.artifacts_dir / "eprocess" / "hourly_live.json"
+    wealth = json.loads(wealth_path.read_text())
+    final = context.collect_context(config).score_summaries[paths[0].stem]
+    assert final.winners["method_id"][0] == "challenger"
+    assert json.loads(wealth_path.read_text()) == wealth
+    history = {
+        path: pl.read_parquet(path)
+        for path in (config.artifacts_dir / "history").glob("*.parquet")
+    }
+    assert history
+    assert _cmd_report(config) == 0
+    assert json.loads(wealth_path.read_text()) == wealth
+    assert set((config.artifacts_dir / "history").glob("*.parquet")) == set(history)
+    for path, frame in history.items():
+        current = pl.read_parquet(path)
+        # Final wealth can add verdicts for the earlier evaluation's new winner.
+        # Every existing evidence row is retained without being rewritten.
+        assert frame.join(
+            current, on=frame.columns, how="anti", nulls_equal=True
+        ).is_empty(), path.name
+        if path.name != "verdicts.parquet":
+            assert current.equals(frame), path.name
+        history[path] = current
+    report_tables = {
+        path: path.read_text() for path in config.reports_dir.glob("leaderboard_*.md")
+    }
+    assert _cmd_report(config) == 0
+    assert json.loads(wealth_path.read_text()) == wealth
+    for path, frame in history.items():
+        assert pl.read_parquet(path).equals(frame), path.name
+    for path, markdown in report_tables.items():
+        assert path.read_text() == markdown, path.name

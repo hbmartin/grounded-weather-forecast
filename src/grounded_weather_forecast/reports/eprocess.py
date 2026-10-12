@@ -42,10 +42,11 @@ import numpy as np
 import polars as pl
 
 from grounded_weather_forecast.contracts import FloatArray
+from grounded_weather_forecast.evaluation import code_identity, config_fingerprint
 from grounded_weather_forecast.storage import atomic_write_text, locked_path
 
 if TYPE_CHECKING:
-    from grounded_weather_forecast.config import PromotionConfig
+    from grounded_weather_forecast.config import Config, PromotionConfig
 
 _ONS_RATE = 2.0 / (2.0 - math.log(3.0))
 _LAMBDA_INIT = 0.1
@@ -176,6 +177,23 @@ class EProcessStore:
     def log_e(self, key: str) -> float:
         entry = self.entries.get(key)
         return entry.log_e if entry is not None else 0.0
+
+
+def product_eprocess_store(
+    config: "Config", product: str, cache: dict[str, EProcessStore]
+) -> EProcessStore:
+    """Load one product's live wealth per call cache without choosing a rule.
+
+    Callers decide whether the product/rule needs wealth. This helper never
+    persists it; ``report`` remains the only writer.
+    """
+    if product not in cache:
+        cache[product] = EProcessStore.load(
+            config.artifacts_dir / "eprocess" / f"{product}_live.json",
+            config_fingerprint(config),
+            code_identity(),
+        )
+    return cache[product]
 
 
 def promotion_comparison(

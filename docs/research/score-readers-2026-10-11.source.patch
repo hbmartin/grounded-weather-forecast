@@ -1,0 +1,550 @@
+diff --git a/src/grounded_weather_forecast/backtest/scores.py b/src/grounded_weather_forecast/backtest/scores.py
+index dad3e78..e26c5d7 100644
+--- a/src/grounded_weather_forecast/backtest/scores.py
++++ b/src/grounded_weather_forecast/backtest/scores.py
+@@ -128,12 +128,15 @@ def write_scores(scores: pl.DataFrame, path: Path) -> None:
+ 
+ 
+ def scan_score_file(path: Path, *, compact: bool = True) -> pl.LazyFrame:
+-    """Decode repeated provenance as categories before retaining score rows.
++    """Scan stored scores, categorizing repeated text when ``compact=True``.
+ 
+     Feature descriptions can be kilobytes long and repeat tens of millions of
+     times. Categorizing them in the streaming scan keeps one copy per value,
+     rather than retaining the Parquet decoder's string buffers for every row.
+     Numeric scores and per-case quantiles retain their original types.
++    With ``compact=False``, all columns retain their stored types. The scan
++    defaults to compact storage; ``load_scores`` defaults to stored types for
++    compatibility with existing joins and concatenations.
+     """
+     scan = pl.scan_parquet(path, parallel="none", low_memory=True)
+     if not compact:
+diff --git a/src/grounded_weather_forecast/cli.py b/src/grounded_weather_forecast/cli.py
+index 8fcabe2..e78cf35 100644
+--- a/src/grounded_weather_forecast/cli.py
++++ b/src/grounded_weather_forecast/cli.py
+@@ -1094,11 +1094,11 @@ def _cmd_report(config: Config) -> int:
+     from grounded_weather_forecast.backtest.scores import load_scores  # noqa: PLC0415
+     from grounded_weather_forecast.contracts import hourly_variable  # noqa: PLC0415
+     from grounded_weather_forecast.dashboard import write_dashboard  # noqa: PLC0415
+-    from grounded_weather_forecast.dataset.matrix import build_truth  # noqa: PLC0415
+-    from grounded_weather_forecast.evaluation import (  # noqa: PLC0415
+-        code_identity,
+-        config_fingerprint,
++    from grounded_weather_forecast.dashboard.score_summary import (  # noqa: PLC0415
++        ScoreSummary,
++        summarize_scores,
+     )
++    from grounded_weather_forecast.dataset.matrix import build_truth  # noqa: PLC0415
+     from grounded_weather_forecast.reports import (  # noqa: PLC0415
+         evidence,
+         operations,
+@@ -1108,6 +1108,7 @@ def _cmd_report(config: Config) -> int:
+     )
+     from grounded_weather_forecast.reports.eprocess import (  # noqa: PLC0415
+         EProcessStore,
++        product_eprocess_store,
+         promotion_comparison,
+     )
+     from grounded_weather_forecast.reports.leaderboard import (  # noqa: PLC0415
+@@ -1136,10 +1137,13 @@ def _cmd_report(config: Config) -> int:
+ 
+     scores_dir = config.dataset.dir / "scores"
+     score_files = sorted(scores_dir.glob("scores_*.parquet"))
++    summaries: dict[str, ScoreSummary] | None = (
++        None if config.promotion.rule == "seq_mcs" else {}
++    )
+     if not score_files:
+         print(f"no scores found in {scores_dir}; run backtest first")
+         _report_pipeline_health(config, [], [])
+-        print(f"wrote {write_dashboard(config)}")
++        print(f"wrote {write_dashboard(config, score_summaries=summaries)}")
+         return 1
+     written: list[Path] = []
+     catalog_rows: list[dict[str, object]] = []
+@@ -1149,13 +1153,14 @@ def _cmd_report(config: Config) -> int:
+     for path in score_files:
+         try:
+             scores = load_scores(path, compact=True)
+-        except FileNotFoundError:
++        except (FileNotFoundError,):  # noqa: B013 -- project convention
+             # The pipeline lock keeps prune out of a running report; this
+             # guard covers deletion by anything outside that lock's scope.
+             print(f"skipping {path.name}: deleted since listing", file=sys.stderr)
+             continue
+         catalog_rows.append(operations.evaluation_catalog_row(path, scores))
+-        board = bh_adjusted(leaderboard(scores, references=references))
++        raw_board = leaderboard(scores, references=references)
++        board = bh_adjusted(raw_board)
+         evidence.record_quality(config, scores, board)
+         # Serving runs on the live provider set, so its realized skill may only
+         # be compared with a leaderboard built from the same provenance — a
+@@ -1171,13 +1176,7 @@ def _cmd_report(config: Config) -> int:
+         )
+         eprocess_store: EProcessStore | None = None
+         if is_live:
+-            if product not in eprocess_stores:
+-                eprocess_stores[product] = EProcessStore.load(
+-                    config.artifacts_dir / "eprocess" / f"{product}_live.json",
+-                    config_fingerprint(config),
+-                    code_identity(),
+-                )
+-            eprocess_store = eprocess_stores[product]
++            eprocess_store = product_eprocess_store(config, product, eprocess_stores)
+         live_sections: list[tuple[str, pl.DataFrame]] = []
+         if is_live and eprocess_store is not None:
+             # Both promotion rules run every report so the operator can watch
+@@ -1225,6 +1224,15 @@ def _cmd_report(config: Config) -> int:
+         # Two curse-corrected estimates beside every argmin-selected winner
+         # mae; report-layer only, same convention as bh/ebh_adjusted.
+         winners = winner_curse_adjusted(winners, scores, promotion=config.promotion)
++        if summaries is not None:
++            summaries[path.stem] = summarize_scores(
++                config,
++                path.stem,
++                scores,
++                eprocess_stores,
++                board=raw_board,
++                winners=winners,
++            )
+         if is_live:
+             evidence.record_winner_curse(config, product, scores, winners)
+             evidence.record_nbm_benchmark(config, product, scores, board)
+@@ -1272,6 +1280,7 @@ def _cmd_report(config: Config) -> int:
+         blocked = blocked_promotions(winners, gap_threshold)
+         if not blocked.is_empty():
+             print_summary(f"blocked promotions ({path.stem})", blocked)
++        del scores
+     matrix_file = _live_hourly_matrix_path(config)
+     if matrix_file.exists():
+         matrix = pl.read_parquet(matrix_file)
+@@ -1319,7 +1328,7 @@ def _cmd_report(config: Config) -> int:
+             )
+     _report_evidence_tail(config, written)
+     _report_pipeline_health(config, written, catalog_rows)
+-    written.append(write_dashboard(config))
++    written.append(write_dashboard(config, score_summaries=summaries))
+     for path in written:
+         print(f"wrote {path}")
+     return 0
+diff --git a/src/grounded_weather_forecast/dashboard/context.py b/src/grounded_weather_forecast/dashboard/context.py
+index d82625f..6448a41 100644
+--- a/src/grounded_weather_forecast/dashboard/context.py
++++ b/src/grounded_weather_forecast/dashboard/context.py
+@@ -269,10 +269,20 @@ def _evidence_history(config: Config, failures: list[str]) -> dict[str, pl.DataF
+     return frames
+ 
+ 
+-def collect_context(config: Config, *, now: datetime | None = None) -> DashboardContext:
++def collect_context(
++    config: Config,
++    *,
++    now: datetime | None = None,
++    score_summaries: Mapping[str, ScoreSummary] | None = None,
++) -> DashboardContext:
++    """Collect artifacts, or reuse a complete supplied score-summary snapshot."""
+     paths = DatasetPaths.in_dir(config.dataset.dir)
+     unreadable: list[str] = []
+-    score_summaries, unreadable_scores = _score_summaries(config, unreadable)
++    unreadable_scores: tuple[str, ...] = ()
++    if score_summaries is None:
++        score_summaries, unreadable_scores = _score_summaries(config, unreadable)
++    else:
++        score_summaries = dict(score_summaries)
+     hourly_live = matrix_path(config.dataset.dir, "hourly", "live")
+     daily_live = matrix_path(config.dataset.dir, "daily", "live")
+     hourly_synthetic = matrix_path(config.dataset.dir, "hourly", "synthetic")
+diff --git a/src/grounded_weather_forecast/dashboard/score_summary.py b/src/grounded_weather_forecast/dashboard/score_summary.py
+index 8a6eda6..9f82f67 100644
+--- a/src/grounded_weather_forecast/dashboard/score_summary.py
++++ b/src/grounded_weather_forecast/dashboard/score_summary.py
+@@ -7,12 +7,14 @@ import numpy as np
+ import polars as pl
+ 
+ from grounded_weather_forecast.config import Config
+-from grounded_weather_forecast.evaluation import code_identity, config_fingerprint
+ from grounded_weather_forecast.metrics.probabilistic import (
+     pit_from_quantiles,
+     reliability_bins,
+ )
+-from grounded_weather_forecast.reports.eprocess import EProcessStore
++from grounded_weather_forecast.reports.eprocess import (
++    EProcessStore,
++    product_eprocess_store,
++)
+ from grounded_weather_forecast.reports.leaderboard import (
+     leaderboard,
+     slice_winners,
+@@ -31,6 +33,8 @@ class ScoreSummary:
+     pit_rows: int = 0
+     reliability: tuple[tuple[float, float, int], ...] = ()
+     unusable: bool = False
++    pit_unusable: bool = False
++    reliability_unusable: bool = False
+ 
+ 
+ def _eprocess_store(
+@@ -40,13 +44,7 @@ def _eprocess_store(
+     if config.promotion.rule != "seq_mcs" or "_live" not in stem:
+         return None
+     product = stem.split("_")[1] if "_" in stem else stem
+-    if product not in cache:
+-        cache[product] = EProcessStore.load(
+-            config.artifacts_dir / "eprocess" / f"{product}_live.json",
+-            config_fingerprint(config),
+-            code_identity(),
+-        )
+-    return cache[product]
++    return product_eprocess_store(config, product, cache)
+ 
+ 
+ def pit_values(scores: pl.DataFrame) -> np.ndarray:
+@@ -104,8 +102,15 @@ def reliability_summary(scores: pl.DataFrame) -> tuple[tuple[float, float, int],
+ 
+ 
+ def summarize_scores(
+-    config: Config, stem: str, scores: pl.DataFrame, stores: dict[str, EProcessStore]
++    config: Config,
++    stem: str,
++    scores: pl.DataFrame,
++    stores: dict[str, EProcessStore],
++    *,
++    board: pl.DataFrame | None = None,
++    winners: pl.DataFrame | None = None,
+ ) -> ScoreSummary:
++    """Summarize one frame, reusing supplied board/winners without deriving them."""
+     kinds = (
+         frozenset(str(value) for value in scores["source_kind"].unique())
+         if "source_kind" in scores.columns and not scores.is_empty()
+@@ -117,21 +122,30 @@ def summarize_scores(
+         else frozenset()
+     )
+     if scores.is_empty():
+-        return ScoreSummary(kinds, folds)
++        return ScoreSummary(source_kinds=kinds, fold_origins=folds)
+     try:
+-        board = leaderboard(scores, references=union_references(config.promotion))
+-        winners = winner_curse_adjusted(
+-            slice_winners(
+-                board,
+-                scores=scores,
+-                rule=config.promotion.rule,
+-                alpha=config.promotion.alpha,
++        if board is None:
++            board = leaderboard(scores, references=union_references(config.promotion))
++        if winners is None:
++            winners = winner_curse_adjusted(
++                slice_winners(
++                    board,
++                    scores=scores,
++                    rule=config.promotion.rule,
++                    alpha=config.promotion.alpha,
++                    promotion=config.promotion,
++                    eprocess_store=_eprocess_store(config, stem, stores),
++                ),
++                scores,
+                 promotion=config.promotion,
+-                eprocess_store=_eprocess_store(config, stem, stores),
+-            ),
+-            scores,
+-            promotion=config.promotion,
+-        )
++            )
++    except (OSError, ValueError, pl.exceptions.PolarsError):
++        # Readable metadata remains useful even when statistical scoring fails.
++        return ScoreSummary(source_kinds=kinds, fold_origins=folds, unusable=True)
++    pit_unusable = False
++    counts: tuple[int, ...] = ()
++    pit_rows = 0
++    try:
+         pit = pit_values(scores)
+         counts = (
+             tuple(
+@@ -140,10 +154,23 @@ def summarize_scores(
+             if pit.size
+             else ()
+         )
++        pit_rows = int(pit.size)
++    except (OSError, ValueError, pl.exceptions.PolarsError):
++        pit_unusable = True
++    reliability_unusable = False
++    reliability: tuple[tuple[float, float, int], ...] = ()
++    try:
+         reliability = reliability_summary(scores)
+     except (OSError, ValueError, pl.exceptions.PolarsError):
+-        # Readable metadata remains useful even when statistical scoring fails.
+-        return ScoreSummary(kinds, folds, unusable=True)
++        reliability_unusable = True
+     return ScoreSummary(
+-        kinds, folds, board, winners, counts, int(pit.size), reliability
++        source_kinds=kinds,
++        fold_origins=folds,
++        board=board,
++        winners=winners,
++        pit_counts=counts,
++        pit_rows=pit_rows,
++        reliability=reliability,
++        pit_unusable=pit_unusable,
++        reliability_unusable=reliability_unusable,
+     )
+diff --git a/src/grounded_weather_forecast/dashboard/writer.py b/src/grounded_weather_forecast/dashboard/writer.py
+index 44a291e..e4fe891 100644
+--- a/src/grounded_weather_forecast/dashboard/writer.py
++++ b/src/grounded_weather_forecast/dashboard/writer.py
+@@ -16,6 +16,7 @@ from grounded_weather_forecast.dashboard.context import (
+ )
+ from grounded_weather_forecast.dashboard.derive import Derived, derive
+ from grounded_weather_forecast.dashboard.html import render_page
++from grounded_weather_forecast.dashboard.score_summary import ScoreSummary
+ from grounded_weather_forecast.dashboard.zones import ALL_ZONES
+ from grounded_weather_forecast.reports.alerts import AlertInputs, evaluate_alerts
+ 
+@@ -175,9 +176,14 @@ def _forecast_payload(ctx: DashboardContext) -> dict[str, object] | None:
+     return document
+ 
+ 
+-def write_dashboard(config: Config, *, now: datetime | None = None) -> Path:
+-    """Collect artifacts, evaluate alerts, render, and write dashboard.html."""
+-    ctx = collect_context(config, now=now)
++def write_dashboard(
++    config: Config,
++    *,
++    now: datetime | None = None,
++    score_summaries: Mapping[str, ScoreSummary] | None = None,
++) -> Path:
++    """Write dashboard.html, optionally reusing a complete score-summary snapshot."""
++    ctx = collect_context(config, now=now, score_summaries=score_summaries)
+     derived = derive(ctx)
+     zones = tuple(build(ctx, derived) for build in ALL_ZONES)
+     alerts = evaluate_alerts(_alert_inputs(ctx, derived))
+diff --git a/src/grounded_weather_forecast/dashboard/zones/evaluation.py b/src/grounded_weather_forecast/dashboard/zones/evaluation.py
+index f1fff48..a5694d7 100644
+--- a/src/grounded_weather_forecast/dashboard/zones/evaluation.py
++++ b/src/grounded_weather_forecast/dashboard/zones/evaluation.py
+@@ -208,7 +208,7 @@ def _calibration_panel(stem: str, summary: ScoreSummary, board: pl.DataFrame) ->
+         if ("crps" in board.columns)
+         else pl.DataFrame()
+     )
+-    if probabilistic.is_empty() and summary.pit_rows == 0:
++    if probabilistic.is_empty() and summary.pit_rows == 0 and not summary.pit_unusable:
+         return empty_panel(
+             "d5",
+             "d5",
+@@ -245,10 +245,12 @@ def _calibration_panel(stem: str, summary: ScoreSummary, board: pl.DataFrame) ->
+     return Panel(
+         panel_id=f"d5-{stem}",
+         title=f"Calibration — {stem.removeprefix('scores_')}",
+-        status="ok",
++        status="amber" if summary.pit_unusable else "ok",
+         copy=PANEL_COPY["d5"],
+         intro=(
+-            "A calibrated forecast has a flat PIT histogram; a U shape means "
++            "PIT calibration could not be calculated from this score file."
++            if summary.pit_unusable
++            else "A calibrated forecast has a flat PIT histogram; a U shape means "
+             "the bands are too narrow, a hump too wide."
+         ),
+         stats=tuple(stats),
+@@ -258,6 +260,14 @@ def _calibration_panel(stem: str, summary: ScoreSummary, board: pl.DataFrame) ->
+ 
+ 
+ def _reliability_panel(stem: str, summary: ScoreSummary) -> Panel | None:
++    if summary.reliability_unusable:
++        return empty_panel(
++            "d5",
++            f"d5r-{stem}",
++            f"PoP reliability — {stem.removeprefix('scores_')}",
++            "amber",
++            "PoP reliability could not be calculated from this score file.",
++        )
+     if not summary.reliability:
+         return None
+     points = [(forecast, frequency) for forecast, frequency, _ in summary.reliability]
+diff --git a/src/grounded_weather_forecast/reports/eprocess.py b/src/grounded_weather_forecast/reports/eprocess.py
+index 1ae403c..9e796ac 100644
+--- a/src/grounded_weather_forecast/reports/eprocess.py
++++ b/src/grounded_weather_forecast/reports/eprocess.py
+@@ -42,10 +42,11 @@ import numpy as np
+ import polars as pl
+ 
+ from grounded_weather_forecast.contracts import FloatArray
++from grounded_weather_forecast.evaluation import code_identity, config_fingerprint
+ from grounded_weather_forecast.storage import atomic_write_text, locked_path
+ 
+ if TYPE_CHECKING:
+-    from grounded_weather_forecast.config import PromotionConfig
++    from grounded_weather_forecast.config import Config, PromotionConfig
+ 
+ _ONS_RATE = 2.0 / (2.0 - math.log(3.0))
+ _LAMBDA_INIT = 0.1
+@@ -178,6 +179,23 @@ class EProcessStore:
+         return entry.log_e if entry is not None else 0.0
+ 
+ 
++def product_eprocess_store(
++    config: "Config", product: str, cache: dict[str, EProcessStore]
++) -> EProcessStore:
++    """Load one product's live wealth per call cache without choosing a rule.
++
++    Callers decide whether the product/rule needs wealth. This helper never
++    persists it; ``report`` remains the only writer.
++    """
++    if product not in cache:
++        cache[product] = EProcessStore.load(
++            config.artifacts_dir / "eprocess" / f"{product}_live.json",
++            config_fingerprint(config),
++            code_identity(),
++        )
++    return cache[product]
++
++
+ def promotion_comparison(
+     board: pl.DataFrame,
+     scores: pl.DataFrame,
+diff --git a/src/grounded_weather_forecast/serve/score_scan.py b/src/grounded_weather_forecast/serve/score_scan.py
+index 1189099..780fc6f 100644
+--- a/src/grounded_weather_forecast/serve/score_scan.py
++++ b/src/grounded_weather_forecast/serve/score_scan.py
+@@ -81,7 +81,7 @@ class ScoreIdentity:
+             predicate &= (
+                 (pl.col("product") != "hourly")
+                 | (pl.col("variable") != variable)
+-                | (pl.col("semantics").fill_null("inst") == semantic.value)
++                | (pl.col("semantics") == semantic.value)
+             )
+         return predicate
+ 
+@@ -195,13 +195,11 @@ def _live_scan(path: Path) -> pl.LazyFrame | None:
+         raise MixedProvenanceError(
+             f"scores at {path} mix source kinds {sorted(map(str, kinds))}"
+         )
+-    return (
+-        scan.with_columns(pl.col("semantics").fill_null("inst"))
+-        if kinds == {"live"} and "semantics" in scan.collect_schema()
+-        else scan
+-        if kinds == {"live"}
+-        else None
+-    )
++    if kinds != {"live"}:
++        return None
++    if "semantics" in scan.collect_schema():
++        scan = scan.with_columns(pl.col("semantics").fill_null("inst"))
++    return scan
+ 
+ 
+ def _catalog_file(
+@@ -314,9 +312,7 @@ def _materialize(
+                 str(error), catalog.path_evaluations[path]
+             ) from error
+     return {
+-        key: pl.concat(frames, how="diagonal_relaxed").with_columns(
+-            pl.col("semantics").fill_null("inst")
+-        )
++        key: pl.concat(frames, how="diagonal_relaxed")
+         for key, frames in fragments.items()
+     }
+ 
+@@ -333,24 +329,36 @@ def _scan_once(
+     for path in sorted(scores_dir.glob("scores_*.parquet")):
+         try:
+             _catalog_file(catalog, path, identity)
+-        except FileNotFoundError as error:
++        except (FileNotFoundError,) as error:  # noqa: B013 -- project convention
+             raise EvidenceChangedError(
+                 str(error), catalog.path_evaluations.get(path, frozenset())
+             ) from error
+-    selected = catalog.newest(promotion)
+-    if not selected:
+-        return ScoreScanResult()
+-    frames = _materialize(catalog, selected, identity)
+-    cutoffs = {
+-        key: value if isinstance(value := frame["valid_time"].max(), datetime) else None
+-        for key, frame in frames.items()
+-    }
+-    evaluations = {evidence.evaluation_id for evidence in selected.values()}
+-    return ScoreScanResult(
+-        frames,
+-        {key: catalog.contexts.contexts[key] for key in sorted(evaluations)},
+-        cutoffs,
+-    )
++    while selected := catalog.newest(promotion):
++        try:
++            frames = _materialize(catalog, selected, identity)
++        except (EvidenceChangedError,) as error:  # noqa: B013 -- project convention
++            newly_invalid = error.evaluations - catalog.contexts.invalid
++            if not newly_invalid:
++                raise EvidenceChangedError(
++                    str(error), frozenset(catalog.contexts.invalid) | error.evaluations
++                ) from error
++            catalog.contexts.invalid.update(newly_invalid)
++            continue
++        cutoffs = {
++            key: value
++            if isinstance(value := frame["valid_time"].max(), datetime)
++            else None
++            for key, frame in frames.items()
++        }
++        evaluations = {evidence.evaluation_id for evidence in selected.values()}
++        return ScoreScanResult(
++            slices=frames,
++            contexts={
++                key: catalog.contexts.contexts[key] for key in sorted(evaluations)
++            },
++            cutoffs=cutoffs,
++        )
++    return ScoreScanResult()
+ 
+ 
+ def compatible_slices(
+@@ -360,10 +368,8 @@ def compatible_slices(
+     for _ in range(MAX_SCORE_SCAN_ATTEMPTS):
+         try:
+             return _scan_once(scores_dir, identity, promotion, excluded=excluded)
+-        except EvidenceChangedError as error:
++        except (EvidenceChangedError,) as error:  # noqa: B013 -- project convention
+             excluded |= error.evaluations
+-        except FileNotFoundError:
+-            continue
+     return ScoreScanResult()
+ 
+ 
+@@ -387,7 +393,7 @@ def live_identity_sets(
+             )
+             for name in columns:
+                 identities[name].update(str(value) for value in probe[name])
+-        except FileNotFoundError:
++        except (FileNotFoundError,):  # noqa: B013 -- project convention
+             if not skip_missing:
+                 raise
+     return (
+diff --git a/src/grounded_weather_forecast/serve/selection.py b/src/grounded_weather_forecast/serve/selection.py
+index 20ecfaa..3dc0687 100644
+--- a/src/grounded_weather_forecast/serve/selection.py
++++ b/src/grounded_weather_forecast/serve/selection.py
+@@ -25,7 +25,10 @@ from grounded_weather_forecast.evaluation import (
+     config_fingerprint,
+     dataset_fingerprint,
+ )
+-from grounded_weather_forecast.reports.eprocess import EProcessStore
++from grounded_weather_forecast.reports.eprocess import (
++    EProcessStore,
++    product_eprocess_store,
++)
+ from grounded_weather_forecast.reports.leaderboard import (
+     _DAILY_GATE_POOL,
+     eligible_board_rows,
+@@ -153,13 +156,7 @@ def _eprocess_store_for(
+     """
+     if config.promotion.rule != "seq_mcs":
+         return None
+-    if product not in cache:
+-        cache[product] = EProcessStore.load(
+-            config.artifacts_dir / "eprocess" / f"{product}_live.json",
+-            config_fingerprint(config),
+-            code_identity(),
+-        )
+-    return cache[product]
++    return product_eprocess_store(config, product, cache)
+ 
+ 
+ def _selection_payload(

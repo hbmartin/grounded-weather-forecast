@@ -302,6 +302,13 @@ dashboard panels. Successful leaderboards, winners, and other calibration
 diagnostics remain available; a calibration-only failure does not mark live
 score evidence unusable.
 
+With `[promotion] rule = "mcs"` or `"legacy"`, report and dashboard share completed
+score summaries, loading each score file once and releasing its full frame
+before the next file. Report tables retain BH/e-BH enrichment; the dashboard
+retains the raw leaderboard. With `"seq_mcs"`, the dashboard independently
+collects scores after all report wealth updates are persisted, retaining two
+full loads per file so every evaluation uses the final wealth state.
+
 ---
 
 ## `alignment`

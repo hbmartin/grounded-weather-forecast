@@ -87,7 +87,7 @@ def maintain(stamp: Path, *, restore: bool) -> int:
     with stamp.with_name("maintenance-job.lock").open("a") as job_lock:
         try:
             fcntl.flock(job_lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except BlockingIOError:
+        except (BlockingIOError,):  # noqa: B013 -- project convention
             print("another maintenance job is running; skipping duplicate", flush=True)
             return 0
         if (
@@ -102,7 +102,7 @@ def maintain(stamp: Path, *, restore: bool) -> int:
             return 0
         os.chdir(REPO)
         print(f"{timestamp()} PROJECT_CWD cwd={Path.cwd()}", flush=True)
-        failures = []
+        failures: list[str] = []
         for step in maintenance_steps(restore=restore):
             name = step[0]
             # Do not prune against a catalog that report failed to refresh.
