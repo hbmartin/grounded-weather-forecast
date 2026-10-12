@@ -44,14 +44,15 @@ mapping. `None` collects score files normally. A supplied mapping is the complet
 score snapshot, including `{}` for an empty archive: score-file I/O is bypassed
 while all other artifacts are still collected. Only completed summaries cross
 this interface; full score frames and mutable wealth stores do not.
-The optional `score_read_failures` tuple carries score-file basenames that the
-producer could not read. These are merged and deduplicated into unreadable-score
-and unreadable-artifact warnings even with an empty supplied mapping. Thus a
-file disappearing after report listing remains visible as a failure without
-forcing the dashboard to reopen successfully summarized files.
+The optional `score_read_failures` tuple carries score-file basenames for genuine
+read faults: corruption, mixed provenance, or permission/I/O errors. These are
+merged and deduplicated into unreadable-score and unreadable-artifact warnings,
+even with an empty supplied mapping or if a faulty file is subsequently removed.
+Successfully summarized files are not reopened.
 
-Files deleted before collection are absent. Decode failures during collection
-appear in unreadable-artifact reporting. When statistical derivation fails,
+Missing files, including deletion between listing and reading, are absence and
+do not mark live scores unusable. Genuine read faults during collection appear
+in unreadable-artifact reporting. When statistical derivation fails,
 readable provenance and fold metadata remain available while the leaderboard
 is marked unusable. PIT and PoP reliability are guarded independently: a failure
 in either produces an amber warning only in that panel, retaining the leaderboard,

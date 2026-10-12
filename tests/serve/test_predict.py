@@ -21,6 +21,193 @@ NOW = utc(2026, 3, 22, 17, 0)
 FETCH = "2026-03-22T16:30:00+00:00"
 
 
+@pytest.mark.parametrize("cause", ["cold", "synthetic", "dataset", "config", "code"])
+def test_rainfall_does_not_mask_evidence_diagnosis(config, cause, capsys, monkeypatch):
+    import polars as pl
+    from score_fixtures import scores
+    from grounded_weather_forecast.evaluation import (
+        code_identity,
+        config_fingerprint,
+        dataset_fingerprint,
+    )
+    from grounded_weather_forecast.serve.selection import no_evidence_reason
+
+    directory = config.dataset.dir / "scores"
+    if cause != "cold":
+        directory.mkdir(exist_ok=True)
+        frame = scores().with_columns(
+            pl.lit("synthetic" if cause == "synthetic" else "live").alias(
+                "source_kind"
+            ),
+            pl.lit("old" if cause == "dataset" else dataset_fingerprint(config)).alias(
+                "dataset_fingerprint"
+            ),
+            pl.lit("old" if cause == "config" else config_fingerprint(config)).alias(
+                "config_fingerprint"
+            ),
+            pl.lit("old" if cause == "code" else code_identity()).alias("code_version"),
+        )
+        frame.write_parquet(
+            directory
+            / f"scores_hourly_{'synthetic' if cause == 'synthetic' else 'live'}_expanding.parquet"
+        )
+    expected = no_evidence_reason(config, directory)
+    document = predict(config, {}, now=NOW)
+    assert document.status == "degraded"
+    assert document.status_reason == expected
+    assert any(
+        "rainfall fallback:" in p.selection_reasons.get("precip_mm", "")
+        for p in document.hourly
+    )
+    assert any(
+        p.methods.get("precip_sum_mm") == "rainfall_accumulation_floor"
+        for p in document.daily
+    )
+    assert (
+        main(
+            [
+                "--config",
+                str(config.dataset.dir.parent / "config.toml"),
+                "predict",
+                "--now",
+                NOW.isoformat(),
+                "--no-history",
+                "--out",
+                "-",
+            ]
+        )
+        == 0
+    )
+    assert expected in capsys.readouterr().err
+    if cause == "code":
+        _assert_diagnosis_channels(config, document, monkeypatch)
+
+
+def _assert_diagnosis_channels(config, document, monkeypatch):
+    import importlib.util
+    import subprocess
+    from dataclasses import replace
+    from pathlib import Path
+    from types import SimpleNamespace
+    from grounded_weather_forecast.dashboard.context import DashboardContext
+    from grounded_weather_forecast.dashboard.derive import Derived
+    from grounded_weather_forecast.dashboard.writer import _alert_inputs
+    from grounded_weather_forecast.dashboard.zones.liveness import _serving_status
+    from grounded_weather_forecast.reports.alerts import evaluate_alerts
+    from grounded_weather_forecast.serve.publish import (
+        _recovery_signature,
+        publish_document,
+        record_publish_attempt,
+        schedule_recovery,
+    )
+
+    target = config.dataset.dir.parent / "forecast.json"
+    target.write_text(replace(document, status="ready", status_reason=None).to_json())
+    outcome = publish_document(document, target, config.predict.history_path, now=NOW)
+    assert outcome.action == "held_last_good"
+    record_publish_attempt(config, document, outcome, target, now=NOW)
+    attempt = json.loads(
+        (config.artifacts_dir / "latest_publish_attempt.json").read_text()
+    )
+    assert attempt["status_reason"] == document.status_reason
+    ctx = DashboardContext(
+        config=config, now=NOW, latest_forecast=document, latest_publish_attempt=attempt
+    )
+    assert _serving_status(ctx).intro == f"degraded: {document.status_reason}"
+    alerts = evaluate_alerts(_alert_inputs(ctx, Derived()))
+    assert any(
+        document.status_reason in alert.message and "held" in alert.message
+        for alert in alerts
+    )
+    calls = []
+    monkeypatch.setattr(
+        subprocess,
+        "Popen",
+        lambda command, **kwargs: calls.append(command) or SimpleNamespace(pid=123),
+    )
+    assert schedule_recovery(
+        config, config.dataset.dir.parent / "config.toml", document, now=NOW
+    )
+    state = json.loads((config.artifacts_dir / "auto-restore.json").read_text())
+    assert state["signature"] == _recovery_signature(
+        config, document.status_reason, "auto", "all", "expanding"
+    )
+    assert state["reason"] == document.status_reason
+    target.write_text(document.to_json())
+    script = Path(__file__).parents[2] / "docs/launchd/hourly-predict-publish.py"
+    spec = importlib.util.spec_from_file_location("rainfall_restore_regression", script)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    monkeypatch.setattr(module, "OUT", str(target))
+    monkeypatch.setattr(module, "RESTORE_LOG", target.with_suffix(".log"))
+    module.maybe_spawn_restore()
+    assert len(calls) == 2
+    assert calls[-1][-1] == "--restore"
+
+
+def test_only_finite_guarded_rows_record_attribution_loss():
+    import numpy as np
+    from grounded_weather_forecast.serve.predict import (
+        VariableBlend,
+        _record_rainfall_guards,
+    )
+    from grounded_weather_forecast.serve.rainfall import RainfallEffects
+
+    blend = VariableBlend(
+        point=np.array([np.nan, 1.0, 1.0]),
+        methods=["equal_weight"] * 3,
+        reasons=["guarded"] * 3,
+        release_ids=[None] * 3,
+        quantiles=[{}] * 3,
+        guarded_release_ids=("removed", None, "removed"),
+    )
+    effects = RainfallEffects()
+    _record_rainfall_guards({"precip_mm": blend}, 0, effects)
+    _record_rainfall_guards({"precip_mm": blend}, 1, effects)
+    assert not effects.guarded_release_removed
+    _record_rainfall_guards({"precip_mm": blend}, 2, effects)
+    assert effects.guarded_release_removed
+
+
+@pytest.mark.parametrize(
+    ("rain_release", "other_release"), [(True, False), (False, False), (True, True)]
+)
+def test_document_reason_requires_reconciliation_attribution_loss(
+    config, monkeypatch, rain_release, other_release
+):
+    import grounded_weather_forecast.serve.predict as module
+    from grounded_weather_forecast.serve.schema import HourlyPoint, MinutelyPoint
+
+    point = HourlyPoint(NOW.isoformat(), 0.0, values={"precip_mm": 1.0})
+    if rain_release:
+        point.release_ids["precip_mm"] = "rain-release"
+    if other_release:
+        point.release_ids["temp_c"] = "temperature-release"
+    monkeypatch.setattr(
+        module, "hourly_product", lambda *_args, **_kwargs: ([point], {})
+    )
+    monkeypatch.setattr(module, "daily_product", lambda *_args, **_kwargs: [])
+    monkeypatch.setattr(
+        module,
+        "minutely_product",
+        lambda *_args, **_kwargs: [
+            MinutelyPoint(
+                (NOW + timedelta(minutes=i)).isoformat(), i, precip_intensity_mmh=2.0
+            )
+            for i in range(1, 61)
+        ],
+    )
+    document = predict(config, {}, now=NOW)
+    assert point.values["precip_mm"] == pytest.approx(2.0)
+    if other_release:
+        assert document.status == "ready"
+        assert document.status_reason is None
+    elif rain_release:
+        assert "rainfall reconciliation" in document.status_reason
+    else:
+        assert "cold start" in document.status_reason
+
+
 def build_fixture(tmp_path, *, obs_temp_f=68.0, extra_toml=""):
     """A station with recent obs plus two providers with 48h of hourly data.
 
@@ -261,7 +448,10 @@ class TestPredict:
         methods = {m for p in document.hourly for m in p.methods.values()}
         assert methods == {"equal_weight"}
 
-    def test_rain_only_release_does_not_keep_ready_status_after_fallback(self, config):
+    def test_rain_only_release_does_not_keep_ready_status_after_fallback(
+        self, config_no_provider_qc
+    ):
+        config = config_no_provider_qc
         selections = {
             ("hourly", "precip_mm", "0-1h"): Selection(
                 "equal_weight",

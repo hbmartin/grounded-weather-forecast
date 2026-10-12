@@ -110,6 +110,8 @@ def _score_summaries(
     for path in sorted((config.dataset.dir / "scores").glob("scores_*.parquet")):
         try:
             frame = load_scores(path, compact=True)
+        except (FileNotFoundError,):  # noqa: B013 -- project convention
+            continue
         except (OSError, MixedProvenanceError, pl.exceptions.PolarsError):
             unreadable.append(path.stem)
             failures.append(f"dataset/scores/{path.name}")

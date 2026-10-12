@@ -72,9 +72,13 @@ forecast — but it is **not** the evidence-backed one. Typical reasons:
 ```
 
 Rainfall safeguards can also remove the last served release despite compatible
-promotion evidence. In that case `status_reason` names insufficient wet-day
-evidence or changed rainfall reconciliation, rather than diagnosing missing
-scores. Detailed counts remain in each affected field's `selection_reasons`.
+promotion evidence. Prediction-local effects record actual attribution loss
+from finite served fields; method labels alone do not determine the reason. If
+both safeguards remove attribution, the wet-day reason takes precedence over
+reconciliation. Without either loss, cold-start, synthetic-only, dataset/config,
+and implementation-change diagnoses retain their existing wording. Detailed wet-day
+counts remain in each affected field's `selection_reasons`. These effects are not
+serialized; the JSON schema remains v6.
 
 Degraded status is also printed to **stderr**, so `--out -` still yields clean
 JSON on stdout. See the [FAQ](../faq.md#why-does-my-forecast-say-degraded).

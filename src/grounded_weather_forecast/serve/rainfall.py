@@ -1,8 +1,9 @@
 """Causal wet-evidence guards and reconciliation of precipitation products."""
 
 import math
+from bisect import bisect_right
 from collections import defaultdict
-from dataclasses import replace
+from dataclasses import dataclass, replace
 from datetime import date, datetime, timedelta
 from itertools import pairwise
 from zoneinfo import ZoneInfo
@@ -22,15 +23,71 @@ MIN_WET_DAYS = 5
 MAX_NATIVE_GAP = timedelta(minutes=15)
 RAIN_VARIABLES = frozenset({"pop", "precip_mm", "precip_sum_mm"})
 HOURLY_FALLBACK = "hourly_rainfall_fallback"
-RECONCILIATION_METHODS = frozenset(
-    {
-        "minutely_rainfall_floor",
-        "hourly_rainfall_sum",
-        "rainfall_accumulation_floor",
-        "hourly_rainfall_probability_floor",
-        "observed_daily_occurrence",
-    }
-)
+MINUTELY_FLOOR = "minutely_rainfall_floor"
+HOURLY_SUM = "hourly_rainfall_sum"
+ACCUMULATION_FLOOR = "rainfall_accumulation_floor"
+PROBABILITY_FLOOR = "hourly_rainfall_probability_floor"
+OBSERVED_OCCURRENCE = "observed_daily_occurrence"
+
+
+@dataclass(frozen=True, slots=True)
+class RainfallTimeline:
+    """Parsed times and point indices, safe across minute replacements."""
+
+    hour_starts: tuple[datetime, ...]
+    minute_times: tuple[datetime, ...]
+    minute_indices: tuple[int, ...]
+    hour_minutes: tuple[tuple[int, ...], ...]
+
+    @classmethod
+    def build(
+        cls, hourly: list[HourlyPoint], minutely: list[MinutelyPoint]
+    ) -> "RainfallTimeline":
+        starts = tuple(datetime.fromisoformat(h.valid_time) for h in hourly)
+        minutes = sorted(
+            (datetime.fromisoformat(m.valid_time), index)
+            for index, m in enumerate(minutely)
+        )
+        times = tuple(time for time, _ in minutes)
+        indices = tuple(index for _, index in minutes)
+        children = tuple(
+            tuple(
+                sorted(
+                    indices[
+                        bisect_right(times, start) : bisect_right(
+                            times, start + timedelta(hours=1)
+                        )
+                    ]
+                )
+            )
+            for start in starts
+        )
+        return cls(starts, times, indices, children)
+
+    def minutes_between(self, start: datetime, end: datetime) -> tuple[int, ...]:
+        """Original point order in an interval whose minute labels end it."""
+        return tuple(
+            sorted(
+                self.minute_indices[
+                    bisect_right(self.minute_times, start) : bisect_right(
+                        self.minute_times, end
+                    )
+                ]
+            )
+        )
+
+    def hours_between(self, start: datetime, end: datetime) -> tuple[int, ...]:
+        return tuple(
+            i for i, time in enumerate(self.hour_starts) if start <= time < end
+        )
+
+
+@dataclass(slots=True)
+class RainfallEffects:
+    """Prediction-local attribution losses; never part of forecast JSON."""
+
+    guarded_release_removed: bool = False
+    reconciled_release_removed: bool = False
 
 
 def rainfall_selections(
@@ -137,6 +194,8 @@ def _set_rain(
     value: float,
     method: str,
     reason: str,
+    *,
+    effects: RainfallEffects | None = None,
 ) -> None:
     old = point.values.get(variable)
     if old is not None and math.isclose(old, value, rel_tol=0.0, abs_tol=1e-12):
@@ -150,7 +209,9 @@ def _set_rain(
     # The original distribution/release did not produce this reconciled value.
     point.quantiles.pop(variable, None)
     point.quantiles_source.pop(variable, None)
-    point.release_ids.pop(variable, None)
+    release = point.release_ids.pop(variable, None)
+    if effects is not None and release and _finite(old) is not None:
+        effects.reconciled_release_removed = True
 
 
 def _native_value(point: MinutelyPoint, field: str) -> float | None:
@@ -160,22 +221,19 @@ def _native_value(point: MinutelyPoint, field: str) -> float | None:
 
 
 def fill_minutely_rain(
-    minutely: list[MinutelyPoint], hourly: list[HourlyPoint]
+    minutely: list[MinutelyPoint],
+    hourly: list[HourlyPoint],
+    *,
+    timeline: RainfallTimeline | None = None,
 ) -> None:
     """Distribute only the original parent hour's remaining rainfall budget."""
-    for hour in hourly:
-        start = datetime.fromisoformat(hour.valid_time)
-        children = [
-            (index, point)
-            for index, point in enumerate(minutely)
-            if start
-            < datetime.fromisoformat(point.valid_time)
-            <= start + timedelta(hours=1)
-        ]
+    timeline = timeline or RainfallTimeline.build(hourly, minutely)
+    for hour, indices in zip(hourly, timeline.hour_minutes, strict=True):
         native = [
             value
-            for _, point in children
-            if (value := _native_value(point, "precip_intensity_mmh")) is not None
+            for index in indices
+            if (value := _native_value(minutely[index], "precip_intensity_mmh"))
+            is not None
         ]
         amount = _finite(hour.values.get("precip_mm"))
         missing = 60 - len(native)
@@ -187,8 +245,8 @@ def fill_minutely_rain(
             else None
         )
         probability = _finite(hour.values.get("pop"), probability=True)
-        for index, original in children:
-            point = original
+        for index in indices:
+            point = minutely[index]
             for field, value in (("precip_intensity_mmh", rate), ("pop", probability)):
                 if _native_value(point, field) is not None or value is None:
                     continue
@@ -203,18 +261,16 @@ def fill_minutely_rain(
 
 
 def reconcile_hourly_rain(
-    hourly: list[HourlyPoint], minutely: list[MinutelyPoint]
+    hourly: list[HourlyPoint],
+    minutely: list[MinutelyPoint],
+    *,
+    effects: RainfallEffects | None = None,
+    timeline: RainfallTimeline | None = None,
 ) -> None:
     """A parent hour contains at least its forecast minute accumulation."""
-    for hour in hourly:
-        start = datetime.fromisoformat(hour.valid_time)
-        minutes = [
-            m
-            for m in minutely
-            if start
-            < datetime.fromisoformat(m.valid_time)
-            <= start + timedelta(hours=1)
-        ]
+    timeline = timeline or RainfallTimeline.build(hourly, minutely)
+    for hour, indices in zip(hourly, timeline.hour_minutes, strict=True):
+        minutes = [minutely[index] for index in indices]
         amount = sum(
             value / 60.0
             for m in minutes
@@ -231,38 +287,48 @@ def reconcile_hourly_rain(
                     hour,
                     variable,
                     floor,
-                    "minutely_rainfall_floor",
+                    MINUTELY_FLOOR,
                     "parent hour reconciled to contained native minute forecasts; probability uses max, without independence assumptions",
+                    effects=effects,
                 )
 
 
-def _complete_day(hours: list[HourlyPoint], start: datetime, end: datetime) -> bool:
+def _complete_day(
+    hours: list[HourlyPoint],
+    starts: tuple[datetime, ...],
+    start: datetime,
+    end: datetime,
+) -> bool:
     expected = {
         start + timedelta(hours=i)
         for i in range(int((end - start).total_seconds() / 3600))
     }
-    return {datetime.fromisoformat(h.valid_time) for h in hours} == expected and all(
+    return set(starts) == expected and all(
         _finite(h.values.get("precip_mm")) is not None for h in hours
     )
 
 
 def _today_prefix(
     minutely: list[MinutelyPoint],
-    hours: list[HourlyPoint],
+    first_hour: datetime,
     issue_time: datetime,
     end: datetime,
+    timeline: RainfallTimeline,
 ) -> float:
-    first_hour = min((datetime.fromisoformat(h.valid_time) for h in hours), default=end)
     return sum(
         value / 60.0
-        for m in minutely
-        if (value := _native_value(m, "precip_intensity_mmh")) is not None
-        and issue_time < datetime.fromisoformat(m.valid_time) <= min(first_hour, end)
+        for index in timeline.minutes_between(issue_time, min(first_hour, end))
+        if (value := _native_value(minutely[index], "precip_intensity_mmh")) is not None
     )
 
 
 def _daily_probability(
-    point: DailyPoint, hours: list[HourlyPoint], *, observed: bool, minute_pop: float
+    point: DailyPoint,
+    hours: list[HourlyPoint],
+    *,
+    observed: bool,
+    minute_pop: float,
+    effects: RainfallEffects | None = None,
 ) -> None:
     probability = (
         1.0
@@ -281,12 +347,11 @@ def _daily_probability(
             point,
             "pop",
             probability,
-            "observed_daily_occurrence"
-            if observed
-            else "hourly_rainfall_probability_floor",
+            OBSERVED_OCCURRENCE if observed else PROBABILITY_FLOOR,
             "measurable rain already observed in this local calendar day"
             if observed
             else "daily probability at least the largest contained native minute or hourly probability; intervals are not assumed independent",
+            effects=effects,
         )
 
 
@@ -299,35 +364,41 @@ def reconcile_daily_rain(
     timezone: str,
     observed_today_mm: float | None,
     threshold_mm: float,
+    effects: RainfallEffects | None = None,
+    timeline: RainfallTimeline | None = None,
 ) -> None:
     """Exact sums for complete local days; explicit lower bounds otherwise."""
     zone = ZoneInfo(timezone)
     today = issue_time.astimezone(zone).date()
+    timeline = timeline or RainfallTimeline.build(hourly, minutely)
     for point in daily:
         day = date.fromisoformat(point.date_local)
         start, end = (
             local_day_start_utc(day, timezone),
             local_day_start_utc(day + timedelta(days=1), timezone),
         )
-        hours = [
-            h for h in hourly if start <= datetime.fromisoformat(h.valid_time) < end
-        ]
+        indices = timeline.hours_between(start, end)
+        hours = [hourly[index] for index in indices]
+        starts = tuple(timeline.hour_starts[index] for index in indices)
         amounts = [_finite(h.values.get("precip_mm")) for h in hours]
-        complete = _complete_day(hours, start, end)
+        complete = _complete_day(hours, starts, start, end)
         total = sum(v for v in amounts if v is not None)
         if day == today:
             total += observed_today_mm or 0.0
-            total += _today_prefix(minutely, hours, issue_time, end)
+            total += _today_prefix(
+                minutely, min(starts, default=end), issue_time, end, timeline
+            )
         old = _finite(point.values.get("precip_sum_mm"))
         if complete or total > (old or 0.0) + 1e-12:
             _set_rain(
                 point,
                 "precip_sum_mm",
                 total,
-                "hourly_rainfall_sum" if complete else "rainfall_accumulation_floor",
+                HOURLY_SUM if complete else ACCUMULATION_FLOOR,
                 "sum of complete local-day hourly path"
                 if complete
                 else "at least observed rain today plus remaining hourly/minute rain; partial coverage is a lower bound",
+                effects=effects,
             )
         _daily_probability(
             point,
@@ -335,30 +406,22 @@ def reconcile_daily_rain(
             minute_pop=max(
                 (
                     value
-                    for minute in minutely
-                    if start < datetime.fromisoformat(minute.valid_time) <= end
-                    and (value := _native_value(minute, "pop")) is not None
+                    for index in timeline.minutes_between(start, end)
+                    if (value := _native_value(minutely[index], "pop")) is not None
                 ),
                 default=0.0,
             ),
             observed=day == today
             and observed_today_mm is not None
             and observed_today_mm >= threshold_mm,
+            effects=effects,
         )
 
 
-def rainfall_status_reason(points: list[HourlyPoint | DailyPoint]) -> str | None:
-    """Name serving safeguards before diagnosing missing promotion evidence."""
-    if any(
-        "rainfall fallback:" in point.selection_reasons.get(variable, "")
-        for point in points
-        for variable in RAIN_VARIABLES
-    ):
+def rainfall_status_reason(effects: RainfallEffects) -> str | None:
+    """Name only safeguards that actually removed served attribution."""
+    if effects.guarded_release_removed:
         return f"rainfall safeguard: fewer than {MIN_WET_DAYS} wet local days in one or more served lead buckets; using uncalibrated rainfall"
-    if any(
-        point.methods.get(variable) in RECONCILIATION_METHODS
-        for point in points
-        for variable in RAIN_VARIABLES
-    ):
+    if effects.reconciled_release_removed:
         return "rainfall reconciliation changed served values; original release attribution no longer applies"
     return None

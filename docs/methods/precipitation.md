@@ -208,12 +208,19 @@ temperature.
 
 ## 6. Coherence
 
-*Implemented in: `serve/rainfall.py`; `dataset/truth.py::observed_rainfall`;
+*Implemented in: `serve/rainfall.py::RainfallTimeline`; `serve/rainfall.py::RainfallEffects`;
+`dataset/truth.py::observed_rainfall`;
 `dataset/providers.py::align_hourly_rain`; `dataset/matrix.py`;
 `dataset/ensembles.py::ensemble_features`*
 
 Daily rain is initially fitted as a separate supervised target. Automatic
 serving reconciles it with the hourly and minute paths after fitting:
+
+A prediction-local timeline parses each hourly/minute timestamp once and shares
+point indices across fallback, floors, daily containment, and prefix calculation.
+It stores no point references: minute replacements remain visible to later
+steps. Minute intervals use `(start, end]`; hourly day membership uses
+`[start, end)`. Direct helper calls create their own timeline when none is supplied.
 
 - Native minute rain uses only the latest vintage per source. Open-Meteo's
   rate represents a preceding **15-minute** accumulation: its converted rate
@@ -254,7 +261,10 @@ serving reconciles it with the hourly and minute paths after fitting:
   Already observed accumulation remains a known lower bound if the live
   stream becomes stale; instantaneous observation anchoring expires separately.
 - Parent hourly PoP is at least the largest contained native minute PoP;
-  daily PoP also includes native prefix minutes. Probabilities are
+  daily PoP includes every contained native minute probability, including the
+  prefix. This remains necessary in timezones whose local midnight falls inside
+  a canonical hour: a minute after midnight belongs to the next day even when
+  its parent hour starts on the preceding day. Probabilities are
   **not** summed and hours are not assumed independent. Today becomes 100%
   occurrence once observed accumulation meets `pop_threshold_mm` (default
   **0.254 mm**, the NWS measurable-precipitation threshold).
@@ -275,7 +285,12 @@ and `selection_reasons`. Changed values discard inherited quantiles and release
 attribution because the prior model did not produce the adjusted value. A
 reconciliation within absolute tolerance **1e-12** leaves the original value and
 all its attribution unchanged; hourly releases are never synthesized into a
-daily release. When no hourly or daily release remains, the document's degraded
-reason names an active wet-day safeguard first, then changed rainfall
-reconciliation, before falling back to the usual evidence diagnosis.
+daily release. Prediction-local `RainfallEffects` records a wet-day guard only
+when it replaces a release-bearing selection for a finite emitted field, and
+records reconciliation only when a changed, previously finite field loses an
+existing release. Changes within **1e-12**, missing releases, and nonfinite rows
+record no loss. When no hourly or daily release remains, the degraded reason
+names a guard that removed attribution first, then reconciliation that removed
+attribution; otherwise the usual evidence diagnosis is retained. Labels alone
+do not establish the cause of degraded serving.
 Non-rain variables keep their existing selection and prediction paths.

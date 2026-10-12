@@ -39,6 +39,7 @@ from grounded_weather_forecast.reports.recalibration import (
     fit_cqr_margins,
     fit_pit_levels,
 )
+from grounded_weather_forecast.serve.row_mask import normalize_eligible_rows
 from grounded_weather_forecast.serve.score_pool import collect_live_pool
 from grounded_weather_forecast.serve.selection import Selection
 
@@ -220,12 +221,7 @@ def recalibrate_variable(
     Rows already labeled by dressing keep their label and values — dressed
     bands are split-conformal already and must not be corrected twice.
     """
-    eligible = (
-        tuple(eligible_rows) if eligible_rows is not None else (True,) * len(chosen)
-    )
-    if len(eligible) != len(chosen):
-        msg = "eligible_rows must match the number of chosen rows"
-        raise ValueError(msg)
+    eligible = normalize_eligible_rows(eligible_rows, len(chosen))
     method_ids = frozenset(
         selection.method_id
         for selection, allowed in zip(chosen, eligible, strict=True)

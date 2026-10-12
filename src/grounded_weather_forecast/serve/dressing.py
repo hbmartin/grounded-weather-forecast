@@ -33,6 +33,7 @@ from grounded_weather_forecast.contracts import (
     TruthSemantics,
     VariableSpec,
 )
+from grounded_weather_forecast.serve.row_mask import normalize_eligible_rows
 from grounded_weather_forecast.serve.score_pool import collect_live_pool
 
 if TYPE_CHECKING:
@@ -188,12 +189,7 @@ def dress_variable(
     are candidates. The label records which ladder rung supplied the pool.
     """
     sources: list[str | None] = [None] * len(quantiles)
-    eligible = (
-        tuple(eligible_rows) if eligible_rows is not None else (True,) * len(chosen)
-    )
-    if len(eligible) != len(chosen):
-        msg = "eligible_rows must match the number of chosen rows"
-        raise ValueError(msg)
+    eligible = normalize_eligible_rows(eligible_rows, len(chosen))
     undressed: dict[tuple[str, str | None], list[int]] = {}
     for row, selection in enumerate(chosen):
         if not eligible[row] or quantiles[row] or not np.isfinite(point[row]):
