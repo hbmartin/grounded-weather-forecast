@@ -1448,7 +1448,9 @@ def _run_pipeline_steps(
     steps: tuple[tuple[str, Callable[[], int]], ...],
     *,
     backtest_args: argparse.Namespace | None = None,
+    continue_on_failure: frozenset[str] = frozenset(),
 ) -> int:
+    first_failure = 0
     for name, step in steps:
         print(f"pipeline step: {name}")
         started_at = datetime.now(tz=UTC)
@@ -1475,9 +1477,17 @@ def _run_pipeline_steps(
                 failure_kind=kind,
             )
         if result:
+            first_failure = first_failure or result
+            if name in continue_on_failure:
+                print(
+                    f"pipeline continuing: {name} exited {result}; "
+                    "remaining outputs will run, but maintenance will fail",
+                    file=sys.stderr,
+                )
+                continue
             print(f"pipeline stopped: {name} exited {result}", file=sys.stderr)
-            return result
-    return 0
+            return first_failure
+    return first_failure
 
 
 def _cmd_maintain(config: Config, args: argparse.Namespace) -> int:
@@ -1491,6 +1501,7 @@ def _cmd_maintain(config: Config, args: argparse.Namespace) -> int:
             ("truth-qc", lambda: _cmd_truth_qc(config, truth_args)),
             ("report", lambda: _cmd_report(config)),
         ),
+        continue_on_failure=frozenset({"truth-qc"}),
     )
 
 

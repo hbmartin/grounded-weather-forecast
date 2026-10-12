@@ -86,6 +86,13 @@ Cold-start blends have no release or guard-loss attribution even when provider
 values are finite. A null rainfall value later filled from native minute evidence
 also records no attribution loss. Archived documents replay as originally served;
 these emission rules do not rewrite historical forecasts.
+An internal fitting diagnostic records when a release-bearing selection cannot
+be fitted from scoreable training history, including choices displaced by a rain
+guard. It does not count as attribution loss. After checking archive provenance
+and dataset/config/code identities, compatible evidence receives the specific
+fitting reason. Other cases say no promoted release produced a finite hourly or
+daily forecast. Per-field reasons retain their selection history. Fitting
+diagnostics are not serialized.
 
 Degraded status is also printed to **stderr**, so `--out -` still yields clean
 JSON on stdout. See the [FAQ](../faq.md#why-does-my-forecast-say-degraded).
@@ -156,7 +163,9 @@ apparent error on a clear day. See
 ### Reading `quantiles` and `quantiles_source`
 
 `quantiles` is empty when the serving method is a point forecaster and no
-dressing pool was available. When present, keys are string levels:
+dressing pool was available. A variable with a null normalized point has neither
+quantiles nor a source label. Empty distributions are omitted, and source labels
+require usable emitted quantiles. When present, keys are string levels:
 
 ```json
 "quantiles": {

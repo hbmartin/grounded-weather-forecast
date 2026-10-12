@@ -49,7 +49,10 @@ New hourly/daily documents carry release IDs only for finite normalized values,
 including zero. Null predictions contribute no release to document readiness or
 the top-level release list. Cold-start blends remain unattributed, and rainfall
 floors that fill their null fields retain the evidence diagnosis. Archived
-documents replay verbatim; historical forecast files are not rewritten.
+documents replay verbatim; historical forecast files are not rewritten. Null
+points also omit quantiles and their source; source labels require usable
+emitted quantiles. With compatible evidence, unavailable fitting for a promoted
+selection is diagnosed separately from rainfall attribution loss.
 
 ### The provenance wall is in the filename
 
@@ -124,6 +127,14 @@ when a read fault persists.
 | `auto-restore.json` | `publish` | last automatic-recovery signature and attempt time |
 | `latest_publish_attempt.json` | `publish` | latest candidate status, reason, hold decision, and locally served document |
 | `auto-restore.log` | `recover` | detached recovery stdout and stderr |
+
+A handled truth-QC failure during CLI maintenance preserves the previous
+`truth_qc.json` and still permits report/dashboard/catalog refresh. The failed
+stage is recorded in `data/runs.parquet`; maintenance returns its first nonzero
+stage result even when report finishes. A refreshed report may therefore use an
+older QC verdict. Build/backtest failures and unexpected exceptions still stop
+maintenance. Source changes alter the code fingerprint: generate fresh live
+backtest and report evidence with the updated code before rollout.
 
 ### The history ledgers
 

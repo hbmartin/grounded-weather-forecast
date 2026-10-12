@@ -77,9 +77,13 @@ maintenance or restore jobs skip as duplicates. A successful daily run writes
 `last-maintenance`; a fresh stamp skips catch-up for **20 hours**. Restore runs
 leave that stamp untouched, and a failed report skips score pruning.
 
-CLI `maintain` also runs truth-QC before report and retains its fail-fast policy:
-a truth-QC failure stops before report, and a report read fault returns failure
-after truth-QC has completed. Corrupt scores are not repaired by pruning or
+CLI `maintain` also runs truth-QC before report. Build/backtest failures stop the
+pipeline, while a handled truth-QC failure permits report under the same lock.
+Maintenance returns the first nonzero stage result after reporting. Failed QC
+refreshes preserve the previous artifact and remain in the run ledger; a fresh
+dashboard can therefore contain an older QC verdict. Unexpected exceptions
+still stop the pipeline. A report read fault preserves available outputs and
+returns failure after truth-QC has been attempted. Corrupt scores are not repaired by pruning or
 automatic quarantine; follow the [manual recovery procedure](reference/cli.md#recovering-from-a-damaged-score-file).
 
 The hourly wrapper checks whether a degraded document says `implementation

@@ -168,8 +168,15 @@ def test_maintain_runs_every_step_in_order(tmp_path, monkeypatch):
     assert stages["parent_run_id"].to_list() == [parent["run_id"]] * 4
 
 
-def test_maintain_stops_before_report_when_truth_qc_fails(tmp_path, monkeypatch):
+@pytest.mark.parametrize("report_exit", [0, 3])
+def test_maintain_reports_after_truth_qc_failure_and_returns_first_failure(
+    tmp_path, monkeypatch, report_exit
+):
     config = write_config(tmp_path)
+    config.artifacts_dir.mkdir(parents=True)
+    artifact = config.artifacts_dir / "truth_qc.json"
+    artifact.write_text('{"schema_version": 3, "drift_reason": "previous verdict"}')
+    original = artifact.read_bytes()
     calls = []
     monkeypatch.setattr(
         cli_module, "_cmd_build_dataset", lambda _config: calls.append("build") or 0
@@ -182,16 +189,114 @@ def test_maintain_stops_before_report_when_truth_qc_fails(tmp_path, monkeypatch)
     monkeypatch.setattr(
         cli_module,
         "_cmd_truth_qc",
-        lambda _config, _args: calls.append("truth-qc") or 1,
+        lambda _config, _args: calls.append("truth-qc") or 2,
     )
     monkeypatch.setattr(
-        cli_module, "_cmd_report", lambda _config: calls.append("report") or 0
+        cli_module, "_cmd_report", lambda _config: calls.append("report") or report_exit
     )
-    assert main(["--config", str(tmp_path / "config.toml"), "maintain"]) == 1
-    assert calls == ["build", "backtest", "truth-qc"]
+    assert main(["--config", str(tmp_path / "config.toml"), "maintain"]) == 2
+    assert calls == ["build", "backtest", "truth-qc", "report"]
     stages = load_runs(runs_path(config)).filter(pl.col("record_kind") == "stage")
-    assert stages["command"].to_list() == ["build-dataset", "backtest", "truth-qc"]
-    assert stages["exit_code"].to_list() == [0, 0, 1]
+    assert stages["command"].to_list() == [
+        "build-dataset",
+        "backtest",
+        "truth-qc",
+        "report",
+    ]
+    assert stages["exit_code"].to_list() == [0, 0, 2, report_exit]
+    assert artifact.read_bytes() == original
+
+
+@pytest.mark.parametrize("stage", ["truth-qc", "report"])
+def test_maintain_unexpected_exception_still_propagates(tmp_path, monkeypatch, stage):
+    config = write_config(tmp_path)
+    calls = []
+    monkeypatch.setattr(cli_module, "_cmd_build_dataset", lambda _config: 0)
+    monkeypatch.setattr(cli_module, "_cmd_backtest", lambda *_args: 0)
+
+    def fail(name):
+        calls.append(name)
+        if name == stage:
+            raise RuntimeError("unexpected stage failure")
+        return 1
+
+    monkeypatch.setattr(cli_module, "_cmd_truth_qc", lambda *_args: fail("truth-qc"))
+    monkeypatch.setattr(cli_module, "_cmd_report", lambda *_args: fail("report"))
+    with pytest.raises(RuntimeError, match="unexpected stage failure"):
+        main(["--config", str(tmp_path / "config.toml"), "maintain"])
+    assert calls == (["truth-qc"] if stage == "truth-qc" else ["truth-qc", "report"])
+    stages = load_runs(runs_path(config)).filter(pl.col("record_kind") == "stage")
+    assert stages["command"][-1] == stage
+    assert stages["exit_code"][-1] is None
+
+
+@pytest.mark.parametrize("rule", ["mcs", "legacy", "seq_mcs"])
+@pytest.mark.parametrize("previous_artifact", [False, True])
+def test_neighbor_fetch_failure_still_refreshes_real_report(
+    tmp_path, monkeypatch, capsys, rule, previous_artifact
+):
+    from grounded_weather_forecast.backtest.scores import write_scores
+    from grounded_weather_forecast.dashboard.context import collect_context
+    from grounded_weather_forecast.dataset import neighbors
+    from grounded_weather_forecast.reports import evidence
+    from score_fixtures import scores
+
+    config = write_config(tmp_path, extra_toml=f'[promotion]\nrule = "{rule}"')
+    config.artifacts_dir.mkdir(parents=True)
+    artifact = config.artifacts_dir / "truth_qc.json"
+    if previous_artifact:
+        artifact.write_text('{"schema_version": 3, "drift_reason": "previous verdict"}')
+    original = artifact.read_bytes() if previous_artifact else None
+    directory = config.dataset.dir / "scores"
+    directory.mkdir(parents=True)
+    good = directory / "scores_hourly_live_expanding_readable.parquet"
+    write_scores(scores(), good)
+    monkeypatch.setattr(cli_module, "_cmd_build_dataset", lambda _config: 0)
+    monkeypatch.setattr(cli_module, "_cmd_backtest", lambda *_args: 0)
+    # Exercise the real truth-QC handler without fetching a live provider.
+    monkeypatch.setattr(
+        "grounded_weather_forecast.dataset.matrix.build_truth",
+        lambda _config: (pl.DataFrame(), pl.DataFrame(), pl.DataFrame()),
+    )
+
+    def unavailable(*_args, **_kwargs):
+        raise OSError("neighbor HTTP unavailable")
+
+    monkeypatch.setattr(neighbors, "fetch_neighbor_checks", unavailable)
+    report = cli_module._cmd_report
+
+    def locked_report(config):
+        with pytest.raises(Timeout):
+            with pipeline_lock(config.dataset.dir, timeout=0.01):
+                pass
+        stages = load_runs(runs_path(config)).filter(pl.col("record_kind") == "stage")
+        assert stages["command"][-1] == "truth-qc"
+        assert stages["exit_code"][-1] == 1
+        return report(config)
+
+    monkeypatch.setattr(cli_module, "_cmd_report", locked_report)
+    assert main(["--config", str(tmp_path / "config.toml"), "maintain"]) == 1
+    assert (config.reports_dir / "dashboard.html").exists()
+    assert (
+        config.reports_dir / "leaderboard_hourly_live_expanding_readable.md"
+    ).exists()
+    assert (config.reports_dir / "pipeline_health.md").exists()
+    assert not evidence.read_ledger(
+        config.artifacts_dir
+        / "history"
+        / f"{evidence.EVALUATIONS_LEDGER.name}.parquet",
+        evidence.EVALUATIONS_LEDGER.schema,
+    ).is_empty()
+    ctx = collect_context(config)
+    if previous_artifact:
+        assert ctx.truth_qc["drift_reason"] == "previous verdict"
+        assert artifact.read_bytes() == original
+    else:
+        assert ctx.truth_qc is None
+        assert not artifact.exists()
+    stages = ctx.runs.filter(pl.col("record_kind") == "stage")
+    assert stages["exit_code"].to_list() == [0, 0, 1, 0]
+    assert "neighbor HTTP unavailable" in capsys.readouterr().out
 
 
 def test_maintain_runs_truth_qc_before_partial_report_failure(
@@ -249,11 +354,14 @@ def test_maintain_runs_truth_qc_before_partial_report_failure(
     assert damaged.exists()
 
 
-def test_maintain_stops_after_failed_step(tmp_path, monkeypatch):
+@pytest.mark.parametrize("failed_stage", ["build", "backtest"])
+def test_maintain_stops_after_failed_step(tmp_path, monkeypatch, failed_stage):
     write_config(tmp_path)
     calls = []
     monkeypatch.setattr(
-        cli_module, "_cmd_build_dataset", lambda config: calls.append("build") or 0
+        cli_module,
+        "_cmd_build_dataset",
+        lambda config: calls.append("build") or int(failed_stage == "build"),
     )
     monkeypatch.setattr(
         cli_module, "_cmd_backtest", lambda config, args: calls.append("backtest") or 1
@@ -261,11 +369,14 @@ def test_maintain_stops_after_failed_step(tmp_path, monkeypatch):
     monkeypatch.setattr(
         cli_module, "_cmd_report", lambda config: calls.append("report") or 0
     )
+    monkeypatch.setattr(
+        cli_module, "_cmd_truth_qc", lambda *_args: calls.append("truth-qc") or 0
+    )
 
     code = main(["--config", str(tmp_path / "config.toml"), "maintain"])
 
     assert code == 1
-    assert calls == ["build", "backtest"]
+    assert calls == (["build"] if failed_stage == "build" else ["build", "backtest"])
 
 
 def test_maintain_records_child_stages_and_marks_only_no_folds(tmp_path, monkeypatch):

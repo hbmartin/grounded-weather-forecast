@@ -928,7 +928,11 @@ def apply_live_gate(
 
 
 def no_evidence_reason(
-    config: Config, scores_dir: Path, *, dataset_id: str | None = None
+    config: Config,
+    scores_dir: Path,
+    *,
+    dataset_id: str | None = None,
+    promoted_fit_unavailable: bool = False,
 ) -> str:
     """Why serving is degraded: cold start vs invalidated evidence.
 
@@ -936,6 +940,9 @@ def no_evidence_reason(
     correctly invalidates promoted evidence — but that failure reads exactly
     like a cold start unless it is named. The distinction decides the fix:
     keep polling, or just re-run the backtest.
+
+    Only compatible live identities may use the prediction-local fitting
+    outcome; missing or invalidated evidence keeps its more actionable reason.
     """
     # Retry the identity diagnosis once against a fresh directory listing
     # before tolerating missing files, so the diagnosis never reflects a
@@ -974,7 +981,15 @@ def no_evidence_reason(
             "implementation changed since the last backtest; re-run "
             "`backtest --source live` then `report`"
         )
-    return "live evidence exists but no slice met the promotion gates; keep polling"
+    if promoted_fit_unavailable:
+        return (
+            "compatible promoted selections could not be fitted: no scoreable "
+            "training history; rebuild the dataset once truth is available"
+        )
+    return (
+        "live evidence exists but no promoted release produced a finite hourly "
+        "or daily forecast; keep polling"
+    )
 
 
 def method_for(

@@ -78,7 +78,7 @@ That works on day one. Everything else needs an archive with some history — se
 | `qc` | summarize station truth quality control | — |
 | `build-dataset` | materialize truth tables and supervised matrices as parquet | — |
 | `backtest` | rolling-origin backtest over the supervised matrices | `--methods` `--hourly-variables` `--daily-variables` `--products` `--window` `--source` `--semantics` |
-| `maintain` | run one locked live build → backtest → truth-QC → report transaction; stop at the first failure | `--methods` `--hourly-variables` `--daily-variables` `--products` `--window` `--semantics` `--truth-qc-days` |
+| `maintain` | run one locked live build → backtest → truth-QC → report transaction; finish report after a handled truth-QC failure, then return failure | `--methods` `--hourly-variables` `--daily-variables` `--products` `--window` `--semantics` `--truth-qc-days` |
 | `report` | leaderboards, evidence ledgers, and dashboard; skip missing scores, show read faults and return nonzero after partial output; one load per file with `mcs`/`legacy` | — |
 | `alignment` | study truth semantics per provider; write the alignment artifact | — |
 | `backfill` | fetch archived forecasts into the synthetic supervised matrix | `--provider` `--models` `--start` `--end` `--chunk-days` |
@@ -95,6 +95,10 @@ Global: `--config PATH` (default `config.toml`), `--version`. Exit codes: `0` ok
 `1` command failure, `2` config error, `75` lock contention (retry later).
 Pipeline mutators serialize on `<dataset dir>/pipeline.lock`;
 scheduled `maintain` waits for it and holds it across the whole transaction.
+Build and backtest failures stop maintenance immediately. A handled truth-QC
+failure still permits report, which may use the previous QC artifact; the failed
+refresh stays in the run ledger and maintenance returns the first nonzero stage
+result. A refreshed dashboard therefore does not imply successful maintenance.
 `predict` and `publish` copy and validate the live dataset under the short
 `<dataset dir>/dataset.lock`, then select and fit outside it.
 
