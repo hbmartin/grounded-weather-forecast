@@ -1482,7 +1482,7 @@ def _run_pipeline_steps(
             if name in continue_on_failure:
                 print(
                     f"pipeline continuing: {name} exited {result}; "
-                    "remaining outputs will run, but maintenance will fail",
+                    "remaining outputs will run, but the pipeline will return failure",
                     file=sys.stderr,
                 )
                 continue

@@ -210,6 +210,7 @@ temperature.
 
 *Implemented in: `serve/rainfall.py::RainfallTimeline`; `serve/rainfall.py::RainfallEffects`;
 `serve/predict.py::_point_fields`; `serve/predict.py::_blend_variable`;
+`serve/diagnostics.py::FitDiagnostics`; `serve/selection.py::no_evidence_reason`;
 `dataset/truth.py::observed_rainfall`;
 `dataset/providers.py::align_hourly_rain`; `dataset/matrix.py`;
 `dataset/ensembles.py::ensemble_features`*
