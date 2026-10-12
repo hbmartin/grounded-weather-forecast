@@ -264,12 +264,13 @@ On live sources it then runs method selection and prints the promoted release id
 | `--products` | CSV of `hourly`,`daily`,`minutely` | `hourly,daily,minutely` | products passed to the live backtest |
 | `--window` | `expanding` \| `rolling` | `expanding` | training window passed to the live backtest |
 | `--semantics` | `auto` \| `inst` \| `mean` | `auto` | hourly truth semantics passed to the live backtest |
-| `--truth-qc-days` | int > 0 | `30` | neighbour history passed to the final truth-QC step |
+| `--truth-qc-days` | int > 0 | `30` | neighbour history passed to truth-QC before report |
 
 The source is always `live`. The command waits for `pipeline.lock`, then runs
-`build-dataset` → `backtest --source live` → `report` → `truth-qc` while holding
-that one lock. It stops immediately on the first nonzero result, so later steps
-never consume a failed predecessor's output.
+`build-dataset` → `backtest --source live` → `truth-qc` → `report` while holding
+that one lock. It stops immediately on the first nonzero result: truth-QC failure
+prevents report, while report failure occurs after truth-QC has completed. The
+report and dashboard can therefore use this run's truth-QC artifact.
 
 ---
 
@@ -310,6 +311,20 @@ occurred or no score file loaded successfully; otherwise it returns **0**. A
 readable empty score frame counts as successfully loaded. Failures outside score
 loading retain their existing behavior. A failed report prevents maintenance
 from pruning against an incomplete catalog.
+
+### Recovering from a damaged score file
+
+Use the basename and error on stderr or in the dashboard to identify the fault.
+Retain a copy of that file outside `<dataset dir>/scores`, then move the damaged
+original out of the score directory while no pipeline command is running. Run
+`backtest` for the affected product and source (with its original window and
+semantics), then `report` to regenerate compatible evidence and confirm the
+read fault is gone. Keep release and evidence-history artifacts intact.
+
+`prune-scores` manages retention; it does not repair corrupt scores. It protects
+the newest files and skips evaluations that were never cataloged, so repeated
+maintenance is not a substitute for this manual recovery. No automatic
+quarantine or repair command is provided.
 
 With `[promotion] rule = "mcs"` or `"legacy"`, report and dashboard share completed
 score summaries, loading each score file once and releasing its full frame
@@ -434,6 +449,8 @@ its current method when no reference passes the quality guard and records
 and live replacement; their statistics belong to the pinned method or are
 absent when it has no compatible evidence. Minutely history attributes a
 release only when its selected method actually produced the value.
+Hourly and daily release IDs are emitted only for finite normalized values;
+null or nonfinite predictions cannot make an automatic forecast ready.
 
 Automatic rainfall uses the uncalibrated provider mean when its lead bucket has
 fewer than five distinct wet training days. Minute coverage is filled from the
@@ -455,11 +472,15 @@ file — polluting it with `--method` experiments makes the live-versus-backtest
 gap meaningless.
 
 Degraded status is printed to **stderr**, so a `--out -` pipeline gets clean JSON
-on stdout. `status: "degraded"` means no promoted release matched the current
-fingerprints, or automatic rain safeguards removed the last served attribution.
+on stdout. `status: "degraded"` means no finite hourly/daily value retains a
+promoted release matching the current fingerprints, including when automatic
+rain safeguards remove the last served attribution.
 Rainfall reasons apply only when they actually remove release attribution from
 finite served fields; otherwise cold-start and identity-change diagnoses remain
-visible, including the implementation-change reason used by automatic restore. See the
+visible, including the implementation-change reason used by automatic restore.
+A blend with no scoreable training truth clears all release and guard-loss
+attribution. Native rainfall filling a null field later does not change that
+cold-start diagnosis. See the
 [FAQ](../faq.md#why-does-my-forecast-say-degraded).
 
 **Writes** the document, appends to `data/predict_history.parquet` unless

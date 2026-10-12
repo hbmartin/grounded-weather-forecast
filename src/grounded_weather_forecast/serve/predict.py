@@ -526,7 +526,6 @@ def _blend_variable(
             release_ids=[None] * predict_frame.height,
             quantiles=[{} for _ in range(predict_frame.height)],
             truth_semantics=semantics.value,
-            guarded_release_ids=guarded_releases,
         )
     results, _ = fitted
     point, quantiles = _blended_rows(results, chosen, predict_frame.height)
@@ -848,11 +847,12 @@ def _point_fields(
     duplicates, so new maps belong here rather than in both.
     """
     _record_rainfall_guards(blended, index, effects)
+    values = {
+        name: _finite(result.point[index], variables[name])
+        for name, result in blended.items()
+    }
     return {
-        "values": {
-            name: _finite(result.point[index], variables[name])
-            for name, result in blended.items()
-        },
+        "values": values,
         "methods": {name: result.methods[index] for name, result in blended.items()},
         "quantiles": {
             name: {
@@ -875,7 +875,8 @@ def _point_fields(
         "release_ids": {
             name: release
             for name, result in blended.items()
-            if (release := result.release_ids[index]) is not None
+            if values[name] is not None
+            and (release := result.release_ids[index]) is not None
         },
         "truth_semantics": {
             name: result.truth_semantics for name, result in blended.items()

@@ -14,7 +14,7 @@ systemd timer or crontab line; the cadence rationale is identical.
 | `poll` — the upstream `omni-weather` collector | **hourly** | Every missed hour of provider vintages is unrecoverable. Hourly catches every provider's update cycle while staying inside free-tier quotas (the upstream quota tracker enforces per-provider caps). If quotas pinch, drop to per-run-cycle (6-hourly) for the slow-refresh providers via the upstream config, not by slowing this job. |
 | `ingest-ensembles` | **every 6 h** (`StartInterval` 21600) | Ensemble models run on 00/06/12/18 UTC cycles and Open-Meteo retains only the latest run's members — a missed cycle's spread is gone forever. A fixed 6-hour interval catches every cycle regardless of publication lag; the as-of join tolerates any offset. |
 | `publish` (the `predict` launchd job) | **every 10 min** (`StartInterval` 600) | Matches the 10-minute snapshot grid, so each accepted serve sees at most one new snapshot. Ready forecasts replace the published document and enter self-verification history; a degraded candidate holds the last ready document without polluting history. Widen to 15–30 min if the machine is battery-constrained; the cost is coarser verification history, not correctness. |
-| `maintain` — `build-dataset` → `backtest --source live` → `report` → `truth-qc` | **daily, 02:15 local** | The retrain loop: refreshed truth and ensemble features, refreshed evidence, re-promoted winners in the release ledger, and the neighbor/shield sensor checks. Schedule it after the latest successful ensemble ingest: ensemble rows become model features only when `build-dataset` rematerializes the matrix. Daily is the right floor — truth accrues by the hour but promotion decisions move on days. As the archive and method count grow, backtest runtime grows too; if the nightly run gets slow, pass a curated `--methods` subset nightly and run the full sweep weekly. Follow with `prune-scores` periodically (or append it to the chain): superseded scores files accumulate at nightly cadence. |
+| `maintain` — `build-dataset` → `backtest --source live` → `truth-qc` → `report` | **daily, 02:15 local** | The retrain loop: refreshed truth and ensemble features, refreshed evidence, re-promoted winners in the release ledger, and the neighbor/shield sensor checks. Schedule it after the latest successful ensemble ingest: ensemble rows become model features only when `build-dataset` rematerializes the matrix. Daily is the right floor — truth accrues by the hour but promotion decisions move on days. As the archive and method count grow, backtest runtime grows too; if the nightly run gets slow, pass a curated `--methods` subset nightly and run the full sweep weekly. Follow with `prune-scores` periodically (or append it to the chain): superseded scores files accumulate at nightly cadence. |
 
 The `backfill` commands are deliberately *not* scheduled: they are one-off
 cold-start tools, and re-running them is idempotent but pointless on a cron.
@@ -76,6 +76,11 @@ a context manager, releasing it on early returns and exceptions. Concurrent
 maintenance or restore jobs skip as duplicates. A successful daily run writes
 `last-maintenance`; a fresh stamp skips catch-up for **20 hours**. Restore runs
 leave that stamp untouched, and a failed report skips score pruning.
+
+CLI `maintain` also runs truth-QC before report and retains its fail-fast policy:
+a truth-QC failure stops before report, and a report read fault returns failure
+after truth-QC has completed. Corrupt scores are not repaired by pruning or
+automatic quarantine; follow the [manual recovery procedure](reference/cli.md#recovering-from-a-damaged-score-file).
 
 The hourly wrapper checks whether a degraded document says `implementation
 changed` before starting detached restore maintenance. The restore child
@@ -169,7 +174,7 @@ exit behavior, and later analysis commands.
   anything a release promoted in the last 7 days are kept. Files the evaluations
   catalog has never seen are never deleted.
 - `maintain` waits for `<dataset dir>/pipeline.lock` and holds it once across
-  build → live backtest → report → truth-QC. Interactive mutators wait 60 s and
+  build → live backtest → truth-QC → report. Interactive mutators wait 60 s and
   exit `75` on contention. This prevents another command from slipping between
   scheduled steps. `predict` and `publish` copy and validate the live dataset
   under the short `dataset.lock`, then select and fit outside it;

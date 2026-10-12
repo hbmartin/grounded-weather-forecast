@@ -169,6 +169,195 @@ def test_only_finite_guarded_rows_record_attribution_loss():
     assert effects.guarded_release_removed
 
 
+@pytest.mark.parametrize("daily", [False, True])
+@pytest.mark.parametrize(
+    "raw", [None, float("nan"), float("inf"), -float("inf"), 0.0, 1.25]
+)
+def test_release_attribution_requires_finite_emitted_values(daily, raw):
+    import numpy as np
+    from grounded_weather_forecast.contracts import daily_variable, hourly_variable
+    from grounded_weather_forecast.serve.predict import (
+        VariableBlend,
+        _point_fields,
+        _served_release_ids,
+    )
+    from grounded_weather_forecast.serve.schema import DailyPoint, HourlyPoint
+
+    name = "precip_sum_mm" if daily else "precip_mm"
+    spec = daily_variable(name) if daily else hourly_variable(name)
+    blend = VariableBlend(
+        point=np.array([raw], dtype=float),
+        methods=["equal_weight"],
+        reasons=["promoted"],
+        release_ids=["candidate"],
+        quantiles=[{}],
+    )
+    fields = _point_fields({name: blend}, {name: spec}, 0)
+    point = (
+        DailyPoint(str(NOW.date()), 0, **fields)
+        if daily
+        else HourlyPoint(NOW.isoformat(), 0.0, **fields)
+    )
+    expected = ["candidate"] if raw is not None and math.isfinite(raw) else []
+    assert point.release_ids == ({name: "candidate"} if expected else {})
+    assert (point.values[name] is not None) == bool(expected)
+    assert (
+        _served_release_ids([] if daily else [point], [point] if daily else [])
+        == expected
+    )
+
+
+def scoreable_rain_training(*, daily=False, wet_days=0):
+    import polars as pl
+    from grounded_weather_forecast.contracts import DAILY_VARIABLES, HOURLY_VARIABLES
+
+    dates = [NOW - timedelta(days=i) for i in range(1, 7)]
+    data = {
+        "issue_time": [day - timedelta(hours=1) for day in dates],
+        "source_kind": ["live"] * len(dates),
+    }
+    if daily:
+        data.update(
+            forecast_date=[day.date() for day in dates], lead_days=[0] * len(dates)
+        )
+    else:
+        data.update(
+            valid_time=dates,
+            lead_hours=[0.5] * len(dates),
+            lead_bucket=["0-1h"] * len(dates),
+        )
+    for variable in DAILY_VARIABLES if daily else HOURLY_VARIABLES:
+        values = (
+            [float(i < wet_days) for i in range(len(dates))]
+            if variable.name == "pop"
+            else [0.0] * len(dates)
+        )
+        semantics = ("inst", "mean") if variable.has_dual_semantics else (None,)
+        for meaning in semantics:
+            name = f"t__{variable.name}" + (f"__{meaning}" if meaning else "")
+            data[name] = values
+        for source in ("nws", "open_meteo"):
+            data[f"{'fxd' if daily else 'fx'}__{source}__{variable.name}"] = values
+    return pl.DataFrame(data)
+
+
+@pytest.mark.parametrize("daily", [False, True])
+def test_fitted_null_rain_raised_by_native_floor_retains_evidence_diagnosis(
+    config, daily
+):
+    import numpy as np
+    import polars as pl
+    import grounded_weather_forecast.serve.predict as module
+    from grounded_weather_forecast.contracts import daily_variable, hourly_variable
+    from grounded_weather_forecast.serve.dataset_snapshot import LiveDatasetSnapshot
+    from grounded_weather_forecast.serve.selection import no_evidence_reason
+
+    name = "precip_sum_mm" if daily else "precip_mm"
+    snapshot = build_snapshot(config, NOW)
+    train = scoreable_rain_training(daily=daily)
+    frame = snapshot.daily if daily else snapshot.hourly
+    fitted = module._fit_methods(
+        train,
+        frame,
+        daily_variable(name) if daily else hourly_variable(name),
+        {"equal_weight"},
+        daily=daily,
+        semantics=TruthSemantics.INSTANTANEOUS,
+    )
+    assert fitted is not None
+    assert np.isnan(fitted[0]["equal_weight"].point).all()
+    dataset = LiveDatasetSnapshot(
+        "fixture",
+        pl.DataFrame() if daily else train,
+        train if daily else pl.DataFrame(),
+        pl.DataFrame(),
+    )
+    selection = Selection(
+        "equal_weight",
+        "promoted",
+        release_id="null-rain",
+        truth_semantics="inst",
+        pinned=True,
+    )
+    selections = {
+        ("daily" if daily else "hourly", name, "D1" if daily else "0-1h"): selection
+    }
+    document = predict(config, selections, now=NOW, dataset_snapshot=dataset)
+    point = document.daily[0] if daily else document.hourly[0]
+    assert point.values[name] == pytest.approx(0.25)
+    assert name not in point.release_ids
+    assert document.release_ids == []
+    assert document.status == "degraded"
+    assert document.status_reason == no_evidence_reason(
+        config, config.dataset.dir / "scores", dataset_id="fixture"
+    )
+
+
+@pytest.mark.parametrize("native", [False, True])
+@pytest.mark.parametrize("other_release", [False, True])
+def test_real_fitted_rain_guard_records_loss(
+    config_no_provider_qc, monkeypatch, native, other_release
+):
+    from dataclasses import replace
+    import polars as pl
+    import grounded_weather_forecast.serve.predict as module
+    from grounded_weather_forecast.contracts import hourly_variable
+    from grounded_weather_forecast.serve.dataset_snapshot import LiveDatasetSnapshot
+    from grounded_weather_forecast.serve.rainfall import RainfallEffects
+
+    config = config_no_provider_qc
+    snapshot = build_snapshot(config, NOW)
+    snapshot = replace(snapshot, daily=snapshot.daily.head(1))
+    if not native:
+        snapshot = replace(snapshot, minutely=snapshot.minutely.head(0))
+    train = scoreable_rain_training()
+    fitted = module._fit_methods(
+        train,
+        snapshot.hourly,
+        hourly_variable("precip_mm"),
+        {"equal_weight"},
+        daily=False,
+        semantics=TruthSemantics.INSTANTANEOUS,
+    )
+    assert fitted is not None
+    assert math.isfinite(fitted[0]["equal_weight"].point[0])
+    monkeypatch.setattr(module, "build_snapshot", lambda *_args: snapshot)
+    selections = {
+        ("hourly", "precip_mm", "0-1h"): Selection(
+            "equal_weight", "promoted", release_id="rain-only", truth_semantics="inst"
+        )
+    }
+    if native:
+        selections[("daily", "precip_sum_mm", "D1")] = Selection(
+            "equal_weight",
+            "promoted",
+            release_id="daily-rain",
+            truth_semantics="inst",
+            pinned=True,
+        )
+    if other_release:
+        selections[("hourly", "temp_c", "0-1h")] = Selection(
+            "equal_weight", "promoted", release_id="temperature", truth_semantics="inst"
+        )
+    effects = RainfallEffects()
+    monkeypatch.setattr(module, "RainfallEffects", lambda: effects)
+    dataset = LiveDatasetSnapshot(
+        "fixture", train, scoreable_rain_training(daily=True), pl.DataFrame()
+    )
+    document = predict(config, selections, now=NOW, dataset_snapshot=dataset)
+    assert effects.guarded_release_removed
+    assert effects.reconciled_release_removed == native
+    assert "rain-only" not in document.release_ids
+    assert "0 wet local days" in document.hourly[0].selection_reasons["precip_mm"]
+    if other_release:
+        assert document.status == "ready"
+        assert document.status_reason is None
+        assert document.release_ids == ["temperature"]
+    else:
+        assert document.status == "degraded"
+        assert "rainfall safeguard" in document.status_reason
+
+
 @pytest.mark.parametrize(
     ("rain_release", "other_release"), [(True, False), (False, False), (True, True)]
 )
@@ -182,6 +371,7 @@ def test_document_reason_requires_reconciliation_attribution_loss(
     if rain_release:
         point.release_ids["precip_mm"] = "rain-release"
     if other_release:
+        point.values["temp_c"] = 20.0
         point.release_ids["temp_c"] = "temperature-release"
     monkeypatch.setattr(
         module, "hourly_product", lambda *_args, **_kwargs: ([point], {})
@@ -447,26 +637,76 @@ class TestPredict:
         document = predict(config, {}, now=NOW, force_method="equal_weight")
         methods = {m for p in document.hourly for m in p.methods.values()}
         assert methods == {"equal_weight"}
+        assert document.status == "ready"
+        assert document.status_reason is None
 
-    def test_rain_only_release_does_not_keep_ready_status_after_fallback(
-        self, config_no_provider_qc
+    @pytest.mark.parametrize("daily", [False, True])
+    @pytest.mark.parametrize("fixture_name", ["config", "config_no_provider_qc"])
+    def test_rain_candidate_does_not_mask_cold_start(
+        self, request, fixture_name, daily
     ):
-        config = config_no_provider_qc
+        import grounded_weather_forecast.serve.predict as module
+        from grounded_weather_forecast.contracts import daily_variable, hourly_variable
+        from grounded_weather_forecast.serve.selection import no_evidence_reason
+
+        config = request.getfixturevalue(fixture_name)
+        product = "daily" if daily else "hourly"
+        name = "precip_sum_mm" if daily else "precip_mm"
         selections = {
-            ("hourly", "precip_mm", "0-1h"): Selection(
+            (product, name, "D1" if daily else "0-1h"): Selection(
                 "equal_weight",
                 "promoted",
                 release_id="rain-only",
                 truth_semantics="inst",
             )
         }
+        snapshot = build_snapshot(config, NOW)
+        train = module._training_matrix(config, product, NOW)
+        assert train.is_empty()
+        blend = module._blend_variable(
+            train,
+            snapshot.daily if daily else snapshot.hourly,
+            daily_variable(name) if daily else hourly_variable(name),
+            selections,
+            config,
+            daily=daily,
+            semantics=TruthSemantics.INSTANTANEOUS,
+        )
+        assert blend is not None
+        assert not blend.guarded_release_ids
         document = predict(config, selections, now=NOW)
         assert document.status == "degraded"
         assert "rain-only" not in document.release_ids
-        assert "rainfall safeguard" in document.status_reason
-        assert "0 wet local days" in document.hourly[0].selection_reasons["precip_mm"]
+        assert document.status_reason == no_evidence_reason(
+            config, config.dataset.dir / "scores"
+        )
+        point = document.daily[0] if daily else document.hourly[0]
+        assert "0 wet local days" in point.selection_reasons[name]
         assert document.hourly[0].values["precip_mm"] == pytest.approx(0.25)
         assert document.daily[0].values["precip_sum_mm"] == pytest.approx(0.25)
+
+    def test_archived_attribution_replays_without_rewriting(self, config, monkeypatch):
+        from dataclasses import replace
+        import grounded_weather_forecast.serve.predict as module
+        from grounded_weather_forecast.serve.history import append_history
+
+        document = predict(config, {}, now=NOW)
+        document.hourly[0].values["precip_mm"] = None
+        document.hourly[0].release_ids["precip_mm"] = "historical-release"
+        document = replace(
+            document,
+            status="ready",
+            status_reason=None,
+            release_ids=["historical-release"],
+        )
+        append_history(document, config.predict.history_path)
+        expected = document.to_json()
+        monkeypatch.setattr(
+            module,
+            "build_snapshot",
+            lambda *_args: pytest.fail("archived forecasts must not be rebuilt"),
+        )
+        assert predict(config, {}, now=NOW).to_json() == expected
 
     def test_unsupported_forced_method_fails_the_whole_prediction(self, config):
         with pytest.raises(UnsupportedMethodError, match="hourly.precip_mm"):

@@ -45,6 +45,12 @@ Written by `build-dataset` unless noted.
     that period. Back it up; do not point `[predict] history_path` at a temp
     directory.
 
+New hourly/daily documents carry release IDs only for finite normalized values,
+including zero. Null predictions contribute no release to document readiness or
+the top-level release list. Cold-start blends remain unattributed, and rainfall
+floors that fill their null fields retain the evidence diagnosis. Archived
+documents replay verbatim; historical forecast files are not rewritten.
+
 ### The provenance wall is in the filename
 
 `_live` and `_synthetic` matrices are separate files. This is deliberate: the
@@ -97,6 +103,9 @@ which is what lets `report` recompute leaderboards under new statistical rules
 without re-running a single fit.
 
 These files are the bulk of the disk footprint. `prune-scores` manages them.
+It does not repair corruption or remove uncataloged evidence. Follow the
+[manual score recovery procedure](cli.md#recovering-from-a-damaged-score-file)
+when a read fault persists.
 
 ---
 
