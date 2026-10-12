@@ -133,9 +133,13 @@ anything else, because every later command will fail more confusingly.
 
 ### Why does my forecast say `degraded`?
 
-`status: "degraded"` means no promoted release matched the current dataset,
-config, and code fingerprints, so serving fell back to `equal_weight` rather than
-using evidence it cannot vouch for. `status_reason` says which. Common ones:
+With automatic selection, `status: "degraded"` means no finite hourly or daily
+value retains a compatible promoted release. Matching dataset, config, and code
+fingerprints is necessary, but the method must also produce a finite attributed
+value. Zero is finite; null, NaN, and infinite outputs cannot justify readiness.
+Serving may use `equal_weight` or native rainfall containment instead.
+Explicit `--method` runs keep their existing ready status without requiring
+release attribution. `status_reason` explains automatic degradation. Common ones:
 
 | Reason | Fix |
 |---|---|
@@ -143,11 +147,23 @@ using evidence it cannot vouch for. `status_reason` says which. Common ones:
 | implementation changed since the last backtest | run `recover`, or re-run `backtest --source live` then `report` |
 | dataset fingerprint changed | run `recover`, which rebuilds before backtesting |
 | configuration changed | run `recover`, or re-run the live backtest and report |
+| compatible promoted selections could not be fitted: no scoreable training history | rebuild the dataset once usable truth is available; compatible promotion evidence alone cannot fit the current forecast |
+| live evidence exists but no promoted release produced a finite hourly or daily forecast | inspect per-field reasons and provider availability; this does not mean a release was never promoted |
+| rainfall safeguard removed attribution | inspect wet-day counts in the affected fields; automatic rainfall needs five distinct wet training days per bucket |
+| rainfall reconciliation removed attribution | inspect native minute, hourly, and observed rainfall; the adjusted value cannot inherit the model's release or uncertainty |
 
 The pattern: **anything that changes the system's identity invalidates the
 evidence that justified a promotion.** Re-running `backtest` then `report`
 re-earns it. See
 [ADR 0005](adr/0005-promoted-model-releases-are-the-serving-boundary.md).
+
+Actual wet-day guard loss takes precedence over actual reconciliation loss.
+Otherwise archive absence and identity changes keep their existing diagnoses;
+fitting failures are named only when evidence identities match. Cold-start blends
+and native floors filling unattributed nulls record no rainfall attribution loss.
+Detailed field reasons retain wet-day selection history even when the document
+names unavailable fitting. Null hourly/daily points omit quantiles and their
+source; a quantile source always accompanies usable emitted quantiles.
 
 Scheduled `publish` attempts that recovery automatically, at most once per
 unchanged degradation signature every six hours. While it runs, an existing

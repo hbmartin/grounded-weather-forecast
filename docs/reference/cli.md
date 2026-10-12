@@ -268,9 +268,16 @@ On live sources it then runs method selection and prints the promoted release id
 
 The source is always `live`. The command waits for `pipeline.lock`, then runs
 `build-dataset` → `backtest --source live` → `truth-qc` → `report` while holding
-that one lock. It stops immediately on the first nonzero result: truth-QC failure
-prevents report, while report failure occurs after truth-QC has completed. The
-report and dashboard can therefore use this run's truth-QC artifact.
+that one lock. Build or backtest failure stops the pipeline. A handled truth-QC
+failure is recorded before report starts and permits report to finish; report
+failure retains its partial-output behavior. Maintenance returns the first
+nonzero stage result, even if report succeeds. Unexpected exceptions still
+propagate and stop the pipeline.
+
+When truth-QC succeeds, report uses its refreshed artifact. A failed refresh
+leaves the previous `truth_qc.json` unchanged, so report may use an older verdict
+or have no verdict yet. Check the run ledger for the truth-QC stage result; a
+completed report or refreshed dashboard does not mean maintenance succeeded.
 
 ---
 
@@ -480,7 +487,12 @@ finite served fields; otherwise cold-start and identity-change diagnoses remain
 visible, including the implementation-change reason used by automatic restore.
 A blend with no scoreable training truth clears all release and guard-loss
 attribution. Native rainfall filling a null field later does not change that
-cold-start diagnosis. See the
+cold-start diagnosis. When live evidence identities match but a promoted
+selection cannot be fitted from scoreable training history, the reason names
+that fitting failure. Other compatible-evidence cases say no promoted release
+produced a finite hourly/daily forecast, without asserting that promotion never
+occurred. Null points omit quantiles and their source; a source is emitted only
+with usable quantiles. See the
 [FAQ](../faq.md#why-does-my-forecast-say-degraded).
 
 **Writes** the document, appends to `data/predict_history.parquet` unless

@@ -11,9 +11,14 @@ adheres to [Semantic Versioning](https://semver.org/).
 - Served hourly/daily release attribution requires a finite emitted value.
   Cold-start blends clear rain-guard attribution-loss bookkeeping, preserving
   the evidence diagnosis even when native minute rain later fills a null field.
+  Null points omit uncertainty maps; quantile sources require usable emitted
+  quantiles. Compatible promoted selections without scoreable training history
+  now report their fitting failure rather than a failed promotion gate.
 - CLI `maintain` runs truth-QC before report, so genuine score-read faults cannot
-  skip truth-QC. The command still stops at the first failing stage; corrupt
-  scores require manual preservation and evidence regeneration, not pruning.
+  skip truth-QC. Handled truth-QC failures permit report and remain recorded;
+  maintenance returns the first nonzero stage result. Build/backtest failures
+  still stop the pipeline. Corrupt scores require manual preservation and
+  evidence regeneration, not pruning.
 - Rainfall fallback allocates only the matching hour's unused accumulation;
   native minute evidence alone can raise parent floors. Unchanged daily totals
   retain their uncertainty and release attribution, and degraded reasons name

@@ -146,6 +146,18 @@ class VariableBlend:
     guarded_release_ids: tuple[str | None, ...] = ()
 
 
+@dataclass(slots=True)
+class FitDiagnostics:
+    """Prediction-local fitting outcome, independent of rainfall attribution."""
+
+    promoted_fit_unavailable: bool = False
+
+    def record_unavailable(self, selections: Sequence[Selection]) -> None:
+        self.promoted_fit_unavailable = self.promoted_fit_unavailable or any(
+            selection.release_id is not None for selection in selections
+        )
+
+
 def _latest_observation(
     minute: pl.DataFrame, issue_time: datetime
 ) -> tuple[dict[str, float], datetime | None]:
@@ -473,6 +485,7 @@ def _blend_variable(
     issue_time: datetime | None = None,
     dresser: ResidualDresser | None = None,
     recalibrator: QuantileRecalibrator | None = None,
+    fit_diagnostics: FitDiagnostics | None = None,
 ) -> VariableBlend | None:
     """Per row: the prediction of the method selected for that row's bucket."""
     chosen = _row_selections(
@@ -491,6 +504,7 @@ def _blend_variable(
         )
         for selection in chosen
     ]
+    validated_selections = chosen
     chosen, guarded_releases = _rainfall_choices(
         train,
         predict_frame,
@@ -511,6 +525,8 @@ def _blend_variable(
         issue_time=issue_time,
     )
     if fitted is None:
+        if fit_diagnostics is not None:
+            fit_diagnostics.record_unavailable(validated_selections)
         if {selection.method_id for selection in chosen} != {"equal_weight"}:
             return None
         point = _cold_start_equal_weight(predict_frame, variable, daily=daily)
@@ -826,11 +842,18 @@ def _record_rainfall_guards(
     points: Sequence[HourlyPoint | DailyPoint],
     effects: RainfallEffects | None,
 ) -> None:
-    if effects is not None and any(
+    if effects is None:
+        return
+    guarded = [
+        (name, result.guarded_release_ids)
+        for name, result in blended.items()
+        if result.guarded_release_ids
+    ]
+    if any(
         point.values.get(name) is not None
         for index, point in enumerate(points)
-        for name, result in blended.items()
-        if result.guarded_release_ids and result.guarded_release_ids[index] is not None
+        for name, removed_releases in guarded
+        if removed_releases[index] is not None
     ):
         effects.guarded_release_removed = True
 
@@ -850,22 +873,26 @@ def _point_fields(
         name: _finite(result.point[index], variables[name])
         for name, result in blended.items()
     }
+    quantiles: dict[str, dict[str, float]] = {}
+    for name, result in blended.items():
+        if values[name] is None:
+            continue
+        usable = {
+            level: value
+            for level, raw in result.quantiles[index].items()
+            if (value := _finite(raw, variables[name])) is not None
+        }
+        if usable:
+            quantiles[name] = usable
     return {
         "values": values,
         "methods": {name: result.methods[index] for name, result in blended.items()},
-        "quantiles": {
-            name: {
-                level: value
-                for level, raw in result.quantiles[index].items()
-                if (value := _finite(raw, variables[name])) is not None
-            }
-            for name, result in blended.items()
-            if result.quantiles[index]
-        },
+        "quantiles": quantiles,
         "quantiles_source": {
             name: source
             for name, result in blended.items()
-            if result.quantile_sources is not None
+            if name in quantiles
+            and result.quantile_sources is not None
             and (source := result.quantile_sources[index]) is not None
         },
         "selection_reasons": {
@@ -892,6 +919,7 @@ def hourly_product(
     force_method: str | None = None,
     *,
     effects: RainfallEffects | None = None,
+    fit_diagnostics: FitDiagnostics | None = None,
 ) -> tuple[list[HourlyPoint], dict[str, VariableBlend]]:
     """Blended hourly path, plus the per-variable blends for the minutely product."""
     frame = snapshot.hourly.sort("valid_time")
@@ -916,6 +944,7 @@ def hourly_product(
             issue_time=snapshot.issue_time,
             dresser=dresser,
             recalibrator=recalibrator,
+            fit_diagnostics=fit_diagnostics,
         )
         if result is None:
             continue
@@ -943,6 +972,7 @@ def daily_product(
     force_method: str | None = None,
     *,
     effects: RainfallEffects | None = None,
+    fit_diagnostics: FitDiagnostics | None = None,
 ) -> list[DailyPoint]:
     """Daily hi/lo and PoP as their own supervised targets (decision 8).
 
@@ -969,6 +999,7 @@ def daily_product(
             issue_time=snapshot.issue_time,
             dresser=dresser,
             recalibrator=recalibrator,
+            fit_diagnostics=fit_diagnostics,
         )
         if result is None:
             continue
@@ -1472,6 +1503,7 @@ def predict(
         frame=dataset_snapshot.daily if dataset_snapshot is not None else None,
     )
     rainfall_effects = RainfallEffects()
+    fit_diagnostics = FitDiagnostics()
     hourly, hourly_blend = hourly_product(
         snapshot,
         hourly_train,
@@ -1480,6 +1512,7 @@ def predict(
         semantics,
         force_method,
         effects=rainfall_effects,
+        fit_diagnostics=fit_diagnostics,
     )
     daily = (
         daily_product(
@@ -1489,6 +1522,7 @@ def predict(
             config,
             force_method,
             effects=rainfall_effects,
+            fit_diagnostics=fit_diagnostics,
         )
         if not snapshot.daily.is_empty()
         else []
@@ -1530,6 +1564,7 @@ def predict(
             dataset_id=dataset_snapshot.fingerprint
             if dataset_snapshot is not None
             else None,
+            promoted_fit_unavailable=fit_diagnostics.promoted_fit_unavailable,
         )
         if degraded
         else None

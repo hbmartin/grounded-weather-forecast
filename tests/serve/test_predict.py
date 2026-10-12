@@ -22,7 +22,10 @@ FETCH = "2026-03-22T16:30:00+00:00"
 
 
 @pytest.mark.parametrize("cause", ["cold", "synthetic", "dataset", "config", "code"])
-def test_rainfall_does_not_mask_evidence_diagnosis(config, cause, capsys, monkeypatch):
+@pytest.mark.parametrize("promoted", [False, True])
+def test_rainfall_does_not_mask_evidence_diagnosis(
+    config, cause, promoted, capsys, monkeypatch
+):
     import polars as pl
     from score_fixtures import scores
     from grounded_weather_forecast.evaluation import (
@@ -52,7 +55,16 @@ def test_rainfall_does_not_mask_evidence_diagnosis(config, cause, capsys, monkey
             / f"scores_hourly_{'synthetic' if cause == 'synthetic' else 'live'}_expanding.parquet"
         )
     expected = no_evidence_reason(config, directory)
-    document = predict(config, {}, now=NOW)
+    selections = (
+        {
+            ("hourly", "precip_mm", "0-1h"): Selection(
+                "equal_weight", "promoted", release_id="rain", truth_semantics="inst"
+            )
+        }
+        if promoted
+        else {}
+    )
+    document = predict(config, selections, now=NOW)
     assert document.status == "degraded"
     assert document.status_reason == expected
     assert any(
@@ -141,12 +153,18 @@ def _assert_diagnosis_channels(config, document, monkeypatch):
     monkeypatch.setattr(module, "OUT", str(target))
     monkeypatch.setattr(module, "RESTORE_LOG", target.with_suffix(".log"))
     module.maybe_spawn_restore()
-    assert len(calls) == 2
-    assert calls[-1][-1] == "--restore"
+    implementation_changed = "implementation changed" in document.status_reason
+    assert len(calls) == 1 + int(implementation_changed)
+    if implementation_changed:
+        assert calls[-1][-1] == "--restore"
 
 
 @pytest.mark.parametrize("daily", [False, True])
-def test_only_finite_guarded_rows_record_attribution_loss(daily):
+@pytest.mark.parametrize(
+    "removed", [(), (None, None, None), ("", None, ""), ("removed", None, "removed")]
+)
+def test_only_finite_guarded_rows_record_attribution_loss(daily, removed):
+    from dataclasses import replace
     import numpy as np
     from grounded_weather_forecast.contracts import daily_variable, hourly_variable
     from grounded_weather_forecast.serve.predict import (
@@ -163,31 +181,34 @@ def test_only_finite_guarded_rows_record_attribution_loss(daily):
         reasons=["guarded"] * 3,
         release_ids=[None] * 3,
         quantiles=[{}] * 3,
-        guarded_release_ids=("removed", None, "removed"),
+        guarded_release_ids=removed,
     )
     name = "precip_sum_mm" if daily else "precip_mm"
     spec = daily_variable(name) if daily else hourly_variable(name)
-    blended = {name: blend}
+    unrelated = "temp_max_c" if daily else "temp_c"
+    unrelated_spec = daily_variable(unrelated) if daily else hourly_variable(unrelated)
+    blended = {name: blend, unrelated: replace(blend, guarded_release_ids=())}
+    variables = {name: spec, unrelated: unrelated_spec}
     points = [
-        DailyPoint(str(NOW.date()), 0, **_point_fields(blended, {name: spec}, i))
+        DailyPoint(str(NOW.date()), 0, **_point_fields(blended, variables, i))
         if daily
-        else HourlyPoint(
-            NOW.isoformat(), 0.0, **_point_fields(blended, {name: spec}, i)
-        )
+        else HourlyPoint(NOW.isoformat(), 0.0, **_point_fields(blended, variables, i))
         for i in range(3)
     ]
     effects = RainfallEffects()
+    _record_rainfall_guards(blended, points, None)
     _record_rainfall_guards(blended, points[:2], effects)
     assert not effects.guarded_release_removed
     _record_rainfall_guards(blended, points, effects)
-    assert effects.guarded_release_removed
+    assert effects.guarded_release_removed == bool(removed and removed[2] is not None)
 
 
 @pytest.mark.parametrize("daily", [False, True])
+@pytest.mark.parametrize("source", [None, "dressed_bucket", "recalibrated_pit_bucket"])
 @pytest.mark.parametrize(
     "raw", [None, float("nan"), float("inf"), -float("inf"), 0.0, 1.25]
 )
-def test_release_attribution_requires_finite_emitted_values(daily, raw):
+def test_release_attribution_requires_finite_emitted_values(daily, source, raw):
     import numpy as np
     from grounded_weather_forecast.contracts import daily_variable, hourly_variable
     from grounded_weather_forecast.serve.predict import (
@@ -204,7 +225,8 @@ def test_release_attribution_requires_finite_emitted_values(daily, raw):
         methods=["equal_weight"],
         reasons=["promoted"],
         release_ids=["candidate"],
-        quantiles=[{}],
+        quantiles=[{"0.1": -1.0, "0.9": 3.0}],
+        quantile_sources=(source,),
     )
     fields = _point_fields({name: blend}, {name: spec}, 0)
     point = (
@@ -215,10 +237,148 @@ def test_release_attribution_requires_finite_emitted_values(daily, raw):
     expected = ["candidate"] if raw is not None and math.isfinite(raw) else []
     assert point.release_ids == ({name: "candidate"} if expected else {})
     assert (point.values[name] is not None) == bool(expected)
+    assert point.quantiles == ({name: {"0.1": 0.0, "0.9": 3.0}} if expected else {})
+    assert point.quantiles_source == ({name: source} if expected and source else {})
     assert (
         _served_release_ids([] if daily else [point], [point] if daily else [])
         == expected
     )
+
+
+@pytest.mark.parametrize(
+    "raw_quantiles", [{}, {"0.1": float("nan"), "0.9": float("inf")}]
+)
+def test_uncertainty_source_requires_usable_quantiles(raw_quantiles):
+    import numpy as np
+    from grounded_weather_forecast.contracts import hourly_variable
+    from grounded_weather_forecast.serve.predict import VariableBlend, _point_fields
+
+    blend = VariableBlend(
+        point=np.array([1.0]),
+        methods=["equal_weight"],
+        reasons=["promoted"],
+        release_ids=["release"],
+        quantiles=[raw_quantiles],
+        quantile_sources=("recalibrated_pit_bucket",),
+    )
+    fields = _point_fields(
+        {"precip_mm": blend}, {"precip_mm": hourly_variable("precip_mm")}, 0
+    )
+    assert fields["values"] == {"precip_mm": 1.0}
+    assert fields["release_ids"] == {"precip_mm": "release"}
+    assert fields["quantiles"] == fields["quantiles_source"] == {}
+
+
+def compatible_promotion(config, product, name, method, *, dataset_id=None):
+    import polars as pl
+    from score_fixtures import scores
+    from grounded_weather_forecast.evaluation import (
+        ModelRelease,
+        code_identity,
+        config_fingerprint,
+        dataset_fingerprint,
+    )
+
+    dataset_id = dataset_id or dataset_fingerprint(config)
+    configuration = config_fingerprint(config)
+    bucket = "D1" if product == "daily" else "0-1h"
+    release = ModelRelease.create(
+        dataset=dataset_id,
+        configuration=configuration,
+        evaluation_ids=("eval",),
+        evaluation_contexts=(),
+        training_cutoff=NOW,
+        selections={
+            f"{product}.{name}.{bucket}": {
+                "method_id": method,
+                "reason": "promoted",
+                "truth_semantics": "inst",
+            }
+        },
+    )
+    release.write(config.artifacts_dir / "releases")
+    directory = config.dataset.dir / "scores"
+    directory.mkdir(exist_ok=True)
+    scores(methods=(method,)).with_columns(
+        pl.lit(product).alias("product"),
+        pl.lit(name).alias("variable"),
+        pl.lit(bucket).alias("lead_bucket"),
+        pl.lit(dataset_id).alias("dataset_fingerprint"),
+        pl.lit(configuration).alias("config_fingerprint"),
+        pl.lit(code_identity()).alias("code_version"),
+    ).write_parquet(directory / f"scores_{product}_live_expanding.parquet")
+    return {
+        (product, name, bucket): Selection(
+            method,
+            "promoted",
+            release_id=release.release_id,
+            truth_semantics="inst",
+        )
+    }
+
+
+@pytest.mark.parametrize("daily", [False, True])
+@pytest.mark.parametrize("rain", [False, True])
+@pytest.mark.parametrize("method", ["equal_weight", "best_provider"])
+def test_compatible_promotion_without_training_names_fitting_failure(
+    config_no_provider_qc, monkeypatch, capsys, daily, rain, method
+):
+    import grounded_weather_forecast.serve.predict as module
+    from grounded_weather_forecast.contracts import daily_variable, hourly_variable
+
+    config = config_no_provider_qc
+    product = "daily" if daily else "hourly"
+    name = (
+        ("precip_sum_mm" if daily else "precip_mm")
+        if rain
+        else ("temp_max_c" if daily else "temp_c")
+    )
+    selections = compatible_promotion(config, product, name, method)
+    training = module._training_matrix(config, product, NOW)
+    assert training.is_empty()
+    snapshot = build_snapshot(config, NOW)
+    assert (
+        module._fit_methods(
+            training,
+            snapshot.daily if daily else snapshot.hourly,
+            daily_variable(name) if daily else hourly_variable(name),
+            {method},
+            daily=daily,
+            semantics=TruthSemantics.INSTANTANEOUS,
+        )
+        is None
+    )
+    document = predict(config, selections, now=NOW)
+    assert document.status == "degraded"
+    assert document.release_ids == []
+    assert document.status_reason == (
+        "compatible promoted selections could not be fitted: no scoreable training "
+        "history; rebuild the dataset once truth is available"
+    )
+    if rain:
+        point = document.daily[0] if daily else document.hourly[0]
+        assert "0 wet local days" in point.selection_reasons[name]
+    elif method == "best_provider":
+        assert name not in (document.daily[0] if daily else document.hourly[0]).values
+    monkeypatch.setattr(module, "predict", lambda *_args, **_kwargs: document)
+    assert (
+        main(
+            [
+                "--config",
+                str(config.dataset.dir.parent / "config.toml"),
+                "predict",
+                "--now",
+                NOW.isoformat(),
+                "--no-history",
+                "--out",
+                "-",
+            ]
+        )
+        == 0
+    )
+    assert document.status_reason in capsys.readouterr().err
+    if rain and not daily and method == "equal_weight":
+        _assert_diagnosis_channels(config, document, monkeypatch)
 
 
 def scoreable_rain_training(*, daily=False, wet_days=0):
@@ -255,9 +415,38 @@ def scoreable_rain_training(*, daily=False, wet_days=0):
     return pl.DataFrame(data)
 
 
+@pytest.mark.parametrize("invalid", ["method", "semantics"])
+def test_unavailable_fit_diagnostic_uses_validated_selection(config, invalid):
+    import polars as pl
+    import grounded_weather_forecast.serve.predict as module
+    from grounded_weather_forecast.contracts import hourly_variable
+
+    diagnostics = module.FitDiagnostics()
+    selection = Selection(
+        "retired_method" if invalid == "method" else "equal_weight",
+        "promoted",
+        release_id="ineligible",
+        truth_semantics="mean" if invalid == "semantics" else "inst",
+    )
+    result = module._blend_variable(
+        pl.DataFrame(),
+        build_snapshot(config, NOW).hourly,
+        hourly_variable("temp_c"),
+        {("hourly", "temp_c", "0-1h"): selection},
+        config,
+        daily=False,
+        semantics=TruthSemantics.INSTANTANEOUS,
+        fit_diagnostics=diagnostics,
+    )
+    assert result is not None
+    assert not diagnostics.promoted_fit_unavailable
+    assert not any(result.release_ids)
+
+
 @pytest.mark.parametrize("daily", [False, True])
+@pytest.mark.parametrize("compatible_evidence", [False, True])
 def test_fitted_null_rain_raised_by_native_floor_retains_evidence_diagnosis(
-    config, daily
+    config, daily, compatible_evidence
 ):
     import numpy as np
     import polars as pl
@@ -296,6 +485,19 @@ def test_fitted_null_rain_raised_by_native_floor_retains_evidence_diagnosis(
     selections = {
         ("daily" if daily else "hourly", name, "D1" if daily else "0-1h"): selection
     }
+    if compatible_evidence:
+        from dataclasses import replace
+
+        selections = {
+            key: replace(chosen, pinned=True)
+            for key, chosen in compatible_promotion(
+                config,
+                "daily" if daily else "hourly",
+                name,
+                "equal_weight",
+                dataset_id="fixture",
+            ).items()
+        }
     document = predict(config, selections, now=NOW, dataset_snapshot=dataset)
     point = document.daily[0] if daily else document.hourly[0]
     assert point.values[name] == pytest.approx(0.25)
@@ -305,6 +507,11 @@ def test_fitted_null_rain_raised_by_native_floor_retains_evidence_diagnosis(
     assert document.status_reason == no_evidence_reason(
         config, config.dataset.dir / "scores", dataset_id="fixture"
     )
+    if compatible_evidence:
+        assert document.status_reason == (
+            "live evidence exists but no promoted release produced a finite hourly "
+            "or daily forecast; keep polling"
+        )
 
 
 @pytest.mark.parametrize("native", [False, True])
