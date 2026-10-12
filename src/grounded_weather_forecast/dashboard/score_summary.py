@@ -7,12 +7,14 @@ import numpy as np
 import polars as pl
 
 from grounded_weather_forecast.config import Config
-from grounded_weather_forecast.evaluation import code_identity, config_fingerprint
 from grounded_weather_forecast.metrics.probabilistic import (
     pit_from_quantiles,
     reliability_bins,
 )
-from grounded_weather_forecast.reports.eprocess import EProcessStore
+from grounded_weather_forecast.reports.eprocess import (
+    EProcessStore,
+    product_eprocess_store,
+)
 from grounded_weather_forecast.reports.leaderboard import (
     leaderboard,
     slice_winners,
@@ -31,6 +33,8 @@ class ScoreSummary:
     pit_rows: int = 0
     reliability: tuple[tuple[float, float, int], ...] = ()
     unusable: bool = False
+    pit_unusable: bool = False
+    reliability_unusable: bool = False
 
 
 def _eprocess_store(
@@ -40,13 +44,7 @@ def _eprocess_store(
     if config.promotion.rule != "seq_mcs" or "_live" not in stem:
         return None
     product = stem.split("_")[1] if "_" in stem else stem
-    if product not in cache:
-        cache[product] = EProcessStore.load(
-            config.artifacts_dir / "eprocess" / f"{product}_live.json",
-            config_fingerprint(config),
-            code_identity(),
-        )
-    return cache[product]
+    return product_eprocess_store(config, product, cache)
 
 
 def pit_values(scores: pl.DataFrame) -> np.ndarray:
@@ -104,8 +102,15 @@ def reliability_summary(scores: pl.DataFrame) -> tuple[tuple[float, float, int],
 
 
 def summarize_scores(
-    config: Config, stem: str, scores: pl.DataFrame, stores: dict[str, EProcessStore]
+    config: Config,
+    stem: str,
+    scores: pl.DataFrame,
+    stores: dict[str, EProcessStore],
+    *,
+    board: pl.DataFrame | None = None,
+    winners: pl.DataFrame | None = None,
 ) -> ScoreSummary:
+    """Summarize one frame, reusing supplied board/winners without deriving them."""
     kinds = (
         frozenset(str(value) for value in scores["source_kind"].unique())
         if "source_kind" in scores.columns and not scores.is_empty()
@@ -117,21 +122,30 @@ def summarize_scores(
         else frozenset()
     )
     if scores.is_empty():
-        return ScoreSummary(kinds, folds)
+        return ScoreSummary(source_kinds=kinds, fold_origins=folds)
     try:
-        board = leaderboard(scores, references=union_references(config.promotion))
-        winners = winner_curse_adjusted(
-            slice_winners(
-                board,
-                scores=scores,
-                rule=config.promotion.rule,
-                alpha=config.promotion.alpha,
+        if board is None:
+            board = leaderboard(scores, references=union_references(config.promotion))
+        if winners is None:
+            winners = winner_curse_adjusted(
+                slice_winners(
+                    board,
+                    scores=scores,
+                    rule=config.promotion.rule,
+                    alpha=config.promotion.alpha,
+                    promotion=config.promotion,
+                    eprocess_store=_eprocess_store(config, stem, stores),
+                ),
+                scores,
                 promotion=config.promotion,
-                eprocess_store=_eprocess_store(config, stem, stores),
-            ),
-            scores,
-            promotion=config.promotion,
-        )
+            )
+    except (OSError, ValueError, pl.exceptions.PolarsError):
+        # Readable metadata remains useful even when statistical scoring fails.
+        return ScoreSummary(source_kinds=kinds, fold_origins=folds, unusable=True)
+    pit_unusable = False
+    counts: tuple[int, ...] = ()
+    pit_rows = 0
+    try:
         pit = pit_values(scores)
         counts = (
             tuple(
@@ -140,10 +154,23 @@ def summarize_scores(
             if pit.size
             else ()
         )
+        pit_rows = int(pit.size)
+    except (OSError, ValueError, pl.exceptions.PolarsError):
+        pit_unusable = True
+    reliability_unusable = False
+    reliability: tuple[tuple[float, float, int], ...] = ()
+    try:
         reliability = reliability_summary(scores)
     except (OSError, ValueError, pl.exceptions.PolarsError):
-        # Readable metadata remains useful even when statistical scoring fails.
-        return ScoreSummary(kinds, folds, unusable=True)
+        reliability_unusable = True
     return ScoreSummary(
-        kinds, folds, board, winners, counts, int(pit.size), reliability
+        source_kinds=kinds,
+        fold_origins=folds,
+        board=board,
+        winners=winners,
+        pit_counts=counts,
+        pit_rows=pit_rows,
+        reliability=reliability,
+        pit_unusable=pit_unusable,
+        reliability_unusable=reliability_unusable,
     )

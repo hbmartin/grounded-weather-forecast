@@ -21,6 +21,7 @@ Three sections, kept deliberately separate:
 
 | Reference | Implemented in |
 |---|---|
+| [Open-Meteo Forecast API parameter definitions](https://open-meteo.com/en/docs). Hourly rain and PoP describe the preceding hour; 15-minute precipitation is a preceding-interval sum. | `dataset/providers.py::_align_hourly_rain`; `serve/rainfall.py::native_rainfall` — align hourly rain to interval starts and conserve native quarter-hour amounts. |
 | Bates, J. M. & Granger, C. W. J. (1969). The combination of forecasts. *Operational Research Quarterly* 20(4), 451–468. | `blenders/combine.py::InverseErrorWeights` |
 | Stock, J. H. & Watson, M. W. (2004). Combination forecasts of output growth in a seven-country data set. *Journal of Forecasting* 23(6), 405–430. | Framing — the combination puzzle; `equal_weight` as benchmark |
 | Timmermann, A. (2006). Forecast combinations. *Handbook of Economic Forecasting* 1, 135–196. | Motivation for `inverse_*`; `invcov` is registered as its counterfactual |
@@ -46,6 +47,7 @@ Three sections, kept deliberately separate:
 
 | Reference | Implemented in |
 |---|---|
+| [National Weather Service: forecast terms](https://www.weather.gov/ppg/forecast_terms). Measurable precipitation is at least 0.01 inch over the forecast period. | `dataset/truth.py`; `serve/rainfall.py` uses the configured 0.254 mm threshold for observed daily occurrence. The five-day evidence guard and containment reconciliation are project operational rules, not an NWS calibration method. |
 | Platt, J. (1999). Probabilistic outputs for support vector machines and comparisons to regularized likelihood methods. | `blenders/pop_calibration.py` — `pop_platt` |
 | Kull, M., Silva Filho, T. & Flach, P. (2017). Beta calibration: a well-founded and easily implemented improvement on logistic calibration for binary classifiers. *AISTATS*. | `blenders/pop_calibration.py` — `pop_beta` |
 | Gupta, C. & Ramdas, A. Calibeating / online calibration. | `pop_platt` framing |
@@ -72,13 +74,13 @@ Three sections, kept deliberately separate:
 
 | Reference | Implemented in |
 |---|---|
-| Gneiting, T. & Raftery, A. E. (2007). Strictly proper scoring rules, prediction, and estimation. *JASA* 102(477), 359–378. | `metrics/probabilistic.py` |
+| Gneiting, T. & Raftery, A. E. (2007). Strictly proper scoring rules, prediction, and estimation. *JASA* 102(477), 359–378. | `metrics/probabilistic.py`; `dashboard/score_summary.py` derives independently guarded PIT and reliability views. |
 | Diebold, F. X. & Mariano, R. S. (1995). Comparing predictive accuracy. *JBES* 13(3), 253–263. | `metrics/dm.py::diebold_mariano` |
 | Harvey, D., Leybourne, S. & Newbold, P. (1997). Testing the equality of prediction mean squared errors. *IJF* 13(2), 281–291. | `metrics/dm.py::_hln_factor` |
 | Tashman, L. J. (2000). Out-of-sample tests of forecasting accuracy: an analysis and review. *IJF* 16(4), 437–450. | `backtest/splits.py` |
 | Hansen, P. R., Lunde, A. & Nason, J. M. (2011). The model confidence set. *Econometrica* 79(2), 453–497. | `reports/mcs.py::model_confidence_set` |
 | Künsch, H. R. (1989); Politis, D. N. & Romano, J. P. (1992). Moving/circular block bootstrap. | `reports/mcs.py::_block_indices` |
-| Ville, J. (1939). *Étude critique de la notion de collectif.* | `reports/eprocess.py`; `leaderboard._seq_gate` |
+| Ville, J. (1939). *Étude critique de la notion de collectif.* | `reports/eprocess.py`; `leaderboard._seq_gate`; `product_eprocess_store` centralizes read-only loading while callers retain rule policy. |
 | Waudby-Smith, I. & Ramdas, A. Estimating means of bounded random variables by betting. *JRSS-B*. | `reports/eprocess.py::EProcessStore.update_pair` |
 | Cutkosky, A. & Orabona, F. — online Newton step lineage for the bet sizing. | `reports/eprocess.py` — `_ONS_RATE` |
 | Benjamini, Y. & Hochberg, Y. (1995). Controlling the false discovery rate. *JRSS-B* 57(1), 289–300. | `reports/leaderboard.py::_benjamini_hochberg` |
@@ -138,4 +140,4 @@ papers and are kept separate so the bibliography above stays a literature claim.
 | **PRISM** elevation-layer logic | `dataset/neighbors.py` |
 | **MADIS / GHCN / ECMWF station blacklisting** | `dataset/truth_qc.py` |
 | **ForecastAdvisor / ForecastWatch** | The consumer analogue this system strictly dominates for one location — it scores per hour, to 10 days, with proper scoring rules, against your actual backyard. |
-| **[Polars StringView storage](https://pola.rs/posts/polars-string-type/)** | Column projection and shared-payload memory behavior in `backtest/scores.py`, `serve/score_scan.py`, `dashboard/score_summary.py`, `reports/leaderboard.py`, and `reports/mcs.py`; an implementation reference rather than a statistical accuracy claim. |
+| **[Polars StringView storage](https://pola.rs/posts/polars-string-type/)** | Column projection and shared-payload memory behavior in `backtest/scores.py`, `serve/score_scan.py`, `dashboard/score_summary.py`, `reports/leaderboard.py`, and `reports/mcs.py`; report/dashboard share completed summaries and release full frames before the next file. An implementation reference rather than a statistical accuracy claim. |

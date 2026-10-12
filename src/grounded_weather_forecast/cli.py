@@ -1094,11 +1094,11 @@ def _cmd_report(config: Config) -> int:
     from grounded_weather_forecast.backtest.scores import load_scores  # noqa: PLC0415
     from grounded_weather_forecast.contracts import hourly_variable  # noqa: PLC0415
     from grounded_weather_forecast.dashboard import write_dashboard  # noqa: PLC0415
-    from grounded_weather_forecast.dataset.matrix import build_truth  # noqa: PLC0415
-    from grounded_weather_forecast.evaluation import (  # noqa: PLC0415
-        code_identity,
-        config_fingerprint,
+    from grounded_weather_forecast.dashboard.score_summary import (  # noqa: PLC0415
+        ScoreSummary,
+        summarize_scores,
     )
+    from grounded_weather_forecast.dataset.matrix import build_truth  # noqa: PLC0415
     from grounded_weather_forecast.reports import (  # noqa: PLC0415
         evidence,
         operations,
@@ -1108,6 +1108,7 @@ def _cmd_report(config: Config) -> int:
     )
     from grounded_weather_forecast.reports.eprocess import (  # noqa: PLC0415
         EProcessStore,
+        product_eprocess_store,
         promotion_comparison,
     )
     from grounded_weather_forecast.reports.leaderboard import (  # noqa: PLC0415
@@ -1136,10 +1137,13 @@ def _cmd_report(config: Config) -> int:
 
     scores_dir = config.dataset.dir / "scores"
     score_files = sorted(scores_dir.glob("scores_*.parquet"))
+    summaries: dict[str, ScoreSummary] | None = (
+        None if config.promotion.rule == "seq_mcs" else {}
+    )
     if not score_files:
         print(f"no scores found in {scores_dir}; run backtest first")
         _report_pipeline_health(config, [], [])
-        print(f"wrote {write_dashboard(config)}")
+        print(f"wrote {write_dashboard(config, score_summaries=summaries)}")
         return 1
     written: list[Path] = []
     catalog_rows: list[dict[str, object]] = []
@@ -1149,13 +1153,14 @@ def _cmd_report(config: Config) -> int:
     for path in score_files:
         try:
             scores = load_scores(path, compact=True)
-        except FileNotFoundError:
+        except (FileNotFoundError,):  # noqa: B013 -- project convention
             # The pipeline lock keeps prune out of a running report; this
             # guard covers deletion by anything outside that lock's scope.
             print(f"skipping {path.name}: deleted since listing", file=sys.stderr)
             continue
         catalog_rows.append(operations.evaluation_catalog_row(path, scores))
-        board = bh_adjusted(leaderboard(scores, references=references))
+        raw_board = leaderboard(scores, references=references)
+        board = bh_adjusted(raw_board)
         evidence.record_quality(config, scores, board)
         # Serving runs on the live provider set, so its realized skill may only
         # be compared with a leaderboard built from the same provenance — a
@@ -1171,13 +1176,7 @@ def _cmd_report(config: Config) -> int:
         )
         eprocess_store: EProcessStore | None = None
         if is_live:
-            if product not in eprocess_stores:
-                eprocess_stores[product] = EProcessStore.load(
-                    config.artifacts_dir / "eprocess" / f"{product}_live.json",
-                    config_fingerprint(config),
-                    code_identity(),
-                )
-            eprocess_store = eprocess_stores[product]
+            eprocess_store = product_eprocess_store(config, product, eprocess_stores)
         live_sections: list[tuple[str, pl.DataFrame]] = []
         if is_live and eprocess_store is not None:
             # Both promotion rules run every report so the operator can watch
@@ -1225,6 +1224,15 @@ def _cmd_report(config: Config) -> int:
         # Two curse-corrected estimates beside every argmin-selected winner
         # mae; report-layer only, same convention as bh/ebh_adjusted.
         winners = winner_curse_adjusted(winners, scores, promotion=config.promotion)
+        if summaries is not None:
+            summaries[path.stem] = summarize_scores(
+                config,
+                path.stem,
+                scores,
+                eprocess_stores,
+                board=raw_board,
+                winners=winners,
+            )
         if is_live:
             evidence.record_winner_curse(config, product, scores, winners)
             evidence.record_nbm_benchmark(config, product, scores, board)
@@ -1272,6 +1280,7 @@ def _cmd_report(config: Config) -> int:
         blocked = blocked_promotions(winners, gap_threshold)
         if not blocked.is_empty():
             print_summary(f"blocked promotions ({path.stem})", blocked)
+        del scores
     matrix_file = _live_hourly_matrix_path(config)
     if matrix_file.exists():
         matrix = pl.read_parquet(matrix_file)
@@ -1319,7 +1328,7 @@ def _cmd_report(config: Config) -> int:
             )
     _report_evidence_tail(config, written)
     _report_pipeline_health(config, written, catalog_rows)
-    written.append(write_dashboard(config))
+    written.append(write_dashboard(config, score_summaries=summaries))
     for path in written:
         print(f"wrote {path}")
     return 0

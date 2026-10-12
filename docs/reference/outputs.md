@@ -61,14 +61,19 @@ String keys. `load_scores(path, compact=True)` encodes repeated text as
 categories in memory. Report, dashboard, and selection readers use compact
 decoding; numeric scores, per-case quantiles, and the on-disk schema stay
 unchanged. Both modes reject mixed provenance unless `allow_mixed=True`.
+`scan_score_file(path)` defaults to compact categories; passing `compact=False`
+preserves stored column types, matching the eager loader's default.
 
 Readers use `parallel="none", low_memory=True` and streaming collection.
 Serving partitions selected evidence in batches of `SCORE_BATCH_ROWS = 65_536`
 rows. The dashboard collects each archived file once, sequentially, retaining
 leaderboards, winners, calibration bins, provenance, and fold metadata, then
 releases its full frame before loading the next file. Rendering uses these
-summaries without reopening score files. A complete `report` has a separate
-score-processing pass, for two full decodes per file overall.
+summaries without reopening score files. With `mcs` or `legacy`, a complete
+`report` shares these summaries with its dashboard and loads each file once.
+With `seq_mcs`, the dashboard retains its independent collection after report
+persists final wealth, for two full loads per file overall. PIT/reliability
+failures produce local dashboard warnings and retain valid scoring results.
 
 ```
 scores_{product}_{kind}_{window}_{evaluation_id}.parquet

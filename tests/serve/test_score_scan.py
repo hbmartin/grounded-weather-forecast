@@ -3,6 +3,7 @@ from datetime import timedelta
 import polars as pl
 import pytest
 from conftest import utc
+from score_fixtures import scores
 
 from grounded_weather_forecast.backtest.scores import (
     SCORES_SCHEMA,
@@ -19,48 +20,6 @@ from grounded_weather_forecast.serve.evidence import (
 
 IDENTITY = score_scan.ScoreIdentity("dataset", "config", "code")
 KEY = ("hourly", "temp_c", "1-3h")
-
-
-def scores(
-    evaluation="eval",
-    day=1,
-    methods=(
-        "equal_weight",
-        "best_provider",
-        "damped_grounded_equal_weight",
-        "challenger",
-    ),
-):
-    rows = []
-    for method in methods:
-        for step in range(8):
-            rows.append(
-                {
-                    "method_id": method,
-                    "variable": "temp_c",
-                    "product": "hourly",
-                    "source_kind": "live",
-                    "evaluation_id": evaluation,
-                    "evaluation_created_at": utc(2026, 8, day),
-                    "dataset_fingerprint": "dataset",
-                    "config_fingerprint": "config",
-                    "code_version": "code",
-                    "source_set_json": '["nws"]',
-                    "feature_set_json": '["feature"]',
-                    "semantics": "inst",
-                    "window": "expanding",
-                    "fold_origin": utc(2026, 7, 1),
-                    "issue_time": utc(2026, 7, 1) + timedelta(hours=step),
-                    "valid_time": utc(2026, 7, 1, 1) + timedelta(hours=step),
-                    "lead_hours": 1.0,
-                    "lead_bucket": "1-3h",
-                    "y_pred": 1.0,
-                    "y_true": 0.0,
-                    "quantile_levels_json": "[]",
-                    "quantiles_json": None,
-                }
-            )
-    return pl.DataFrame(rows, schema=SCORES_SCHEMA)
 
 
 def select(directory, identity=IDENTITY):
@@ -227,12 +186,77 @@ def test_second_pass_prune_excludes_evaluation_and_reconsiders_older(
         counts[path] = counts.get(path, 0) + 1
         if path == first and counts[path] == 2:
             raise FileNotFoundError(path)
-        if path == second and counts[path] == 3:
+        if path == second and counts[path] == 2:
             path.unlink()
         return real(path)
 
     monkeypatch.setattr(score_scan, "scan_scores", disappear)
     assert select(tmp_path)[KEY]["evaluation_id"][0] == "old"
+
+
+def test_three_materialization_prunes_keep_the_oldest_complete_evaluation(
+    tmp_path, monkeypatch
+):
+    paths = [tmp_path / f"scores_{index}.parquet" for index in range(4)]
+    for index, path in enumerate(paths):
+        write_scores(scores(str(index), index + 1), path)
+    real = score_scan.scan_scores
+    counts = {}
+    removed = []
+
+    def disappear(path):
+        counts[path] = counts.get(path, 0) + 1
+        assert counts[path] <= 2, "fallback did not invalidate a failed evaluation"
+        if path != paths[0] and counts[path] == 2:
+            path.unlink()
+            removed.append(path)
+        return real(path)
+
+    monkeypatch.setattr(score_scan, "scan_scores", disappear)
+    result = score_scan.compatible_slices(tmp_path, IDENTITY, PromotionConfig())
+    assert result.slices[KEY]["evaluation_id"].unique().to_list() == ["0"]
+    assert set(result.contexts) == {"0"}
+    assert removed == list(reversed(paths[1:]))
+    assert paths[0].exists()
+
+
+def test_materialization_without_invalidation_progress_restarts_boundedly(
+    tmp_path, monkeypatch
+):
+    write_scores(scores(), tmp_path / "scores_eval.parquet")
+    catalogs = []
+
+    def fail(catalog, *_args):
+        catalogs.append(catalog)
+        assert len(catalogs) <= 3, "unidentified changes caused an unbounded retry"
+        raise score_scan.EvidenceChangedError("unidentified change")
+
+    monkeypatch.setattr(score_scan, "_materialize", fail)
+    assert select(tmp_path) == {}
+    assert len(catalogs) == score_scan.MAX_SCORE_SCAN_ATTEMPTS == 3
+    assert len({id(catalog) for catalog in catalogs}) == 3
+
+
+def test_known_materialization_exclusions_survive_a_fresh_catalog(
+    tmp_path, monkeypatch
+):
+    write_scores(scores("old"), tmp_path / "scores_old.parquet")
+    write_scores(scores("new", 2), tmp_path / "scores_new.parquet")
+    real = score_scan._materialize
+    seen = []
+
+    def change(catalog, selected, identity):
+        seen.append({evidence.evaluation_id for evidence in selected.values()})
+        if len(seen) == 1:
+            raise score_scan.EvidenceChangedError("changed", frozenset({"new"}))
+        if len(seen) == 2:
+            raise score_scan.EvidenceChangedError("unknown change")
+        assert len(seen) == 3
+        return real(catalog, selected, identity)
+
+    monkeypatch.setattr(score_scan, "_materialize", change)
+    assert select(tmp_path)[KEY]["evaluation_id"][0] == "old"
+    assert seen == [{"new"}, {"old"}, {"old"}]
 
 
 def test_identity_diagnosis_accepts_legacy_columns(tmp_path):

@@ -25,7 +25,10 @@ from grounded_weather_forecast.evaluation import (
     config_fingerprint,
     dataset_fingerprint,
 )
-from grounded_weather_forecast.reports.eprocess import EProcessStore
+from grounded_weather_forecast.reports.eprocess import (
+    EProcessStore,
+    product_eprocess_store,
+)
 from grounded_weather_forecast.reports.leaderboard import (
     _DAILY_GATE_POOL,
     eligible_board_rows,
@@ -153,13 +156,7 @@ def _eprocess_store_for(
     """
     if config.promotion.rule != "seq_mcs":
         return None
-    if product not in cache:
-        cache[product] = EProcessStore.load(
-            config.artifacts_dir / "eprocess" / f"{product}_live.json",
-            config_fingerprint(config),
-            code_identity(),
-        )
-    return cache[product]
+    return product_eprocess_store(config, product, cache)
 
 
 def _selection_payload(

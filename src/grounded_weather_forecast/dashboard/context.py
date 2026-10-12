@@ -269,10 +269,20 @@ def _evidence_history(config: Config, failures: list[str]) -> dict[str, pl.DataF
     return frames
 
 
-def collect_context(config: Config, *, now: datetime | None = None) -> DashboardContext:
+def collect_context(
+    config: Config,
+    *,
+    now: datetime | None = None,
+    score_summaries: Mapping[str, ScoreSummary] | None = None,
+) -> DashboardContext:
+    """Collect artifacts, or reuse a complete supplied score-summary snapshot."""
     paths = DatasetPaths.in_dir(config.dataset.dir)
     unreadable: list[str] = []
-    score_summaries, unreadable_scores = _score_summaries(config, unreadable)
+    unreadable_scores: tuple[str, ...] = ()
+    if score_summaries is None:
+        score_summaries, unreadable_scores = _score_summaries(config, unreadable)
+    else:
+        score_summaries = dict(score_summaries)
     hourly_live = matrix_path(config.dataset.dir, "hourly", "live")
     daily_live = matrix_path(config.dataset.dir, "daily", "live")
     hourly_synthetic = matrix_path(config.dataset.dir, "hourly", "synthetic")

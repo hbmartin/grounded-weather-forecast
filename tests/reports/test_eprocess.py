@@ -2,18 +2,24 @@
 
 import json
 import math
+from dataclasses import replace
 from datetime import timedelta
 
 import numpy as np
 import polars as pl
+import pytest
+from conftest import write_config
 
 from grounded_weather_forecast.config import PromotionConfig
+from grounded_weather_forecast.dashboard import score_summary
 from grounded_weather_forecast.reports.eprocess import (
     EProcessStore,
     pair_key,
+    product_eprocess_store,
     promotion_comparison,
 )
 from grounded_weather_forecast.reports.leaderboard import slice_winners
+from grounded_weather_forecast.serve import selection
 from grounded_weather_forecast.timeutil import utc
 
 _REFERENCES = ("best_provider", "equal_weight", "damped_grounded_equal_weight")
@@ -22,6 +28,43 @@ _SKILL_COLUMNS = tuple(
     for reference in _REFERENCES
     for column in (f"skill_vs_{reference}", f"dm_p_vs_{reference}")
 )
+
+
+@pytest.mark.parametrize("rule", ["mcs", "legacy", "seq_mcs"])
+def test_product_store_cache_is_policy_neutral_and_readers_keep_their_guards(
+    tmp_path, monkeypatch, rule
+):
+    config = write_config(tmp_path)
+    config = replace(config, promotion=replace(config.promotion, rule=rule))
+    real = EProcessStore.load
+    paths = []
+
+    def load(path, configuration, code):
+        paths.append(path)
+        return real(path, configuration, code)
+
+    monkeypatch.setattr(EProcessStore, "load", load)
+    cache = {}
+    hourly = product_eprocess_store(config, "hourly", cache)
+    assert product_eprocess_store(config, "hourly", cache) is hourly
+    daily = product_eprocess_store(config, "daily", cache)
+    assert daily is not hourly
+    assert len(paths) == 2
+    assert not any(path.exists() for path in paths)
+    assert (
+        score_summary._eprocess_store(config, "scores_hourly_synthetic", cache) is None
+    )
+    if rule == "seq_mcs":
+        assert selection._eprocess_store_for(config, "hourly", cache) is hourly
+        assert (
+            score_summary._eprocess_store(config, "scores_hourly_live", cache) is hourly
+        )
+    else:
+        assert selection._eprocess_store_for(config, "hourly", cache) is None
+        assert (
+            score_summary._eprocess_store(config, "scores_hourly_live", cache) is None
+        )
+    assert len(paths) == 2
 
 
 def make_store(tmp_path, config_fingerprint="cfg1", code_version="code1"):

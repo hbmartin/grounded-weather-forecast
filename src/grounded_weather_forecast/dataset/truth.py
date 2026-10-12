@@ -11,12 +11,18 @@ Insufficient coverage yields null truth — rows drop out of training/scoring.
 
 from collections.abc import Sequence
 from dataclasses import dataclass
+from datetime import datetime, timedelta
+from zoneinfo import ZoneInfo
 
 import polars as pl
 
 from grounded_weather_forecast.config import Config
 from grounded_weather_forecast.dataset.qc import masked, qc_col
-from grounded_weather_forecast.timeutil import local_date_expr, local_day_minutes
+from grounded_weather_forecast.timeutil import (
+    local_date_expr,
+    local_day_minutes,
+    local_day_start_utc,
+)
 from grounded_weather_forecast.units import dew_point_expr, sea_level_pressure_expr
 
 STATE_VARIABLES: tuple[str, ...] = (
@@ -118,6 +124,37 @@ def _clean_minutes(variable: str) -> pl.Expr:
     return (
         pl.col("ts").dt.truncate("1m").filter(pl.col(variable).is_not_null()).n_unique()
     )
+
+
+def observed_rainfall(
+    minute: pl.DataFrame, issue_time: datetime, config: Config
+) -> dict[str, float]:
+    """Known accumulation only, using causal QC and the shared counter rules.
+
+    These are lower bounds when samples are missing, never imputed totals.
+    The event counter itself is not a calendar-day accumulation.
+    """
+    if "rain_counter_mm" not in minute.columns:
+        return {}
+    past = minute.filter(
+        (pl.col("ts") <= issue_time) & pl.col("rain_counter_mm").is_finite()
+    )
+    # Known rain does not stop having fallen when the observation stream lags.
+    # Instantaneous anchoring has its own freshness guard; these are lower bounds.
+    if past.is_empty():
+        return {}
+    deltas = _precip_deltas(past, config.dataset.precip_reset_fraction)
+    start = local_day_start_utc(
+        issue_time.astimezone(ZoneInfo(config.station.timezone)).date(),
+        config.station.timezone,
+    )
+    return {
+        name: float(deltas.filter(pl.col("ts") >= boundary)["precip_delta_mm"].sum())
+        for name, boundary in (
+            ("rain_observed_today_mm", start),
+            ("rain_observed_last_hour_mm", issue_time - timedelta(hours=1)),
+        )
+    }
 
 
 def _instantaneous(

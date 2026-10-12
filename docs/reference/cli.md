@@ -297,6 +297,18 @@ scores served forecasts against realized truth, and detects drift.
 data payload are inlined — so it opens from `file://` with no server. See
 [Operator dashboard](../dashboard.md).
 
+PIT and PoP reliability failures appear as amber warnings in their respective
+dashboard panels. Successful leaderboards, winners, and other calibration
+diagnostics remain available; a calibration-only failure does not mark live
+score evidence unusable.
+
+With `[promotion] rule = "mcs"` or `"legacy"`, report and dashboard share completed
+score summaries, loading each score file once and releasing its full frame
+before the next file. Report tables retain BH/e-BH enrichment; the dashboard
+retains the raw leaderboard. With `"seq_mcs"`, the dashboard independently
+collects scores after all report wealth updates are persisted, retaining two
+full loads per file so every evaluation uses the final wealth state.
+
 ---
 
 ## `alignment`
@@ -412,6 +424,17 @@ its current method when no reference passes the quality guard and records
 and live replacement; their statistics belong to the pinned method or are
 absent when it has no compatible evidence. Minutely history attributes a
 release only when its selected method actually produced the value.
+
+Automatic rainfall uses the uncalibrated provider mean when its lead bucket has
+fewer than five distinct wet training days. Minute coverage is filled from the
+hourly path where necessary; hourly and daily amounts and probabilities receive
+containment checks, including station-measured rain today. Adjusted fields carry
+their own provenance and discard inherited model quantiles and release IDs.
+Open-Meteo's hourly rain fields are aligned from interval-end timestamps to
+hour starts; its minute rates preserve the reported quarter-hour amounts.
+`--method` bypasses the rain evidence guard and hourly/daily reconciliation for
+controlled experiments; native minute interpolation and coverage fallback still
+apply. See [Rainfall coherence](../methods/precipitation.md#6-coherence).
 
 **`--now` is the reproducibility flag.** It reissues a forecast from an archived
 snapshot, which is how you reproduce something the system served last Tuesday.

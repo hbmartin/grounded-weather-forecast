@@ -79,12 +79,12 @@ That works on day one. Everything else needs an archive with some history — se
 | `build-dataset` | materialize truth tables and supervised matrices as parquet | — |
 | `backtest` | rolling-origin backtest over the supervised matrices | `--methods` `--hourly-variables` `--daily-variables` `--products` `--window` `--source` `--semantics` |
 | `maintain` | run one locked live build → backtest → report → truth-QC transaction | `--methods` `--hourly-variables` `--daily-variables` `--products` `--window` `--semantics` `--truth-qc-days` |
-| `report` | leaderboards, correlation reports, evidence ledgers, and `reports/dashboard.html` | — |
+| `report` | leaderboards, correlation reports, evidence ledgers, and `reports/dashboard.html`; one score load per file with `mcs`/`legacy`, local calibration warnings | — |
 | `alignment` | study truth semantics per provider; write the alignment artifact | — |
 | `backfill` | fetch archived forecasts into the synthetic supervised matrix | `--provider` `--models` `--start` `--end` `--chunk-days` |
 | `truth-qc` | cross-check truth against lapse-adjusted neighbors; fit the radiation-shield model | `--days` |
 | `ingest-ensembles` | poll the Open-Meteo Ensemble API for per-model spread features | `--models` |
-| `predict` | emit schema-6 JSON with per-variable minutely release provenance | `--out` `--method` `--no-history` `--semantics` `--now` |
+| `predict` | emit schema-6 JSON with rainfall containment checks and per-variable provenance; `--method` bypasses automatic rain safeguards for experiments | `--out` `--method` `--no-history` `--semantics` `--now` |
 | `publish` | safely publish an automatic forecast, holding a matching ready document for up to six hours | `--out` `--semantics` `--recovery-methods` `--recovery-window` |
 | `recover` | recheck degradation, then rebuild live evidence and reports when recovery is still needed | `--semantics` `--methods` `--window` |
 | `prune-scores` | delete superseded scores files | `--dry-run` |

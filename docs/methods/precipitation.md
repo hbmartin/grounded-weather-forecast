@@ -208,10 +208,51 @@ temperature.
 
 ## 6. Coherence
 
-The precipitation *sum* over a local day is a genuinely **linear** aggregate of
-the hourly path, so it is derivable from the blended hourly forecast and coherent
-by construction — unlike daily max/min, which are nonlinear and get their own
-supervised targets ([combination §9](combination.md#9-daily-heads)).
+*Implemented in: `serve/rainfall.py`; `dataset/truth.py::observed_rainfall`;
+`dataset/providers.py::_align_hourly_rain`*
 
-This is the one place where the hierarchical-reconciliation literature would
-apply, and the one place it is not needed.
+Daily rain is initially fitted as a separate supervised target. Automatic
+serving reconciles it with the hourly and minute paths after fitting:
+
+- Native minute rain uses only the latest vintage per source. Open-Meteo's
+  rate represents a preceding **15-minute** accumulation: its converted rate
+  is held constant over those 15 minutes, preserving the published amount.
+  Other native rates and probabilities use linear interpolation across gaps
+  of at most **15 minutes**, inside each source's published range. One extra
+  endpoint up to **15 minutes** beyond the output horizon supplies its final
+  interval or interpolation bracket. Missing rate or probability uses a named
+  `hourly_rainfall_fallback`; missing hourly evidence remains null.
+- Open-Meteo hourly amount and PoP end their **preceding hour**. Canonical
+  rainfall targets start their hour, so these two fields move back **one hour**
+  during archive reading, including composite model sources. State variables
+  keep their original timestamps; missing state hours do not erase known rain.
+- A minute rate represents the minute interval ending at its timestamp.
+  Its contribution is `precip_intensity_mmh / 60` mm. Each parent hour's
+  accumulation is at least the sum of its contained minute contributions.
+- A complete future local day uses the exact sum of its hourly accumulations,
+  with **23, 24, or 25 hours** according to the station timezone. Partial days
+  receive a lower bound rather than treating absent hours as dry.
+- Today's lower bound includes causal, QC-clean station counter increments
+  since local midnight, the minute prefix before the first future hour, and
+  remaining hourly rain. The event counter is not itself today's rain. Gaps
+  longer than **10 minutes** are unattributable; the shared **0.5** reset rule
+  handles resets and ignores small dips and rebounds.
+  Already observed accumulation remains a known lower bound if the live
+  stream becomes stale; instantaneous observation anchoring expires separately.
+- Parent PoP is at least the largest contained child PoP. Probabilities are
+  **not** summed and hours are not assumed independent. Today becomes 100%
+  occurrence once observed accumulation meets `pop_threshold_mm` (default
+  **0.254 mm**, the NWS measurable-precipitation threshold).
+
+Before fitting automatic rain selections, fewer than **5 distinct wet local
+days** in the causal training data for that lead bucket triggers an uncalibrated
+equal-weight provider mean for `pop`, `precip_mm`, and `precip_sum_mm`. Repeated
+forecast vintages of one storm count as one day. This operational safeguard
+prevents a mostly dry archive from licensing suppression of current rain;
+five days is a minimum evidence guard, not a claim of calibration. Pins bypass
+this guard. Explicit `predict --method` experiments also bypass reconciliation.
+
+Fallback and reconciled fields name their actual calculation in `methods` and
+`selection_reasons`. They discard inherited quantiles and release attribution,
+because the prior model did not produce the adjusted value. Non-rain variables
+keep their existing selection and prediction paths.

@@ -80,6 +80,19 @@ failure — U-shaped means under-dispersed, hump-shaped over-dispersed, sloped
 means biased. `empirical_coverage` reports the fraction of truths inside a
 declared interval, checked against nominal.
 
+### Dashboard diagnostics
+
+*Implemented in: `dashboard/score_summary.py`, `dashboard/zones/evaluation.py`*
+
+The dashboard retains a 10-bin PIT histogram on `[0, 1]` and PoP reliability
+bins when at least 20 probability rows are available. PIT and reliability
+derivation have independent failure guards: either failed diagnostic receives
+an amber warning while valid leaderboard, winner, and other diagnostic results
+remain available. The summary flags `pit_unusable` and `reliability_unusable`
+describe these local failures; `unusable` is reserved for core scoring failures.
+These views use the proper-score conventions cited in
+[Bibliography](bibliography.md#verification-testing-and-selection).
+
 ---
 
 ## 3. Skill

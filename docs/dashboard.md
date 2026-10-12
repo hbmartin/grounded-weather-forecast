@@ -31,14 +31,27 @@ Each score file is decoded once in a sequential collection pass using compact
 column types. The collector derives its leaderboard, winners, ten-bin PIT
 histogram, PoP reliability bins, provenance, and fold metadata, then releases
 the full frame before opening the next file. Zone builders consume the retained
-summaries without score-file I/O. A standalone dashboard therefore needs one
-full decode per file; `report` needs two including its separate processing pass.
+summaries without score-file I/O. A standalone dashboard needs one full load per
+file. Under `mcs` and `legacy`, `report` passes its completed score summaries to
+the dashboard, sharing the raw leaderboard and corrected winners while keeping
+BH/e-BH enrichment in the report. Its combined report/dashboard pass therefore
+loads each file once. Under `seq_mcs`, the dashboard independently reads scores
+after report finishes persisting wealth, so every evaluation uses the final
+wealth state; the combined command retains two full loads per file.
+
+`write_dashboard` and `collect_context` accept an optional `score_summaries`
+mapping. `None` collects score files normally. A supplied mapping is the complete
+score snapshot, including `{}` for an empty archive: score-file I/O is bypassed
+while all other artifacts are still collected. Only completed summaries cross
+this interface; full score frames and mutable wealth stores do not.
 
 Files deleted before collection are absent. Decode failures during collection
 appear in unreadable-artifact reporting. When statistical derivation fails,
 readable provenance and fold metadata remain available while the leaderboard
-is marked unusable. Deleting files after summarization does not interrupt
-rendering.
+is marked unusable. PIT and PoP reliability are guarded independently: a failure
+in either produces an amber warning only in that panel, retaining the leaderboard,
+winners, and successful diagnostics. Calibration-only failures do not mark live
+scores unusable. Deleting files after summarization does not interrupt rendering.
 
 ## Zone reference
 

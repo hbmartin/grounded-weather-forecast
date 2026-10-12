@@ -176,16 +176,31 @@ class TestPredict:
         for point in document.hourly:
             assert point.values["humidity_pct"] == 100.0
             assert point.values["wind_speed_ms"] == 0.0
-            assert point.values["precip_mm"] == 0.0
+            assert point.values["precip_mm"] >= 0.0
             assert point.values["pop"] == 1.0
         for point in document.daily:
-            assert point.values["precip_sum_mm"] == 0.0
+            assert point.values["precip_sum_mm"] >= 0.0
             assert point.values["pop"] == 1.0
 
     def test_force_method(self, config):
         document = predict(config, {}, now=NOW, force_method="equal_weight")
         methods = {m for p in document.hourly for m in p.methods.values()}
         assert methods == {"equal_weight"}
+
+    def test_rain_only_release_does_not_keep_ready_status_after_fallback(self, config):
+        selections = {
+            ("hourly", "precip_mm", "0-1h"): Selection(
+                "equal_weight",
+                "promoted",
+                release_id="rain-only",
+                truth_semantics="inst",
+            )
+        }
+        document = predict(config, selections, now=NOW)
+        assert document.status == "degraded"
+        assert "rain-only" not in document.release_ids
+        assert document.hourly[0].values["precip_mm"] == pytest.approx(0.25)
+        assert document.daily[0].values["precip_sum_mm"] == pytest.approx(0.25)
 
     def test_unsupported_forced_method_fails_the_whole_prediction(self, config):
         with pytest.raises(UnsupportedMethodError, match="hourly.precip_mm"):
@@ -203,7 +218,7 @@ class TestPredict:
         }
         document = predict(config, selections, now=NOW)
         first = document.hourly[0]
-        assert first.methods["precip_mm"] == "equal_weight"
+        assert first.methods["precip_mm"] == "minutely_rainfall_floor"
         assert "degraded stale selection" in first.selection_reasons["precip_mm"]
         assert "stale-release" not in document.release_ids
 
@@ -249,7 +264,7 @@ class TestPredict:
     def test_fallback_method_when_no_scores(self, config):
         document = predict(config, {}, now=NOW)
         methods = {m for p in document.hourly for m in p.methods.values()}
-        assert methods == {"equal_weight"}
+        assert methods == {"equal_weight", "minutely_rainfall_floor"}
         assert document.status == "degraded"
 
     def test_incompatible_historical_release_degrades_without_provenance(self, config):

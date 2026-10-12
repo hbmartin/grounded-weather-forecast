@@ -70,6 +70,7 @@ nav = [
       { "Week 2 provider diagnostic (2026-08-04)" = "research/week2-provider-diagnostic-2026-08-04.md" },
       { "Selection memory (2026-10-07)" = "research/selection-memory-2026-10-07.md" },
       { "Score readers (2026-10-10)" = "research/score-readers-2026-10-10.md" },
+      { "Score fallback and report reuse (2026-10-11)" = "research/score-readers-2026-10-11.md" },
       { "Cross-cutting summary" = "research/summary.md" },
     ] },
     { "Decisions" = [

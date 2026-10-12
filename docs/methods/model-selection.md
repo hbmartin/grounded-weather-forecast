@@ -386,12 +386,17 @@ Selection first scans compact metadata and method-presence summaries, then
 materializes only the newest complete evaluation for each slice. Compatibility
 filters run in lazy Parquet scans; source provenance is checked before those
 filters. `SCORE_BATCH_ROWS = 65_536` bounds each materialization batch.
-`MAX_SCORE_SCAN_ATTEMPTS = 3` bounds complete catalog/materialization attempts.
-File disappearance/change restarts from a fresh listing and excludes every
-known affected evaluation across all slices, carrying those exclusions into
-later attempts. Unknown catalog disappearances also restart; evaluation
-identity is read from columns rather than inferred from filenames. Exhausting
-the budget returns no evidence. Degraded diagnosis reads only identity columns.
+`MAX_SCORE_SCAN_ATTEMPTS = 3` bounds fresh catalog attempts. Within each catalog,
+a materialization disappearance/change invalidates every known affected
+evaluation across all slices and reconsiders the newest remaining complete
+evaluation. Each fallback must enlarge the invalid set, so the finite catalog
+bounds that loop without capping the number of older evaluations considered.
+Catalog disappearance or a materialization failure without invalidation progress
+restarts from a fresh listing, carrying known exclusions into later attempts.
+Evaluation identity is read from columns rather than inferred from filenames.
+Exhausting the fresh-catalog budget returns no evidence. Null semantics are
+normalized to `inst` at the live-scan boundary. Degraded diagnosis reads only
+identity columns.
 
 The scan returns selected slices, validated evaluation contexts, and each
 slice's maximum valid time. Release evidence reuses those contexts and cutoffs
@@ -399,13 +404,29 @@ only for selections with evaluation attribution, projecting semantics to their
 selected variables in deterministic order. It does not scan retained score
 frames again to reconstruct contexts.
 
+The shared `reports/eprocess.py::product_eprocess_store` loads each product's
+live wealth once per caller-owned cache, keyed by product and pinned to the
+configuration/code identities. It has no promotion-rule policy and never
+persists state. Serving and standalone dashboard readers consult it only under
+`seq_mcs`; report loads live wealth under every rule so its rule comparison and
+wealth ledger remain available. Only report saves the store, following the
+[sequential evidence convention](bibliography.md#verification-testing-and-selection).
+
+Report passes its raw leaderboard and corrected winners into
+`dashboard/score_summary.py::summarize_scores` under `mcs` and `legacy`, bypassing
+those derivations while still collecting calibration/provenance/fold summaries.
+Under `seq_mcs`, dashboard derivation remains independent after all report wealth
+updates are persisted, preserving the final-store interpretation of earlier
+evaluations. No full score frames or wealth stores are retained in dashboard
+summaries.
+
 Leaderboard and loss builders project required columns before partitions,
 filters, and joins, and reference frames are cached per slice. Polars generally
 shares long string payload buffers through these operations while allocating
 column views and numeric buffers; memory savings therefore depend on rows,
 columns, and retained buffers, not simply JSON string length. See the Polars
 StringView reference in [Bibliography](bibliography.md#3-operational-analogues)
-and the [final score-reader benchmark](../research/score-readers-2026-10-10.md).
+and the [score fallback and report-reuse benchmark](../research/score-readers-2026-10-11.md).
 
 Deploying these source changes changes the code fingerprint and requires fresh
 compatible `backtest --source live` / `report` evidence. Existing artifacts
