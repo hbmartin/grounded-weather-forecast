@@ -842,11 +842,18 @@ def _record_rainfall_guards(
     points: Sequence[HourlyPoint | DailyPoint],
     effects: RainfallEffects | None,
 ) -> None:
-    if effects is not None and any(
+    if effects is None:
+        return
+    guarded = [
+        (name, result.guarded_release_ids)
+        for name, result in blended.items()
+        if result.guarded_release_ids
+    ]
+    if any(
         point.values.get(name) is not None
         for index, point in enumerate(points)
-        for name, result in blended.items()
-        if result.guarded_release_ids and result.guarded_release_ids[index] is not None
+        for name, removed_releases in guarded
+        if removed_releases[index] is not None
     ):
         effects.guarded_release_removed = True
 

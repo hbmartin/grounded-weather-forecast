@@ -160,7 +160,11 @@ def _assert_diagnosis_channels(config, document, monkeypatch):
 
 
 @pytest.mark.parametrize("daily", [False, True])
-def test_only_finite_guarded_rows_record_attribution_loss(daily):
+@pytest.mark.parametrize(
+    "removed", [(), (None, None, None), ("", None, ""), ("removed", None, "removed")]
+)
+def test_only_finite_guarded_rows_record_attribution_loss(daily, removed):
+    from dataclasses import replace
     import numpy as np
     from grounded_weather_forecast.contracts import daily_variable, hourly_variable
     from grounded_weather_forecast.serve.predict import (
@@ -177,24 +181,26 @@ def test_only_finite_guarded_rows_record_attribution_loss(daily):
         reasons=["guarded"] * 3,
         release_ids=[None] * 3,
         quantiles=[{}] * 3,
-        guarded_release_ids=("removed", None, "removed"),
+        guarded_release_ids=removed,
     )
     name = "precip_sum_mm" if daily else "precip_mm"
     spec = daily_variable(name) if daily else hourly_variable(name)
-    blended = {name: blend}
+    unrelated = "temp_max_c" if daily else "temp_c"
+    unrelated_spec = daily_variable(unrelated) if daily else hourly_variable(unrelated)
+    blended = {name: blend, unrelated: replace(blend, guarded_release_ids=())}
+    variables = {name: spec, unrelated: unrelated_spec}
     points = [
-        DailyPoint(str(NOW.date()), 0, **_point_fields(blended, {name: spec}, i))
+        DailyPoint(str(NOW.date()), 0, **_point_fields(blended, variables, i))
         if daily
-        else HourlyPoint(
-            NOW.isoformat(), 0.0, **_point_fields(blended, {name: spec}, i)
-        )
+        else HourlyPoint(NOW.isoformat(), 0.0, **_point_fields(blended, variables, i))
         for i in range(3)
     ]
     effects = RainfallEffects()
+    _record_rainfall_guards(blended, points, None)
     _record_rainfall_guards(blended, points[:2], effects)
     assert not effects.guarded_release_removed
     _record_rainfall_guards(blended, points, effects)
-    assert effects.guarded_release_removed
+    assert effects.guarded_release_removed == bool(removed and removed[2] is not None)
 
 
 @pytest.mark.parametrize("daily", [False, True])
