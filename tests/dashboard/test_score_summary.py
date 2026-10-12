@@ -1,6 +1,7 @@
 import weakref
 
 import polars as pl
+import pytest
 from conftest import synthetic_hourly_matrix, write_config
 from serve.test_score_scan import scores
 
@@ -71,15 +72,18 @@ def test_file_disappearing_during_collection_is_reported(tmp_path, monkeypatch):
     assert derive(collected).live_scores_unusable
 
 
+@pytest.mark.parametrize(
+    "stage", ["leaderboard", "slice_winners", "winner_curse_adjusted"]
+)
 def test_statistical_failure_retains_provenance_and_fold_metadata(
-    tmp_path, monkeypatch
+    tmp_path, monkeypatch, stage
 ):
     config, paths = score_archive(tmp_path, count=1)
 
     def fail(*_args, **_kwargs):
         raise ValueError("invalid statistical evidence")
 
-    monkeypatch.setattr(score_summary, "leaderboard", fail)
+    monkeypatch.setattr(score_summary, stage, fail)
     collected = context.collect_context(config)
     summary = collected.score_summaries[paths[0].stem]
     assert summary.unusable
@@ -113,3 +117,81 @@ def test_probabilistic_summaries_preserve_histogram_and_reliability(tmp_path):
     reliability = evaluation._reliability_panel(paths[0].stem, summary)
     assert reliability is not None
     assert reliability.status == "ok"
+
+
+def test_ragged_calibration_keeps_valid_point_scores_and_reliability(tmp_path):
+    config, paths = score_archive(tmp_path, count=1)
+    frame = (
+        scores()
+        .group_by("method_id", maintain_order=True)
+        .head(7)
+        .with_columns(
+            pl.lit("pop").alias("variable"),
+            pl.lit("[0.1, 0.5, 0.9]").alias("quantile_levels_json"),
+            pl.when(pl.col("method_id") == "challenger")
+            .then(pl.lit("[0.0, 1.0]"))
+            .otherwise(pl.lit("[0.0, 1.0, 2.0]"))
+            .alias("quantiles_json"),
+        )
+    )
+    write_scores(frame, paths[0])
+    collected = context.collect_context(config)
+    summary = collected.score_summaries[paths[0].stem]
+    assert summary.board.height == 4
+    assert summary.winners is not None
+    assert not summary.unusable
+    assert summary.pit_unusable
+    assert summary.reliability == ((1.0, 0.0, 28),)
+    assert not summary.reliability_unusable
+    derived = derive(collected)
+    assert not derived.live_scores_unusable
+    assert paths[0].stem in derived.boards
+    text = writer.write_dashboard(config).read_text()
+    assert "PIT calibration could not be calculated from this score file." in text
+    assert "Leaderboard — hourly_live_expanding_eval0" in text
+
+
+@pytest.mark.parametrize(
+    "failed",
+    [("pit_values",), ("reliability_summary",), ("pit_values", "reliability_summary")],
+)
+def test_calibration_failures_are_independent_local_warnings(
+    tmp_path, monkeypatch, failed
+):
+    config, paths = score_archive(tmp_path, count=1)
+    frame = scores().with_columns(
+        pl.lit("pop").alias("variable"),
+        pl.lit(0.5).alias("y_pred"),
+        pl.lit(1.0).alias("y_true"),
+        pl.lit("[0.1, 0.5, 0.9]").alias("quantile_levels_json"),
+        pl.lit("[0.0, 1.0, 2.0]").alias("quantiles_json"),
+    )
+    write_scores(frame, paths[0])
+
+    def fail(*_args):
+        raise ValueError("calibration failed")
+
+    for stage in failed:
+        monkeypatch.setattr(score_summary, stage, fail)
+    collected = context.collect_context(config)
+    summary = collected.score_summaries[paths[0].stem]
+    assert summary.board is not None
+    assert summary.winners is not None
+    assert not summary.unusable
+    assert not derive(collected).live_scores_unusable
+    assert summary.pit_unusable == ("pit_values" in failed)
+    assert summary.reliability_unusable == ("reliability_summary" in failed)
+    pit = evaluation._calibration_panel(paths[0].stem, summary, summary.board)
+    assert pit.status == ("amber" if summary.pit_unusable else "ok")
+    assert "best CRPS" in {stat.label for stat in pit.stats}
+    assert (pit.chart is None) == summary.pit_unusable
+    reliability = evaluation._reliability_panel(paths[0].stem, summary)
+    assert reliability.status == ("amber" if summary.reliability_unusable else "ok")
+    assert (reliability.chart is None) == summary.reliability_unusable
+    if summary.reliability_unusable:
+        assert (
+            reliability.empty_reason
+            == "PoP reliability could not be calculated from this score file."
+        )
+    else:
+        assert summary.reliability == ((0.5, 1.0, 32),)

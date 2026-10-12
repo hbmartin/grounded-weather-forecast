@@ -208,7 +208,7 @@ def _calibration_panel(stem: str, summary: ScoreSummary, board: pl.DataFrame) ->
         if ("crps" in board.columns)
         else pl.DataFrame()
     )
-    if probabilistic.is_empty() and summary.pit_rows == 0:
+    if probabilistic.is_empty() and summary.pit_rows == 0 and not summary.pit_unusable:
         return empty_panel(
             "d5",
             "d5",
@@ -245,10 +245,12 @@ def _calibration_panel(stem: str, summary: ScoreSummary, board: pl.DataFrame) ->
     return Panel(
         panel_id=f"d5-{stem}",
         title=f"Calibration — {stem.removeprefix('scores_')}",
-        status="ok",
+        status="amber" if summary.pit_unusable else "ok",
         copy=PANEL_COPY["d5"],
         intro=(
-            "A calibrated forecast has a flat PIT histogram; a U shape means "
+            "PIT calibration could not be calculated from this score file."
+            if summary.pit_unusable
+            else "A calibrated forecast has a flat PIT histogram; a U shape means "
             "the bands are too narrow, a hump too wide."
         ),
         stats=tuple(stats),
@@ -258,6 +260,14 @@ def _calibration_panel(stem: str, summary: ScoreSummary, board: pl.DataFrame) ->
 
 
 def _reliability_panel(stem: str, summary: ScoreSummary) -> Panel | None:
+    if summary.reliability_unusable:
+        return empty_panel(
+            "d5",
+            f"d5r-{stem}",
+            f"PoP reliability — {stem.removeprefix('scores_')}",
+            "amber",
+            "PoP reliability could not be calculated from this score file.",
+        )
     if not summary.reliability:
         return None
     points = [(forecast, frequency) for forecast, frequency, _ in summary.reliability]

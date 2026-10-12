@@ -37,8 +37,10 @@ full decode per file; `report` needs two including its separate processing pass.
 Files deleted before collection are absent. Decode failures during collection
 appear in unreadable-artifact reporting. When statistical derivation fails,
 readable provenance and fold metadata remain available while the leaderboard
-is marked unusable. Deleting files after summarization does not interrupt
-rendering.
+is marked unusable. PIT and PoP reliability are guarded independently: a failure
+in either produces an amber warning only in that panel, retaining the leaderboard,
+winners, and successful diagnostics. Calibration-only failures do not mark live
+scores unusable. Deleting files after summarization does not interrupt rendering.
 
 ## Zone reference
 

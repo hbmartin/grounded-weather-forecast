@@ -31,6 +31,8 @@ class ScoreSummary:
     pit_rows: int = 0
     reliability: tuple[tuple[float, float, int], ...] = ()
     unusable: bool = False
+    pit_unusable: bool = False
+    reliability_unusable: bool = False
 
 
 def _eprocess_store(
@@ -117,7 +119,7 @@ def summarize_scores(
         else frozenset()
     )
     if scores.is_empty():
-        return ScoreSummary(kinds, folds)
+        return ScoreSummary(source_kinds=kinds, fold_origins=folds)
     try:
         board = leaderboard(scores, references=union_references(config.promotion))
         winners = winner_curse_adjusted(
@@ -132,6 +134,13 @@ def summarize_scores(
             scores,
             promotion=config.promotion,
         )
+    except (OSError, ValueError, pl.exceptions.PolarsError):
+        # Readable metadata remains useful even when statistical scoring fails.
+        return ScoreSummary(source_kinds=kinds, fold_origins=folds, unusable=True)
+    pit_unusable = False
+    counts: tuple[int, ...] = ()
+    pit_rows = 0
+    try:
         pit = pit_values(scores)
         counts = (
             tuple(
@@ -140,10 +149,23 @@ def summarize_scores(
             if pit.size
             else ()
         )
+        pit_rows = int(pit.size)
+    except (OSError, ValueError, pl.exceptions.PolarsError):
+        pit_unusable = True
+    reliability_unusable = False
+    reliability: tuple[tuple[float, float, int], ...] = ()
+    try:
         reliability = reliability_summary(scores)
     except (OSError, ValueError, pl.exceptions.PolarsError):
-        # Readable metadata remains useful even when statistical scoring fails.
-        return ScoreSummary(kinds, folds, unusable=True)
+        reliability_unusable = True
     return ScoreSummary(
-        kinds, folds, board, winners, counts, int(pit.size), reliability
+        source_kinds=kinds,
+        fold_origins=folds,
+        board=board,
+        winners=winners,
+        pit_counts=counts,
+        pit_rows=pit_rows,
+        reliability=reliability,
+        pit_unusable=pit_unusable,
+        reliability_unusable=reliability_unusable,
     )

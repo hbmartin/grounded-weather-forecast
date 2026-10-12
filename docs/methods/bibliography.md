@@ -74,7 +74,7 @@ Three sections, kept deliberately separate:
 
 | Reference | Implemented in |
 |---|---|
-| Gneiting, T. & Raftery, A. E. (2007). Strictly proper scoring rules, prediction, and estimation. *JASA* 102(477), 359–378. | `metrics/probabilistic.py` |
+| Gneiting, T. & Raftery, A. E. (2007). Strictly proper scoring rules, prediction, and estimation. *JASA* 102(477), 359–378. | `metrics/probabilistic.py`; `dashboard/score_summary.py` derives independently guarded PIT and reliability views. |
 | Diebold, F. X. & Mariano, R. S. (1995). Comparing predictive accuracy. *JBES* 13(3), 253–263. | `metrics/dm.py::diebold_mariano` |
 | Harvey, D., Leybourne, S. & Newbold, P. (1997). Testing the equality of prediction mean squared errors. *IJF* 13(2), 281–291. | `metrics/dm.py::_hln_factor` |
 | Tashman, L. J. (2000). Out-of-sample tests of forecasting accuracy: an analysis and review. *IJF* 16(4), 437–450. | `backtest/splits.py` |

@@ -386,12 +386,17 @@ Selection first scans compact metadata and method-presence summaries, then
 materializes only the newest complete evaluation for each slice. Compatibility
 filters run in lazy Parquet scans; source provenance is checked before those
 filters. `SCORE_BATCH_ROWS = 65_536` bounds each materialization batch.
-`MAX_SCORE_SCAN_ATTEMPTS = 3` bounds complete catalog/materialization attempts.
-File disappearance/change restarts from a fresh listing and excludes every
-known affected evaluation across all slices, carrying those exclusions into
-later attempts. Unknown catalog disappearances also restart; evaluation
-identity is read from columns rather than inferred from filenames. Exhausting
-the budget returns no evidence. Degraded diagnosis reads only identity columns.
+`MAX_SCORE_SCAN_ATTEMPTS = 3` bounds fresh catalog attempts. Within each catalog,
+a materialization disappearance/change invalidates every known affected
+evaluation across all slices and reconsiders the newest remaining complete
+evaluation. Each fallback must enlarge the invalid set, so the finite catalog
+bounds that loop without capping the number of older evaluations considered.
+Catalog disappearance or a materialization failure without invalidation progress
+restarts from a fresh listing, carrying known exclusions into later attempts.
+Evaluation identity is read from columns rather than inferred from filenames.
+Exhausting the fresh-catalog budget returns no evidence. Null semantics are
+normalized to `inst` at the live-scan boundary. Degraded diagnosis reads only
+identity columns.
 
 The scan returns selected slices, validated evaluation contexts, and each
 slice's maximum valid time. Release evidence reuses those contexts and cutoffs

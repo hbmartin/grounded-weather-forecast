@@ -297,6 +297,11 @@ scores served forecasts against realized truth, and detects drift.
 data payload are inlined — so it opens from `file://` with no server. See
 [Operator dashboard](../dashboard.md).
 
+PIT and PoP reliability failures appear as amber warnings in their respective
+dashboard panels. Successful leaderboards, winners, and other calibration
+diagnostics remain available; a calibration-only failure does not mark live
+score evidence unusable.
+
 ---
 
 ## `alignment`

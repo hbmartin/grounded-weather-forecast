@@ -81,7 +81,7 @@ class ScoreIdentity:
             predicate &= (
                 (pl.col("product") != "hourly")
                 | (pl.col("variable") != variable)
-                | (pl.col("semantics").fill_null("inst") == semantic.value)
+                | (pl.col("semantics") == semantic.value)
             )
         return predicate
 
@@ -195,13 +195,11 @@ def _live_scan(path: Path) -> pl.LazyFrame | None:
         raise MixedProvenanceError(
             f"scores at {path} mix source kinds {sorted(map(str, kinds))}"
         )
-    return (
-        scan.with_columns(pl.col("semantics").fill_null("inst"))
-        if kinds == {"live"} and "semantics" in scan.collect_schema()
-        else scan
-        if kinds == {"live"}
-        else None
-    )
+    if kinds != {"live"}:
+        return None
+    if "semantics" in scan.collect_schema():
+        scan = scan.with_columns(pl.col("semantics").fill_null("inst"))
+    return scan
 
 
 def _catalog_file(
@@ -314,9 +312,7 @@ def _materialize(
                 str(error), catalog.path_evaluations[path]
             ) from error
     return {
-        key: pl.concat(frames, how="diagonal_relaxed").with_columns(
-            pl.col("semantics").fill_null("inst")
-        )
+        key: pl.concat(frames, how="diagonal_relaxed")
         for key, frames in fragments.items()
     }
 
@@ -333,24 +329,36 @@ def _scan_once(
     for path in sorted(scores_dir.glob("scores_*.parquet")):
         try:
             _catalog_file(catalog, path, identity)
-        except FileNotFoundError as error:
+        except (FileNotFoundError,) as error:  # noqa: B013 -- project convention
             raise EvidenceChangedError(
                 str(error), catalog.path_evaluations.get(path, frozenset())
             ) from error
-    selected = catalog.newest(promotion)
-    if not selected:
-        return ScoreScanResult()
-    frames = _materialize(catalog, selected, identity)
-    cutoffs = {
-        key: value if isinstance(value := frame["valid_time"].max(), datetime) else None
-        for key, frame in frames.items()
-    }
-    evaluations = {evidence.evaluation_id for evidence in selected.values()}
-    return ScoreScanResult(
-        frames,
-        {key: catalog.contexts.contexts[key] for key in sorted(evaluations)},
-        cutoffs,
-    )
+    while selected := catalog.newest(promotion):
+        try:
+            frames = _materialize(catalog, selected, identity)
+        except (EvidenceChangedError,) as error:  # noqa: B013 -- project convention
+            newly_invalid = error.evaluations - catalog.contexts.invalid
+            if not newly_invalid:
+                raise EvidenceChangedError(
+                    str(error), frozenset(catalog.contexts.invalid) | error.evaluations
+                ) from error
+            catalog.contexts.invalid.update(newly_invalid)
+            continue
+        cutoffs = {
+            key: value
+            if isinstance(value := frame["valid_time"].max(), datetime)
+            else None
+            for key, frame in frames.items()
+        }
+        evaluations = {evidence.evaluation_id for evidence in selected.values()}
+        return ScoreScanResult(
+            slices=frames,
+            contexts={
+                key: catalog.contexts.contexts[key] for key in sorted(evaluations)
+            },
+            cutoffs=cutoffs,
+        )
+    return ScoreScanResult()
 
 
 def compatible_slices(
@@ -360,10 +368,8 @@ def compatible_slices(
     for _ in range(MAX_SCORE_SCAN_ATTEMPTS):
         try:
             return _scan_once(scores_dir, identity, promotion, excluded=excluded)
-        except EvidenceChangedError as error:
+        except (EvidenceChangedError,) as error:  # noqa: B013 -- project convention
             excluded |= error.evaluations
-        except FileNotFoundError:
-            continue
     return ScoreScanResult()
 
 
@@ -387,7 +393,7 @@ def live_identity_sets(
             )
             for name in columns:
                 identities[name].update(str(value) for value in probe[name])
-        except FileNotFoundError:
+        except (FileNotFoundError,):  # noqa: B013 -- project convention
             if not skip_missing:
                 raise
     return (
