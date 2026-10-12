@@ -128,6 +128,80 @@ class TestSnapshot:
             build_snapshot(config, NOW + timedelta(days=30))
 
 
+@pytest.mark.parametrize(
+    ("native", "wet"), [(False, True), (True, True), (True, False)]
+)
+def test_wet_guard_skips_diagnostics_only_for_guarded_rows(
+    tmp_path, monkeypatch, native, wet
+):
+    import numpy as np
+    import polars as pl
+    import grounded_weather_forecast.serve.predict as module
+    from grounded_weather_forecast.contracts import BlendResult, hourly_variable
+
+    config = write_config(tmp_path)
+    train = pl.DataFrame(
+        {
+            "t__pop": [1.0 if wet else 0.0] * 5,
+            "lead_hours": [25.0] * 5,
+            "valid_time": [NOW - timedelta(days=i) for i in range(1, 6)],
+        }
+    )
+    future = pl.DataFrame({"lead_hours": [2.0, 25.0]})
+    result = BlendResult(
+        np.array([0.2, 0.2]),
+        quantiles=np.array([[0.1, 0.3]] * 2) if native else None,
+        quantile_levels=(0.1, 0.9) if native else (),
+    )
+    monkeypatch.setattr(
+        module,
+        "_fit_methods",
+        lambda *_args, **_kwargs: ({"equal_weight": result}, None),
+    )
+    pools, fits = [], []
+
+    class Dresser:
+        def errors_for(self, _variable, _semantics, _methods, _method, bucket):
+            pools.append(bucket)
+            return np.arange(40.0) / 100.0
+
+    class Recalibrator:
+        mode = "cqr"
+
+        def fitted_for(self, _variable, _semantics, _methods, _method, bucket):
+            fits.append(bucket)
+            return None
+
+    selections = {
+        ("hourly", "pop", bucket): Selection(
+            "equal_weight",
+            "promoted",
+            release_id="rain-release",
+            truth_semantics="inst",
+        )
+        for bucket in ("1-3h", "24-48h")
+    }
+    blend = module._blend_variable(
+        train,
+        future,
+        hourly_variable("pop"),
+        selections,
+        config,
+        daily=False,
+        semantics=TruthSemantics.INSTANTANEOUS,
+        dresser=Dresser(),
+        recalibrator=Recalibrator(),
+    )
+    assert blend.quantiles[0] == {}
+    assert blend.release_ids[0] is None
+    assert pools == (["24-48h"] if wet and not native else [])
+    assert fits == (["24-48h"] if wet and native else [])
+    assert bool(blend.quantiles[1]) == wet
+    assert blend.release_ids[1] == ("rain-release" if wet else None)
+    if native and wet:
+        assert blend.quantiles[1] == {"0.1": 0.1, "0.9": 0.3}
+
+
 class TestPredict:
     def test_three_products(self, config):
         document = predict(config, {}, now=NOW)

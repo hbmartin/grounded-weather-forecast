@@ -266,6 +266,9 @@ forecast vintages of one storm count as one day. This operational safeguard
 prevents a mostly dry archive from licensing suppression of current rain;
 five days is a minimum evidence guard, not a claim of calibration. Pins bypass
 this guard. Explicit `predict --method` experiments also bypass reconciliation.
+Guarded rainfall rows skip residual dressing and native-grid recalibration
+before any score pools or fitted diagnostics are requested; eligible rows and
+non-rain variables retain their existing uncertainty paths.
 
 Fallback and changed reconciled fields name their actual calculation in `methods`
 and `selection_reasons`. Changed values discard inherited quantiles and release

@@ -18,6 +18,7 @@ never fail ``predict``.
 """
 
 import json
+from collections.abc import Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -211,18 +212,30 @@ def recalibrate_variable(
     lead_buckets: list[str | None],
     quantiles: list[dict[str, float]],
     existing_sources: tuple[str | None, ...] | None,
+    *,
+    eligible_rows: Sequence[bool] | None = None,
 ) -> tuple[str | None, ...]:
     """Transform native quantile rows in place; return provenance labels.
 
     Rows already labeled by dressing keep their label and values — dressed
     bands are split-conformal already and must not be corrected twice.
     """
-    method_ids = frozenset(selection.method_id for selection in chosen)
+    eligible = (
+        tuple(eligible_rows) if eligible_rows is not None else (True,) * len(chosen)
+    )
+    if len(eligible) != len(chosen):
+        msg = "eligible_rows must match the number of chosen rows"
+        raise ValueError(msg)
+    method_ids = frozenset(
+        selection.method_id
+        for selection, allowed in zip(chosen, eligible, strict=True)
+        if allowed
+    )
     labels: list[str | None] = (
         list(existing_sources) if existing_sources is not None else [None] * len(chosen)
     )
     for row, (selection, bucket) in enumerate(zip(chosen, lead_buckets, strict=True)):
-        if labels[row] is not None or not quantiles[row]:
+        if not eligible[row] or labels[row] is not None or not quantiles[row]:
             continue
         fitted = recalibrator.fitted_for(
             variable, semantics, method_ids, selection.method_id, bucket

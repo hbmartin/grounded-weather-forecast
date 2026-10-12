@@ -16,6 +16,9 @@ adheres to [Semantic Versioning](https://semver.org/).
   live backtest/report evidence before rollout.
 - Report forwards skipped score-file failures to its dashboard while retaining
   the existing summary reuse and sequential final-wealth readback.
+- Rainfall rows rejected by the wet-day safeguard skip uncertainty diagnostics
+  that would be discarded. Observed rainfall computes only the consumed daily
+  total while retaining causal counter history.
 
 - **Served hourly horizon extended 48h → 96h** (`HOURLY_HORIZON_HOURS`), so
   the published document carries hourly rows for today plus the next three

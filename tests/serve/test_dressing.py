@@ -103,6 +103,47 @@ def dress_one(
     return quantiles[0], sources[0]
 
 
+@pytest.mark.parametrize("eligible", [(False, True), (False, False)])
+def test_dressing_does_not_request_pools_for_excluded_rows(eligible):
+    calls = []
+
+    class Dresser:
+        def errors_for(self, variable, semantics, method_ids, method_id, bucket):
+            calls.append((method_ids, method_id))
+            return np.arange(40.0)
+
+    quantiles = [{}, {}]
+    sources = dress_variable(
+        Dresser(),
+        HUMIDITY,
+        TruthSemantics.INSTANTANEOUS,
+        [Selection("excluded", "guarded"), Selection("eligible", "promoted")],
+        ["1-3h", "24-48h"],
+        np.array([50.0, 50.0]),
+        quantiles,
+        eligible_rows=eligible,
+    )
+    assert quantiles[0] == {}
+    assert sources[0] is None
+    assert calls == ([(frozenset({"eligible"}), "eligible")] if eligible[1] else [])
+    assert bool(quantiles[1]) == eligible[1]
+
+
+def test_dressing_rejects_mismatched_eligibility_mask(env):
+    config, directory = env
+    with pytest.raises(ValueError, match="eligible_rows"):
+        dress_variable(
+            ResidualDresser(directory, "hourly", config),
+            HUMIDITY,
+            TruthSemantics.INSTANTANEOUS,
+            [Selection("equal_weight", "test")],
+            ["1-3h"],
+            np.array([50.0]),
+            [{}],
+            eligible_rows=[],
+        )
+
+
 class TestCorrectedErrorQuantiles:
     def test_conformal_rank_rule(self):
         errors = np.arange(1.0, 100.0)  # n = 99, ranks are transparent

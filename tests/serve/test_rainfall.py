@@ -258,12 +258,10 @@ def test_observed_rain_is_causal_local_day_sum_not_event_counter(tmp_path):
     )
     result = observed_rainfall(frame, ts[4], config)
     assert result["rain_observed_today_mm"] == pytest.approx(0.3)
-    assert result["rain_observed_last_hour_mm"] == pytest.approx(0.3)
     stale = observed_rainfall(
         frame.filter(pl.col("ts") <= ts[4]), ts[4] + timedelta(hours=2), config
     )
     assert stale["rain_observed_today_mm"] == pytest.approx(0.3)
-    assert stale["rain_observed_last_hour_mm"] == 0.0
     assert observed_rainfall(frame.head(0), ts[4], config) == {}
     assert observed_rainfall(frame.drop("rain_counter_mm"), ts[4], config) == {}
 
@@ -276,6 +274,18 @@ def test_observed_rain_does_not_attribute_counter_jumps_across_missing_samples(
         [NOW - timedelta(minutes=20), NOW], rain_counter_mm=[0.0, 5.0]
     )
     assert observed_rainfall(frame, NOW, config)["rain_observed_today_mm"] == 0.0
+
+
+def test_observed_rain_retains_counter_maximum_from_before_midnight(tmp_path):
+    config = write_config(tmp_path)
+    midnight = utc(2026, 10, 11, 7)
+    frame = canonical_minute_frame(
+        [midnight - timedelta(minutes=1), midnight, midnight + timedelta(minutes=1)],
+        rain_counter_mm=[10.0, 9.8, 10.0],
+    )
+    assert observed_rainfall(frame, midnight + timedelta(minutes=1), config) == {
+        "rain_observed_today_mm": 0.0
+    }
 
 
 @pytest.mark.parametrize(

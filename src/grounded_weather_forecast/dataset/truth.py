@@ -11,7 +11,7 @@ Insufficient coverage yields null truth — rows drop out of training/scoring.
 
 from collections.abc import Sequence
 from dataclasses import dataclass
-from datetime import datetime, timedelta
+from datetime import datetime
 from zoneinfo import ZoneInfo
 
 import polars as pl
@@ -149,10 +149,8 @@ def observed_rainfall(
         config.station.timezone,
     )
     return {
-        name: float(deltas.filter(pl.col("ts") >= boundary)["precip_delta_mm"].sum())
-        for name, boundary in (
-            ("rain_observed_today_mm", start),
-            ("rain_observed_last_hour_mm", issue_time - timedelta(hours=1)),
+        "rain_observed_today_mm": float(
+            deltas.filter(pl.col("ts") >= start)["precip_delta_mm"].sum()
         )
     }
 
