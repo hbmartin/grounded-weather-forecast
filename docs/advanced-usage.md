@@ -45,7 +45,7 @@ grounded-weather-forecast report
 | Good for | Not valid for |
 |---|---|
 | Validating the entire pipeline end-to-end **today**. | Any conclusion about commercial providers (Google, Tomorrow.io, …) — they cannot be backfilled. |
-| Ranking methods at 24–240 h leads with real skill numbers. | **Leads under 24 h.** Previous Runs offsets are whole days, so those buckets are empty. |
+| Ranking methods at day-offset leads with real skill numbers. | **The 0–6 h anchoring range.** Instantaneous leads start at 24 h; rain interval-start leads begin at 23 h. |
 | Measuring provider error correlation and effective ensemble size. | Evaluating **anchoring**, which needs a short-lead row to compute the residual. |
 | Fitting grounding coefficients for open NWP models. | Choosing a serving method for your *live* provider set. |
 
@@ -530,7 +530,7 @@ Before you trust a number this system produces, read
 
 - A young live archive can have too few snapshots for any live leaderboard. Synthetic
   NWP results never justify serving choices for commercial providers.
-- Nothing under 24 h lead has been evaluated on real data, including the anchoring
+- Nothing in the 0–6 h range has been evaluated by Previous Runs, including the anchoring
   stage.
 - The evaluation harness has already caught three real bugs — grounding *injecting*
   bias, the online experts being unable to adapt to drift, and a climatology

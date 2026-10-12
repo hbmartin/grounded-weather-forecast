@@ -374,6 +374,11 @@ def ensemble_features(
         )
     snap = snapshot_long(
         ensembles.rename({"model": "source"}), snapshots, max_age_hours
+    ).with_columns(
+        pl.when(pl.col("variable") == "precip_mm")
+        .then(pl.col("valid_time") - pl.duration(hours=1))
+        .otherwise(pl.col("valid_time"))
+        .alias("valid_time")
     )
     if snap.is_empty():
         return pl.DataFrame(

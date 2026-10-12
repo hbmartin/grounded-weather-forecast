@@ -10,6 +10,7 @@ import pytest
 from conftest import (
     canonical_minute_frame,
     make_forecast_db,
+    make_station_db,
     minute_series,
     write_config,
 )
@@ -37,6 +38,7 @@ from grounded_weather_forecast.dataset.matrix import (
 )
 from grounded_weather_forecast.dataset.providers import read_hourly_long
 from grounded_weather_forecast.dataset.truth import truth_hourly
+from grounded_weather_forecast.serve.predict import build_snapshot
 from grounded_weather_forecast.timeutil import utc
 
 FETCHED = utc(2026, 3, 22, 11, 30)
@@ -291,6 +293,41 @@ def _snapshots(*times):
 
 
 class TestEnsembleFeatures:
+    @pytest.mark.parametrize("backfill", [False, True])
+    def test_rain_interval_alignment_preserves_availability_and_state_times(
+        self, backfill
+    ):
+        data = payload()
+        data["hourly"]["precipitation"] = [2.0, 3.0]
+        data["hourly"]["precipitation_member01"] = [4.0, 5.0]
+        if backfill:
+            data["hourly"].update(
+                precipitation_previous_day1=[3.0, 4.0],
+                precipitation_spread_previous_day1=[1.0, 1.0],
+                temperature_2m_previous_day1=[12.0, 13.0],
+            )
+            raw = parse_ensemble_mean_runs(
+                data, "gefs", ("temp_c", "precip_mm"), previous_days=1
+            )
+            issue = VALID - timedelta(days=1)
+        else:
+            raw = parse_ensemble(data, "gefs", FETCHED, ("temp_c", "precip_mm"))
+            issue = ISSUE
+        before = raw.clone()
+        wide = ensemble_features(raw, _snapshots(issue), 12.0)
+        rain = wide.filter(pl.col("valid_time") == VALID - timedelta(hours=1)).row(
+            0, named=True
+        )
+        state = wide.filter(pl.col("valid_time") == VALID).row(0, named=True)
+        assert rain["ens__gefs__precip_mm__mean"] == 3.0
+        assert rain["ens__gefs__temp_c__mean"] is None
+        assert state["ens__gefs__temp_c__mean"] == 12.0
+        assert raw.equals(before)
+        assert ensemble_features(raw, _snapshots(issue), 12.0).equals(wide)
+        assert ensemble_features(
+            raw, _snapshots(raw["fetched_at"].min() - timedelta(seconds=1)), 12.0
+        ).is_empty()
+
     def make_long(self, fetched_at=FETCHED):
         return parse_ensemble(payload(), "gefs", fetched_at, VARIABLES)
 
@@ -378,6 +415,48 @@ class TestMatrixIntegration:
         assert "ens__gefs__temp_c__mean" in matrix.columns
         slice_ = to_supervised_slice(matrix, hourly_variable("temp_c"))
         assert "ens__gefs__temp_c__mean" in slice_.x.features.columns
+
+    def test_rain_feature_alignment_agrees_in_training_and_serving(self, tmp_path):
+        config = replace(
+            self.build(tmp_path),
+            ensembles=EnsemblesConfig(
+                models=("gefs",), variables=("temp_c", "precip_mm")
+            ),
+        )
+        data = payload()
+        data["hourly"].update(
+            precipitation=[2.0, 3.0], precipitation_member01=[4.0, 5.0]
+        )
+        raw = parse_ensemble(data, "gefs", FETCHED, config.ensembles.variables)
+        store = config.dataset.dir / "ensembles.parquet"
+        append_ensembles(store, raw)
+        stored_bytes = store.read_bytes()
+        times = minute_series(VALID - timedelta(minutes=5), 11)
+        make_station_db(
+            tmp_path / "station.db",
+            [
+                (time.strftime("%Y-%m-%d %H:%M:%S"), {"outTemp": 50.0 + index / 10.0})
+                for index, time in enumerate(times)
+            ],
+        )
+        minute = canonical_minute_frame(times, temp_c=[9.0] * 11)
+        training = build_hourly_matrix(
+            read_hourly_long(config.forecasts),
+            _snapshots(ISSUE),
+            truth_hourly(minute, config),
+            minute,
+            config,
+            ensembles=raw,
+        )
+        serving = build_snapshot(config, ISSUE).hourly
+        columns = [
+            "valid_time",
+            *(name for name in training.columns if name.startswith("ens__")),
+        ]
+        assert training.select(columns).equals(serving.select(columns))
+        assert serving["ens__gefs__precip_mm__mean"].to_list() == [4.0]
+        assert serving["ens__gefs__temp_c__mean"].to_list() == [12.0]
+        assert store.read_bytes() == stored_bytes
 
 
 class TestTrainServeSymmetry:

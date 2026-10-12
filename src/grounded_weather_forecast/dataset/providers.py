@@ -195,10 +195,10 @@ def _read_hourly_long(
             *HOURLY_COLUMN_MAP.values(),
         ),
     )
-    return _align_hourly_rain(canonical)
+    return align_hourly_rain(canonical)
 
 
-def _align_hourly_rain(frame: pl.DataFrame) -> pl.DataFrame:
+def align_hourly_rain(frame: pl.DataFrame) -> pl.DataFrame:
     """Open-Meteo rain labels end the interval; canonical hours start it.
 
     Move only rain amount and PoP. Instantaneous state variables retain their
@@ -224,7 +224,7 @@ def _align_hourly_rain(frame: pl.DataFrame) -> pl.DataFrame:
     )
     aligned = (
         native.drop(*rain_fields)
-        .join(rain, on=list(keys), how="full", coalesce=True)
+        .join(rain, on=list(keys), how="full", coalesce=True, nulls_equal=True)
         .with_columns(
             (
                 (pl.col("valid_time") - pl.col("fetched_at")).dt.total_seconds()

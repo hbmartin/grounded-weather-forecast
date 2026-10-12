@@ -347,7 +347,8 @@ Two properties a reader should carry away:
     `_ANCHOR_MAX_LEAD = 6.0` hours. A snapshot whose earliest forecast row is
     beyond 6 h yields no residual, and the anchored method collapses to its base.
     This is why anchored variants are numerically identical to their bases on the
-    synthetic backfill, whose leads begin at 24 h.
+    synthetic backfill, whose instantaneous leads begin at 24 h and rain
+    interval-start leads at 23 h.
 
 Anchoring is the useful core of a Kalman filter's "correct toward the
 observation" step, extracted without the state-space machinery, the covariance

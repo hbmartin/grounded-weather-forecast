@@ -61,7 +61,8 @@ change document readiness.
 Explicit `--method` runs keep their existing `"ready"` status and can have
 empty release attribution.
 
-`"degraded"` means it was not, and the system fell back to `equal_weight`. The
+`"degraded"` means no hourly or daily value retains a promoted release. The
+system may use `equal_weight` or rainfall reconciled from its child forecasts. The
 forecast is still usable — an ungrounded equal-weight blend is a reasonable
 forecast — but it is **not** the evidence-backed one. Typical reasons:
 
@@ -69,6 +70,11 @@ forecast — but it is **not** the evidence-backed one. Typical reasons:
 "status": "degraded",
 "status_reason": "implementation changed since the last backtest; re-run `backtest --source live` then `report`"
 ```
+
+Rainfall safeguards can also remove the last served release despite compatible
+promotion evidence. In that case `status_reason` names insufficient wet-day
+evidence or changed rainfall reconciliation, rather than diagnosing missing
+scores. Detailed counts remain in each affected field's `selection_reasons`.
 
 Degraded status is also printed to **stderr**, so `--out -` still yields clean
 JSON on stdout. See the [FAQ](../faq.md#why-does-my-forecast-say-degraded).
@@ -183,10 +189,12 @@ path — so a daily max need not equal the max of the hourly block, and that is
 intentional ([ADR 0002](../adr/0002-anchored-nowcast-instead-of-temporal-disaggregation.md)).
 Automatic daily rainfall equals the hourly sum for a complete future local day.
 For partial days it is at least the known hourly accumulation, plus today's
-observed rain and the minute prefix before the first future hour. Its method and
+observed rain and the native minute prefix before the first future hour. Its method and
 reason distinguish an exact sum from a lower bound. Daily PoP is at least the
-largest contained hourly PoP; measurable rain already observed today sets its
+largest contained native minute or hourly PoP; measurable rain already observed today sets its
 occurrence to 100%. See [Rainfall coherence](../methods/precipitation.md#6-coherence).
+Changed reconciled fields clear inherited uncertainty and release attribution;
+unchanged values within absolute tolerance `1e-12` retain all original metadata.
 
 ---
 
@@ -212,7 +220,11 @@ their support across gaps of at most 15 minutes. Open-Meteo's preceding
 15-minute accumulations instead use constant rates over each reported interval
 to conserve their amounts. Its hourly rain fields are aligned to interval
 starts during archive reading. Outside native coverage, an
-available hourly rate/PoP supplies a named `hourly_rainfall_fallback`.
+available matching hour supplies a named `hourly_rainfall_fallback`: its unused
+rainfall amount is shared uniformly across missing minute slots, including
+unshown slots, while its PoP is copied. Native minute values are preserved.
+Missing parent evidence stays null; future hours are not borrowed into earlier
+gaps. The fallback is an assumed shape and cannot raise its own hourly floor.
 
 `methods` here names a minutely path construction (`minutely_interp`,
 `minutely_persistence`, `minutely_anchor_tau_1h`, …) rather than a blender. See

@@ -69,7 +69,7 @@ But its limits are structural, not incidental:
 | Limitation | Consequence |
 |---|---|
 | **Open-data NWP models only** (ECMWF, GFS, ICON via Open-Meteo). | The leaderboard says **nothing** about Google, Tomorrow.io, AccuWeather-style blends, NWS's human-edited grids, or MET Norway. These are exactly the sources most likely to be *diverse*, and they can only be acquired live. |
-| **Leads are exact 24-hour multiples** (offsets `previous_day1..7`). | Only the buckets ≥ 24 h are populated. The 0–24 h buckets — where the product actually lives, and where anchoring earns its keep — are **entirely unevaluated** on this data. |
+| **Native offsets are whole days** (`previous_day1..7`). | Instantaneous leads are 24, 48, ... h; canonical rain interval starts are 23, 47, ... h. The 0–6 h anchoring range remains **entirely unevaluated** on this data. |
 | **Day-0 is deliberately excluded.** | The unsuffixed Previous Runs field is the *latest* run for a past hour, whose effective lead is near zero. Including it would have filled the short-lead buckets with what is essentially an analysis and made anchoring look miraculous. Excluding it is honest, and it is why the short-lead gap above cannot be papered over. |
 | **Synthetic and live are never pooled** (`MixedProvenanceError`). | Correct, but it means you currently have *no* leaderboard for the providers you actually serve from. |
 
@@ -215,7 +215,7 @@ Read carefully, this says:
 It does **not** say:
 
 - Anything about the providers you actually serve from (§3).
-- Anything about leads under 24 hours (§3) — including the anchoring stage, whose
+- Anything about the 0–6 h anchoring range (§3), whose
   advantage is verified only on synthetic fixtures.
 - Anything about wind, precipitation or PoP at production quality — those slices
   exist but are thin, and precipitation in particular is zero-inflated in a way

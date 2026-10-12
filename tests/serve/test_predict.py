@@ -199,6 +199,8 @@ class TestPredict:
         document = predict(config, selections, now=NOW)
         assert document.status == "degraded"
         assert "rain-only" not in document.release_ids
+        assert "rainfall safeguard" in document.status_reason
+        assert "0 wet local days" in document.hourly[0].selection_reasons["precip_mm"]
         assert document.hourly[0].values["precip_mm"] == pytest.approx(0.25)
         assert document.daily[0].values["precip_sum_mm"] == pytest.approx(0.25)
 

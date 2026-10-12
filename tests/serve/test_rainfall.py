@@ -1,4 +1,5 @@
 from datetime import timedelta
+from copy import deepcopy
 
 import polars as pl
 import pytest
@@ -9,6 +10,7 @@ from grounded_weather_forecast.serve.rainfall import (
     fill_minutely_rain,
     native_rainfall,
     rainfall_selections,
+    rainfall_status_reason,
     reconcile_daily_rain,
     reconcile_hourly_rain,
 )
@@ -274,3 +276,147 @@ def test_observed_rain_does_not_attribute_counter_jumps_across_missing_samples(
         [NOW - timedelta(minutes=20), NOW], rain_counter_mm=[0.0, 5.0]
     )
     assert observed_rainfall(frame, NOW, config)["rain_observed_today_mm"] == 0.0
+
+
+@pytest.mark.parametrize(
+    ("amount", "rate", "expected", "fallback"),
+    [
+        (2.0, 4.0, 2.0, 0.0),
+        (4.0, 4.0, 4.0, 4.0),
+        (2.0, 6.0, 3.0, 0.0),
+        (0.0, 0.0, 0.0, 0.0),
+    ],
+)
+def test_partial_native_path_cannot_inflate_its_own_parent(
+    amount, rate, expected, fallback
+):
+    parent = hour(NOW, amount)
+    points = minutes(NOW, count=30, rate=rate) + minutes(
+        NOW + timedelta(minutes=30), count=30, rate=None, pop=None
+    )
+    fill_minutely_rain(points, [parent])
+    assert [p.precip_intensity_mmh for p in points[:30]] == [rate] * 30
+    assert [p.precip_intensity_mmh for p in points[30:]] == [fallback] * 30
+    reconcile_hourly_rain([parent], points)
+    assert parent.values["precip_mm"] == pytest.approx(expected)
+    assert sum(p.precip_intensity_mmh / 60 for p in points) == pytest.approx(expected)
+
+
+def test_partial_output_horizon_keeps_unshown_slots_share_of_budget():
+    parent = hour(NOW, 3.0)
+    points = minutes(NOW, count=10, rate=6.0) + minutes(
+        NOW + timedelta(minutes=10), count=10, rate=None, pop=None
+    )
+    fill_minutely_rain(points, [parent])
+    assert points[-1].precip_intensity_mmh == pytest.approx(2.4)
+    assert sum(p.precip_intensity_mmh / 60 for p in points) == pytest.approx(1.4)
+    reconcile_hourly_rain([parent], points)
+    assert parent.values["precip_mm"] == 3.0
+
+
+def test_missing_parent_amount_does_not_impute_missing_minutes_as_dry():
+    parent = hour(NOW, None, None)
+    points = minutes(NOW, count=30) + minutes(
+        NOW + timedelta(minutes=30), count=30, rate=None, pop=None
+    )
+    fill_minutely_rain(points, [parent])
+    assert points[-1].precip_intensity_mmh is None
+    assert points[-1].pop is None
+    reconcile_hourly_rain([parent], points)
+    assert parent.values["precip_mm"] == 3.0
+
+
+def test_hourly_derived_minutes_are_not_independent_floor_evidence():
+    parent = hour(NOW, 2.0, 0.2)
+    points = minutes(NOW, rate=10.0, pop=0.9)
+    for point in points:
+        point.methods.update(
+            precip_intensity_mmh="hourly_rainfall_fallback",
+            pop="hourly_rainfall_fallback",
+        )
+    reconcile_hourly_rain([parent], points)
+    assert parent.values == {"precip_mm": 2.0, "pop": 0.2}
+
+
+def test_future_hour_is_not_borrowed_into_the_daily_prefix():
+    issue = NOW + timedelta(minutes=30)
+    points = minutes(issue, rate=None, pop=None)
+    hours = [hour(NOW + timedelta(hours=1), 2.0, 0.2)]
+    fill_minutely_rain(points, hours)
+    assert all(point.precip_intensity_mmh is None for point in points[:30])
+    assert all(point.pop is None for point in points[:30])
+    parent = daily(issue.date(), amount=2.0, pop=0.2)
+    reconcile_hourly_rain(hours, points)
+    reconcile([parent], hours, points, issue=issue)
+    assert parent.values == {"precip_sum_mm": 2.0, "pop": 0.2}
+
+
+def test_native_prefix_probability_is_a_daily_floor_even_without_hourly_pop():
+    issue = NOW + timedelta(minutes=30)
+    points = minutes(issue, count=30, rate=None, pop=0.9)
+    parent = daily(issue.date(), pop=0.2)
+    reconcile(
+        [parent], [hour(NOW + timedelta(hours=1), 2.0, None)], points, issue=issue
+    )
+    assert parent.values["pop"] == 0.9
+    assert "native minute" in parent.selection_reasons["pop"]
+    # A minute ending at local midnight belongs to the preceding day.
+    midnight = local_day_start_utc(
+        issue.date() + timedelta(days=1), "America/Los_Angeles"
+    )
+    following = daily(issue.date() + timedelta(days=1), pop=0.2)
+    reconcile(
+        [following],
+        [],
+        minutes(midnight - timedelta(minutes=1), count=1, pop=0.9),
+        issue=issue,
+    )
+    assert following.values["pop"] == 0.2
+
+
+@pytest.mark.parametrize("difference", [0.0, 5e-13])
+def test_unchanged_complete_day_keeps_original_distribution_and_release(difference):
+    day = (NOW + timedelta(days=1)).date()
+    start = local_day_start_utc(day, "America/Los_Angeles")
+    parent = DailyPoint(
+        str(day),
+        1,
+        values={"precip_sum_mm": 24.0 + difference, "pop": 0.9},
+        methods={"precip_sum_mm": "csgd"},
+        quantiles={"precip_sum_mm": {"0.5": 24.0}},
+        quantiles_source={"precip_sum_mm": "native"},
+        release_ids={"precip_sum_mm": "daily-release"},
+        selection_reasons={"precip_sum_mm": "promoted"},
+    )
+    before = deepcopy(parent)
+    reconcile([parent], [hour(start + timedelta(hours=i)) for i in range(24)])
+    assert parent == before
+
+
+def test_changed_daily_amount_clears_only_its_own_attribution():
+    day = (NOW + timedelta(days=1)).date()
+    start = local_day_start_utc(day, "America/Los_Angeles")
+    parent = DailyPoint(
+        str(day),
+        1,
+        values={"precip_sum_mm": 25.0, "pop": 0.9},
+        methods={"precip_sum_mm": "csgd", "pop": "pop_calibration"},
+        quantiles={"precip_sum_mm": {"0.5": 25.0}, "pop": {"0.5": 0.9}},
+        quantiles_source={"precip_sum_mm": "native", "pop": "native"},
+        release_ids={"precip_sum_mm": "daily-release", "pop": "pop-release"},
+    )
+    reconcile([parent], [hour(start + timedelta(hours=i)) for i in range(24)])
+    assert parent.values["precip_sum_mm"] == 24.0
+    assert parent.release_ids == {"pop": "pop-release"}
+    assert parent.quantiles == {"pop": {"0.5": 0.9}}
+    assert parent.quantiles_source == {"pop": "native"}
+    assert parent.methods["pop"] == "pop_calibration"
+
+
+def test_status_names_wet_guard_before_reconciliation_and_otherwise_abstains():
+    parent = hour(NOW, 0.0)
+    assert rainfall_status_reason([parent]) is None
+    reconcile_hourly_rain([parent], minutes(NOW))
+    assert "reconciliation changed served values" in rainfall_status_reason([parent])
+    parent.selection_reasons["pop"] = "rainfall fallback: 0 wet local days; need 5"
+    assert "fewer than 5 wet local days" in rainfall_status_reason([parent])

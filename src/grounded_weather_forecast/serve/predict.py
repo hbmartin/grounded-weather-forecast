@@ -77,6 +77,7 @@ from grounded_weather_forecast.serve.rainfall import (
     fill_minutely_rain,
     native_rainfall,
     rainfall_selections,
+    rainfall_status_reason,
     reconcile_daily_rain,
     reconcile_hourly_rain,
 )
@@ -1451,7 +1452,8 @@ def predict(
         )
     degraded = not _served_release_ids(hourly, daily) and force_method is None
     status_reason = (
-        no_evidence_reason(
+        rainfall_status_reason([*hourly, *daily])
+        or no_evidence_reason(
             config,
             config.dataset.dir / "scores",
             dataset_id=dataset_snapshot.fingerprint

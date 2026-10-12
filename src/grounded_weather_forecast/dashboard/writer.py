@@ -181,9 +181,15 @@ def write_dashboard(
     *,
     now: datetime | None = None,
     score_summaries: Mapping[str, ScoreSummary] | None = None,
+    score_read_failures: tuple[str, ...] = (),
 ) -> Path:
     """Write dashboard.html, optionally reusing a complete score-summary snapshot."""
-    ctx = collect_context(config, now=now, score_summaries=score_summaries)
+    ctx = collect_context(
+        config,
+        now=now,
+        score_summaries=score_summaries,
+        score_read_failures=score_read_failures,
+    )
     derived = derive(ctx)
     zones = tuple(build(ctx, derived) for build in ALL_ZONES)
     alerts = evaluate_alerts(_alert_inputs(ctx, derived))

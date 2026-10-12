@@ -8,6 +8,15 @@ adheres to [Semantic Versioning](https://semver.org/).
 
 ### Changed
 
+- Rainfall fallback allocates only the matching hour's unused accumulation;
+  native minute evidence alone can raise parent floors. Unchanged daily totals
+  retain their uncertainty and release attribution, and degraded reasons name
+  active rainfall safeguards. Synthetic and ensemble rain are aligned when
+  consumed, preserving existing raw archives; rebuild matrices and refresh
+  live backtest/report evidence before rollout.
+- Report forwards skipped score-file failures to its dashboard while retaining
+  the existing summary reuse and sequential final-wealth readback.
+
 - **Served hourly horizon extended 48h → 96h** (`HOURLY_HORIZON_HOURS`), so
   the published document carries hourly rows for today plus the next three
   station-local days. Leads 48–96h serve from the existing `48-96h` bucket's

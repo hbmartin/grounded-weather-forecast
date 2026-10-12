@@ -74,6 +74,9 @@ summaries without reopening score files. With `mcs` or `legacy`, a complete
 With `seq_mcs`, the dashboard retains its independent collection after report
 persists final wealth, for two full loads per file overall. PIT/reliability
 failures produce local dashboard warnings and retain valid scoring results.
+Report also forwards filenames skipped after deletion so the supplied-summary
+dashboard retains unreadable-score and unreadable-artifact warnings. This does
+not add score reads or change sequential final-wealth readback.
 
 ```
 scores_{product}_{kind}_{window}_{evaluation_id}.parquet
