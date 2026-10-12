@@ -277,7 +277,7 @@ never consume a failed predecessor's output.
 
 > render leaderboards and correlation reports from scores
 
-No flags, and the heaviest command. For every scores file it builds the
+No flags, and the heaviest command. For every readable scores file it builds the
 leaderboard, applies BH and e-BH multiplicity control, updates the e-process
 store, computes MCS winners and winner's-curse corrections, gates promotions,
 scores served forecasts against realized truth, and detects drift.
@@ -301,6 +301,15 @@ PIT and PoP reliability failures appear as amber warnings in their respective
 dashboard panels. Successful leaderboards, winners, and other calibration
 diagnostics remain available; a calibration-only failure does not mark live
 score evidence unusable.
+
+Missing score files, including deletion between listing and loading, are skipped
+as absence. Corrupt, mixed-provenance, and permission/I/O read failures are named
+on stderr and in dashboard warnings; readable files still produce their reports.
+After writing available outputs, `report` returns **1** if a genuine read fault
+occurred or no score file loaded successfully; otherwise it returns **0**. A
+readable empty score frame counts as successfully loaded. Failures outside score
+loading retain their existing behavior. A failed report prevents maintenance
+from pruning against an incomplete catalog.
 
 With `[promotion] rule = "mcs"` or `"legacy"`, report and dashboard share completed
 score summaries, loading each score file once and releasing its full frame
@@ -447,7 +456,10 @@ gap meaningless.
 
 Degraded status is printed to **stderr**, so a `--out -` pipeline gets clean JSON
 on stdout. `status: "degraded"` means no promoted release matched the current
-fingerprints and the system fell back to `equal_weight`; see the
+fingerprints, or automatic rain safeguards removed the last served attribution.
+Rainfall reasons apply only when they actually remove release attribution from
+finite served fields; otherwise cold-start and identity-change diagnoses remain
+visible, including the implementation-change reason used by automatic restore. See the
 [FAQ](../faq.md#why-does-my-forecast-say-degraded).
 
 **Writes** the document, appends to `data/predict_history.parquet` unless

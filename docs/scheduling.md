@@ -83,7 +83,10 @@ acquires the job lock itself; the hourly eligibility check does not probe it.
 Healthy hourly checks therefore cannot prevent a daily job from acquiring its
 lock. Publication continues while restoration runs, retaining the existing
 last-good behavior. Installing updated wrappers and refreshing compatible live
-evidence are deployment steps: source changes alter the code fingerprint.
+evidence are deployment steps: source changes, including diagnostic corrections,
+alter the code fingerprint. Run a fresh live backtest and report with the updated
+code before rollout. Rainfall guards that remove no release preserve the
+implementation-change diagnosis required by the wrapper's restore check.
 
 Rain interval-alignment changes also require rebuilding live and synthetic
 matrices before regenerating their score evidence. Existing synthetic forecast

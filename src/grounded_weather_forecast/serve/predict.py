@@ -74,6 +74,7 @@ from grounded_weather_forecast.serve.history import load_archived_forecast
 from grounded_weather_forecast.serve.observability import snapshot_observability
 from grounded_weather_forecast.serve.rainfall import (
     RAIN_VARIABLES,
+    RainfallEffects,
     fill_minutely_rain,
     native_rainfall,
     rainfall_selections,
@@ -141,6 +142,7 @@ class VariableBlend:
     truth_semantics: str = TruthSemantics.INSTANTANEOUS.value
     # Per-row residual-dressing provenance; None means native (or no) quantiles.
     quantile_sources: tuple[str | None, ...] | None = None
+    guarded_release_ids: tuple[str | None, ...] = ()
 
 
 def _latest_observation(
@@ -431,6 +433,32 @@ def _blended_rows(
     return point, quantiles
 
 
+def _rainfall_choices(
+    train: pl.DataFrame,
+    predict_frame: pl.DataFrame,
+    variable: VariableSpec,
+    chosen: list[Selection],
+    config: Config,
+    *,
+    daily: bool,
+    force_method: str | None,
+) -> tuple[list[Selection], tuple[str | None, ...]]:
+    if variable.name not in RAIN_VARIABLES or force_method is not None:
+        return chosen, ()
+    guarded = rainfall_selections(
+        train,
+        chosen,
+        _lead_buckets(predict_frame, daily=daily),
+        daily=daily,
+        timezone=config.station.timezone,
+    )
+    removed = tuple(
+        before.release_id if after.release_id is None else None
+        for before, after in zip(chosen, guarded, strict=True)
+    )
+    return guarded, removed
+
+
 def _blend_variable(
     train: pl.DataFrame,
     predict_frame: pl.DataFrame,
@@ -462,14 +490,15 @@ def _blend_variable(
         )
         for selection in chosen
     ]
-    if variable.name in RAIN_VARIABLES and force_method is None:
-        chosen = rainfall_selections(
-            train,
-            chosen,
-            _lead_buckets(predict_frame, daily=daily),
-            daily=daily,
-            timezone=config.station.timezone,
-        )
+    chosen, guarded_releases = _rainfall_choices(
+        train,
+        predict_frame,
+        variable,
+        chosen,
+        config,
+        daily=daily,
+        force_method=force_method,
+    )
     fitted = _fit_methods(
         train,
         predict_frame,
@@ -496,6 +525,7 @@ def _blend_variable(
             release_ids=[None] * predict_frame.height,
             quantiles=[{} for _ in range(predict_frame.height)],
             truth_semantics=semantics.value,
+            guarded_release_ids=guarded_releases,
         )
     results, _ = fitted
     point, quantiles = _blended_rows(results, chosen, predict_frame.height)
@@ -550,6 +580,7 @@ def _blend_variable(
         quantiles=quantiles,
         truth_semantics=semantics.value,
         quantile_sources=quantile_sources,
+        guarded_release_ids=guarded_releases,
     )
 
 
@@ -790,10 +821,24 @@ def _cohere_daily(points: list[DailyPoint]) -> None:
             point.values["temp_min_c"], point.values["temp_max_c"] = high, low
 
 
+def _record_rainfall_guards(
+    blended: dict[str, VariableBlend], index: int, effects: RainfallEffects | None
+) -> None:
+    if effects is not None and any(
+        result.guarded_release_ids
+        and result.guarded_release_ids[index]
+        and math.isfinite(result.point[index])
+        for result in blended.values()
+    ):
+        effects.guarded_release_removed = True
+
+
 def _point_fields(
     blended: dict[str, VariableBlend],
     variables: dict[str, VariableSpec],
     index: int,
+    *,
+    effects: RainfallEffects | None = None,
 ) -> dict[str, dict]:
     """The per-variable maps every emitted point carries, for one row.
 
@@ -801,6 +846,7 @@ def _point_fields(
     class and time fields — lizard already flagged the two bodies as
     duplicates, so new maps belong here rather than in both.
     """
+    _record_rainfall_guards(blended, index, effects)
     return {
         "values": {
             name: _finite(result.point[index], variables[name])
@@ -843,6 +889,8 @@ def hourly_product(
     config: Config,
     semantics: TruthSemantics | Mapping[str, TruthSemantics],
     force_method: str | None = None,
+    *,
+    effects: RainfallEffects | None = None,
 ) -> tuple[list[HourlyPoint], dict[str, VariableBlend]]:
     """Blended hourly path, plus the per-variable blends for the minutely product."""
     frame = snapshot.hourly.sort("valid_time")
@@ -877,7 +925,7 @@ def hourly_product(
             valid_time=row["valid_time"].isoformat(),
             lead_hours=round(float(row["lead_hours"]), 2),
             lead_bucket=row["lead_bucket"],
-            **_point_fields(blended, variables, index),
+            **_point_fields(blended, variables, index, effects=effects),
         )
         for index, row in enumerate(frame.iter_rows(named=True))
     ]
@@ -891,6 +939,8 @@ def daily_product(
     selections: SelectionMap,
     config: Config,
     force_method: str | None = None,
+    *,
+    effects: RainfallEffects | None = None,
 ) -> list[DailyPoint]:
     """Daily hi/lo and PoP as their own supervised targets (decision 8).
 
@@ -926,7 +976,7 @@ def daily_product(
         DailyPoint(
             date_local=row["forecast_date"].isoformat(),
             lead_days=int(row["lead_days"]),
-            **_point_fields(blended, variables, index),
+            **_point_fields(blended, variables, index, effects=effects),
         )
         for index, row in enumerate(frame.iter_rows(named=True))
     ]
@@ -1418,11 +1468,25 @@ def predict(
         issue_time,
         frame=dataset_snapshot.daily if dataset_snapshot is not None else None,
     )
+    rainfall_effects = RainfallEffects()
     hourly, hourly_blend = hourly_product(
-        snapshot, hourly_train, selections, config, semantics, force_method
+        snapshot,
+        hourly_train,
+        selections,
+        config,
+        semantics,
+        force_method,
+        effects=rainfall_effects,
     )
     daily = (
-        daily_product(snapshot, daily_train, selections, config, force_method)
+        daily_product(
+            snapshot,
+            daily_train,
+            selections,
+            config,
+            force_method,
+            effects=rainfall_effects,
+        )
         if not snapshot.daily.is_empty()
         else []
     )
@@ -1439,7 +1503,7 @@ def predict(
     )
     fill_minutely_rain(minutely, hourly)
     if force_method is None:
-        reconcile_hourly_rain(hourly, minutely)
+        reconcile_hourly_rain(hourly, minutely, effects=rainfall_effects)
         reconcile_daily_rain(
             daily,
             hourly,
@@ -1448,10 +1512,11 @@ def predict(
             timezone=config.station.timezone,
             observed_today_mm=snapshot.observation.get("rain_observed_today_mm"),
             threshold_mm=config.dataset.pop_threshold_mm,
+            effects=rainfall_effects,
         )
     degraded = not _served_release_ids(hourly, daily) and force_method is None
     status_reason = (
-        rainfall_status_reason([*hourly, *daily])
+        rainfall_status_reason(rainfall_effects)
         or no_evidence_reason(
             config,
             config.dataset.dir / "scores",

@@ -7,6 +7,7 @@ from conftest import canonical_minute_frame, utc, write_config
 
 from grounded_weather_forecast.dataset.truth import observed_rainfall
 from grounded_weather_forecast.serve.rainfall import (
+    RainfallEffects,
     fill_minutely_rain,
     native_rainfall,
     rainfall_selections,
@@ -425,8 +426,69 @@ def test_changed_daily_amount_clears_only_its_own_attribution():
 
 def test_status_names_wet_guard_before_reconciliation_and_otherwise_abstains():
     parent = hour(NOW, 0.0)
-    assert rainfall_status_reason([parent]) is None
-    reconcile_hourly_rain([parent], minutes(NOW))
-    assert "reconciliation changed served values" in rainfall_status_reason([parent])
-    parent.selection_reasons["pop"] = "rainfall fallback: 0 wet local days; need 5"
-    assert "fewer than 5 wet local days" in rainfall_status_reason([parent])
+    effects = RainfallEffects()
+    assert rainfall_status_reason(effects) is None
+    reconcile_hourly_rain([parent], minutes(NOW), effects=effects)
+    assert "reconciliation changed served values" in rainfall_status_reason(effects)
+    effects.guarded_release_removed = True
+    assert "fewer than 5 wet local days" in rainfall_status_reason(effects)
+
+
+@pytest.mark.parametrize(
+    ("original", "release", "removed"),
+    [
+        (0.0, "old", True),
+        (0.0, None, False),
+        (None, "old", False),
+        (float("nan"), "old", False),
+        (6.0 + 5e-13, "old", False),
+    ],
+)
+def test_effects_require_changed_finite_released_values(original, release, removed):
+    parent = hour(NOW, original)
+    parent.release_ids.clear()
+    if release:
+        parent.release_ids["precip_mm"] = release
+    effects = RainfallEffects()
+    reconcile_hourly_rain([parent], minutes(NOW), effects=effects)
+    assert effects.reconciled_release_removed is removed
+    assert bool(rainfall_status_reason(effects)) is removed
+
+
+def test_daily_reconciliation_records_only_actual_attribution_loss():
+    parent = daily(NOW.date())
+    parent.release_ids["precip_sum_mm"] = "daily-release"
+    effects = RainfallEffects()
+    reconcile_daily_rain(
+        [parent],
+        [hour(NOW, 2.0)],
+        [],
+        issue_time=NOW,
+        timezone="America/Los_Angeles",
+        observed_today_mm=None,
+        threshold_mm=0.254,
+        effects=effects,
+    )
+    assert effects.reconciled_release_removed
+    assert parent.values["precip_sum_mm"] == 2.0
+    assert "precip_sum_mm" not in parent.release_ids
+
+
+def test_native_probability_crossing_half_hour_midnight_floors_following_day():
+    issue = utc(2026, 10, 11, 17, 45)
+    hours = [hour(utc(2026, 10, 11, h), 0.0, 0.2) for h in (18, 19)]
+    points = minutes(utc(2026, 10, 11, 18, 34), count=1, rate=None, pop=0.9)
+    following = daily("2026-10-12", pop=0.2)
+    reconcile_hourly_rain(hours, points)
+    reconcile_daily_rain(
+        [following],
+        hours,
+        points,
+        issue_time=issue,
+        timezone="Asia/Kolkata",
+        observed_today_mm=None,
+        threshold_mm=0.254,
+    )
+    assert hours[0].values["pop"] == 0.9
+    assert hours[1].values["pop"] == 0.2
+    assert following.values["pop"] == 0.9

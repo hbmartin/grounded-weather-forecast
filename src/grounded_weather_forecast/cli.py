@@ -1092,7 +1092,10 @@ def _explain_no_folds(config: Config, matrix: pl.DataFrame, product: str) -> Non
 
 def _cmd_report(config: Config) -> int:
     from grounded_weather_forecast.backtest.scores import load_scores  # noqa: PLC0415
-    from grounded_weather_forecast.contracts import hourly_variable  # noqa: PLC0415
+    from grounded_weather_forecast.contracts import (  # noqa: PLC0415
+        MixedProvenanceError,
+        hourly_variable,
+    )
     from grounded_weather_forecast.dashboard import write_dashboard  # noqa: PLC0415
     from grounded_weather_forecast.dashboard.score_summary import (  # noqa: PLC0415
         ScoreSummary,
@@ -1158,6 +1161,9 @@ def _cmd_report(config: Config) -> int:
             # The pipeline lock keeps prune out of a running report; this
             # guard covers deletion by anything outside that lock's scope.
             print(f"skipping {path.name}: deleted since listing", file=sys.stderr)
+            continue
+        except (OSError, MixedProvenanceError, pl.exceptions.PolarsError) as error:
+            print(f"skipping {path.name}: {error}", file=sys.stderr)
             score_read_failures.append(path.name)
             continue
         catalog_rows.append(operations.evaluation_catalog_row(path, scores))
@@ -1339,7 +1345,7 @@ def _cmd_report(config: Config) -> int:
     )
     for path in written:
         print(f"wrote {path}")
-    return 0
+    return 1 if score_read_failures or not catalog_rows else 0
 
 
 def _report_evidence_tail(config: Config, written: list[Path]) -> None:

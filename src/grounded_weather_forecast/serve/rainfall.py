@@ -2,7 +2,7 @@
 
 import math
 from collections import defaultdict
-from dataclasses import replace
+from dataclasses import dataclass, replace
 from datetime import date, datetime, timedelta
 from itertools import pairwise
 from zoneinfo import ZoneInfo
@@ -22,15 +22,14 @@ MIN_WET_DAYS = 5
 MAX_NATIVE_GAP = timedelta(minutes=15)
 RAIN_VARIABLES = frozenset({"pop", "precip_mm", "precip_sum_mm"})
 HOURLY_FALLBACK = "hourly_rainfall_fallback"
-RECONCILIATION_METHODS = frozenset(
-    {
-        "minutely_rainfall_floor",
-        "hourly_rainfall_sum",
-        "rainfall_accumulation_floor",
-        "hourly_rainfall_probability_floor",
-        "observed_daily_occurrence",
-    }
-)
+
+
+@dataclass(slots=True)
+class RainfallEffects:
+    """Prediction-local attribution losses; never part of forecast JSON."""
+
+    guarded_release_removed: bool = False
+    reconciled_release_removed: bool = False
 
 
 def rainfall_selections(
@@ -137,6 +136,8 @@ def _set_rain(
     value: float,
     method: str,
     reason: str,
+    *,
+    effects: RainfallEffects | None = None,
 ) -> None:
     old = point.values.get(variable)
     if old is not None and math.isclose(old, value, rel_tol=0.0, abs_tol=1e-12):
@@ -150,7 +151,9 @@ def _set_rain(
     # The original distribution/release did not produce this reconciled value.
     point.quantiles.pop(variable, None)
     point.quantiles_source.pop(variable, None)
-    point.release_ids.pop(variable, None)
+    release = point.release_ids.pop(variable, None)
+    if effects is not None and release and _finite(old) is not None:
+        effects.reconciled_release_removed = True
 
 
 def _native_value(point: MinutelyPoint, field: str) -> float | None:
@@ -203,7 +206,10 @@ def fill_minutely_rain(
 
 
 def reconcile_hourly_rain(
-    hourly: list[HourlyPoint], minutely: list[MinutelyPoint]
+    hourly: list[HourlyPoint],
+    minutely: list[MinutelyPoint],
+    *,
+    effects: RainfallEffects | None = None,
 ) -> None:
     """A parent hour contains at least its forecast minute accumulation."""
     for hour in hourly:
@@ -233,6 +239,7 @@ def reconcile_hourly_rain(
                     floor,
                     "minutely_rainfall_floor",
                     "parent hour reconciled to contained native minute forecasts; probability uses max, without independence assumptions",
+                    effects=effects,
                 )
 
 
@@ -262,7 +269,12 @@ def _today_prefix(
 
 
 def _daily_probability(
-    point: DailyPoint, hours: list[HourlyPoint], *, observed: bool, minute_pop: float
+    point: DailyPoint,
+    hours: list[HourlyPoint],
+    *,
+    observed: bool,
+    minute_pop: float,
+    effects: RainfallEffects | None = None,
 ) -> None:
     probability = (
         1.0
@@ -287,6 +299,7 @@ def _daily_probability(
             "measurable rain already observed in this local calendar day"
             if observed
             else "daily probability at least the largest contained native minute or hourly probability; intervals are not assumed independent",
+            effects=effects,
         )
 
 
@@ -299,6 +312,7 @@ def reconcile_daily_rain(
     timezone: str,
     observed_today_mm: float | None,
     threshold_mm: float,
+    effects: RainfallEffects | None = None,
 ) -> None:
     """Exact sums for complete local days; explicit lower bounds otherwise."""
     zone = ZoneInfo(timezone)
@@ -328,6 +342,7 @@ def reconcile_daily_rain(
                 "sum of complete local-day hourly path"
                 if complete
                 else "at least observed rain today plus remaining hourly/minute rain; partial coverage is a lower bound",
+                effects=effects,
             )
         _daily_probability(
             point,
@@ -344,21 +359,14 @@ def reconcile_daily_rain(
             observed=day == today
             and observed_today_mm is not None
             and observed_today_mm >= threshold_mm,
+            effects=effects,
         )
 
 
-def rainfall_status_reason(points: list[HourlyPoint | DailyPoint]) -> str | None:
-    """Name serving safeguards before diagnosing missing promotion evidence."""
-    if any(
-        "rainfall fallback:" in point.selection_reasons.get(variable, "")
-        for point in points
-        for variable in RAIN_VARIABLES
-    ):
+def rainfall_status_reason(effects: RainfallEffects) -> str | None:
+    """Name only safeguards that actually removed served attribution."""
+    if effects.guarded_release_removed:
         return f"rainfall safeguard: fewer than {MIN_WET_DAYS} wet local days in one or more served lead buckets; using uncalibrated rainfall"
-    if any(
-        point.methods.get(variable) in RECONCILIATION_METHODS
-        for point in points
-        for variable in RAIN_VARIABLES
-    ):
+    if effects.reconciled_release_removed:
         return "rainfall reconciliation changed served values; original release attribution no longer applies"
     return None

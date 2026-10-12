@@ -87,7 +87,7 @@ def test_collected_dashboard_renders_after_score_files_disappear(tmp_path, monke
     assert data_trust._provenance(collected).status == "ok"
 
 
-def test_file_disappearing_during_collection_is_reported(tmp_path, monkeypatch):
+def test_file_disappearing_during_collection_is_absent(tmp_path, monkeypatch):
     config, paths = score_archive(tmp_path, count=1)
 
     def load(path, **kwargs):
@@ -97,9 +97,9 @@ def test_file_disappearing_during_collection_is_reported(tmp_path, monkeypatch):
     monkeypatch.setattr(context, "load_scores", load)
     collected = context.collect_context(config)
     assert collected.score_summaries == {}
-    assert collected.unreadable_scores == (paths[0].stem,)
-    assert f"dataset/scores/{paths[0].name}" in collected.unreadable_artifacts
-    assert derive(collected).live_scores_unusable
+    assert collected.unreadable_scores == ()
+    assert f"dataset/scores/{paths[0].name}" not in collected.unreadable_artifacts
+    assert not derive(collected).live_scores_unusable
 
 
 @pytest.mark.parametrize(
@@ -463,18 +463,29 @@ def test_sequential_report_dashboard_uses_final_persisted_wealth(tmp_path, monke
 
 
 @pytest.mark.parametrize("rule", ["mcs", "legacy", "seq_mcs"])
+@pytest.mark.parametrize("fault", ["corrupt", "mixed", "permission"])
 def test_report_preserves_skipped_score_faults_in_dashboard(
-    tmp_path, monkeypatch, rule
+    tmp_path, monkeypatch, rule, fault, capsys
 ):
     config, paths = score_archive(tmp_path, count=2)
     config = replace(config, promotion=replace(config.promotion, rule=rule))
     matrix_path(config.dataset.dir, "hourly", "live").unlink()
     calls, collected = [], []
+    if fault == "corrupt":
+        paths[0].write_bytes(b"not parquet")
+    elif fault == "mixed":
+        frame = load_scores(paths[0]).with_columns(
+            pl.when(pl.col("method_id") == "challenger")
+            .then(pl.lit("synthetic"))
+            .otherwise(pl.lit("live"))
+            .alias("source_kind")
+        )
+        frame.write_parquet(paths[0])
 
     def load(path, **kwargs):
         calls.append(path)
-        if path == paths[0]:
-            raise FileNotFoundError(path)
+        if path == paths[0] and fault == "permission":
+            raise PermissionError(f"permission denied: {path}")
         return load_scores(path, **kwargs)
 
     def dashboard(config, *, score_summaries, score_read_failures):
@@ -499,7 +510,7 @@ def test_report_preserves_skipped_score_faults_in_dashboard(
     )
     independent = context.collect_context(config)
     calls.clear()
-    assert _cmd_report(config) == 0
+    assert _cmd_report(config) == 1
     expected_reads = 3 if rule == "seq_mcs" else 1
     assert calls.count(paths[1]) == expected_reads
     actual = collected[0]
@@ -509,6 +520,12 @@ def test_report_preserves_skipped_score_faults_in_dashboard(
     assert label in independent.unreadable_artifacts
     assert derive(actual).live_scores_unusable
     assert paths[0].name in (config.reports_dir / "dashboard.html").read_text()
+    assert paths[0].name in capsys.readouterr().err
+    assert (
+        (config.reports_dir / paths[1].stem.replace("scores_", "leaderboard_"))
+        .with_suffix(".md")
+        .exists()
+    )
 
 
 def test_empty_supplied_snapshot_keeps_failures_without_reading_scores(
@@ -528,3 +545,67 @@ def test_empty_supplied_snapshot_keeps_failures_without_reading_scores(
     assert actual.unreadable_scores == (paths[0].stem,)
     assert actual.unreadable_artifacts.count(f"dataset/scores/{paths[0].name}") == 1
     assert derive(actual).live_scores_unusable
+
+
+@pytest.mark.parametrize("rule", ["mcs", "legacy", "seq_mcs"])
+@pytest.mark.parametrize("all_missing", [False, True])
+def test_report_vanished_scores_are_absent(tmp_path, monkeypatch, rule, all_missing):
+    config, paths = score_archive(tmp_path, count=1 if all_missing else 2)
+    config = replace(config, promotion=replace(config.promotion, rule=rule))
+    matrix_path(config.dataset.dir, "hourly", "live").unlink()
+    snapshots = []
+
+    def load(path, **kwargs):
+        if path == paths[0]:
+            path.unlink()
+        return load_scores(path, **kwargs)
+
+    def dashboard(config, *, score_summaries, score_read_failures):
+        assert score_read_failures == ()
+        snapshots.append(
+            context.collect_context(config, score_summaries=score_summaries)
+        )
+        return writer.write_dashboard(config, score_summaries=score_summaries)
+
+    monkeypatch.setattr(score_module, "load_scores", load)
+    monkeypatch.setattr(
+        "grounded_weather_forecast.dashboard.write_dashboard", dashboard
+    )
+    assert _cmd_report(config) == (1 if all_missing else 0)
+    assert snapshots[0].unreadable_scores == ()
+    assert not derive(snapshots[0]).live_scores_unusable
+    assert (config.reports_dir / "dashboard.html").exists()
+
+
+@pytest.mark.parametrize("rule", ["mcs", "legacy", "seq_mcs"])
+def test_report_all_faults_writes_empty_snapshot_and_returns_failure(tmp_path, rule):
+    config, paths = score_archive(tmp_path, count=1)
+    config = replace(config, promotion=replace(config.promotion, rule=rule))
+    matrix_path(config.dataset.dir, "hourly", "live").unlink()
+    paths[0].write_bytes(b"corrupt parquet")
+    assert _cmd_report(config) == 1
+    assert paths[0].name in (config.reports_dir / "dashboard.html").read_text()
+
+
+def test_recorded_fault_survives_later_file_removal(tmp_path):
+    config, paths = score_archive(tmp_path, count=1)
+    paths[0].unlink()
+    collected = context.collect_context(
+        config,
+        score_summaries={},
+        score_read_failures=(paths[0].name,),
+    )
+    assert collected.unreadable_scores == (paths[0].stem,)
+    assert derive(collected).live_scores_unusable
+
+
+@pytest.mark.parametrize("rule", ["mcs", "legacy", "seq_mcs"])
+def test_report_readable_empty_scores_count_as_success(tmp_path, rule):
+    from grounded_weather_forecast.backtest.scores import empty_scores
+
+    config, paths = score_archive(tmp_path, count=1)
+    config = replace(config, promotion=replace(config.promotion, rule=rule))
+    matrix_path(config.dataset.dir, "hourly", "live").unlink()
+    empty_scores().write_parquet(paths[0])
+    assert _cmd_report(config) == 0
+    assert (config.reports_dir / "dashboard.html").exists()

@@ -11,11 +11,13 @@ adheres to [Semantic Versioning](https://semver.org/).
 - Rainfall fallback allocates only the matching hour's unused accumulation;
   native minute evidence alone can raise parent floors. Unchanged daily totals
   retain their uncertainty and release attribution, and degraded reasons name
-  active rainfall safeguards. Synthetic and ensemble rain are aligned when
+  rainfall safeguards only when they actually remove attribution. Cold-start and
+  identity-change diagnoses remain visible. Synthetic and ensemble rain are aligned when
   consumed, preserving existing raw archives; rebuild matrices and refresh
   live backtest/report evidence before rollout.
-- Report forwards skipped score-file failures to its dashboard while retaining
-  the existing summary reuse and sequential final-wealth readback.
+- Report treats missing scores as absence, completes readable outputs after
+  genuine score-read faults, and forwards fault warnings to the dashboard before
+  returning nonzero. Summary reuse and sequential final-wealth readback remain.
 - Rainfall rows rejected by the wet-day safeguard skip uncertainty diagnostics
   that would be discarded. Observed rainfall computes only the consumed daily
   total while retaining causal counter history.
