@@ -208,12 +208,19 @@ temperature.
 
 ## 6. Coherence
 
-*Implemented in: `serve/rainfall.py`; `dataset/truth.py::observed_rainfall`;
+*Implemented in: `serve/rainfall.py::RainfallTimeline`; `serve/rainfall.py::RainfallEffects`;
+`dataset/truth.py::observed_rainfall`;
 `dataset/providers.py::align_hourly_rain`; `dataset/matrix.py`;
 `dataset/ensembles.py::ensemble_features`*
 
 Daily rain is initially fitted as a separate supervised target. Automatic
 serving reconciles it with the hourly and minute paths after fitting:
+
+A prediction-local timeline parses each hourly/minute timestamp once and shares
+point indices across fallback, floors, daily containment, and prefix calculation.
+It stores no point references: minute replacements remain visible to later
+steps. Minute intervals use `(start, end]`; hourly day membership uses
+`[start, end)`. Direct helper calls create their own timeline when none is supplied.
 
 - Native minute rain uses only the latest vintage per source. Open-Meteo's
   rate represents a preceding **15-minute** accumulation: its converted rate

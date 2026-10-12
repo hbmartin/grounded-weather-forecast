@@ -21,7 +21,7 @@ Three sections, kept deliberately separate:
 
 | Reference | Implemented in |
 |---|---|
-| [Open-Meteo Forecast API parameter definitions](https://open-meteo.com/en/docs). Hourly rain and PoP describe the preceding hour; 15-minute precipitation is a preceding-interval sum. | `dataset/providers.py::align_hourly_rain`; synthetic matrix and ensemble-feature assembly; `serve/rainfall.py` — align rain to interval starts, conserve native quarter-hour amounts, and allocate only the remaining hourly fallback budget. |
+| [Open-Meteo Forecast API parameter definitions](https://open-meteo.com/en/docs). Hourly rain and PoP describe the preceding hour; 15-minute precipitation is a preceding-interval sum. | `dataset/providers.py::align_hourly_rain`; synthetic matrix and ensemble-feature assembly; `serve/rainfall.py` — align rain to interval starts, conserve native quarter-hour amounts, and allocate only the remaining hourly fallback budget; a shared parsed timeline preserves containment boundaries across minute replacement. |
 | Bates, J. M. & Granger, C. W. J. (1969). The combination of forecasts. *Operational Research Quarterly* 20(4), 451–468. | `blenders/combine.py::InverseErrorWeights` |
 | Stock, J. H. & Watson, M. W. (2004). Combination forecasts of output growth in a seven-country data set. *Journal of Forecasting* 23(6), 405–430. | Framing — the combination puzzle; `equal_weight` as benchmark |
 | Timmermann, A. (2006). Forecast combinations. *Handbook of Economic Forecasting* 1, 135–196. | Motivation for `inverse_*`; `invcov` is registered as its counterfactual |

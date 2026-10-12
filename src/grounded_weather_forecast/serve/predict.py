@@ -75,6 +75,7 @@ from grounded_weather_forecast.serve.observability import snapshot_observability
 from grounded_weather_forecast.serve.rainfall import (
     RAIN_VARIABLES,
     RainfallEffects,
+    RainfallTimeline,
     fill_minutely_rain,
     native_rainfall,
     rainfall_selections,
@@ -1501,9 +1502,12 @@ def predict(
             dataset_snapshot.truth_minute if dataset_snapshot is not None else None,
         ),
     )
-    fill_minutely_rain(minutely, hourly)
+    rainfall_timeline = RainfallTimeline.build(hourly, minutely)
+    fill_minutely_rain(minutely, hourly, timeline=rainfall_timeline)
     if force_method is None:
-        reconcile_hourly_rain(hourly, minutely, effects=rainfall_effects)
+        reconcile_hourly_rain(
+            hourly, minutely, effects=rainfall_effects, timeline=rainfall_timeline
+        )
         reconcile_daily_rain(
             daily,
             hourly,
@@ -1513,6 +1517,7 @@ def predict(
             observed_today_mm=snapshot.observation.get("rain_observed_today_mm"),
             threshold_mm=config.dataset.pop_threshold_mm,
             effects=rainfall_effects,
+            timeline=rainfall_timeline,
         )
     degraded = not _served_release_ids(hourly, daily) and force_method is None
     status_reason = (
