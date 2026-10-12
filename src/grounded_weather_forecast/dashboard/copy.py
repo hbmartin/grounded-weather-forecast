@@ -182,7 +182,9 @@ PANEL_COPY: Mapping[str, PanelCopy] = {
         thresholds=(
             "Amber on an SNHT exceedance (small-sample criticals, 95%); red "
             "only when a station-drift attribution latches for 3 straight "
-            "days. [truth_qc].gate_fitting decides whether a latch also "
+            "days. Retained verdicts are amber after a failed refresh, beyond "
+            "48 hours, or when refresh time is unknown. Date-only timestamps "
+            "use a conservative age bound. [truth_qc].gate_fitting decides whether a latch also "
             "quarantines training labels (ships off)."
         ),
     ),

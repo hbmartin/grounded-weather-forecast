@@ -667,6 +667,7 @@ def _cmd_truth_qc(config: Config, args: argparse.Namespace) -> int:
                     "positive slope is the failing-shield signature"
                 )
     config.artifacts_dir.mkdir(parents=True, exist_ok=True)
+    artifact["generated_at"] = datetime.now(tz=UTC).isoformat()
     (config.artifacts_dir / "truth_qc.json").write_text(
         json.dumps(artifact, indent=2, default=str), encoding="utf-8"
     )

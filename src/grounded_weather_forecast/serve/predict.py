@@ -58,6 +58,7 @@ from grounded_weather_forecast.dataset.matrix import (
     matrix_sources,
     to_forecast_matrix,
     to_supervised_slice,
+    truth_column_for,
 )
 from grounded_weather_forecast.dataset.providers import read_forecast_archive
 from grounded_weather_forecast.dataset.truth import observed_rainfall
@@ -69,6 +70,7 @@ from grounded_weather_forecast.leads import (
     minutely_bucket,
 )
 from grounded_weather_forecast.serve.dataset_snapshot import LiveDatasetSnapshot
+from grounded_weather_forecast.serve.diagnostics import FitDiagnostics
 from grounded_weather_forecast.serve.dressing import ResidualDresser, dress_variable
 from grounded_weather_forecast.serve.history import load_archived_forecast
 from grounded_weather_forecast.serve.observability import snapshot_observability
@@ -144,18 +146,6 @@ class VariableBlend:
     # Per-row residual-dressing provenance; None means native (or no) quantiles.
     quantile_sources: tuple[str | None, ...] | None = None
     guarded_release_ids: tuple[str | None, ...] = ()
-
-
-@dataclass(slots=True)
-class FitDiagnostics:
-    """Prediction-local fitting outcome, independent of rainfall attribution."""
-
-    promoted_fit_unavailable: bool = False
-
-    def record_unavailable(self, selections: Sequence[Selection]) -> None:
-        self.promoted_fit_unavailable = self.promoted_fit_unavailable or any(
-            selection.release_id is not None for selection in selections
-        )
 
 
 def _latest_observation(
@@ -472,6 +462,23 @@ def _rainfall_choices(
     return guarded, removed
 
 
+def _record_unavailable_fit(
+    diagnostics: FitDiagnostics,
+    selections: Sequence[Selection],
+    variable: VariableSpec,
+    semantics: TruthSemantics,
+    *,
+    daily: bool,
+) -> None:
+    diagnostics.record_unavailable(
+        (selection.release_id for selection in selections),
+        product="daily" if daily else "hourly",
+        variable=variable.name,
+        truth_semantics=semantics.value,
+        truth_column=truth_column_for(variable, semantics),
+    )
+
+
 def _blend_variable(
     train: pl.DataFrame,
     predict_frame: pl.DataFrame,
@@ -526,7 +533,9 @@ def _blend_variable(
     )
     if fitted is None:
         if fit_diagnostics is not None:
-            fit_diagnostics.record_unavailable(validated_selections)
+            _record_unavailable_fit(
+                fit_diagnostics, validated_selections, variable, semantics, daily=daily
+            )
         if {selection.method_id for selection in chosen} != {"equal_weight"}:
             return None
         point = _cold_start_equal_weight(predict_frame, variable, daily=daily)
@@ -1438,22 +1447,28 @@ def _training_matrix(
     issue_time: datetime,
     *,
     frame: pl.DataFrame | None = None,
+    fit_diagnostics: FitDiagnostics | None = None,
 ) -> pl.DataFrame:
     if frame is None:
         path = matrix_path(config.dataset.dir, product, "live")
-        if not path.exists():
-            return pl.DataFrame()
-        frame = pl.read_parquet(path)
+        frame = pl.read_parquet(path) if path.exists() else pl.DataFrame()
     if frame.is_empty():
-        return frame
-    known_at = (
-        daily_truth_known_at(frame, config.station.timezone)
-        if product == "daily"
-        else hourly_truth_known_at(frame)
-    )
-    return frame.with_columns(known_at).filter(
-        (pl.col("issue_time") <= issue_time) & (pl.col("truth_known_at") <= issue_time)
-    )
+        eligible = frame
+    else:
+        known_at = (
+            daily_truth_known_at(frame, config.station.timezone)
+            if product == "daily"
+            else hourly_truth_known_at(frame)
+        )
+        eligible = frame.with_columns(known_at).filter(
+            (pl.col("issue_time") <= issue_time)
+            & (pl.col("truth_known_at") <= issue_time)
+        )
+    if fit_diagnostics is not None:
+        fit_diagnostics.capture_training(
+            product, frame, eligible, has_forecasts=bool(matrix_sources(frame))
+        )
+    return eligible
 
 
 def _served_release_ids(
@@ -1490,20 +1505,22 @@ def predict(
         if archived is not None:
             return archived
     snapshot = build_snapshot(config, issue_time)
+    fit_diagnostics = FitDiagnostics()
     hourly_train = _training_matrix(
         config,
         "hourly",
         issue_time,
         frame=dataset_snapshot.hourly if dataset_snapshot is not None else None,
+        fit_diagnostics=fit_diagnostics,
     )
     daily_train = _training_matrix(
         config,
         "daily",
         issue_time,
         frame=dataset_snapshot.daily if dataset_snapshot is not None else None,
+        fit_diagnostics=fit_diagnostics,
     )
     rainfall_effects = RainfallEffects()
-    fit_diagnostics = FitDiagnostics()
     hourly, hourly_blend = hourly_product(
         snapshot,
         hourly_train,
@@ -1564,7 +1581,7 @@ def predict(
             dataset_id=dataset_snapshot.fingerprint
             if dataset_snapshot is not None
             else None,
-            promoted_fit_unavailable=fit_diagnostics.promoted_fit_unavailable,
+            fit_failures=fit_diagnostics.failures,
         )
         if degraded
         else None

@@ -90,9 +90,14 @@ An internal fitting diagnostic records when a release-bearing selection cannot
 be fitted from scoreable training history, including choices displaced by a rain
 guard. It does not count as attribution loss. After checking archive provenance
 and dataset/config/code identities, compatible evidence receives the specific
-fitting reason. Other cases say no promoted release produced a finite hourly or
-daily forecast. Per-field reasons retain their selection history. Fitting
-diagnostics are not serialized.
+fitting reason, scoped to product, variable, and truth semantics. The prefix
+“some compatible promoted selections could not be fitted at issuance” permits
+mixed outcomes. Causes distinguish a missing/empty matrix, missing provider
+forecast columns, finite truth excluded by the causal cutoff, and no finite
+training truth. Causal exclusion calls for polling; rebuilding alone is not
+required. Other cases say no promoted release produced a finite hourly or daily
+forecast. Per-field reasons retain their selection history. Diagnostics retain
+only small counts and failure records and are not serialized.
 
 Degraded status is also printed to **stderr**, so `--out -` still yields clean
 JSON on stdout. See the [FAQ](../faq.md#why-does-my-forecast-say-degraded).

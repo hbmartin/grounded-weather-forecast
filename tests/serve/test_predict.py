@@ -351,9 +351,14 @@ def test_compatible_promotion_without_training_names_fitting_failure(
     document = predict(config, selections, now=NOW)
     assert document.status == "degraded"
     assert document.release_ids == []
+    expected_cause = (
+        "no finite training truth; wait for valid truth and rebuild once it is incorporated"
+        if rain
+        else "finite training truth is excluded by the issue-time cutoff; keep polling"
+    )
     assert document.status_reason == (
-        "compatible promoted selections could not be fitted: no scoreable training "
-        "history; rebuild the dataset once truth is available"
+        "some compatible promoted selections could not be fitted at issuance: "
+        f"{product}.{name} (inst: {expected_cause})"
     )
     if rain:
         point = document.daily[0] if daily else document.hourly[0]
@@ -441,6 +446,339 @@ def test_unavailable_fit_diagnostic_uses_validated_selection(config, invalid):
     assert result is not None
     assert not diagnostics.promoted_fit_unavailable
     assert not any(result.release_ids)
+
+
+@pytest.mark.parametrize("daily", [False, True])
+def test_causal_fit_becomes_available_without_rebuilding(config_no_provider_qc, daily):
+    import polars as pl
+    import grounded_weather_forecast.serve.predict as module
+    from grounded_weather_forecast.backtest.splits import (
+        daily_truth_known_at,
+        hourly_truth_known_at,
+    )
+    from grounded_weather_forecast.contracts import daily_variable, hourly_variable
+    from grounded_weather_forecast.serve.diagnostics import (
+        FitDiagnostics,
+        FitUnavailableCause,
+    )
+
+    config = config_no_provider_qc
+    product = "daily" if daily else "hourly"
+    name = "temp_max_c" if daily else "temp_c"
+    variable = daily_variable(name) if daily else hourly_variable(name)
+    raw = (
+        scoreable_rain_training(daily=daily)
+        .head(1)
+        .with_columns(
+            pl.lit(NOW - timedelta(hours=1)).alias("issue_time"),
+            pl.lit(NOW.date()).alias("forecast_date")
+            if daily
+            else pl.lit(NOW).alias("valid_time"),
+        )
+    )
+    known = (
+        daily_truth_known_at(raw, config.station.timezone)
+        if daily
+        else hourly_truth_known_at(raw)
+    ).item()
+    original = raw.serialize()
+    selections = compatible_promotion(config, product, name, "equal_weight")
+    snapshot = build_snapshot(config, NOW)
+    future = snapshot.daily if daily else snapshot.hourly
+    first, later = FitDiagnostics(), FitDiagnostics()
+    excluded = module._training_matrix(
+        config,
+        product,
+        known - timedelta(microseconds=1),
+        frame=raw,
+        fit_diagnostics=first,
+    )
+    eligible = module._training_matrix(
+        config, product, known, frame=raw, fit_diagnostics=later
+    )
+    assert excluded.is_empty()
+    assert eligible.height == 1
+    early_blend = module._blend_variable(
+        excluded,
+        future,
+        variable,
+        selections,
+        config,
+        daily=daily,
+        semantics=TruthSemantics.INSTANTANEOUS,
+        fit_diagnostics=first,
+    )
+    later_blend = module._blend_variable(
+        eligible,
+        future,
+        variable,
+        selections,
+        config,
+        daily=daily,
+        semantics=TruthSemantics.INSTANTANEOUS,
+        fit_diagnostics=later,
+    )
+    assert early_blend is not None and all(
+        value is None for value in early_blend.release_ids
+    )
+    assert later_blend is not None and any(
+        value is not None for value in later_blend.release_ids
+    )
+    assert first.failures[0].cause == FitUnavailableCause.CAUSAL_EXCLUSION
+    assert not later.failures
+    assert raw.serialize() == original
+
+
+@pytest.mark.parametrize(
+    "cause", ["empty_matrix", "no_forecast_columns", "no_finite_truth"]
+)
+def test_unavailable_fit_classifies_observed_training_facts(
+    config_no_provider_qc, cause
+):
+    import polars as pl
+    import grounded_weather_forecast.serve.predict as module
+    from grounded_weather_forecast.contracts import hourly_variable
+    from grounded_weather_forecast.serve.diagnostics import FitDiagnostics
+
+    config = config_no_provider_qc
+    raw = scoreable_rain_training()
+    if cause == "empty_matrix":
+        raw = raw.head(0)
+    elif cause == "no_forecast_columns":
+        raw = raw.drop(name for name in raw.columns if name.startswith("fx__"))
+    else:
+        raw = raw.with_columns(
+            pl.Series(
+                "t__temp_c__inst",
+                [None, float("nan"), float("inf"), -float("inf"), None, None],
+            )
+        )
+    diagnostics = FitDiagnostics()
+    training = module._training_matrix(
+        config, "hourly", NOW, frame=raw, fit_diagnostics=diagnostics
+    )
+    selections = compatible_promotion(config, "hourly", "temp_c", "equal_weight")
+    module._blend_variable(
+        training,
+        build_snapshot(config, NOW).hourly,
+        hourly_variable("temp_c"),
+        selections,
+        config,
+        daily=False,
+        semantics=TruthSemantics.INSTANTANEOUS,
+        fit_diagnostics=diagnostics,
+    )
+    assert [
+        (
+            failure.product,
+            failure.variable,
+            failure.truth_semantics,
+            failure.cause.value,
+        )
+        for failure in diagnostics.failures
+    ] == [("hourly", "temp_c", "inst", cause)]
+
+
+@pytest.mark.parametrize("malformed", ["missing_column", "wrong_type"])
+def test_fit_diagnostics_preserve_malformed_training_exceptions(config, malformed):
+    import polars as pl
+    import grounded_weather_forecast.serve.predict as module
+    from grounded_weather_forecast.contracts import hourly_variable
+    from grounded_weather_forecast.serve.diagnostics import FitDiagnostics
+
+    raw = scoreable_rain_training()
+    raw = (
+        raw.drop("t__temp_c__inst")
+        if malformed == "missing_column"
+        else raw.with_columns(pl.lit("bad").alias("t__temp_c__inst"))
+    )
+    diagnostics = FitDiagnostics()
+    training = module._training_matrix(
+        config, "hourly", NOW, frame=raw, fit_diagnostics=diagnostics
+    )
+    with pytest.raises(pl.exceptions.PolarsError):
+        module._blend_variable(
+            training,
+            build_snapshot(config, NOW).hourly,
+            hourly_variable("temp_c"),
+            {},
+            config,
+            daily=False,
+            semantics=TruthSemantics.INSTANTANEOUS,
+            fit_diagnostics=diagnostics,
+        )
+    assert not diagnostics.failures
+
+
+def test_training_diagnostics_load_once_and_release_frames(config, monkeypatch):
+    import gc
+    import weakref
+    import polars as pl
+    import grounded_weather_forecast.serve.predict as module
+    from grounded_weather_forecast.dataset.matrix import matrix_path
+    from grounded_weather_forecast.serve.diagnostics import FitDiagnostics
+
+    path = matrix_path(config.dataset.dir, "hourly", "live")
+    scoreable_rain_training().write_parquet(path)
+    real_read = pl.read_parquet
+    reads, references = [], []
+
+    def read_once(path):
+        frame = real_read(path)
+        reads.append(path)
+        references.append(weakref.ref(frame))
+        return frame
+
+    monkeypatch.setattr(module.pl, "read_parquet", read_once)
+    diagnostics = FitDiagnostics()
+    training = module._training_matrix(
+        config, "hourly", NOW, fit_diagnostics=diagnostics
+    )
+    references.append(weakref.ref(training))
+    del training
+    gc.collect()
+    assert reads == [path]
+    assert all(reference() is None for reference in references)
+    assert diagnostics.training["hourly"].raw_rows == 6
+
+
+def test_missing_training_matrix_records_absence_without_reading(config, monkeypatch):
+    import grounded_weather_forecast.serve.predict as module
+    from grounded_weather_forecast.dataset.matrix import matrix_path
+    from grounded_weather_forecast.serve.diagnostics import FitDiagnostics
+
+    matrix_path(config.dataset.dir, "hourly", "live").unlink()
+    monkeypatch.setattr(
+        module.pl, "read_parquet", lambda *_args: pytest.fail("missing matrix was read")
+    )
+    diagnostics = FitDiagnostics()
+    assert module._training_matrix(
+        config, "hourly", NOW, fit_diagnostics=diagnostics
+    ).is_empty()
+    assert diagnostics.training["hourly"].raw_rows == 0
+
+
+def test_training_cause_is_specific_to_truth_semantics(config_no_provider_qc):
+    import polars as pl
+    import grounded_weather_forecast.serve.predict as module
+    from grounded_weather_forecast.contracts import hourly_variable
+    from grounded_weather_forecast.serve.diagnostics import (
+        FitDiagnostics,
+        FitUnavailableCause,
+    )
+
+    config = config_no_provider_qc
+    raw = (
+        scoreable_rain_training()
+        .head(2)
+        .with_columns(
+            pl.Series("valid_time", [NOW - timedelta(days=1), NOW]),
+            pl.Series("t__temp_c__inst", [None, 10.0]),
+            pl.Series("t__temp_c__mean", [5.0, None]),
+        )
+    )
+    diagnostics = FitDiagnostics()
+    training = module._training_matrix(
+        config, "hourly", NOW, frame=raw, fit_diagnostics=diagnostics
+    )
+    snapshot = build_snapshot(config, NOW)
+    for semantics in (TruthSemantics.INSTANTANEOUS, TruthSemantics.INTERVAL_MEAN):
+        selections = {
+            ("hourly", "temp_c", "0-1h"): Selection(
+                "equal_weight",
+                "promoted",
+                release_id="semantic-release",
+                truth_semantics=semantics.value,
+            )
+        }
+        module._blend_variable(
+            training,
+            snapshot.hourly,
+            hourly_variable("temp_c"),
+            selections,
+            config,
+            daily=False,
+            semantics=semantics,
+            fit_diagnostics=diagnostics,
+        )
+    assert [
+        (failure.truth_semantics, failure.cause) for failure in diagnostics.failures
+    ] == [("inst", FitUnavailableCause.CAUSAL_EXCLUSION)]
+
+
+def test_boolean_fit_diagnostic_compatibility_uses_conditional_advice(config):
+    from grounded_weather_forecast.serve.selection import no_evidence_reason
+
+    compatible_promotion(config, "hourly", "temp_c", "equal_weight")
+    reason = no_evidence_reason(
+        config, config.dataset.dir / "scores", promoted_fit_unavailable=True
+    )
+    assert reason.startswith("at least one compatible promoted selection")
+    assert "rebuild only when" in reason
+
+
+@pytest.mark.parametrize("provider_available", [False, True])
+def test_mixed_fitting_outcomes_name_only_unavailable_variable(
+    config_no_provider_qc, provider_available
+):
+    from dataclasses import replace
+    import polars as pl
+    import grounded_weather_forecast.serve.predict as module
+    from grounded_weather_forecast.contracts import hourly_variable
+    from grounded_weather_forecast.serve.dataset_snapshot import LiveDatasetSnapshot
+
+    config = config_no_provider_qc
+    train = scoreable_rain_training().with_columns(
+        pl.lit(None, dtype=pl.Float64).alias("t__wind_speed_ms__inst")
+    )
+    if not provider_available:
+        train = train.rename(
+            {
+                name: name.replace("__nws__", "__old_nws__").replace(
+                    "__open_meteo__", "__old_open_meteo__"
+                )
+                for name in train.columns
+                if name.startswith("fx__")
+            }
+        )
+    selections = compatible_promotion(
+        config, "hourly", "temp_c", "equal_weight", dataset_id="fixture"
+    )
+    selections.update(
+        compatible_promotion(
+            config, "hourly", "wind_speed_ms", "equal_weight", dataset_id="fixture"
+        )
+    )
+    # Daily fitting has a distinct unavailable promoted slice as well.
+    selections.update(
+        compatible_promotion(
+            config, "daily", "temp_max_c", "equal_weight", dataset_id="fixture"
+        )
+    )
+    snapshot = build_snapshot(config, NOW)
+    fitted = module._fit_methods(
+        train,
+        snapshot.hourly,
+        hourly_variable("temp_c"),
+        {"equal_weight"},
+        daily=False,
+        semantics=TruthSemantics.INSTANTANEOUS,
+    )
+    assert fitted is not None
+    dataset = LiveDatasetSnapshot("fixture", train, pl.DataFrame(), pl.DataFrame())
+    document = predict(config, selections, now=NOW, dataset_snapshot=dataset)
+    if provider_available:
+        assert document.status == "ready"
+        assert document.status_reason is None
+    else:
+        assert document.status == "degraded"
+        assert document.status_reason.startswith("some compatible promoted selections")
+        assert "hourly.wind_speed_ms" in document.status_reason
+        assert "daily.temp_max_c" in document.status_reason
+        assert "hourly.temp_c" not in document.status_reason
+        assert document.status_reason.index(
+            "daily.temp_max_c"
+        ) < document.status_reason.index("hourly.wind_speed_ms")
 
 
 @pytest.mark.parametrize("daily", [False, True])
@@ -532,6 +870,9 @@ def test_real_fitted_rain_guard_records_loss(
     if not native:
         snapshot = replace(snapshot, minutely=snapshot.minutely.head(0))
     train = scoreable_rain_training()
+    train = train.with_columns(
+        pl.lit(None, dtype=pl.Float64).alias("t__wind_speed_ms__inst")
+    )
     fitted = module._fit_methods(
         train,
         snapshot.hourly,
@@ -548,6 +889,12 @@ def test_real_fitted_rain_guard_records_loss(
             "equal_weight", "promoted", release_id="rain-only", truth_semantics="inst"
         )
     }
+    selections[("hourly", "wind_speed_ms", "0-1h")] = Selection(
+        "equal_weight",
+        "promoted",
+        release_id="unavailable-wind",
+        truth_semantics="inst",
+    )
     if native:
         selections[("daily", "precip_sum_mm", "D1")] = Selection(
             "equal_weight",

@@ -147,7 +147,7 @@ release attribution. `status_reason` explains automatic degradation. Common ones
 | implementation changed since the last backtest | run `recover`, or re-run `backtest --source live` then `report` |
 | dataset fingerprint changed | run `recover`, which rebuilds before backtesting |
 | configuration changed | run `recover`, or re-run the live backtest and report |
-| compatible promoted selections could not be fitted: no scoreable training history | rebuild the dataset once usable truth is available; compatible promotion evidence alone cannot fit the current forecast |
+| some compatible promoted selections could not be fitted at issuance | inspect the named product/variable and cause: keep polling for causal exclusion; build missing matrices or incorporate newly available valid truth as advised |
 | live evidence exists but no promoted release produced a finite hourly or daily forecast | inspect per-field reasons and provider availability; this does not mean a release was never promoted |
 | rainfall safeguard removed attribution | inspect wet-day counts in the affected fields; automatic rainfall needs five distinct wet training days per bucket |
 | rainfall reconciliation removed attribution | inspect native minute, hourly, and observed rainfall; the adjusted value cannot inherit the model's release or uncertainty |
@@ -159,7 +159,10 @@ re-earns it. See
 
 Actual wet-day guard loss takes precedence over actual reconciliation loss.
 Otherwise archive absence and identity changes keep their existing diagnoses;
-fitting failures are named only when evidence identities match. Cold-start blends
+fitting failures are named only when evidence identities match. The message lists
+only unavailable promoted fits in stable product/variable/semantics order; it does
+not claim every fit failed. Existing finite truth excluded by the issue-time
+cutoff can become eligible on a later prediction without any dataset rebuild. Cold-start blends
 and native floors filling unattributed nulls record no rainfall attribution loss.
 Detailed field reasons retain wet-day selection history even when the document
 names unavailable fitting. Null hourly/daily points omit quantiles and their

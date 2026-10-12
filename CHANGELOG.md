@@ -8,6 +8,13 @@ adheres to [Semantic Versioning](https://semver.org/).
 
 ### Changed
 
+- Truth-QC artifacts carry an optional UTC refresh timestamp. Retained dashboard
+  verdicts warn after a failed refresh, beyond 48 hours, or when freshness is
+  unknown; latched drift remains red. Date-only legacy artifacts remain readable.
+- Unavailable promoted fits are diagnosed by product/variable/semantics and
+  observed training cause. Causally excluded truth can become eligible without
+  rebuilding; mixed fit outcomes no longer imply all training is unavailable.
+
 - Served hourly/daily release attribution requires a finite emitted value.
   Cold-start blends clear rain-guard attribution-loss bookkeeping, preserving
   the evidence diagnosis even when native minute rain later fills a null field.

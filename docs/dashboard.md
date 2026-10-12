@@ -74,7 +74,13 @@ corrected), a daily truth-coverage calendar against
 live/synthetic provenance wall asserted as a badge. The panel verdict reads
 both the *current* flatline state and the overall flagged share (amber past
 5%, red past 25%), so a channel that is wholly out-of-bounds cannot render
-green on the strength of having no stuck sensor.
+green on the strength of having no stuck sensor. The truth cross-check retains
+its available verdict and chart while separately showing refresh time, age,
+and a failed refresh. It is amber after a failed QC attempt, beyond 48 hours,
+or when freshness is unknown; latched drift stays red. New QC artifacts include
+UTC `generated_at`; older verdict dates are labeled date-only and use a
+conservative age bound. File mtime never makes an old verdict look fresh, and
+these display warnings do not change fitting quarantine.
 
 **C — Learning readiness.** Archive issue-time span versus the
 `initial_train_days + step_days` a first rolling-origin fold needs (a

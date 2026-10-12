@@ -52,7 +52,11 @@ floors that fill their null fields retain the evidence diagnosis. Archived
 documents replay verbatim; historical forecast files are not rewritten. Null
 points also omit quantiles and their source; source labels require usable
 emitted quantiles. With compatible evidence, unavailable fitting for a promoted
-selection is diagnosed separately from rainfall attribution loss.
+selection is diagnosed separately from rainfall attribution loss. Reasons name
+the affected product/variable/semantics and distinguish causal exclusion from
+missing matrices, missing forecast columns, and absent finite truth. A fitted
+variable with unavailable prediction inputs is not mislabeled as an unavailable
+fit, and a surviving attributed finite value keeps the document ready.
 
 ### The provenance wall is in the filename
 
@@ -121,7 +125,7 @@ when a read fault persists.
 | `eprocess/{product}_{kind}.json` | `report` | accumulated betting wealth per candidate/reference pair |
 | `history/*.parquet` | `report` | ten append-only ledgers (below) |
 | `alignment.json` | `alignment` | measured truth semantics per provider |
-| `truth_qc.json` | `truth-qc` | neighbour verdicts and the shield fit (schema v3) |
+| `truth_qc.json` | `truth-qc` | neighbour verdicts, shield fit, and optional UTC ISO `generated_at` refresh timestamp (schema v3) |
 | `drift.json` | `report` | provider drift alarms |
 | `observability/` | `predict`, `publish` | per-serve snapshots |
 | `auto-restore.json` | `publish` | last automatic-recovery signature and attempt time |
@@ -132,7 +136,13 @@ A handled truth-QC failure during CLI maintenance preserves the previous
 `truth_qc.json` and still permits report/dashboard/catalog refresh. The failed
 stage is recorded in `data/runs.parquet`; maintenance returns its first nonzero
 stage result even when report finishes. A refreshed report may therefore use an
-older QC verdict. Build/backtest failures and unexpected exceptions still stop
+older QC verdict. The dashboard shows its refresh time and age, plus a failed
+refresh warning. A quiet retained verdict becomes amber after a failed refresh,
+when older than 48 hours, or when freshness is unknown; latched drift stays red.
+Legacy `drift_verdict.as_of_date` is displayed as date-only evidence, becoming
+stale only when its latest possible refresh time is beyond 48 hours. File mtime
+is not evidence of refresh. No historical artifacts need migration or rewriting.
+Build/backtest failures and unexpected exceptions still stop
 maintenance. Source changes alter the code fingerprint: generate fresh live
 backtest and report evidence with the updated code before rollout.
 
