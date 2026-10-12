@@ -18,6 +18,7 @@ evaluations would double-count cases. Dressing never raises out of
 """
 
 import math
+from collections.abc import Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -178,6 +179,8 @@ def dress_variable(
     lead_buckets: list[str | None],
     point: FloatArray,
     quantiles: list[dict[str, float]],
+    *,
+    eligible_rows: Sequence[bool] | None = None,
 ) -> tuple[str | None, ...]:
     """Fill empty per-row quantile dicts in place; return provenance labels.
 
@@ -185,9 +188,15 @@ def dress_variable(
     are candidates. The label records which ladder rung supplied the pool.
     """
     sources: list[str | None] = [None] * len(quantiles)
+    eligible = (
+        tuple(eligible_rows) if eligible_rows is not None else (True,) * len(chosen)
+    )
+    if len(eligible) != len(chosen):
+        msg = "eligible_rows must match the number of chosen rows"
+        raise ValueError(msg)
     undressed: dict[tuple[str, str | None], list[int]] = {}
     for row, selection in enumerate(chosen):
-        if quantiles[row] or not np.isfinite(point[row]):
+        if not eligible[row] or quantiles[row] or not np.isfinite(point[row]):
             continue
         undressed.setdefault((selection.method_id, lead_buckets[row]), []).append(row)
     if not undressed:

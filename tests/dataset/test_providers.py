@@ -2,9 +2,11 @@ import sqlite3
 from datetime import timedelta
 
 import pytest
+import polars as pl
 from conftest import make_forecast_db, utc, write_config
 
 from grounded_weather_forecast.dataset.providers import (
+    align_hourly_rain,
     read_daily_long,
     read_forecast_archive,
     read_hourly_long,
@@ -31,6 +33,35 @@ class TestSourceSlug:
         assert source_slug("nws", "nws") == "nws"
         assert source_slug("open_meteo", "ecmwf_ifs025") == "open_meteo_ecmwf_ifs025"
         assert source_slug("met_norway", "") == "met_norway"
+
+
+def test_rain_alignment_keeps_null_run_ids_and_rain_without_state_hours():
+    frame = pl.DataFrame(
+        {
+            "run_id": [None, None],
+            "source": ["open_meteo_gfs"] * 2,
+            "source_kind": ["synthetic"] * 2,
+            "fetched_at": [VALID - timedelta(days=1)] * 2,
+            "valid_time": [VALID - timedelta(hours=1), VALID],
+            "lead_hours": [23.0, 24.0],
+            "temp_c": [5.0, None],
+            "precip_mm": [None, 2.0],
+            "pop": [None, 0.7],
+        },
+        schema_overrides={"run_id": pl.Int64},
+    )
+    aligned = align_hourly_rain(frame)
+    row = aligned.filter(pl.col("valid_time") == VALID - timedelta(hours=1)).row(
+        0, named=True
+    )
+    assert row["temp_c"] == 5.0
+    assert row["precip_mm"] == 2.0
+    assert row["pop"] == 0.7
+    assert row["lead_hours"] == 23.0
+    rain_only = align_hourly_rain(frame.tail(1))
+    assert rain_only.filter(pl.col("precip_mm").is_not_null())["valid_time"][
+        0
+    ] == VALID - timedelta(hours=1)
 
 
 class TestReadHourlyLong:

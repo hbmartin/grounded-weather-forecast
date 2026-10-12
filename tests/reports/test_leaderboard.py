@@ -188,6 +188,24 @@ class TestLeaderboard:
         result = aggregate_leaderboard(board).row(0, named=True)
         assert result["rmse"] == pytest.approx(5.0**0.5)
 
+    @pytest.mark.parametrize("semantics", [False, True])
+    def test_aggregate_ties_have_stable_method_order(self, semantics):
+        board = pl.DataFrame(
+            {
+                "product": ["hourly"] * 2,
+                "variable": ["temp_c"] * 2,
+                "method_id": ["b", "a"],
+                "n": [10, 10],
+                "mae": [1.0, 1.0],
+                "rmse": [1.0, 1.0],
+            }
+        )
+        if semantics:
+            board = board.with_columns(pl.lit("inst").alias("truth_semantics"))
+        result = aggregate_leaderboard(board)
+        assert result["method_id"].to_list() == ["a", "b"]
+        assert result.equals(aggregate_leaderboard(board.reverse()))
+
     def test_ineligible_slice_has_no_winner(self):
         board = pl.DataFrame(
             {

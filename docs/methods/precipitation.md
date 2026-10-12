@@ -209,7 +209,8 @@ temperature.
 ## 6. Coherence
 
 *Implemented in: `serve/rainfall.py`; `dataset/truth.py::observed_rainfall`;
-`dataset/providers.py::_align_hourly_rain`*
+`dataset/providers.py::align_hourly_rain`; `dataset/matrix.py`;
+`dataset/ensembles.py::ensemble_features`*
 
 Daily rain is initially fitted as a separate supervised target. Automatic
 serving reconciles it with the hourly and minute paths after fitting:
@@ -220,26 +221,40 @@ serving reconciles it with the hourly and minute paths after fitting:
   Other native rates and probabilities use linear interpolation across gaps
   of at most **15 minutes**, inside each source's published range. One extra
   endpoint up to **15 minutes** beyond the output horizon supplies its final
-  interval or interpolation bracket. Missing rate or probability uses a named
-  `hourly_rainfall_fallback`; missing hourly evidence remains null.
+  interval or interpolation bracket. Missing probability uses the matching
+  parent hour's PoP. Missing rate uses a named `hourly_rainfall_fallback`:
+  with native accumulation $M$ over $K$ minute slots and original hourly
+  amount $H$, the remaining $60-K$ slots share $\max(H-M,0)$ mm uniformly.
+  Slots outside the displayed horizon retain their share. This assumes a
+  fallback shape; it is not native minute evidence. Missing hourly evidence
+  remains null, and the first future hour is never borrowed into its prefix.
 - Open-Meteo hourly amount and PoP end their **preceding hour**. Canonical
   rainfall targets start their hour, so these two fields move back **one hour**
-  during archive reading, including composite model sources. State variables
-  keep their original timestamps; missing state hours do not erase known rain.
+  during live archive reading, including composite model sources. Synthetic
+  archives and ensemble stores retain their native interval-end timestamps;
+  matrix and ensemble-feature assembly align them before use, including old
+  stored rows. Availability times and instantaneous state variables are unchanged.
+  Synthetic rain leads are therefore $24d-1$ hours for Previous Runs offset $d$;
+  state leads remain $24d$. Missing state hours do not erase known rain.
 - A minute rate represents the minute interval ending at its timestamp.
   Its contribution is `precip_intensity_mmh / 60` mm. Each parent hour's
-  accumulation is at least the sum of its contained minute contributions.
+  accumulation is raised only by contained native minute contributions.
+  Hourly-derived fallback minutes cannot raise their own parent. Filling occurs
+  before this floor, using the original hourly amount; if native rain exceeds
+  that amount, missing slots receive zero and the native accumulation raises
+  the parent. Missing original hourly amounts leave missing minute rates null.
 - A complete future local day uses the exact sum of its hourly accumulations,
   with **23, 24, or 25 hours** according to the station timezone. Partial days
   receive a lower bound rather than treating absent hours as dry.
 - Today's lower bound includes causal, QC-clean station counter increments
-  since local midnight, the minute prefix before the first future hour, and
+  since local midnight, the native minute prefix before the first future hour, and
   remaining hourly rain. The event counter is not itself today's rain. Gaps
   longer than **10 minutes** are unattributable; the shared **0.5** reset rule
   handles resets and ignores small dips and rebounds.
   Already observed accumulation remains a known lower bound if the live
   stream becomes stale; instantaneous observation anchoring expires separately.
-- Parent PoP is at least the largest contained child PoP. Probabilities are
+- Parent hourly PoP is at least the largest contained native minute PoP;
+  daily PoP also includes native prefix minutes. Probabilities are
   **not** summed and hours are not assumed independent. Today becomes 100%
   occurrence once observed accumulation meets `pop_threshold_mm` (default
   **0.254 mm**, the NWS measurable-precipitation threshold).
@@ -251,8 +266,16 @@ forecast vintages of one storm count as one day. This operational safeguard
 prevents a mostly dry archive from licensing suppression of current rain;
 five days is a minimum evidence guard, not a claim of calibration. Pins bypass
 this guard. Explicit `predict --method` experiments also bypass reconciliation.
+Guarded rainfall rows skip residual dressing and native-grid recalibration
+before any score pools or fitted diagnostics are requested; eligible rows and
+non-rain variables retain their existing uncertainty paths.
 
-Fallback and reconciled fields name their actual calculation in `methods` and
-`selection_reasons`. They discard inherited quantiles and release attribution,
-because the prior model did not produce the adjusted value. Non-rain variables
-keep their existing selection and prediction paths.
+Fallback and changed reconciled fields name their actual calculation in `methods`
+and `selection_reasons`. Changed values discard inherited quantiles and release
+attribution because the prior model did not produce the adjusted value. A
+reconciliation within absolute tolerance **1e-12** leaves the original value and
+all its attribution unchanged; hourly releases are never synthesized into a
+daily release. When no hourly or daily release remains, the document's degraded
+reason names an active wet-day safeguard first, then changed rainfall
+reconciliation, before falling back to the usual evidence diagnosis.
+Non-rain variables keep their existing selection and prediction paths.

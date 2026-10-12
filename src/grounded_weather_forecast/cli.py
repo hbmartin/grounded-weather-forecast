@@ -1146,6 +1146,7 @@ def _cmd_report(config: Config) -> int:
         print(f"wrote {write_dashboard(config, score_summaries=summaries)}")
         return 1
     written: list[Path] = []
+    score_read_failures: list[str] = []
     catalog_rows: list[dict[str, object]] = []
     gap_threshold = config.promotion.report_gap_threshold
     references = union_references(config.promotion)
@@ -1157,6 +1158,7 @@ def _cmd_report(config: Config) -> int:
             # The pipeline lock keeps prune out of a running report; this
             # guard covers deletion by anything outside that lock's scope.
             print(f"skipping {path.name}: deleted since listing", file=sys.stderr)
+            score_read_failures.append(path.name)
             continue
         catalog_rows.append(operations.evaluation_catalog_row(path, scores))
         raw_board = leaderboard(scores, references=references)
@@ -1328,7 +1330,13 @@ def _cmd_report(config: Config) -> int:
             )
     _report_evidence_tail(config, written)
     _report_pipeline_health(config, written, catalog_rows)
-    written.append(write_dashboard(config, score_summaries=summaries))
+    written.append(
+        write_dashboard(
+            config,
+            score_summaries=summaries,
+            score_read_failures=tuple(score_read_failures),
+        )
+    )
     for path in written:
         print(f"wrote {path}")
     return 0

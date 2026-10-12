@@ -39,9 +39,9 @@ grounded-weather-forecast backfill --provider open_meteo --start 2024-01-01
 grounded-weather-forecast backtest --source synthetic
 ```
 
-Two honest caveats. Open-Meteo's Previous Runs API gives leads at exact 24-hour
-multiples, so the 0–24 h range — where the product actually lives and where
-anchoring earns its keep — stays **entirely unevaluated**. And it covers three
+Two honest caveats. Open-Meteo's Previous Runs API gives instantaneous leads at exact
+24-hour multiples; rain interval starts have leads of 23, 47, ... hours. The
+0–6 h range where anchoring earns its keep stays **entirely unevaluated**. And it covers three
 open NWP models, so the resulting leaderboard says nothing about the commercial
 providers you will actually serve from.
 

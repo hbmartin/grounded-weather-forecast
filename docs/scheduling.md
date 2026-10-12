@@ -85,6 +85,15 @@ lock. Publication continues while restoration runs, retaining the existing
 last-good behavior. Installing updated wrappers and refreshing compatible live
 evidence are deployment steps: source changes alter the code fingerprint.
 
+Rain interval-alignment changes also require rebuilding live and synthetic
+matrices before regenerating their score evidence. Existing synthetic forecast
+and ensemble archives retain their native interval-end timestamps and need no
+rewrite; normalization occurs when they are consumed. Rebuild synthetic
+matrices with a backfill invocation (which merges the retained archive), then
+regenerate synthetic evidence where used. Run `build-dataset`, a fresh
+`backtest --source live`, and `report` under the updated code before rollout.
+Source implementation and PR delivery do not install the deployment.
+
 ## Profiling a scheduled run
 
 The optional Memray wrapper records allocations from the start of a command,

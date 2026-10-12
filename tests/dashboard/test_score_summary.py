@@ -323,7 +323,8 @@ def test_report_reuses_equivalent_summaries_and_releases_each_frame(
         decoded.append(weakref.ref(frame))
         return frame
 
-    def dashboard(config, *, score_summaries):
+    def dashboard(config, *, score_summaries, score_read_failures=()):
+        assert score_read_failures == ()
         snapshots.append(score_summaries)
         return writer.write_dashboard(
             config, now=utc(2026, 8, 5), score_summaries=score_summaries
@@ -405,7 +406,8 @@ def test_sequential_report_dashboard_uses_final_persisted_wealth(tmp_path, monke
                 report_winners[name] = frame
         return real_report(directory, name, title, sections)
 
-    def dashboard(config, *, score_summaries):
+    def dashboard(config, *, score_summaries, score_read_failures=()):
+        assert score_read_failures == ()
         snapshots.append(score_summaries)
         return writer.write_dashboard(config, score_summaries=score_summaries)
 
@@ -458,3 +460,71 @@ def test_sequential_report_dashboard_uses_final_persisted_wealth(tmp_path, monke
         assert pl.read_parquet(path).equals(frame), path.name
     for path, markdown in report_tables.items():
         assert path.read_text() == markdown, path.name
+
+
+@pytest.mark.parametrize("rule", ["mcs", "legacy", "seq_mcs"])
+def test_report_preserves_skipped_score_faults_in_dashboard(
+    tmp_path, monkeypatch, rule
+):
+    config, paths = score_archive(tmp_path, count=2)
+    config = replace(config, promotion=replace(config.promotion, rule=rule))
+    matrix_path(config.dataset.dir, "hourly", "live").unlink()
+    calls, collected = [], []
+
+    def load(path, **kwargs):
+        calls.append(path)
+        if path == paths[0]:
+            raise FileNotFoundError(path)
+        return load_scores(path, **kwargs)
+
+    def dashboard(config, *, score_summaries, score_read_failures):
+        assert score_read_failures == (paths[0].name,)
+        collected.append(
+            context.collect_context(
+                config,
+                score_summaries=score_summaries,
+                score_read_failures=score_read_failures,
+            )
+        )
+        return writer.write_dashboard(
+            config,
+            score_summaries=score_summaries,
+            score_read_failures=score_read_failures,
+        )
+
+    monkeypatch.setattr(score_module, "load_scores", load)
+    monkeypatch.setattr(context, "load_scores", load)
+    monkeypatch.setattr(
+        "grounded_weather_forecast.dashboard.write_dashboard", dashboard
+    )
+    independent = context.collect_context(config)
+    calls.clear()
+    assert _cmd_report(config) == 0
+    expected_reads = 3 if rule == "seq_mcs" else 1
+    assert calls.count(paths[1]) == expected_reads
+    actual = collected[0]
+    assert actual.unreadable_scores == independent.unreadable_scores == (paths[0].stem,)
+    label = f"dataset/scores/{paths[0].name}"
+    assert actual.unreadable_artifacts.count(label) == 1
+    assert label in independent.unreadable_artifacts
+    assert derive(actual).live_scores_unusable
+    assert paths[0].name in (config.reports_dir / "dashboard.html").read_text()
+
+
+def test_empty_supplied_snapshot_keeps_failures_without_reading_scores(
+    tmp_path, monkeypatch
+):
+    config, paths = score_archive(tmp_path, count=1)
+
+    def unexpected(*_args, **_kwargs):
+        pytest.fail("supplied snapshot reopened score files")
+
+    monkeypatch.setattr(context, "load_scores", unexpected)
+    failures = (paths[0].name, paths[0].name)
+    actual = context.collect_context(
+        config, score_summaries={}, score_read_failures=failures
+    )
+    assert actual.score_summaries == {}
+    assert actual.unreadable_scores == (paths[0].stem,)
+    assert actual.unreadable_artifacts.count(f"dataset/scores/{paths[0].name}") == 1
+    assert derive(actual).live_scores_unusable

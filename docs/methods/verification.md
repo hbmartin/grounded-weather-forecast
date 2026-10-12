@@ -230,7 +230,8 @@ separate files, carry a `source_kind` tag, and any attempt to mix them raises
 matrix filename — not merely a runtime check.
 
 This is not fastidiousness. The synthetic archive contains three open NWP models
-at 24-hour-multiple leads; the live archive contains eleven commercial providers
+at whole-day native offsets (canonical rain starts one hour earlier); the live
+archive contains eleven commercial providers
 at native cadence. A leaderboard built on the former says nothing about the
 latter, and a number quietly averaging the two would be worse than no number.
 

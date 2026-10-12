@@ -405,6 +405,8 @@ def aggregate_leaderboard(board: pl.DataFrame) -> pl.DataFrame:
     if "truth_semantics" in board.columns:
         group_columns.append("truth_semantics")
     group_columns.append("method_id")
+    # Equal scores must not inherit the nondeterministic group-by row order.
+    sort_columns = ["product", "variable", "mae", *group_columns[2:]]
     return (
         board.group_by(*group_columns)
         .agg(
@@ -414,7 +416,7 @@ def aggregate_leaderboard(board: pl.DataFrame) -> pl.DataFrame:
                 ((pl.col("rmse") ** 2 * pl.col("n")).sum() / pl.col("n").sum()).sqrt()
             ).alias("rmse"),
         )
-        .sort("product", "variable", "mae")
+        .sort(sort_columns)
     )
 
 

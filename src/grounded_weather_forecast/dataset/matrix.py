@@ -48,6 +48,7 @@ from grounded_weather_forecast.dataset.provider_qc import apply_provider_qc
 from grounded_weather_forecast.dataset.providers import (
     DAILY_COLUMN_MAP,
     HOURLY_COLUMN_MAP,
+    align_hourly_rain,
     read_forecast_archive,
 )
 from grounded_weather_forecast.dataset.qc import apply_causal_qc, apply_qc
@@ -280,6 +281,11 @@ def build_hourly_matrix(
     as ``ens__*`` feature columns (spread information, never a source).
     """
     kind = assert_single_kind(hourly_long)
+    # Synthetic archives keep provider-native interval-end labels on disk.
+    # Normalize at consumption so old stores and new backfills agree, while
+    # live archive readers have already normalized their rain exactly once.
+    if kind == SourceKind.SYNTHETIC.value:
+        hourly_long = align_hourly_rain(hourly_long)
     # Provider QC runs AFTER the as-of snapshot join, grouped per snapshot, so the
     # cross-source outlier test never compares different historical vintages of the
     # same valid time (which would flag a genuine, freshly-forecast weather shift).

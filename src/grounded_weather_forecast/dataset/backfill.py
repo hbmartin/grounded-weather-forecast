@@ -16,10 +16,9 @@ Three properties are load-bearing:
 - Only offsets 1..7 are requested. The unsuffixed field is the *latest* run for
   a past hour, whose effective lead is near zero; treating it as a forecast
   would fill the short-lead buckets with what is essentially an analysis and
-  make anchoring look miraculous. Excluding it means synthetic leads are exact
-  24-hour multiples.
-- Leads are therefore quantized to whole days, so synthetic matrices populate
-  only the buckets at and beyond 24 h. Reports surface bucket coverage per
+  make anchoring look miraculous. Native timestamps have exact 24-hour offsets.
+- Instantaneous leads remain whole-day offsets. Rain labels end their preceding
+  hour; matrix assembly shifts them to interval starts, giving 23, 47, ... hours. Reports surface bucket coverage per
   source kind rather than interpolating across the gap.
 
 The HTTP fetcher is injected, so tests never touch the network.
@@ -111,10 +110,12 @@ class BackfillError(RuntimeError):
 def parse_previous_runs(
     payload: Mapping[str, Any], model: str, previous_days: int = MAX_PREVIOUS_DAYS
 ) -> pl.DataFrame:
-    """Payload -> canonical long frame, one row per (day-offset, valid hour).
+    """Payload -> source long frame, one row per (day-offset, native valid hour).
 
     Each day-offset becomes a synthetic issue time: the forecast for this valid
-    hour as it stood ``day`` days earlier, at the same clock time.
+    hour as it stood ``day`` days earlier, at the same clock time. Rain keeps
+    native interval-end labels here and on disk; matrix assembly aligns it to
+    interval starts without moving the synthetic availability instant.
     """
     hourly = payload.get("hourly")
     if not isinstance(hourly, dict) or "time" not in hourly:

@@ -345,9 +345,10 @@ Tuesday, but a few open-data archives publish their own history.
 
 Providers differ in what they can give you:
 
-- **`open_meteo`** — the Previous Runs API. Leads are exact 24-hour multiples, so
-  only buckets ≥ 24 h are populated. The 0–24 h range, where the product actually
-  lives, stays unevaluated.
+- **`open_meteo`** — the Previous Runs API. Instantaneous leads are exact 24-hour
+  multiples. Rain uses interval-start leads of 23, 47, ... hours while keeping
+  the same synthetic availability times; this does not evaluate the 0–6 h
+  anchoring range.
 - **`dynamical`** — dynamical.org Zarr archives at native model steps, so
   **sub-24h leads**. Requires the `backfill` optional extra
   (`uv sync --extra backfill`).

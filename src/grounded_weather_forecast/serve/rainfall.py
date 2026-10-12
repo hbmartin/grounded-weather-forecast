@@ -21,6 +21,16 @@ from grounded_weather_forecast.timeutil import local_day_start_utc
 MIN_WET_DAYS = 5
 MAX_NATIVE_GAP = timedelta(minutes=15)
 RAIN_VARIABLES = frozenset({"pop", "precip_mm", "precip_sum_mm"})
+HOURLY_FALLBACK = "hourly_rainfall_fallback"
+RECONCILIATION_METHODS = frozenset(
+    {
+        "minutely_rainfall_floor",
+        "hourly_rainfall_sum",
+        "rainfall_accumulation_floor",
+        "hourly_rainfall_probability_floor",
+        "observed_daily_occurrence",
+    }
+)
 
 
 def rainfall_selections(
@@ -128,6 +138,9 @@ def _set_rain(
     method: str,
     reason: str,
 ) -> None:
+    old = point.values.get(variable)
+    if old is not None and math.isclose(old, value, rel_tol=0.0, abs_tol=1e-12):
+        return
     previous = point.selection_reasons.get(variable)
     point.values[variable] = value
     point.methods[variable] = method
@@ -140,33 +153,53 @@ def _set_rain(
     point.release_ids.pop(variable, None)
 
 
+def _native_value(point: MinutelyPoint, field: str) -> float | None:
+    if point.methods.get(field) == HOURLY_FALLBACK:
+        return None
+    return _finite(getattr(point, field), probability=field == "pop")
+
+
 def fill_minutely_rain(
     minutely: list[MinutelyPoint], hourly: list[HourlyPoint]
 ) -> None:
-    """Use an explicitly attributed hourly fallback outside native support."""
-    if not hourly:
-        return
-    hours = [(datetime.fromisoformat(p.valid_time), p) for p in hourly]
-    for index, original in enumerate(minutely):
-        minute = original
-        valid = datetime.fromisoformat(minute.valid_time)
-        eligible = [(t, p) for t, p in hours if t < valid <= t + timedelta(hours=1)]
-        if not eligible and hours[0][0] - timedelta(hours=1) < valid <= hours[0][0]:
-            eligible = [hours[0]]
-        if not eligible:
-            continue
-        point = eligible[0][1]
-        for field, variable in (("precip_intensity_mmh", "precip_mm"), ("pop", "pop")):
-            if getattr(minute, field) is not None:
-                continue
-            value = _finite(point.values.get(variable), probability=variable == "pop")
-            if value is not None:
-                minute = replace(minute, **{field: value})
-                minute.methods[field] = "hourly_rainfall_fallback"
-                minute.selection_reasons[field] = (
-                    "native minute coverage ended; hourly rain rate/probability"
+    """Distribute only the original parent hour's remaining rainfall budget."""
+    for hour in hourly:
+        start = datetime.fromisoformat(hour.valid_time)
+        children = [
+            (index, point)
+            for index, point in enumerate(minutely)
+            if start
+            < datetime.fromisoformat(point.valid_time)
+            <= start + timedelta(hours=1)
+        ]
+        native = [
+            value
+            for _, point in children
+            if (value := _native_value(point, "precip_intensity_mmh")) is not None
+        ]
+        amount = _finite(hour.values.get("precip_mm"))
+        missing = 60 - len(native)
+        # Unshown slots consume their share too; a truncated horizon must not
+        # concentrate the whole hour's budget into its displayed minutes.
+        rate = (
+            max(amount - sum(native) / 60.0, 0.0) * 60.0 / missing
+            if amount is not None and missing > 0
+            else None
+        )
+        probability = _finite(hour.values.get("pop"), probability=True)
+        for index, original in children:
+            point = original
+            for field, value in (("precip_intensity_mmh", rate), ("pop", probability)):
+                if _native_value(point, field) is not None or value is None:
+                    continue
+                point = replace(point, **{field: value})
+                point.methods[field] = HOURLY_FALLBACK
+                point.selection_reasons[field] = (
+                    "remaining hourly accumulation distributed uniformly across missing minute slots; assumed fallback shape"
+                    if field == "precip_intensity_mmh"
+                    else "native minute probability missing; matching hourly probability"
                 )
-        minutely[index] = minute
+            minutely[index] = point
 
 
 def reconcile_hourly_rain(
@@ -183,11 +216,14 @@ def reconcile_hourly_rain(
             <= start + timedelta(hours=1)
         ]
         amount = sum(
-            m.precip_intensity_mmh / 60.0
+            value / 60.0
             for m in minutes
-            if m.precip_intensity_mmh is not None
+            if (value := _native_value(m, "precip_intensity_mmh")) is not None
         )
-        probability = max((m.pop for m in minutes if m.pop is not None), default=0.0)
+        probability = max(
+            (value for m in minutes if (value := _native_value(m, "pop")) is not None),
+            default=0.0,
+        )
         for variable, floor in (("precip_mm", amount), ("pop", probability)):
             old = _finite(hour.values.get(variable), probability=variable == "pop")
             if floor > 0.0 and (old is None or floor > old + 1e-12):
@@ -196,7 +232,7 @@ def reconcile_hourly_rain(
                     variable,
                     floor,
                     "minutely_rainfall_floor",
-                    "parent hour reconciled to contained minute forecasts; probability uses max, without independence assumptions",
+                    "parent hour reconciled to contained native minute forecasts; probability uses max, without independence assumptions",
                 )
 
 
@@ -218,22 +254,25 @@ def _today_prefix(
 ) -> float:
     first_hour = min((datetime.fromisoformat(h.valid_time) for h in hours), default=end)
     return sum(
-        m.precip_intensity_mmh / 60.0
+        value / 60.0
         for m in minutely
-        if m.precip_intensity_mmh is not None
+        if (value := _native_value(m, "precip_intensity_mmh")) is not None
         and issue_time < datetime.fromisoformat(m.valid_time) <= min(first_hour, end)
     )
 
 
 def _daily_probability(
-    point: DailyPoint, hours: list[HourlyPoint], *, observed: bool
+    point: DailyPoint, hours: list[HourlyPoint], *, observed: bool, minute_pop: float
 ) -> None:
     probability = (
         1.0
         if observed
         else max(
-            (_finite(h.values.get("pop"), probability=True) or 0.0 for h in hours),
-            default=0.0,
+            minute_pop,
+            max(
+                (_finite(h.values.get("pop"), probability=True) or 0.0 for h in hours),
+                default=0.0,
+            ),
         )
     )
     old_pop = _finite(point.values.get("pop"), probability=True)
@@ -247,7 +286,7 @@ def _daily_probability(
             else "hourly_rainfall_probability_floor",
             "measurable rain already observed in this local calendar day"
             if observed
-            else "daily probability at least the largest contained hourly probability; hours are not assumed independent",
+            else "daily probability at least the largest contained native minute or hourly probability; intervals are not assumed independent",
         )
 
 
@@ -293,7 +332,33 @@ def reconcile_daily_rain(
         _daily_probability(
             point,
             hours,
+            minute_pop=max(
+                (
+                    value
+                    for minute in minutely
+                    if start < datetime.fromisoformat(minute.valid_time) <= end
+                    and (value := _native_value(minute, "pop")) is not None
+                ),
+                default=0.0,
+            ),
             observed=day == today
             and observed_today_mm is not None
             and observed_today_mm >= threshold_mm,
         )
+
+
+def rainfall_status_reason(points: list[HourlyPoint | DailyPoint]) -> str | None:
+    """Name serving safeguards before diagnosing missing promotion evidence."""
+    if any(
+        "rainfall fallback:" in point.selection_reasons.get(variable, "")
+        for point in points
+        for variable in RAIN_VARIABLES
+    ):
+        return f"rainfall safeguard: fewer than {MIN_WET_DAYS} wet local days in one or more served lead buckets; using uncalibrated rainfall"
+    if any(
+        point.methods.get(variable) in RECONCILIATION_METHODS
+        for point in points
+        for variable in RAIN_VARIABLES
+    ):
+        return "rainfall reconciliation changed served values; original release attribution no longer applies"
+    return None

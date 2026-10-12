@@ -77,6 +77,7 @@ from grounded_weather_forecast.serve.rainfall import (
     fill_minutely_rain,
     native_rainfall,
     rainfall_selections,
+    rainfall_status_reason,
     reconcile_daily_rain,
     reconcile_hourly_rain,
 )
@@ -499,6 +500,10 @@ def _blend_variable(
     results, _ = fitted
     point, quantiles = _blended_rows(results, chosen, predict_frame.height)
     lead_buckets = _lead_buckets(predict_frame, daily=daily)
+    eligible_rows = tuple(
+        not (variable.name in RAIN_VARIABLES and selection.degraded)
+        for selection in chosen
+    )
     quantile_sources: tuple[str | None, ...] | None = None
     if dresser is not None:
         # Dressing is strictly additive; any failure leaves the bare points.
@@ -511,6 +516,7 @@ def _blend_variable(
                 lead_buckets,
                 point,
                 quantiles,
+                eligible_rows=eligible_rows,
             )
         except (OSError, ValueError, pl.exceptions.PolarsError):
             quantile_sources = None
@@ -526,6 +532,7 @@ def _blend_variable(
                 lead_buckets,
                 quantiles,
                 quantile_sources,
+                eligible_rows=eligible_rows,
             )
     for index, selection in enumerate(chosen):
         if variable.name in RAIN_VARIABLES and selection.degraded:
@@ -932,13 +939,6 @@ def _anchor_weight(minutes_ahead: int, tau_hours: float) -> float:
     return 0.0 if weight < 0.05 else weight
 
 
-def _minutely_precip(
-    snapshot: Snapshot,
-) -> dict[datetime, tuple[float | None, float | None]]:
-    """Availability-weighted mean of providers' native minutely precipitation."""
-    return native_rainfall(snapshot.minutely)
-
-
 def _now_forecast(leads: np.ndarray, path: np.ndarray) -> float:
     """The path extrapolated to lead 0 (``np.interp`` would clamp to the
     first hourly value, ~0.5-1 h out, and misstate the anchor residual)."""
@@ -1236,7 +1236,7 @@ def minutely_product(
     if frame.is_empty():
         return []
     leads = frame["lead_hours"].to_numpy().astype(float)
-    precip = _minutely_precip(snapshot)
+    precip = native_rainfall(snapshot.minutely)
     points: list[MinutelyPoint] = []
     for minute in range(1, MINUTELY_HORIZON_MINUTES + 1):
         valid = snapshot.issue_time + timedelta(minutes=minute)
@@ -1451,7 +1451,8 @@ def predict(
         )
     degraded = not _served_release_ids(hourly, daily) and force_method is None
     status_reason = (
-        no_evidence_reason(
+        rainfall_status_reason([*hourly, *daily])
+        or no_evidence_reason(
             config,
             config.dataset.dir / "scores",
             dataset_id=dataset_snapshot.fingerprint

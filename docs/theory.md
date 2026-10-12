@@ -488,7 +488,10 @@ label    = the realized max/min of the QC'd station minutes over the LOCAL day
 which sidesteps the nonlinear-reconciliation problem entirely and, incidentally,
 lets the model learn that (say) providers' daily highs are systematically low
 relative to *this* thermometer. The genuinely linear field (precipitation sum) is
-derivable from the blended hourly path and is coherent by construction.
+reconciled after fitting: complete future local days use the hourly sum, while
+partial days use known accumulation as a lower bound. This conditional serving
+constraint does not make the independently fitted daily distribution coherent
+by construction; see [Rainfall coherence](methods/precipitation.md#6-coherence).
 
 "Day" always means the **America/Los_Angeles calendar day**, with DST handled
 properly: coverage thresholds are computed against the day's *actual* length

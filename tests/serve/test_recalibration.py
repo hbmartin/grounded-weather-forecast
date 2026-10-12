@@ -107,6 +107,55 @@ def recalibrate_one(
     return quantiles[0], sources[0]
 
 
+@pytest.mark.parametrize("eligible", [(False, True), (False, False)])
+def test_recalibration_skips_excluded_native_grids_and_keeps_eligible_results(
+    env, monkeypatch, eligible
+):
+    config, directory = env
+    write_scores(make_scores(), directory / "scores_hourly_live_a.parquet")
+    expected, label = recalibrate_one(config, directory)
+    calls = []
+    real = QuantileRecalibrator.fitted_for
+
+    def fitted(self, variable, semantics, method_ids, method_id, bucket):
+        calls.append((method_ids, method_id))
+        return real(self, variable, semantics, method_ids, method_id, bucket)
+
+    monkeypatch.setattr(QuantileRecalibrator, "fitted_for", fitted)
+    native = native_row()
+    quantiles = [dict(native), dict(native)]
+    sources = recalibrate_variable(
+        QuantileRecalibrator(directory, "hourly", config, "cqr"),
+        TEMP,
+        TruthSemantics.INSTANTANEOUS,
+        [Selection("excluded", "guarded"), Selection("idr", "promoted")],
+        ["12-24h"] * 2,
+        quantiles,
+        None,
+        eligible_rows=eligible,
+    )
+    assert quantiles[0] == native
+    assert sources[0] is None
+    assert calls == ([(frozenset({"idr"}), "idr")] if eligible[1] else [])
+    assert quantiles[1] == (expected if eligible[1] else native)
+    assert sources[1] == (label if eligible[1] else None)
+
+
+def test_recalibration_rejects_mismatched_eligibility_mask(env):
+    config, directory = env
+    with pytest.raises(ValueError, match="eligible_rows"):
+        recalibrate_variable(
+            QuantileRecalibrator(directory, "hourly", config, "cqr"),
+            TEMP,
+            TruthSemantics.INSTANTANEOUS,
+            [Selection("idr", "test")],
+            ["12-24h"],
+            [native_row()],
+            None,
+            eligible_rows=[],
+        )
+
+
 class TestTransformApplication:
     def test_cqr_shifts_the_band_onto_the_bias(self, env):
         config, scores_dir = env

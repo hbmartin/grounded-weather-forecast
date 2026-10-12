@@ -274,6 +274,7 @@ def collect_context(
     *,
     now: datetime | None = None,
     score_summaries: Mapping[str, ScoreSummary] | None = None,
+    score_read_failures: tuple[str, ...] = (),
 ) -> DashboardContext:
     """Collect artifacts, or reuse a complete supplied score-summary snapshot."""
     paths = DatasetPaths.in_dir(config.dataset.dir)
@@ -283,6 +284,10 @@ def collect_context(
         score_summaries, unreadable_scores = _score_summaries(config, unreadable)
     else:
         score_summaries = dict(score_summaries)
+    unreadable_scores = tuple(
+        sorted({*unreadable_scores, *(Path(name).stem for name in score_read_failures)})
+    )
+    unreadable.extend(f"dataset/scores/{name}" for name in score_read_failures)
     hourly_live = matrix_path(config.dataset.dir, "hourly", "live")
     daily_live = matrix_path(config.dataset.dir, "daily", "live")
     hourly_synthetic = matrix_path(config.dataset.dir, "hourly", "synthetic")

@@ -190,10 +190,32 @@ class TestSyntheticMatrix:
 
         matrix = pl.read_parquet(path)
         assert matrix["source_kind"].unique().to_list() == ["synthetic"]
-        # 24h-quantized leads only populate buckets at and beyond 24h
+        # Interval-start rain leads are one hour below the native day offsets.
         buckets = set(matrix["lead_bucket"].unique().to_list())
-        assert buckets <= {"24-48h", "48-96h", "96-168h", "168-240h"}
+        assert buckets <= {"12-24h", "24-48h", "48-96h", "96-168h", "168-240h"}
         assert "0-1h" not in buckets
+
+        issue = START - timedelta(days=1)
+        rain = matrix.filter(
+            (pl.col("issue_time") == issue)
+            & (pl.col("valid_time") == START - timedelta(hours=1))
+        ).row(0, named=True)
+        state = matrix.filter(
+            (pl.col("issue_time") == issue) & (pl.col("valid_time") == START)
+        ).row(0, named=True)
+        assert rain["lead_hours"] == 23.0
+        assert rain["fx__open_meteo_gfs_seamless__precip_mm"] == 1.0
+        assert rain["fx__open_meteo_gfs_seamless__temp_c"] is None
+        assert state["lead_hours"] == 24.0
+        assert state["fx__open_meteo_gfs_seamless__temp_c"] == 1.0
+        # Existing stores retain native timestamps. Rebuilding from the old
+        # store alone must normalize once and produce identical artifacts.
+        archive = config.dataset.dir / "forecasts_long_synthetic.parquet"
+        assert pl.read_parquet(archive).equals(long_frame)
+        archive_bytes, matrix_bytes = archive.read_bytes(), path.read_bytes()
+        write_synthetic_matrix(config, long_frame.head(0))
+        assert archive.read_bytes() == archive_bytes
+        assert path.read_bytes() == matrix_bytes
 
         scored = to_supervised_slice(matrix, hourly_variable("temp_c"))
         assert scored.source_kind is SourceKind.SYNTHETIC
