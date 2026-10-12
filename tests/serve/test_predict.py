@@ -145,13 +145,17 @@ def _assert_diagnosis_channels(config, document, monkeypatch):
     assert calls[-1][-1] == "--restore"
 
 
-def test_only_finite_guarded_rows_record_attribution_loss():
+@pytest.mark.parametrize("daily", [False, True])
+def test_only_finite_guarded_rows_record_attribution_loss(daily):
     import numpy as np
+    from grounded_weather_forecast.contracts import daily_variable, hourly_variable
     from grounded_weather_forecast.serve.predict import (
         VariableBlend,
+        _point_fields,
         _record_rainfall_guards,
     )
     from grounded_weather_forecast.serve.rainfall import RainfallEffects
+    from grounded_weather_forecast.serve.schema import DailyPoint, HourlyPoint
 
     blend = VariableBlend(
         point=np.array([np.nan, 1.0, 1.0]),
@@ -161,11 +165,21 @@ def test_only_finite_guarded_rows_record_attribution_loss():
         quantiles=[{}] * 3,
         guarded_release_ids=("removed", None, "removed"),
     )
+    name = "precip_sum_mm" if daily else "precip_mm"
+    spec = daily_variable(name) if daily else hourly_variable(name)
+    blended = {name: blend}
+    points = [
+        DailyPoint(str(NOW.date()), 0, **_point_fields(blended, {name: spec}, i))
+        if daily
+        else HourlyPoint(
+            NOW.isoformat(), 0.0, **_point_fields(blended, {name: spec}, i)
+        )
+        for i in range(3)
+    ]
     effects = RainfallEffects()
-    _record_rainfall_guards({"precip_mm": blend}, 0, effects)
-    _record_rainfall_guards({"precip_mm": blend}, 1, effects)
+    _record_rainfall_guards(blended, points[:2], effects)
     assert not effects.guarded_release_removed
-    _record_rainfall_guards({"precip_mm": blend}, 2, effects)
+    _record_rainfall_guards(blended, points, effects)
     assert effects.guarded_release_removed
 
 
