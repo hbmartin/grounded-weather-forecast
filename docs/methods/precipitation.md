@@ -209,6 +209,7 @@ temperature.
 ## 6. Coherence
 
 *Implemented in: `serve/rainfall.py::RainfallTimeline`; `serve/rainfall.py::RainfallEffects`;
+`serve/predict.py::_point_fields`; `serve/predict.py::_blend_variable`;
 `dataset/truth.py::observed_rainfall`;
 `dataset/providers.py::align_hourly_rain`; `dataset/matrix.py`;
 `dataset/ensembles.py::ensemble_features`*
@@ -285,12 +286,18 @@ and `selection_reasons`. Changed values discard inherited quantiles and release
 attribution because the prior model did not produce the adjusted value. A
 reconciliation within absolute tolerance **1e-12** leaves the original value and
 all its attribution unchanged; hourly releases are never synthesized into a
-daily release. Prediction-local `RainfallEffects` records a wet-day guard only
-when it replaces a release-bearing selection for a finite emitted field, and
+daily release. Hourly and daily release maps use the normalized emitted values:
+finite values (including zero) can retain a release; null and nonfinite values
+cannot. A cold-start blend with no scoreable training truth clears release IDs
+and guard-loss bookkeeping, even when providers supply finite values.
+Prediction-local `RainfallEffects` records a wet-day guard only
+when it replaces a release-bearing selection on a fitted blend for a finite emitted field, and
 records reconciliation only when a changed, previously finite field loses an
 existing release. Changes within **1e-12**, missing releases, and nonfinite rows
 record no loss. When no hourly or daily release remains, the degraded reason
 names a guard that removed attribution first, then reconciliation that removed
 attribution; otherwise the usual evidence diagnosis is retained. Labels alone
-do not establish the cause of degraded serving.
+do not establish the cause of degraded serving. Native minute floors that fill
+an unattributed null do not create a release or an attribution-loss event; the
+usual evidence diagnosis remains visible.
 Non-rain variables keep their existing selection and prediction paths.

@@ -53,10 +53,13 @@ everything it needs.
 
 ### `status`
 
-With automatic selection, `"ready"` means an hourly or daily value carries a
+With automatic selection, `"ready"` means a finite hourly or daily value carries a
 promoted release matching current dataset, config, and code fingerprints. Check each variable's
 `release_ids` for its own attribution. A minutely promotion alone does not
 change document readiness.
+Hourly and daily values are normalized once before attribution: null, NaN, or
+infinite model outputs have no release ID and cannot justify readiness. Zero is
+a finite value and retains valid attribution.
 
 Explicit `--method` runs keep their existing `"ready"` status and can have
 empty release attribution.
@@ -79,6 +82,10 @@ reconciliation. Without either loss, cold-start, synthetic-only, dataset/config,
 and implementation-change diagnoses retain their existing wording. Detailed wet-day
 counts remain in each affected field's `selection_reasons`. These effects are not
 serialized; the JSON schema remains v6.
+Cold-start blends have no release or guard-loss attribution even when provider
+values are finite. A null rainfall value later filled from native minute evidence
+also records no attribution loss. Archived documents replay as originally served;
+these emission rules do not rewrite historical forecasts.
 
 Degraded status is also printed to **stderr**, so `--out -` still yields clean
 JSON on stdout. See the [FAQ](../faq.md#why-does-my-forecast-say-degraded).

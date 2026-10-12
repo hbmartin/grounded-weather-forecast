@@ -227,7 +227,8 @@ def fill_minutely_rain(
     timeline: RainfallTimeline | None = None,
 ) -> None:
     """Distribute only the original parent hour's remaining rainfall budget."""
-    timeline = timeline or RainfallTimeline.build(hourly, minutely)
+    if timeline is None:
+        timeline = RainfallTimeline.build(hourly, minutely)
     for hour, indices in zip(hourly, timeline.hour_minutes, strict=True):
         native = [
             value
@@ -268,7 +269,8 @@ def reconcile_hourly_rain(
     timeline: RainfallTimeline | None = None,
 ) -> None:
     """A parent hour contains at least its forecast minute accumulation."""
-    timeline = timeline or RainfallTimeline.build(hourly, minutely)
+    if timeline is None:
+        timeline = RainfallTimeline.build(hourly, minutely)
     for hour, indices in zip(hourly, timeline.hour_minutes, strict=True):
         minutes = [minutely[index] for index in indices]
         amount = sum(
@@ -370,7 +372,8 @@ def reconcile_daily_rain(
     """Exact sums for complete local days; explicit lower bounds otherwise."""
     zone = ZoneInfo(timezone)
     today = issue_time.astimezone(zone).date()
-    timeline = timeline or RainfallTimeline.build(hourly, minutely)
+    if timeline is None:
+        timeline = RainfallTimeline.build(hourly, minutely)
     for point in daily:
         day = date.fromisoformat(point.date_local)
         start, end = (

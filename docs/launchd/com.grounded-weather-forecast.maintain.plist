@@ -3,7 +3,7 @@
   "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
-  <!-- The nightly retrain: rebuild -> backtest -> report -> truth QC.
+  <!-- The nightly retrain: rebuild -> backtest -> truth QC -> report.
        This is what makes "improves as the archive grows" happen unattended;
        promotions land in the append-only release ledger. -->
   <key>Label</key>

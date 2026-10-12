@@ -110,7 +110,7 @@ def build_parser() -> argparse.ArgumentParser:
     _add_backtest_arguments(backtest, include_source=True)
     maintain = subparsers.add_parser(
         "maintain",
-        help="run build, live backtest, report, and truth QC under one lock",
+        help="run build, live backtest, truth QC, and report under one lock",
     )
     _add_backtest_arguments(maintain, include_source=False)
     maintain.add_argument(
@@ -1488,8 +1488,8 @@ def _cmd_maintain(config: Config, args: argparse.Namespace) -> int:
         (
             ("build-dataset", lambda: _cmd_build_dataset(config)),
             ("backtest --source live", lambda: _cmd_backtest(config, args)),
-            ("report", lambda: _cmd_report(config)),
             ("truth-qc", lambda: _cmd_truth_qc(config, truth_args)),
+            ("report", lambda: _cmd_report(config)),
         ),
     )
 

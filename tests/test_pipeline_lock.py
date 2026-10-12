@@ -121,7 +121,7 @@ def test_selection_and_fitting_run_after_dataset_lock_is_released(
 
 
 def test_maintain_runs_every_step_in_order(tmp_path, monkeypatch):
-    write_config(tmp_path)
+    config = write_config(tmp_path)
     calls = []
     held = False
 
@@ -155,7 +155,98 @@ def test_maintain_runs_every_step_in_order(tmp_path, monkeypatch):
     code = main(["--config", str(tmp_path / "config.toml"), "maintain"])
 
     assert code == 0
-    assert calls == ["build", "backtest", "report", "truth-qc"]
+    assert calls == ["build", "backtest", "truth-qc", "report"]
+    frame = load_runs(runs_path(config))
+    stages = frame.filter(pl.col("record_kind") == "stage")
+    assert stages["command"].to_list() == [
+        "build-dataset",
+        "backtest",
+        "truth-qc",
+        "report",
+    ]
+    parent = frame.filter(pl.col("record_kind") == "invocation").row(0, named=True)
+    assert stages["parent_run_id"].to_list() == [parent["run_id"]] * 4
+
+
+def test_maintain_stops_before_report_when_truth_qc_fails(tmp_path, monkeypatch):
+    config = write_config(tmp_path)
+    calls = []
+    monkeypatch.setattr(
+        cli_module, "_cmd_build_dataset", lambda _config: calls.append("build") or 0
+    )
+    monkeypatch.setattr(
+        cli_module,
+        "_cmd_backtest",
+        lambda _config, _args: calls.append("backtest") or 0,
+    )
+    monkeypatch.setattr(
+        cli_module,
+        "_cmd_truth_qc",
+        lambda _config, _args: calls.append("truth-qc") or 1,
+    )
+    monkeypatch.setattr(
+        cli_module, "_cmd_report", lambda _config: calls.append("report") or 0
+    )
+    assert main(["--config", str(tmp_path / "config.toml"), "maintain"]) == 1
+    assert calls == ["build", "backtest", "truth-qc"]
+    stages = load_runs(runs_path(config)).filter(pl.col("record_kind") == "stage")
+    assert stages["command"].to_list() == ["build-dataset", "backtest", "truth-qc"]
+    assert stages["exit_code"].to_list() == [0, 0, 1]
+
+
+def test_maintain_runs_truth_qc_before_partial_report_failure(
+    tmp_path, monkeypatch, capsys
+):
+    from grounded_weather_forecast.backtest.scores import write_scores
+    from grounded_weather_forecast.dashboard.context import collect_context
+    from score_fixtures import scores
+
+    config = write_config(tmp_path)
+    directory = config.dataset.dir / "scores"
+    directory.mkdir(parents=True)
+    good = directory / "scores_hourly_live_expanding_readable.parquet"
+    write_scores(scores(), good)
+    damaged = directory / "scores_hourly_live_expanding_truncated.parquet"
+    damaged.write_bytes(b"PAR1\x00\x00")
+    calls = []
+    monkeypatch.setattr(
+        cli_module, "_cmd_build_dataset", lambda _config: calls.append("build") or 0
+    )
+    monkeypatch.setattr(
+        cli_module,
+        "_cmd_backtest",
+        lambda _config, _args: calls.append("backtest") or 0,
+    )
+    monkeypatch.setattr(
+        cli_module,
+        "_cmd_truth_qc",
+        lambda _config, _args: calls.append("truth-qc") or 0,
+    )
+    report = cli_module._cmd_report
+
+    def record_report(config):
+        calls.append("report")
+        return report(config)
+
+    monkeypatch.setattr(cli_module, "_cmd_report", record_report)
+    assert main(["--config", str(tmp_path / "config.toml"), "maintain"]) == 1
+    assert calls == ["build", "backtest", "truth-qc", "report"]
+    dashboard = (config.reports_dir / "dashboard.html").read_text()
+    assert damaged.name in dashboard
+    assert (
+        config.reports_dir / "leaderboard_hourly_live_expanding_readable.md"
+    ).exists()
+    assert collect_context(config).unreadable_scores == (damaged.stem,)
+    stages = load_runs(runs_path(config)).filter(pl.col("record_kind") == "stage")
+    assert stages["command"].to_list() == [
+        "build-dataset",
+        "backtest",
+        "truth-qc",
+        "report",
+    ]
+    assert stages["exit_code"].to_list() == [0, 0, 0, 1]
+    assert damaged.name in capsys.readouterr().err
+    assert damaged.exists()
 
 
 def test_maintain_stops_after_failed_step(tmp_path, monkeypatch):

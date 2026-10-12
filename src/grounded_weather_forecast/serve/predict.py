@@ -13,7 +13,7 @@ because it is the only genuinely minute-resolution signal they publish.
 """
 
 import math
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from contextlib import suppress
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime, timedelta
@@ -526,7 +526,6 @@ def _blend_variable(
             release_ids=[None] * predict_frame.height,
             quantiles=[{} for _ in range(predict_frame.height)],
             truth_semantics=semantics.value,
-            guarded_release_ids=guarded_releases,
         )
     results, _ = fitted
     point, quantiles = _blended_rows(results, chosen, predict_frame.height)
@@ -823,13 +822,15 @@ def _cohere_daily(points: list[DailyPoint]) -> None:
 
 
 def _record_rainfall_guards(
-    blended: dict[str, VariableBlend], index: int, effects: RainfallEffects | None
+    blended: dict[str, VariableBlend],
+    points: Sequence[HourlyPoint | DailyPoint],
+    effects: RainfallEffects | None,
 ) -> None:
     if effects is not None and any(
-        result.guarded_release_ids
-        and result.guarded_release_ids[index]
-        and math.isfinite(result.point[index])
-        for result in blended.values()
+        point.values.get(name) is not None
+        for index, point in enumerate(points)
+        for name, result in blended.items()
+        if result.guarded_release_ids and result.guarded_release_ids[index] is not None
     ):
         effects.guarded_release_removed = True
 
@@ -838,8 +839,6 @@ def _point_fields(
     blended: dict[str, VariableBlend],
     variables: dict[str, VariableSpec],
     index: int,
-    *,
-    effects: RainfallEffects | None = None,
 ) -> dict[str, dict]:
     """The per-variable maps every emitted point carries, for one row.
 
@@ -847,12 +846,12 @@ def _point_fields(
     class and time fields — lizard already flagged the two bodies as
     duplicates, so new maps belong here rather than in both.
     """
-    _record_rainfall_guards(blended, index, effects)
+    values = {
+        name: _finite(result.point[index], variables[name])
+        for name, result in blended.items()
+    }
     return {
-        "values": {
-            name: _finite(result.point[index], variables[name])
-            for name, result in blended.items()
-        },
+        "values": values,
         "methods": {name: result.methods[index] for name, result in blended.items()},
         "quantiles": {
             name: {
@@ -875,7 +874,8 @@ def _point_fields(
         "release_ids": {
             name: release
             for name, result in blended.items()
-            if (release := result.release_ids[index]) is not None
+            if values[name] is not None
+            and (release := result.release_ids[index]) is not None
         },
         "truth_semantics": {
             name: result.truth_semantics for name, result in blended.items()
@@ -926,11 +926,12 @@ def hourly_product(
             valid_time=row["valid_time"].isoformat(),
             lead_hours=round(float(row["lead_hours"]), 2),
             lead_bucket=row["lead_bucket"],
-            **_point_fields(blended, variables, index, effects=effects),
+            **_point_fields(blended, variables, index),
         )
         for index, row in enumerate(frame.iter_rows(named=True))
     ]
     _cohere_hourly(points)
+    _record_rainfall_guards(blended, points, effects)
     return points, blended
 
 
@@ -977,11 +978,12 @@ def daily_product(
         DailyPoint(
             date_local=row["forecast_date"].isoformat(),
             lead_days=int(row["lead_days"]),
-            **_point_fields(blended, variables, index, effects=effects),
+            **_point_fields(blended, variables, index),
         )
         for index, row in enumerate(frame.iter_rows(named=True))
     ]
     _cohere_daily(points)
+    _record_rainfall_guards(blended, points, effects)
     return points
 
 
