@@ -159,16 +159,29 @@ Build/backtest failures and unexpected exceptions still stop
 maintenance. Source changes alter the code fingerprint: generate fresh live
 backtest and report evidence with the updated code before rollout.
 
-### Fitting benchmark scratch outputs
+### Benchmark scratch outputs
 
-`scripts/benchmark_fit_diagnostics.py` defaults to unique UTC timestamp-and-UUID
-sample names under the repository's ignored `reports/benchmarks/`, with a summary
-beside each JSONL. It prints both paths. Explicit relative destinations use the
-caller's working directory. Existing sample or summary destinations are refused
-before measuring (exit `2`); exclusive creation also protects late collisions.
-Publication failures return nonzero and clean up only that invocation's files.
-Use a new explicit destination to retain evidence; ordinary runs do not replace
-committed research artifacts.
+The fitting and score-reader benchmark scripts default to unique UTC
+timestamp-and-UUID JSONLs under the repository's ignored `reports/benchmarks/`.
+Validated results include a `.summary.json`; each written path is printed.
+Explicit relative destinations use the caller's working directory.
+
+Existing sample, summary, or registered optional payload destinations are refused
+before measuring (exit `2`), as are unwritable parents discovered by a temporary
+write/flush probe. Exclusive creation protects late collisions too. Publication
+failures exit `1`, retain possibly incomplete destination files, and attempt one
+rescue to unique `*-recovery-...` scratch paths. If rescue fails, the available
+sample JSONL is emitted to stderr. Nothing deletes destination files during
+failure handling.
+
+Worker/validation failures rescue collected samples before propagating their
+original exception. Such results omit an unvalidated summary; score mismatches
+also retain `.payloads.json` diagnostics. Recovery files may describe an
+incomplete experiment and never imply success. Inspect retained destinations
+before removing them manually, and choose a new output path for another run.
+Historical research memos describe their original runners; current commands use
+these scratch defaults without replacing the committed evidence. See
+[CLI output semantics](cli.md#benchmark-output-safety-and-recovery).
 
 ### The history ledgers
 

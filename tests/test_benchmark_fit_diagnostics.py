@@ -7,7 +7,6 @@ import os
 import shutil
 import subprocess
 import sys
-from datetime import UTC, datetime
 from pathlib import Path
 from types import ModuleType
 
@@ -18,7 +17,8 @@ SCRIPT = REPO / "scripts/benchmark_fit_diagnostics.py"
 
 
 @pytest.fixture
-def benchmark():
+def benchmark(monkeypatch):
+    monkeypatch.syspath_prepend(str(SCRIPT.parent))
     spec = importlib.util.spec_from_file_location("fit_benchmark", SCRIPT)
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
@@ -112,158 +112,26 @@ def test_worker_rejects_unverifiable_module_origin(benchmark, monkeypatch):
         benchmark.module_origins((REPO / "src").resolve())
 
 
-@pytest.mark.parametrize("kind", ["default", "relative", "absolute"])
-def test_output_path_contract_from_another_cwd(benchmark, tmp_path, monkeypatch, kind):
-    monkeypatch.chdir(tmp_path)
-    supplied = (
-        None
-        if kind == "default"
-        else Path("chosen/results.jsonl")
-        if kind == "relative"
-        else tmp_path / "chosen.jsonl"
-    )
-    destination = benchmark.output_path(REPO, supplied)
-    if supplied is None:
-        assert destination.parent == REPO / "reports/benchmarks"
-        assert destination.is_absolute()
-        stamp, identifier = destination.stem.removeprefix("fit-diagnostics-").split("-")
-        assert datetime.strptime(stamp, "%Y%m%dT%H%M%S%fZ").replace(
-            tzinfo=UTC
-        ) <= datetime.now(UTC)
-        assert len(identifier) == 32
-        assert destination != benchmark.output_path(REPO, None)
-    else:
-        assert destination == supplied
-        if not supplied.is_absolute():
-            assert destination.resolve() == tmp_path / supplied
-
-
-@pytest.mark.parametrize("artifact", [0, 1])
-@pytest.mark.parametrize("kind", ["file", "directory", "symlink", "broken_symlink"])
-def test_existing_destination_rejected_before_workers(
-    benchmark, tmp_path, monkeypatch, artifact, kind
-):
-    output = tmp_path / "samples.jsonl"
-    collision = benchmark.artifact_paths(output)[artifact]
-    if kind == "file":
-        collision.write_bytes(b"previous evidence")
-    elif kind == "directory":
-        collision.mkdir()
-    else:
-        target = tmp_path / "target"
-        if kind == "symlink":
-            target.write_bytes(b"previous evidence")
-        collision.symlink_to(target)
-    monkeypatch.setattr(sys, "argv", [str(SCRIPT), "--output", str(output)])
-
-    def no_workers(*_args, **_kwargs):
-        pytest.fail("preflight collision must stop before git or workers")
-
-    monkeypatch.setattr(benchmark.subprocess, "check_output", no_workers)
-    with pytest.raises(SystemExit) as error:
-        benchmark.main()
-    assert error.value.code == 2
-    assert collision.exists() or collision.is_symlink()
-    if kind in {"file", "symlink"}:
-        assert collision.read_bytes() == b"previous evidence"
-
-
-@pytest.mark.parametrize("output", [".", "/"])
-def test_nameless_directory_output_is_an_existing_destination(
-    benchmark, tmp_path, monkeypatch, output
-):
-    monkeypatch.chdir(tmp_path)
-    monkeypatch.setattr(sys, "argv", [str(SCRIPT), "--output", output])
-    with pytest.raises(SystemExit) as error:
-        benchmark.main()
-    assert error.value.code == 2
-
-
-@pytest.mark.parametrize("artifact", [0, 1])
-def test_late_collision_preserves_existing_bytes_and_removes_only_owned_outputs(
-    benchmark, tmp_path, artifact
-):
-    output = tmp_path / "samples.jsonl"
-    benchmark.check_output_paths(output)
-    collision = benchmark.artifact_paths(output)[artifact]
-    collision.write_bytes(b"late evidence")
-    with pytest.raises(FileExistsError):
-        benchmark.publish_outputs(output, "new samples", "new summary")
-    assert collision.read_bytes() == b"late evidence"
-    assert not benchmark.artifact_paths(output)[1 - artifact].exists()
-
-
-def test_failed_publication_preserves_replacement_owned_by_another_writer(
-    benchmark, tmp_path, monkeypatch
-):
-    output = tmp_path / "samples.jsonl"
-    summary = benchmark.artifact_paths(output)[1]
-    real_open = Path.open
-
-    def replace_sample(path, *args, **kwargs):
-        if path == summary:
-            output.unlink()
-            output.write_bytes(b"other writer")
-            raise PermissionError("summary permission denied")
-        return real_open(path, *args, **kwargs)
-
-    monkeypatch.setattr(Path, "open", replace_sample)
-    with pytest.raises(PermissionError, match="summary permission denied"):
-        benchmark.publish_outputs(output, "new samples", "new summary")
-    assert output.read_bytes() == b"other writer"
-    assert not summary.exists()
-
-
-def test_write_failure_removes_both_owned_outputs(benchmark, tmp_path, monkeypatch):
-    output = tmp_path / "samples.jsonl"
-    real_open = Path.open
-
-    class BrokenWriter:
-        def __init__(self, stream):
-            self.stream = stream
-
-        def __enter__(self):
-            self.stream.__enter__()
-            return self
-
-        def __exit__(self, *args):
-            return self.stream.__exit__(*args)
-
-        def fileno(self):
-            return self.stream.fileno()
-
-        def write(self, content):
-            self.stream.write(content[:2])
-            raise OSError("write failed")
-
-    def broken_open(path, *args, **kwargs):
-        return BrokenWriter(real_open(path, *args, **kwargs))
-
-    monkeypatch.setattr(Path, "open", broken_open)
-    with pytest.raises(OSError, match="write failed"):
-        benchmark.publish_outputs(output, "samples", "summary")
-    assert all(not path.exists() for path in benchmark.artifact_paths(output))
-
-
-def test_exclusive_publication_writes_both_outputs(benchmark, tmp_path):
-    output = tmp_path / "new/samples.jsonl"
-    benchmark.publish_outputs(output, "samples\n", "summary\n")
-    assert [path.read_text() for path in benchmark.artifact_paths(output)] == [
-        "samples\n",
-        "summary\n",
-    ]
-
-
 @pytest.mark.parametrize("fail", [False, True])
 def test_main_reports_artifact_paths_or_publication_failure(
     benchmark, tmp_path, monkeypatch, capsys, fail
 ):
+    import benchmark_outputs  # noqa: PLC0415 -- script helper
+
     output = tmp_path / "samples.jsonl"
+    repository = tmp_path / "repository"
+    source = repository / "src"
+    source.mkdir(parents=True)
+    (source / "fixture.py").write_text("# source fixture\n")
+    script = repository / "scripts/benchmark.py"
+    script.parent.mkdir()
+    script.write_text("# runner fixture\n")
+    monkeypatch.setattr(benchmark, "__file__", str(script))
     monkeypatch.setattr(
         sys, "argv", [str(SCRIPT), "--runs", "1", "--output", str(output)]
     )
 
-    def worker_output(command, **kwargs):
+    def worker_output(command, **_kwargs):
         if command[:2] == ["git", "rev-parse"]:
             return "0" * 40 + "\n"
         if command[:2] == ["git", "archive"]:
@@ -279,10 +147,10 @@ def test_main_reports_artifact_paths_or_publication_failure(
             )
         pytest.fail(f"unexpected subprocess: {command}")
 
-    def extract_archive(command, *, input, check):
+    def extract_archive(command, **kwargs):
         assert command[:4] == ["tar", "-xf", "-", "-C"]
-        assert input == b"fixture archive"
-        assert check
+        assert kwargs["input"] == b"fixture archive"
+        assert kwargs["check"]
         source = Path(command[4]) / "src"
         source.mkdir()
         (source / "fixture.py").write_text("# immutable fixture source\n")
@@ -291,11 +159,14 @@ def test_main_reports_artifact_paths_or_publication_failure(
     monkeypatch.setattr(benchmark.subprocess, "check_output", worker_output)
     monkeypatch.setattr(benchmark.subprocess, "run", extract_archive)
     if fail:
+        real_publish = benchmark_outputs.publish_artifacts
 
-        def collision(*_args):
-            raise FileExistsError("late collision")
+        def collision(paths, contents):
+            if paths["samples"] == output:
+                raise FileExistsError("late collision")
+            return real_publish(paths, contents)
 
-        monkeypatch.setattr(benchmark, "publish_outputs", collision)
+        monkeypatch.setattr(benchmark_outputs, "publish_artifacts", collision)
         with pytest.raises(SystemExit) as error:
             benchmark.main()
         assert error.value.code == 1
@@ -307,7 +178,8 @@ def test_main_reports_artifact_paths_or_publication_failure(
         benchmark.main()
         printed = capsys.readouterr().out
         assert all(
-            f"wrote {path}" in printed for path in benchmark.artifact_paths(output)
+            f"wrote {path}" in printed
+            for path in benchmark_outputs.artifact_paths(output).values()
         )
 
 
@@ -332,7 +204,9 @@ def test_worker_rechecks_origins_after_warmup(source_tree, tmp_path, benchmark):
     probe = tmp_path / "probe.py"
     probe.write_text(f"""import argparse
 import importlib.util
+import sys
 from pathlib import Path
+sys.path.insert(0, {str(SCRIPT.parent)!r})
 spec = importlib.util.spec_from_file_location("benchmark", {str(SCRIPT)!r})
 benchmark = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(benchmark)
