@@ -63,7 +63,7 @@ def _truth_availability(
     raw: pl.DataFrame, columns: Sequence[str], issue_time: datetime
 ) -> dict[str, TruthAvailability]:
     if raw.is_empty() or not columns:
-        return {}
+        return {name: TruthAvailability(0, 0, 0) for name in columns}
     finite = raw.select(
         pl.col("issue_time"),
         *(pl.col(name).is_finite().alias(name) for name in columns),
@@ -122,7 +122,9 @@ class FitDiagnostics:
 
     Starting an attempt resets only its branch. Promoted failures remain until
     capture_training begins a new snapshot for that product. Resolve training
-    after all fits, while the raw matrix is still local to the caller.
+    after all fits, while the raw matrix is still local to the caller, before
+    reading failures. Incremental resolution caches facts within the same raw
+    matrix and issuance cutoff; capture a new snapshot before either changes.
     """
 
     training: dict[str, TrainingFacts] = field(default_factory=dict)
@@ -132,10 +134,16 @@ class FitDiagnostics:
 
     @property
     def promoted_fit_unavailable(self) -> bool:
-        return bool(self.unavailable)
+        return bool(self.unavailable or self.pending)
 
     @property
     def failures(self) -> tuple[FitFailure, ...]:
+        if self.pending:
+            products = ", ".join(sorted({attempt.product for attempt in self.pending}))
+            raise RuntimeError(
+                f"fit diagnostics pending for {products}; call resolve_training "
+                "before reading failures"
+            )
         return tuple(sorted(set(self.unavailable.values())))
 
     def capture_training(self, product: str, raw: pl.DataFrame) -> None:
@@ -164,10 +172,12 @@ class FitDiagnostics:
         )
         if not targets:
             return
-        columns = sorted({attempt.truth_column for attempt in targets})
-        self.training[product] = TrainingFacts(
-            raw_rows=raw.height, truth=_truth_availability(raw, columns, issue_time)
-        )
+        facts = self.training.get(product)
+        truth = dict(facts.truth) if facts is not None else {}
+        columns = sorted({attempt.truth_column for attempt in targets} - truth.keys())
+        if columns:
+            truth.update(_truth_availability(raw, columns, issue_time))
+        self.training[product] = TrainingFacts(raw_rows=raw.height, truth=truth)
         for attempt in targets:
             self.unavailable[attempt] = self._failure(attempt)
             self.pending.remove(attempt)
@@ -213,11 +223,12 @@ class FitDiagnostics:
             return
         key = product, variable, truth_semantics
         attempt = UnavailableFit(*key, truth_column, self.branches.get(key))
-        if attempt in self.unavailable:
+        if attempt in self.unavailable or attempt in self.pending:
             return
-        self.unavailable[attempt] = self._failure(attempt)
         if attempt.branch == FitUnavailableBranch.EMPTY_SLICE:
             self.pending.add(attempt)
+        else:
+            self.unavailable[attempt] = self._failure(attempt)
 
 
 def describe_fit_failures(failures: Sequence[FitFailure]) -> str:

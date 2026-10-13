@@ -174,12 +174,19 @@ variants and repetitions. No memory threshold is enforced in CI. See the
 
 Run `uv run python scripts/benchmark_fit_diagnostics.py` from a source checkout.
 `--baseline REF` defaults to merged PR #54 (`2ccd7e0`); `--runs N` defaults to
-three fresh processes per variant/workload/size; `--output PATH` defaults to
-the repository's `docs/research/fit-diagnostics-2026-10-13.jsonl`, independent of
-the caller's working directory. An explicitly supplied relative `--output` path
+three fresh processes per variant/workload/size; `--output PATH` defaults to a
+unique UTC timestamp-and-UUID filename under the repository's ignored
+`reports/benchmarks/` directory, independent of the caller's working directory.
+An explicitly supplied relative `--output` path
 is relative to the caller's working directory; an absolute path is used as given.
-The runner also writes a summary
-JSON beside the samples. Configurations and immutable source snapshots remain
+The runner also writes a `.summary.json` beside the samples and prints both paths.
+Both destinations must be new: an existing file, directory, or symlink causes
+exit `2` before workers start. Publication uses exclusive creation, protecting
+destinations that appear after that check too. Publication failures return
+nonzero and remove only files created by that invocation. There is no overwrite
+option; choose a new explicit path when saving evidence. Historical research
+artifacts remain unchanged by ordinary benchmark runs.
+Configurations and immutable source snapshots remain
 in temporary directories. Fixed thread settings match the score-reader benchmark.
 
 The workloads measure isolated diagnostic collection and real successful/pending

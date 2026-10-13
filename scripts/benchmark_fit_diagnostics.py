@@ -20,8 +20,10 @@ import subprocess
 import sys
 import tempfile
 import time
+from contextlib import ExitStack
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from uuid import uuid4
 
 THREADS = {
     "POLARS_MAX_THREADS": "2",
@@ -48,10 +50,17 @@ def module_origins(source: Path) -> dict[str, str]:
             "grounded_weather_forecast."
         ):
             continue
+        if module is None:
+            continue
         filename = getattr(module, "__file__", None)
         if filename is None:
             raise RuntimeError(f"worker cannot verify module origin: {name}")
-        path = Path(filename).resolve(strict=True)
+        try:
+            path = Path(filename).resolve(strict=True)
+        except (OSError,) as error:  # noqa: B013 -- project tuple convention
+            raise RuntimeError(
+                f"worker cannot resolve module origin: {name} at {filename}: {error}"
+            ) from error
         if not path.is_relative_to(source):
             raise RuntimeError(
                 f"worker imported the wrong source tree: {name} at {path}"
@@ -61,11 +70,61 @@ def module_origins(source: Path) -> dict[str, str]:
 
 
 def output_path(repository: Path, supplied: Path | None) -> Path:
+    if supplied is not None:
+        return supplied
+    stamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%S%fZ")
     return (
-        repository / "docs/research/fit-diagnostics-2026-10-13.jsonl"
-        if supplied is None
-        else supplied
+        repository
+        / "reports/benchmarks"
+        / f"fit-diagnostics-{stamp}-{uuid4().hex}.jsonl"
     )
+
+
+def artifact_paths(destination: Path) -> tuple[Path, Path]:
+    return destination, destination.with_suffix(".summary.json")
+
+
+def check_output_paths(destination: Path) -> None:
+    def require_new(path: Path) -> None:
+        if path.exists() or path.is_symlink():
+            raise FileExistsError(f"benchmark output already exists: {path}")
+
+    require_new(destination)
+    require_new(artifact_paths(destination)[1])
+
+
+def _remove_created(path: Path, device: int, inode: int) -> None:
+    """Clean up our own inode, preserving a replacement from another writer."""
+    try:
+        current = path.lstat()
+        if (current.st_dev, current.st_ino) == (device, inode):
+            path.unlink()
+    except (FileNotFoundError,):  # noqa: B013 -- project tuple convention
+        pass
+    except (OSError,) as error:  # noqa: B013 -- project tuple convention
+        print(
+            f"could not remove incomplete benchmark output {path}: {error}",
+            file=sys.stderr,
+        )
+
+
+def publish_outputs(destination: Path, samples: str, summary: str) -> None:
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    created = []
+    try:
+        with ExitStack() as stack:
+            streams = []
+            for path in artifact_paths(destination):
+                stream = stack.enter_context(path.open("x", encoding="utf-8"))
+                identity = os.fstat(stream.fileno())
+                created.append((path, identity.st_dev, identity.st_ino))
+                streams.append(stream)
+            for stream, content in zip(streams, (samples, summary), strict=True):
+                stream.write(content)
+    except (BaseException,):  # noqa: B013 -- project tuple convention
+        for path, device, inode in created:
+            _remove_created(path, device, inode)
+        raise
 
 
 def worker(args: argparse.Namespace) -> dict[str, object]:
@@ -197,7 +256,7 @@ def main() -> None:
     parser.add_argument(
         "--output",
         type=Path,
-        help="output JSONL path; defaults to the repository's dated experiment path",
+        help="new output JSONL path; defaults to unique ignored reports/benchmarks files",
     )
     parser.add_argument("--worker", action="store_true")
     parser.add_argument("--source", type=Path)
@@ -211,6 +270,10 @@ def main() -> None:
         return
     repo = Path(__file__).resolve().parents[1]
     destination = output_path(repo, args.output)
+    try:
+        check_output_paths(destination)
+    except (FileExistsError,) as error:  # noqa: B013 -- project tuple convention
+        parser.error(str(error))
     baseline_sha = subprocess.check_output(  # noqa: S603 -- Git argv, no shell
         ["git", "rev-parse", args.baseline],
         cwd=repo,
@@ -301,13 +364,17 @@ def main() -> None:
                     "payloads_equal": True,
                 }
             )
-    destination.parent.mkdir(parents=True, exist_ok=True)
-    destination.write_text(
-        "".join(json.dumps(record, sort_keys=True) + "\n" for record in records)
-    )
-    destination.with_suffix(".summary.json").write_text(
-        json.dumps(summary, indent=2) + "\n"
-    )
+    try:
+        publish_outputs(
+            destination,
+            "".join(json.dumps(record, sort_keys=True) + "\n" for record in records),
+            json.dumps(summary, indent=2) + "\n",
+        )
+    except (OSError,) as error:  # noqa: B013 -- project tuple convention
+        print(f"could not publish benchmark outputs: {error}", file=sys.stderr)
+        raise SystemExit(1) from error
+    for path in artifact_paths(destination):
+        print(f"wrote {path}")
 
 
 if __name__ == "__main__":

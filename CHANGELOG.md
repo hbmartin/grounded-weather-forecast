@@ -8,6 +8,11 @@ adheres to [Semantic Versioning](https://semver.org/).
 
 ### Changed
 
+- Fitting benchmarks default to unique ignored scratch files and refuse existing
+  sample or summary destinations, including late collisions. Diagnostic truth
+  facts accumulate within a product snapshot; pending promoted fits must be
+  resolved before completed failures can be read.
+
 - Promoted-fit failures survive later attempts within a product snapshot. QC
   alerts distinguish missing assessments from absent verdicts and display both
   exception class and detail. Benchmark workers verify imported source origins,
