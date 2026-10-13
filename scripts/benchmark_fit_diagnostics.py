@@ -23,7 +23,13 @@ import time
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
-from benchmark_outputs import BenchmarkOutputs, result_contents
+# Resolve sibling tooling explicitly, including under -P, -I, and PYTHONSAFEPATH.
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from benchmark_outputs import (
+    BenchmarkOutputs,
+    BenchmarkResults,
+    JournalPreparationError,
+)
 
 THREADS = {
     "POLARS_MAX_THREADS": "2",
@@ -191,7 +197,9 @@ dir = "{directory / "data"}"
     }
 
 
-def collect(repo: Path, args: argparse.Namespace, records: list[dict]) -> list[dict]:
+def collect(
+    repo: Path, args: argparse.Namespace, results: BenchmarkResults
+) -> list[dict]:
     baseline_sha = subprocess.check_output(  # noqa: S603 -- Git argv, no shell
         ["git", "rev-parse", args.baseline],
         cwd=repo,
@@ -245,7 +253,7 @@ def collect(repo: Path, args: argparse.Namespace, records: list[dict]) -> list[d
                                 Path(__file__).read_bytes()
                             ).hexdigest(),
                         )
-                        records.append(record)
+                        results.add_sample(record)
                         print(
                             f"{workload} {rows} {variant} run {repetition + 1}: {record['median_ms']:.3f} ms",
                             flush=True,
@@ -258,7 +266,7 @@ def collect(repo: Path, args: argparse.Namespace, records: list[dict]) -> list[d
         for rows in (100_000, 1_000_000):
             group = [
                 record
-                for record in records
+                for record in results.records
                 if record["workload"] == workload and record["rows"] == rows
             ]
             assert (
@@ -308,10 +316,13 @@ def main() -> None:
         outputs = BenchmarkOutputs.prepare(repo, "fit-diagnostics", args.output)
     except (OSError, ValueError) as error:
         parser.error(str(error))
-    records = []
-    with outputs.measurements(records):
-        summary = collect(repo, args, records)
-    outputs.publish(result_contents(records, summary=summary))
+    try:
+        with outputs.measurements() as results:
+            summary = collect(repo, args, results)
+            contents = results.contents(summary=summary)
+    except (JournalPreparationError,) as error:  # noqa: B013 -- project tuple convention
+        parser.error(str(error))
+    outputs.publish(contents, journal_path=results.journal_path)
 
 
 if __name__ == "__main__":

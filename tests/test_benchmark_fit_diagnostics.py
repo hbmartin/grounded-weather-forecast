@@ -33,12 +33,14 @@ def source_tree(tmp_path):
 
 
 @pytest.mark.parametrize("workload", ["aggregation", "successful_fit", "pending_fit"])
+@pytest.mark.parametrize("mode", ["normal", "-P", "-I", "environment"])
 def test_worker_reports_verified_snapshot_modules(
-    benchmark, source_tree, tmp_path, workload
+    benchmark, source_tree, tmp_path, workload, mode
 ):
     completed = subprocess.run(  # noqa: S603 -- local worker and fixture argv
         [
             sys.executable,
+            *([mode] if mode in {"-P", "-I"} else []),
             str(SCRIPT),
             "--worker",
             "--source",
@@ -49,7 +51,10 @@ def test_worker_reports_verified_snapshot_modules(
             workload,
         ],
         cwd=tmp_path,
-        env=os.environ | benchmark.THREADS,
+        env=os.environ
+        | benchmark.THREADS
+        | ({"PYTHONSAFEPATH": "1"} if mode == "environment" else {}),
+        timeout=30,
         text=True,
         capture_output=True,
         check=True,

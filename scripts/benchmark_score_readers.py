@@ -31,7 +31,13 @@ from functools import partial
 from pathlib import Path
 from typing import Any
 
-from benchmark_outputs import BenchmarkOutputs, result_contents
+# Resolve sibling tooling explicitly, including under -P, -I, and PYTHONSAFEPATH.
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from benchmark_outputs import (
+    BenchmarkOutputs,
+    BenchmarkResults,
+    JournalPreparationError,
+)
 from benchmark_selection_memory import prepare
 
 POLICIES = ("bounded", "auto_low_memory", "auto")
@@ -258,144 +264,146 @@ def summarize(records: list[dict]) -> list[dict]:
     return summaries
 
 
+def collect(
+    repository: Path, args: argparse.Namespace, results: BenchmarkResults
+) -> list[dict]:
+    baseline_sha = subprocess.check_output(  # noqa: S603 -- Git argv, no shell
+        ["git", "rev-parse", args.baseline],  # noqa: S607
+        cwd=repository,
+        text=True,
+    ).strip()
+    with tempfile.TemporaryDirectory(prefix="score-reader-benchmark-") as temporary:
+        directory = Path(temporary)
+        fixtures = directory / "fixtures"
+        fixtures.mkdir()
+        prepare(fixtures, args.evaluations, args.cases)
+        prepare_reporting(fixtures)
+        for path in fixtures.rglob("*.parquet"):
+            path.chmod(0o444)
+        baseline = directory / "baseline"
+        baseline.mkdir()
+        archive = subprocess.check_output(  # noqa: S603 -- resolved Git commit
+            ["git", "archive", baseline_sha, "src"],  # noqa: S607
+            cwd=repository,
+        )
+        with tarfile.open(fileobj=io.BytesIO(archive)) as contents:
+            contents.extractall(baseline, filter="data")
+        updated = directory / "updated" / "src"
+        shutil.copytree(
+            repository / "src",
+            updated,
+            ignore=shutil.ignore_patterns("__pycache__", ".DS_Store"),
+        )
+        sources = {"baseline": baseline / "src", "updated": updated}
+        hashes = {variant: tree_hash(source) for variant, source in sources.items()}
+        # Exclude the location-dependent config from the stable fixture hash.
+        fixture_hashes = {name: tree_hash(fixtures / name) for name in SCENARIOS}
+        fixture_hash = digest_payload(fixture_hashes)
+        fixture_details = {
+            name: {
+                "sha256": fixture_hashes[name],
+                "files": args.evaluations,
+                "compressed_bytes": sum(
+                    path.stat().st_size for path in (fixtures / name).glob("*.parquet")
+                ),
+                "rows": (
+                    args.evaluations * args.cases * 4
+                    if name == "many_evaluations"
+                    else (args.evaluations - 1) * args.cases * 4 + 80 * 4
+                    if name == "mostly_incompatible"
+                    else args.evaluations * args.cases * 8
+                ),
+            }
+            for name in SCENARIOS
+        }
+        environment = os.environ | {
+            "POLARS_MAX_THREADS": "2",
+            "OMP_NUM_THREADS": "1",
+            "OPENBLAS_NUM_THREADS": "1",
+            "MKL_NUM_THREADS": "1",
+            "PYTHONHASHSEED": "0",
+        }
+        payloads = {}
+        for workload in WORKLOADS:
+            for repetition in range(args.runs):
+                for variant, policies in (
+                    ("baseline", ("bounded",)),
+                    ("updated", POLICIES),
+                ):
+                    for policy in policies:
+                        command = [
+                            sys.executable,
+                            str(Path(__file__).resolve()),
+                            "--worker",
+                            "--source",
+                            str(sources[variant]),
+                            "--fixtures",
+                            str(fixtures),
+                            "--workload",
+                            workload,
+                            "--policy",
+                            policy,
+                        ]
+                        record = json.loads(
+                            subprocess.check_output(  # noqa: S603 -- this script, no shell
+                                command, env=environment, text=True
+                            )
+                        )
+                        payload = record.pop("payload")
+                        if repetition == 0:
+                            payloads[f"{workload}/{variant}/{policy}"] = payload
+                        record.update(
+                            variant=variant,
+                            run=repetition + 1,
+                            source_sha256=hashes[variant],
+                            runner_sha256=hashlib.sha256(
+                                Path(__file__).read_bytes()
+                            ).hexdigest(),
+                            baseline_sha=baseline_sha,
+                            fixture_sha256=fixture_hash,
+                            fixture_details=fixture_details,
+                            evaluations=args.evaluations,
+                            cases=args.cases,
+                            feature_json_bytes=8196,
+                            threads={
+                                key: environment[key]
+                                for key in (
+                                    "POLARS_MAX_THREADS",
+                                    "OMP_NUM_THREADS",
+                                    "OPENBLAS_NUM_THREADS",
+                                    "MKL_NUM_THREADS",
+                                )
+                            },
+                            platform=platform.platform(),
+                        )
+                        results.add_sample(record)
+                        print(
+                            f"{workload} {variant} {policy} run={repetition + 1}: {record['seconds']:.3f}s {record['peak_rss_mib']:.1f}MiB",
+                            flush=True,
+                        )
+            hashes_for_workload = {
+                record["payload_sha256"]
+                for record in results.records
+                if record["workload"] == workload
+            }
+            if len(hashes_for_workload) != 1:
+                results.record_payloads(payloads)
+                raise RuntimeError(f"payloads differ for {workload}")
+        if fixture_hashes != {name: tree_hash(fixtures / name) for name in SCENARIOS}:
+            raise RuntimeError("benchmark inputs changed")
+        if hashes != {
+            variant: tree_hash(source) for variant, source in sources.items()
+        }:
+            raise RuntimeError("benchmark source snapshots changed")
+        return summarize(results.records)
+
+
 def run(args: argparse.Namespace, outputs: BenchmarkOutputs) -> None:
     repository = Path(__file__).resolve().parents[1]
-    records = []
-    failure_payloads = {}
-    with outputs.measurements(records, payloads=failure_payloads):
-        baseline_sha = subprocess.check_output(  # noqa: S603 -- Git argv, no shell
-            ["git", "rev-parse", args.baseline],  # noqa: S607
-            cwd=repository,
-            text=True,
-        ).strip()
-        with tempfile.TemporaryDirectory(prefix="score-reader-benchmark-") as temporary:
-            directory = Path(temporary)
-            fixtures = directory / "fixtures"
-            fixtures.mkdir()
-            prepare(fixtures, args.evaluations, args.cases)
-            prepare_reporting(fixtures)
-            for path in fixtures.rglob("*.parquet"):
-                path.chmod(0o444)
-            baseline = directory / "baseline"
-            baseline.mkdir()
-            archive = subprocess.check_output(  # noqa: S603 -- resolved Git commit
-                ["git", "archive", baseline_sha, "src"],  # noqa: S607
-                cwd=repository,
-            )
-            with tarfile.open(fileobj=io.BytesIO(archive)) as contents:
-                contents.extractall(baseline, filter="data")
-            updated = directory / "updated" / "src"
-            shutil.copytree(
-                repository / "src",
-                updated,
-                ignore=shutil.ignore_patterns("__pycache__", ".DS_Store"),
-            )
-            sources = {"baseline": baseline / "src", "updated": updated}
-            hashes = {variant: tree_hash(source) for variant, source in sources.items()}
-            # Exclude the location-dependent config from the stable fixture hash.
-            fixture_hashes = {name: tree_hash(fixtures / name) for name in SCENARIOS}
-            fixture_hash = digest_payload(fixture_hashes)
-            fixture_details = {
-                name: {
-                    "sha256": fixture_hashes[name],
-                    "files": args.evaluations,
-                    "compressed_bytes": sum(
-                        path.stat().st_size
-                        for path in (fixtures / name).glob("*.parquet")
-                    ),
-                    "rows": (
-                        args.evaluations * args.cases * 4
-                        if name == "many_evaluations"
-                        else (args.evaluations - 1) * args.cases * 4 + 80 * 4
-                        if name == "mostly_incompatible"
-                        else args.evaluations * args.cases * 8
-                    ),
-                }
-                for name in SCENARIOS
-            }
-            environment = os.environ | {
-                "POLARS_MAX_THREADS": "2",
-                "OMP_NUM_THREADS": "1",
-                "OPENBLAS_NUM_THREADS": "1",
-                "MKL_NUM_THREADS": "1",
-                "PYTHONHASHSEED": "0",
-            }
-            payloads = {}
-            for workload in WORKLOADS:
-                for repetition in range(args.runs):
-                    for variant, policies in (
-                        ("baseline", ("bounded",)),
-                        ("updated", POLICIES),
-                    ):
-                        for policy in policies:
-                            command = [
-                                sys.executable,
-                                str(Path(__file__).resolve()),
-                                "--worker",
-                                "--source",
-                                str(sources[variant]),
-                                "--fixtures",
-                                str(fixtures),
-                                "--workload",
-                                workload,
-                                "--policy",
-                                policy,
-                            ]
-                            record = json.loads(
-                                subprocess.check_output(  # noqa: S603 -- this script, no shell
-                                    command, env=environment, text=True
-                                )
-                            )
-                            payload = record.pop("payload")
-                            if repetition == 0:
-                                payloads[f"{workload}/{variant}/{policy}"] = payload
-                            record.update(
-                                variant=variant,
-                                run=repetition + 1,
-                                source_sha256=hashes[variant],
-                                runner_sha256=hashlib.sha256(
-                                    Path(__file__).read_bytes()
-                                ).hexdigest(),
-                                baseline_sha=baseline_sha,
-                                fixture_sha256=fixture_hash,
-                                fixture_details=fixture_details,
-                                evaluations=args.evaluations,
-                                cases=args.cases,
-                                feature_json_bytes=8196,
-                                threads={
-                                    key: environment[key]
-                                    for key in (
-                                        "POLARS_MAX_THREADS",
-                                        "OMP_NUM_THREADS",
-                                        "OPENBLAS_NUM_THREADS",
-                                        "MKL_NUM_THREADS",
-                                    )
-                                },
-                                platform=platform.platform(),
-                            )
-                            records.append(record)
-                            print(
-                                f"{workload} {variant} {policy} run={repetition + 1}: {record['seconds']:.3f}s {record['peak_rss_mib']:.1f}MiB",
-                                flush=True,
-                            )
-                hashes_for_workload = {
-                    record["payload_sha256"]
-                    for record in records
-                    if record["workload"] == workload
-                }
-                if len(hashes_for_workload) != 1:
-                    failure_payloads.update(payloads)
-                    raise RuntimeError(f"payloads differ for {workload}")
-            if fixture_hashes != {
-                name: tree_hash(fixtures / name) for name in SCENARIOS
-            }:
-                raise RuntimeError("benchmark inputs changed")
-            if hashes != {
-                variant: tree_hash(source) for variant, source in sources.items()
-            }:
-                raise RuntimeError("benchmark source snapshots changed")
-            summary = summarize(records)
-    outputs.publish(result_contents(records, summary=summary))
+    with outputs.measurements() as results:
+        summary = collect(repository, args, results)
+        contents = results.contents(summary=summary)
+    outputs.publish(contents, journal_path=results.journal_path)
 
 
 def main() -> None:
@@ -427,11 +435,13 @@ def main() -> None:
                 Path(__file__).resolve().parents[1],
                 "score-readers",
                 args.output,
-                include_payloads=True,
             )
         except (OSError, ValueError) as error:
             parser.error(str(error))
-        run(args, outputs)
+        try:
+            run(args, outputs)
+        except (JournalPreparationError,) as error:  # noqa: B013 -- project tuple convention
+            parser.error(str(error))
 
 
 if __name__ == "__main__":

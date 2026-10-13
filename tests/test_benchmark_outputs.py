@@ -60,13 +60,11 @@ def test_unique_defaults_and_explicit_paths_from_another_cwd(
         assert destination.resolve() == tmp_path / supplied
 
 
-@pytest.mark.parametrize("artifact", ["samples", "summary", "payloads"])
+@pytest.mark.parametrize("artifact", ["samples", "summary"])
 @pytest.mark.parametrize("kind", ["file", "directory", "symlink", "broken_symlink"])
 def test_all_registered_collisions_stop_before_git(
     runner, outputs, tmp_path, monkeypatch, artifact, kind
 ):
-    if artifact == "payloads" and "fit_diagnostics" in runner.__name__:
-        pytest.skip("the fitting runner does not register a payload artifact")
     destination = tmp_path / "samples.jsonl"
     collision = outputs.artifact_paths(destination, include_payloads=True)[artifact]
     if kind == "file":
@@ -240,7 +238,7 @@ def test_publication_failure_rescues_validated_results_and_returns_failure(
     assert error.value.code == 1
     assert publisher.paths["summary"].read_bytes() == b"late evidence"
     assert publisher.paths["samples"].read_bytes() == b""
-    recovery = next((tmp_path / "reports/benchmarks").glob("*.jsonl"))
+    recovery = next((tmp_path / "reports/benchmarks").glob("*recovery-*.jsonl"))
     assert recovery.read_text() == contents["samples"]
     assert recovery.with_suffix(".summary.json").read_text() == contents["summary"]
     assert "no files were removed" in capsys.readouterr().err
@@ -273,18 +271,17 @@ def test_measurement_failure_rescues_rows_but_no_summary(outputs, tmp_path):
     publisher = outputs.BenchmarkOutputs.prepare(
         tmp_path, "probe", tmp_path / "out.jsonl"
     )
-    records = []
     original = RuntimeError("worker stopped")
 
     def measured_failure():
-        with publisher.measurements(records):
-            records.append({"sample": 1})
+        with publisher.measurements() as results:
+            results.add_sample({"sample": 1})
             raise original
 
     with pytest.raises(RuntimeError) as error:
         measured_failure()
     assert error.value is original
-    recovery = next((tmp_path / "reports/benchmarks").glob("*.jsonl"))
+    recovery = next((tmp_path / "reports/benchmarks").glob("*recovery-*.jsonl"))
     assert json.loads(recovery.read_text()) == {"sample": 1}
     assert not recovery.with_suffix(".summary.json").exists()
     assert not publisher.paths["samples"].exists()
@@ -294,9 +291,10 @@ def test_failure_before_samples_does_not_create_recovery(outputs, tmp_path):
     publisher = outputs.BenchmarkOutputs.prepare(
         tmp_path, "probe", tmp_path / "out.jsonl"
     )
-    with pytest.raises(RuntimeError), publisher.measurements([]):
+    with pytest.raises(RuntimeError), publisher.measurements() as results:
         raise RuntimeError("Git failed")
-    assert not (tmp_path / "reports").exists()
+    assert results.journal_path.read_text() == ""
+    assert not list((tmp_path / "reports/benchmarks").glob("*recovery-*.jsonl"))
 
 
 def test_success_prints_created_paths_and_omits_unused_payloads(
@@ -404,7 +402,11 @@ def test_score_runner_publishes_validated_samples_without_payload_diagnostics(
     monkeypatch.setattr(sys, "argv", argv)
     score_runner.main()
     output = (
-        next((tmp_path / "repository/reports/benchmarks").glob("*.jsonl"))
+        next(
+            path
+            for path in (tmp_path / "repository/reports/benchmarks").glob("*.jsonl")
+            if "-journal-" not in path.name
+        )
         if kind == "default"
         else tmp_path / "out.jsonl"
     )
@@ -462,7 +464,9 @@ def test_score_runner_failure_retains_results_and_original_failure(
         assert output.with_suffix(".summary.json").read_bytes() == b"other writer"
     else:
         assert "payloads differ" in str(error.value)
-    recovery = next((tmp_path / "repository/reports/benchmarks").glob("*.jsonl"))
+    recovery = next(
+        (tmp_path / "repository/reports/benchmarks").glob("*recovery-*.jsonl")
+    )
     assert (
         len(recovery.read_text().splitlines())
         == {"worker_failure": 1, "mismatch": 12, "publication_failure": 48}[mode]
@@ -486,14 +490,14 @@ def test_fitting_validation_failure_rescues_before_propagating(
     )
     original = AssertionError("payloads differ")
 
-    def failed_collection(_repository, _args, records):
-        records.append({"payload": {"point": 1.0}})
+    def failed_collection(_repository, _args, results):
+        results.add_sample({"payload": {"point": 1.0}})
         raise original
 
     monkeypatch.setattr(runner, "collect", failed_collection)
     with pytest.raises(AssertionError) as error:
         runner.main()
     assert error.value is original
-    recovery = next((repository / "reports/benchmarks").glob("*.jsonl"))
+    recovery = next((repository / "reports/benchmarks").glob("*recovery-*.jsonl"))
     assert json.loads(recovery.read_text())["payload"]["point"] == 1.0
     assert not recovery.with_suffix(".summary.json").exists()

@@ -8,6 +8,12 @@ adheres to [Semantic Versioning](https://semver.org/).
 
 ### Changed
 
+- Fitting and score-reader benchmarks checkpoint completed samples in retained,
+  flushed scratch journals before final publication. Recovery failures preserve
+  the original exception, safe-path Python launchers resolve sibling tooling,
+  and unused primary payload destinations no longer block score comparisons.
+  Journals do not promise power-loss durability.
+
 - Fitting and score-reader benchmarks share unique ignored outputs, writable-parent
   preflight, and exclusive publication. Failures retain destination files and
   rescue available samples; validated summaries and mismatch payloads are saved
