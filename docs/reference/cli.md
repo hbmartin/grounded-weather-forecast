@@ -12,7 +12,10 @@ The entry point is `grounded_weather_forecast.cli:main`. Once a command has
 parsed and its configuration has loaded successfully, its outcome is appended
 to the **run ledger** (`data/runs.parquet`, pruned to 90 days / 50k rows), so
 `report` can tell you what actually ran. Help, `--version`, parse failures, and
-configuration failures occur before ledgering.
+configuration failures occur before ledgering. The optional `error_detail` stores
+a single-line failure message capped at 400 characters, separately from the
+exception class in `error`. Older ledgers read with null detail. Handled truth-QC
+failures record the message for both standalone invocations and maintenance stages.
 
 ---
 
@@ -161,6 +164,21 @@ report median process peak RSS, min/max spread, runtime, and individual
 samples. The runner verifies that selection payload hashes agree across all
 variants and repetitions. No memory threshold is enforced in CI. See the
 [dated results](../research/selection-memory-2026-10-07.md) for scope and measurements.
+
+### Fitting diagnostics benchmark
+
+Run `uv run python scripts/benchmark_fit_diagnostics.py` from a source checkout.
+`--baseline REF` defaults to merged PR #54 (`2ccd7e0`); `--runs N` defaults to
+three fresh processes per variant/workload/size; `--output PATH` defaults to
+`docs/research/fit-diagnostics-2026-10-12.jsonl`. The runner also writes a summary
+JSON beside the samples. Configurations and immutable source snapshots remain
+in temporary directories. Fixed thread settings match the score-reader benchmark.
+
+The workloads measure isolated diagnostic collection and real successful/pending
+hourly fitting with 100,000 and one million raw rows. They exclude matrix I/O and
+full forecast assembly, assert the fitting fixtures actually contain promoted
+selections, and check equivalent point/method/release/quantile outputs.
+See the [dated measurements](../research/fit-diagnostics-2026-10-12.md).
 
 ---
 
@@ -414,7 +432,10 @@ New artifacts include UTC ISO `generated_at`. The dashboard uses it for the
 48-hour freshness warning, with a conservative date-only fallback for older
 `drift_verdict.as_of_date` records. Undated or invalid refresh times show amber;
 filesystem mtime does not establish freshness. These warnings do not alter
-quarantine or the drift latch. Handled neighbor-fetch failures preserve the
+quarantine or the drift latch. The same assessment supplies one central amber
+alert combining stale, unknown-age, and failed-refresh warnings. Verdict chips
+retain the drift verdict’s color; age and refresh-time chips use their own conditions.
+A failed attempt does not make a fresh age amber. Handled neighbor-fetch failures preserve the
 previous artifact and return failure; unexpected exceptions still propagate.
 
 The drift verdict is **latched**: three consecutive days above threshold are
@@ -501,8 +522,10 @@ selection cannot be fitted from scoreable training history, the reason names
 the affected product, variable, semantics, and observed cause. Missing/empty
 matrices require building; missing forecast columns require archived forecasts;
 absent finite truth requires waiting for valid truth and incorporating it.
-Finite truth excluded by the issue-time cutoff calls for polling and can become
-eligible without rebuilding. The message describes some unavailable fits, not
+Pending truth on already-issued training rows can become eligible as live issuance
+advances without rebuilding. Finite truth available only on later-issued rows is
+diagnosed separately. Repeating a fixed historical `--now` cannot admit either
+kind of future evidence; rebuilding alone cannot bypass the cutoff. The message describes some unavailable fits, not
 every cause of degradation. Other compatible-evidence cases say no promoted
 release produced a finite hourly/daily forecast, without asserting that promotion
 never occurred. Null points omit quantiles and their source; a source is emitted only

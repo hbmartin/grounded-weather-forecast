@@ -205,17 +205,24 @@ default: a wrong quarantine silently deletes truth.
 ### Retained verdict freshness
 
 *Implemented in: `cli.py::_cmd_truth_qc`;
-`dashboard/truth_qc.py::truth_qc_freshness`;
+`reports/truth_qc.py::truth_qc_freshness`;
+`reports/operations.py::FRESHNESS_THRESHOLDS`; `reports/alerts.py::_truth_qc_alerts`;
 `dashboard/zones/data_trust.py::_truth_cross_check`*
 
 New schema-v3 QC artifacts carry a UTC ISO `generated_at` timestamp.
-`TRUTH_QC_MAX_AGE = 48 hours` is an operational display threshold, allowing two
+`FRESHNESS_THRESHOLDS["truth_qc_age_minutes"] = 2880` (48 hours) is the shared
+operational panel/alert threshold, allowing two
 nightly cycles; it is not a statistical drift threshold. The panel retains the
 verdict and chart but shows amber for old evidence, unknown refresh time, or
 a completed failed refresh not superseded by success. Both CLI invocation and
 maintenance-stage records count; unfinished and future records are ignored.
 A latched verdict remains red, and freshness changes neither latching nor
-quarantine.
+quarantine. The dashboard derives one assessment for the panel and central
+alerts. Verdict, refresh-time, age, and failed-attempt chips use independent
+conditions; failures do not change a fresh age’s color. One amber alert combines
+all freshness warnings. Failed attempts use the optional run-ledger
+`error_detail`, normalized to one line and at most 400 characters; legacy records
+fall back to exception class and exit code.
 
 Older `drift_verdict.as_of_date` values establish only a UTC date. The panel
 labels that precision and calls them stale only after the latest possible time

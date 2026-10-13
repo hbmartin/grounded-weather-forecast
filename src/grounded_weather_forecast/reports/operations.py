@@ -83,6 +83,7 @@ FRESHNESS_THRESHOLDS: Mapping[str, float] = {
     "collector_age_minutes": _COLLECTOR_AGE_ALARM_MINUTES,
     "served_history_age_minutes": _SERVED_AGE_ALARM_MINUTES,
     "forecast_document_age_minutes": _DOCUMENT_AGE_ALARM_MINUTES,
+    "truth_qc_age_minutes": 2880.0,
 }
 
 _SNAPSHOT_NAME = "identity_snapshot.json"

@@ -41,6 +41,7 @@ def test_append_and_load_round_trip(tmp_path):
     assert row["command"] == "qc"
     assert row["exit_code"] == 0
     assert row["error"] is None
+    assert row["error_detail"] is None
     assert row["duration_ms"] == 1500
 
 
@@ -62,7 +63,22 @@ def test_load_null_fills_missing_columns(tmp_path):
     pl.DataFrame({"run_id": ["x"], "command": ["qc"]}).write_parquet(path)
     frame = load_runs(path)
     assert frame["exit_code"].to_list() == [None]
+    assert frame["error_detail"].to_list() == [None]
     assert frame.schema == RUNS_SCHEMA
+
+
+def test_error_detail_round_trip_is_bounded_and_single_line(tmp_path):
+    from dataclasses import replace
+
+    detail = "  HTTP\n unavailable\t" + "x" * 500
+    record = replace(_record(exit_code=1), error_detail=detail)
+    path = tmp_path / "runs.parquet"
+    append_run(record, path, now=TEST_NOW)
+    row = load_runs(path).row(0, named=True)
+    assert row["error"] is None
+    assert row["error_detail"].startswith("HTTP unavailable ")
+    assert len(row["error_detail"]) == 400
+    assert row["error_detail"].endswith("...")
 
 
 def test_load_corrupt_parquet_returns_empty_schema_frame(tmp_path):
@@ -133,6 +149,7 @@ class TestRetention:
                 "record_kind": ["invocation", "invocation"],
                 "parent_run_id": [None, None],
                 "failure_kind": [None, None],
+                "error_detail": [None, None],
             },
             schema=RUNS_SCHEMA,
         )

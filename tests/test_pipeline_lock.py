@@ -228,6 +228,8 @@ def test_maintain_unexpected_exception_still_propagates(tmp_path, monkeypatch, s
     assert calls == (["truth-qc"] if stage == "truth-qc" else ["truth-qc", "report"])
     stages = load_runs(runs_path(config)).filter(pl.col("record_kind") == "stage")
     assert stages["command"][-1] == stage
+    assert stages["error"][-1] == "RuntimeError"
+    assert stages["error_detail"][-1] == "unexpected stage failure"
     assert stages["exit_code"][-1] is None
 
 
@@ -324,7 +326,32 @@ def test_neighbor_fetch_failure_still_refreshes_real_report(
         assert not artifact.exists()
     stages = ctx.runs.filter(pl.col("record_kind") == "stage")
     assert stages["exit_code"].to_list() == [0, 0, 1, 0]
+    assert stages["error_detail"].to_list() == [
+        None,
+        None,
+        "neighbor HTTP unavailable",
+        None,
+    ]
+    assert "neighbor HTTP unavailable" in (panel.intro or panel.empty_reason)
+    from grounded_weather_forecast.dashboard.derive import derive
+    from grounded_weather_forecast.dashboard.writer import _alert_inputs
+    from grounded_weather_forecast.reports.alerts import evaluate_alerts
+
+    alerts = [
+        a
+        for a in evaluate_alerts(_alert_inputs(ctx, derive(ctx)))
+        if a.panel_id == "truth-qc-freshness"
+    ]
+    assert len(alerts) == 1
+    assert "neighbor HTTP unavailable" in alerts[0].message
     assert "neighbor HTTP unavailable" in capsys.readouterr().out
+    assert main(["--config", str(tmp_path / "config.toml"), "truth-qc"]) == 1
+    invocation = load_runs(runs_path(config)).row(-1, named=True)
+    assert invocation["record_kind"] == "invocation"
+    assert invocation["error"] is None
+    assert invocation["error_detail"] == "neighbor HTTP unavailable"
+    if previous_artifact:
+        assert artifact.read_bytes() == original
     # A real subsequent standalone refresh supersedes the failed stage.
     checks = neighbors.NeighborChecks(
         daily_drift=pl.DataFrame(),
@@ -343,6 +370,7 @@ def test_neighbor_fetch_failure_still_refreshes_real_report(
     assert main(["--config", str(tmp_path / "config.toml"), "truth-qc"]) == 0
     refreshed = _truth_cross_check(collect_context(config))
     assert refreshed.status == "info"
+    assert load_runs(runs_path(config))["error_detail"][-1] is None
     assert "failed" not in refreshed.intro
     assert any(
         stat.label == "refreshed" and stat.value != "unknown"

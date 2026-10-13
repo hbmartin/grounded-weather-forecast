@@ -70,7 +70,10 @@ from grounded_weather_forecast.leads import (
     minutely_bucket,
 )
 from grounded_weather_forecast.serve.dataset_snapshot import LiveDatasetSnapshot
-from grounded_weather_forecast.serve.diagnostics import FitDiagnostics
+from grounded_weather_forecast.serve.diagnostics import (
+    FitDiagnostics,
+    FitUnavailableBranch,
+)
 from grounded_weather_forecast.serve.dressing import ResidualDresser, dress_variable
 from grounded_weather_forecast.serve.history import load_archived_forecast
 from grounded_weather_forecast.serve.observability import snapshot_observability
@@ -288,17 +291,34 @@ def _fit_methods(
     semantics: TruthSemantics,
     config: Config | None = None,
     issue_time: datetime | None = None,
+    fit_diagnostics: FitDiagnostics | None = None,
 ) -> tuple[dict[str, BlendResult], ForecastMatrix] | None:
     """Fit each needed method on history and predict the snapshot's rows."""
+    product = "daily" if daily else "hourly"
+    if fit_diagnostics is not None:
+        fit_diagnostics.start_fit(product, variable.name, semantics.value)
     truth_sources = matrix_sources(train)
     if not truth_sources:
+        if fit_diagnostics is not None:
+            fit_diagnostics.note_branch(
+                product,
+                variable.name,
+                semantics.value,
+                FitUnavailableBranch.NO_FORECAST_COLUMNS,
+            )
         return None
     slice_ = to_supervised_slice(train, variable, daily=daily, semantics=semantics)
     if slice_.x.n_rows == 0:
+        if fit_diagnostics is not None:
+            fit_diagnostics.note_branch(
+                product,
+                variable.name,
+                semantics.value,
+                FitUnavailableBranch.EMPTY_SLICE,
+            )
         return None
     x = to_forecast_matrix(predict_frame, variable, daily=daily, sources=truth_sources)
     results: dict[str, BlendResult] = {}
-    product = "daily" if daily else "hourly"
     for method_id in sorted(method_ids):
         if config is not None and method_id in _STATEFUL_METHODS:
             blender = _stateful_blender(
@@ -530,6 +550,7 @@ def _blend_variable(
         semantics=semantics,
         config=config,
         issue_time=issue_time,
+        fit_diagnostics=fit_diagnostics,
     )
     if fitted is None:
         if fit_diagnostics is not None:
@@ -1441,6 +1462,15 @@ def minutely_product(
     return points
 
 
+def _raw_training_matrix(
+    config: Config, product: str, frame: pl.DataFrame | None = None
+) -> pl.DataFrame:
+    if frame is not None:
+        return frame
+    path = matrix_path(config.dataset.dir, product, "live")
+    return pl.read_parquet(path) if path.exists() else pl.DataFrame()
+
+
 def _training_matrix(
     config: Config,
     product: str,
@@ -1449,9 +1479,7 @@ def _training_matrix(
     frame: pl.DataFrame | None = None,
     fit_diagnostics: FitDiagnostics | None = None,
 ) -> pl.DataFrame:
-    if frame is None:
-        path = matrix_path(config.dataset.dir, product, "live")
-        frame = pl.read_parquet(path) if path.exists() else pl.DataFrame()
+    frame = _raw_training_matrix(config, product, frame)
     if frame.is_empty():
         eligible = frame
     else:
@@ -1465,9 +1493,7 @@ def _training_matrix(
             & (pl.col("truth_known_at") <= issue_time)
         )
     if fit_diagnostics is not None:
-        fit_diagnostics.capture_training(
-            product, frame, eligible, has_forecasts=bool(matrix_sources(frame))
-        )
+        fit_diagnostics.capture_training(product, frame)
     return eligible
 
 
@@ -1506,21 +1532,15 @@ def predict(
             return archived
     snapshot = build_snapshot(config, issue_time)
     fit_diagnostics = FitDiagnostics()
-    hourly_train = _training_matrix(
+    rainfall_effects = RainfallEffects()
+    raw_hourly = _raw_training_matrix(
         config,
         "hourly",
-        issue_time,
-        frame=dataset_snapshot.hourly if dataset_snapshot is not None else None,
-        fit_diagnostics=fit_diagnostics,
+        dataset_snapshot.hourly if dataset_snapshot is not None else None,
     )
-    daily_train = _training_matrix(
-        config,
-        "daily",
-        issue_time,
-        frame=dataset_snapshot.daily if dataset_snapshot is not None else None,
-        fit_diagnostics=fit_diagnostics,
+    hourly_train = _training_matrix(
+        config, "hourly", issue_time, frame=raw_hourly, fit_diagnostics=fit_diagnostics
     )
-    rainfall_effects = RainfallEffects()
     hourly, hourly_blend = hourly_product(
         snapshot,
         hourly_train,
@@ -1530,6 +1550,16 @@ def predict(
         force_method,
         effects=rainfall_effects,
         fit_diagnostics=fit_diagnostics,
+    )
+    fit_diagnostics.resolve_training("hourly", raw_hourly, issue_time)
+    del raw_hourly
+    raw_daily = _raw_training_matrix(
+        config,
+        "daily",
+        dataset_snapshot.daily if dataset_snapshot is not None else None,
+    )
+    daily_train = _training_matrix(
+        config, "daily", issue_time, frame=raw_daily, fit_diagnostics=fit_diagnostics
     )
     daily = (
         daily_product(
@@ -1544,6 +1574,8 @@ def predict(
         if not snapshot.daily.is_empty()
         else []
     )
+    fit_diagnostics.resolve_training("daily", raw_daily, issue_time)
+    del raw_daily
     minutely = minutely_product(
         snapshot,
         hourly_blend,

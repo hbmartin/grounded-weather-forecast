@@ -23,6 +23,7 @@ from grounded_weather_forecast.dashboard.model import (
 )
 from grounded_weather_forecast.dashboard.truth_qc import truth_qc_freshness
 from grounded_weather_forecast.dashboard.zones.common import empty_panel
+from grounded_weather_forecast.reports.truth_qc import TruthQCFreshness
 
 _CALENDAR_DAYS = 45
 _FLAGGED_AMBER = 0.05
@@ -267,10 +268,21 @@ def _mapping(value: object) -> dict[str, object]:
     return {}
 
 
-def _truth_cross_check(ctx: DashboardContext) -> Panel:
+def _truth_verdict_status(verdict: dict[str, object]) -> PanelStatus:
+    if verdict.get("latched"):
+        return "red"
+    if verdict.get("exceeded"):
+        return "amber"
+    return "info" if verdict.get("exceeded") is None else "ok"
+
+
+def _truth_cross_check(
+    ctx: DashboardContext, *, freshness: TruthQCFreshness | None = None
+) -> Panel:
     payload = _mapping(ctx.truth_qc)
     verdict = _mapping(payload.get("drift_verdict"))
-    freshness = truth_qc_freshness(ctx)
+    if freshness is None:
+        freshness = truth_qc_freshness(ctx)
     if not payload or not verdict:
         return empty_panel(
             "b5",
@@ -288,31 +300,26 @@ def _truth_cross_check(ctx: DashboardContext) -> Panel:
         finite_number(row.get("difference")) for row in rows if isinstance(row, dict)
     ]
     cusums = [finite_number(row.get("cusum")) for row in rows if isinstance(row, dict)]
-    latched = bool(verdict.get("latched"))
-    exceeded = verdict.get("exceeded")
     attribution = verdict.get("attribution")
-    status: PanelStatus = (
-        "red"
-        if latched
-        else "amber"
-        if exceeded
-        else "info"
-        if exceeded is None
-        else "ok"
-    )
+    verdict_status = _truth_verdict_status(verdict)
+    status = verdict_status
     if freshness.warnings and status != "red":
         status = "amber"
     stats = (
         Stat(
             "verdict",
             str(attribution) if attribution else "quiet",
-            status if status != "info" else "ok",
+            verdict_status if verdict_status != "info" else "ok",
         ),
         Stat("streak", str(verdict.get("streak", 0))),
         Stat("days used", str(verdict.get("days_used", 0))),
         Stat("inversion days excluded", str(verdict.get("inversion_days_excluded", 0))),
-        Stat("refreshed", freshness.refreshed),
-        Stat("verdict age", freshness.age, "amber" if freshness.warnings else "ok"),
+        Stat(
+            "refreshed",
+            freshness.refreshed,
+            "amber" if freshness.refresh_unknown else "ok",
+        ),
+        Stat("verdict age", freshness.age, "amber" if freshness.age_unusable else "ok"),
         *(
             (Stat("failed refresh", freshness.failed_attempt, "amber"),)
             if freshness.failed_attempt is not None
@@ -345,7 +352,7 @@ def _truth_cross_check(ctx: DashboardContext) -> Panel:
     )
 
 
-def build(ctx: DashboardContext, derived: Derived) -> Zone:  # noqa: ARG001
+def build(ctx: DashboardContext, derived: Derived) -> Zone:
     return Zone(
         zone_id="B",
         title="Ingestion & data trust",
@@ -355,6 +362,6 @@ def build(ctx: DashboardContext, derived: Derived) -> Zone:  # noqa: ARG001
             _coverage_calendar(ctx),
             _provider_nulls(ctx),
             _provenance(ctx),
-            _truth_cross_check(ctx),
+            _truth_cross_check(ctx, freshness=derived.truth_qc_freshness),
         ),
     )

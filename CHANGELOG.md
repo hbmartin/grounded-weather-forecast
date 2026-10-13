@@ -8,6 +8,12 @@ adheres to [Semantic Versioning](https://semver.org/).
 
 ### Changed
 
+- Truth-QC chips now describe independent conditions and share freshness with
+  central alerts. Run ledgers retain bounded handled-failure details. Unavailable
+  fits report authoritative fitting branches and distinguish pending truth from
+  later-issued evidence, with advice for fixed historical issuance. Diagnostic
+  truth scans run only for failed promoted targets, with no extra matrix reads.
+
 - Truth-QC artifacts carry an optional UTC refresh timestamp. Retained dashboard
   verdicts warn after a failed refresh, beyond 48 hours, or when freshness is
   unknown; latched drift remains red. Date-only legacy artifacts remain readable.

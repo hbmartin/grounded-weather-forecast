@@ -53,6 +53,7 @@ def _alert_inputs(ctx: DashboardContext, derived: Derived) -> AlertInputs:
         now=ctx.now,
         manifest=ctx.manifest,
         runs=ctx.runs,
+        truth_qc_freshness=derived.truth_qc_freshness,
         minute_truth=ctx.truth_minute if ctx.truth_minute is not None else _empty(),
         hourly_truth=ctx.truth_hourly if ctx.truth_hourly is not None else _empty(),
         daily_truth=ctx.truth_daily if ctx.truth_daily is not None else _empty(),

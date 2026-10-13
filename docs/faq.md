@@ -131,6 +131,16 @@ anything else, because every later command will fail more confusingly.
 
 ## Interpreting output
 
+### Why does the truth-QC panel warn after a successful report?
+
+A report refreshes the dashboard, not the retained QC verdict. The panel and
+central alert list warn after a failed QC refresh, when the verdict is over
+48 hours old, or when its freshness is unknown. Individual chips keep their own
+conditions: a quiet verdict stays green, an unknown refresh time is amber, and
+a failed attempt does not change a fresh age’s color. Failed attempts display
+the bounded message saved in the run ledger. Latched drift remains red, and
+these operational warnings do not change fitting quarantine.
+
 ### Why does my forecast say `degraded`?
 
 With automatic selection, `status: "degraded"` means no finite hourly or daily
@@ -147,7 +157,7 @@ release attribution. `status_reason` explains automatic degradation. Common ones
 | implementation changed since the last backtest | run `recover`, or re-run `backtest --source live` then `report` |
 | dataset fingerprint changed | run `recover`, which rebuilds before backtesting |
 | configuration changed | run `recover`, or re-run the live backtest and report |
-| some compatible promoted selections could not be fitted at issuance | inspect the named product/variable and cause: keep polling for causal exclusion; build missing matrices or incorporate newly available valid truth as advised |
+| some compatible promoted selections could not be fitted at issuance | inspect the named product/variable and cause: poll as live issuance advances for pending truth; later-issued rows remain unavailable at fixed historical `--now`; build missing matrices or incorporate valid truth as advised |
 | live evidence exists but no promoted release produced a finite hourly or daily forecast | inspect per-field reasons and provider availability; this does not mean a release was never promoted |
 | rainfall safeguard removed attribution | inspect wet-day counts in the affected fields; automatic rainfall needs five distinct wet training days per bucket |
 | rainfall reconciliation removed attribution | inspect native minute, hourly, and observed rainfall; the adjusted value cannot inherit the model's release or uncertainty |

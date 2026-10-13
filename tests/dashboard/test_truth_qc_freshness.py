@@ -41,12 +41,15 @@ def context(tmp_path, *, generated_at=NOW.isoformat(), verdict=None, runs=()):
                 "ended_at": pl.Datetime("us", "UTC"),
                 "exit_code": pl.Int64,
                 "error": pl.String,
+                "error_detail": pl.String,
             },
         ),
     )
 
 
-def attempt(*, kind="stage", ended=NOW, code=1, error=None, command="truth-qc"):
+def attempt(
+    *, kind="stage", ended=NOW, code=1, error=None, detail=None, command="truth-qc"
+):
     return {
         "command": command,
         "record_kind": kind,
@@ -54,6 +57,7 @@ def attempt(*, kind="stage", ended=NOW, code=1, error=None, command="truth-qc"):
         "ended_at": ended,
         "exit_code": code,
         "error": error,
+        "error_detail": detail,
     }
 
 
@@ -64,6 +68,16 @@ def test_qc_age_uses_48_hour_boundary(tmp_path, hours, stale):
     assert panel.status == ("amber" if stale else "ok")
     assert ("over 48 hours" in panel.intro) == stale
     assert any(stat.label == "refreshed" for stat in panel.stats)
+    from grounded_weather_forecast.dashboard.derive import derive
+    from grounded_weather_forecast.dashboard.writer import _alert_inputs
+    from grounded_weather_forecast.reports.alerts import evaluate_alerts
+
+    alerts = [
+        a
+        for a in evaluate_alerts(_alert_inputs(ctx, derive(ctx)))
+        if a.panel_id == "truth-qc-freshness"
+    ]
+    assert bool(alerts) == stale
 
 
 @pytest.mark.parametrize(
@@ -172,6 +186,18 @@ def test_no_verdict_is_young_or_failed_refresh(tmp_path, has_failure):
     assert panel.status == ("amber" if has_failure else "info")
     assert panel.empty_reason
     assert ("failed" in panel.empty_reason) == has_failure
+    from grounded_weather_forecast.dashboard.derive import derive
+    from grounded_weather_forecast.dashboard.writer import _alert_inputs
+    from grounded_weather_forecast.reports.alerts import evaluate_alerts
+
+    empty_ctx = replace(ctx, truth_qc=None)
+    (alert,) = [
+        a
+        for a in evaluate_alerts(_alert_inputs(empty_ctx, derive(empty_ctx)))
+        if a.panel_id == "truth-qc-freshness"
+    ]
+    assert alert.severity == ("amber" if has_failure else "info")
+    assert alert.evaluable == has_failure
 
 
 def test_latched_drift_remains_red_with_staleness_and_failed_refresh(tmp_path):
@@ -185,3 +211,70 @@ def test_latched_drift_remains_red_with_staleness_and_failed_refresh(tmp_path):
     assert panel.status == "red"
     assert "over 48 hours" in panel.intro
     assert "failed" in panel.intro
+
+
+@pytest.mark.parametrize(
+    "hours,unknown,failed", [(1, False, True), (49, False, False), (1, True, False)]
+)
+def test_qc_chips_describe_their_own_conditions(tmp_path, hours, unknown, failed):
+    ctx = context(
+        tmp_path,
+        generated_at=None if unknown else (NOW - timedelta(hours=hours)).isoformat(),
+        runs=[attempt(detail="neighbor HTTP unavailable")] if failed else [],
+    )
+    panel = _truth_cross_check(ctx)
+    chips = {stat.label: stat for stat in panel.stats}
+    assert panel.status == "amber"
+    assert chips["verdict"].status == "ok"
+    assert chips["refreshed"].status == ("amber" if unknown else "ok")
+    assert chips["verdict age"].status == ("amber" if unknown or hours > 48 else "ok")
+    if failed:
+        assert "neighbor HTTP unavailable" in chips["failed refresh"].value
+
+
+def test_shared_qc_assessment_drives_panel_and_single_alert(tmp_path, monkeypatch):
+    from grounded_weather_forecast.dashboard.derive import derive
+    from grounded_weather_forecast.dashboard.writer import _alert_inputs
+    from grounded_weather_forecast.dashboard.zones import data_trust
+    from grounded_weather_forecast.reports.alerts import evaluate_alerts
+
+    ctx = context(
+        tmp_path,
+        generated_at=(NOW - timedelta(hours=49)).isoformat(),
+        runs=[attempt(detail="HTTP unavailable")],
+    )
+    derived = derive(ctx)
+    monkeypatch.setattr(
+        data_trust,
+        "truth_qc_freshness",
+        lambda _ctx: pytest.fail("assessment recomputed"),
+    )
+    zone = data_trust.build(ctx, derived)
+    panel = next(panel for panel in zone.panels if panel.panel_id == "b5")
+    inputs = _alert_inputs(ctx, derived)
+    assert inputs.truth_qc_freshness is derived.truth_qc_freshness
+    alerts = [
+        alert
+        for alert in evaluate_alerts(inputs)
+        if alert.panel_id == "truth-qc-freshness"
+    ]
+    assert len(alerts) == 1
+    assert alerts[0].severity == "amber"
+    for warning in derived.truth_qc_freshness.warnings:
+        assert warning in alerts[0].message
+        assert warning in panel.intro
+
+
+def test_error_details_are_html_escaped(tmp_path):
+    from grounded_weather_forecast.dashboard.html import render_panel
+
+    panel = _truth_cross_check(
+        context(
+            tmp_path,
+            generated_at=(NOW - timedelta(hours=1)).isoformat(),
+            runs=[attempt(detail='<script>alert("x")</script>')],
+        )
+    )
+    html = render_panel(panel)
+    assert "<script>alert" not in html
+    assert "&lt;script&gt;" in html

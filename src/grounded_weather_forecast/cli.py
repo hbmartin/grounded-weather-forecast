@@ -2,7 +2,7 @@
 
 import argparse
 import sys
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 
@@ -607,13 +607,16 @@ def _cmd_truth_qc(config: Config, args: argparse.Namespace) -> int:
     )
     from grounded_weather_forecast.solar import toa_irradiance_wm2  # noqa: PLC0415
 
+    vars(args).pop("_error_detail", None)
     if args.days <= 0:
+        vars(args)["_error_detail"] = "--days must be a positive integer"
         print("truth-qc failed: --days must be a positive integer")
         return 1
     _minute, hourly_truth, _daily = build_truth(config)
     try:
         checks = fetch_neighbor_checks(config, hourly_truth, hours=args.days * 24)
     except (NeighborError, OSError, ValueError) as exc:
+        vars(args)["_error_detail"] = str(exc)
         print(f"truth-qc failed: {exc}")
         return 1
     verdict_block = _drift_verdict_block(config, checks, hourly_truth)
@@ -1450,9 +1453,12 @@ def _run_pipeline_steps(
     *,
     backtest_args: argparse.Namespace | None = None,
     continue_on_failure: frozenset[str] = frozenset(),
+    stage_args: Mapping[str, argparse.Namespace] | None = None,
 ) -> int:
     first_failure = 0
     for name, step in steps:
+        record_args = stage_args.get(name, args) if stage_args is not None else args
+        vars(record_args).pop("_error_detail", None)
         print(f"pipeline step: {name}")
         started_at = datetime.now(tz=UTC)
         result: int | None = None
@@ -1466,7 +1472,7 @@ def _run_pipeline_steps(
             )
             if kind:
                 vars(args)["_failure_kind"] = kind
-            stage = argparse.Namespace(**vars(args))
+            stage = argparse.Namespace(**vars(record_args))
             stage.command = name.split()[0]
             _record_run(
                 config,
@@ -1503,6 +1509,7 @@ def _cmd_maintain(config: Config, args: argparse.Namespace) -> int:
             ("report", lambda: _cmd_report(config)),
         ),
         continue_on_failure=frozenset({"truth-qc"}),
+        stage_args={"truth-qc": truth_args},
     )
 
 
@@ -1726,6 +1733,9 @@ def _record_run(
             record_kind=record_kind,
             parent_run_id=parent_run_id,
             failure_kind=failure_kind or getattr(args, "_failure_kind", None),
+            error_detail=runs.normalize_error_detail(
+                error if error is not None else getattr(args, "_error_detail", None)
+            ),
         )
         runs.append_run(record, runs.runs_path(config))
     except (Exception,):  # noqa: B013 - project style requires tuple clauses
