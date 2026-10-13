@@ -82,6 +82,42 @@ def test_cli_failure_detail_normalizes_once_at_persistence(
         assert record["error_detail"] == raw
 
 
+@pytest.mark.parametrize("unexpected", [False, True])
+def test_recorder_uses_explicit_metadata_and_active_exception_precedence(
+    tmp_path, unexpected
+):
+    import argparse
+    from datetime import UTC, datetime
+    from grounded_weather_forecast import runs
+
+    config = write_config(tmp_path)
+    args = argparse.Namespace(
+        command="truth-qc",
+        days=17,
+        _failure_kind="must not inherit",
+        _error_detail="must not inherit",
+    )
+    started = datetime.now(UTC)
+    if unexpected:
+        with pytest.raises(RuntimeError, match="active exception detail"):
+            try:
+                raise RuntimeError("active exception detail")
+            finally:
+                cli_module._record_run(
+                    config,
+                    args,
+                    started_at=started,
+                    exit_code=None,
+                    failure_kind="explicit-kind",
+                    error_detail="handled detail",
+                )
+    else:
+        cli_module._record_run(config, args, started_at=started, exit_code=1)
+    record = load_runs(runs.runs_path(config)).row(0, named=True)
+    assert record["failure_kind"] == ("explicit-kind" if unexpected else None)
+    assert record["error_detail"] == ("active exception detail" if unexpected else None)
+
+
 def test_mean_semantics_binds_only_dual_semantics_variables(tmp_path: Path) -> None:
     config = write_config(tmp_path)
 

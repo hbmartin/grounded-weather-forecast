@@ -152,6 +152,9 @@ migration or rewriting.
 Warnings display class and detail together when both exist. Maintenance's
 parent run retains its options, while the linked QC stage records `{"days": N}`;
 unrelated child stages do not inherit the parent's private failure kind.
+Child stage arguments contain public options only. Failure kind and handled
+detail are passed explicitly; an active exception supplies its class and message
+in preference to a handled detail. Details are normalized when persisted.
 Build/backtest failures and unexpected exceptions still stop
 maintenance. Source changes alter the code fingerprint: generate fresh live
 backtest and report evidence with the updated code before rollout.

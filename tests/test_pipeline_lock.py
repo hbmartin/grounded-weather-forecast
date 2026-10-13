@@ -279,6 +279,63 @@ def test_pipeline_child_records_do_not_inherit_parent_failure_kind(tmp_path):
     assert args._failure_kind == "parent-only"
 
 
+def test_stage_namespaces_are_public_and_metadata_is_explicit(tmp_path, monkeypatch):
+    import argparse
+    from datetime import UTC, datetime
+
+    config = write_config(tmp_path)
+    args = argparse.Namespace(
+        command="maintain",
+        truth_qc_days=17,
+        _failure_kind="parent-only",
+        _run_started_at=datetime.now(UTC),
+        _unknown_private="never copy",
+        _error_detail="old parent detail",
+    )
+    truth_args = argparse.Namespace(
+        days=17, _error_detail="old QC detail", _other="private"
+    )
+    recorded = []
+    real_record = cli_module._record_run
+
+    def record(config, stage, **metadata):
+        assert not any(key.startswith("_") for key in vars(stage))
+        recorded.append((vars(stage).copy(), metadata))
+        real_record(config, stage, **metadata)
+
+    def fail_qc():
+        assert not hasattr(truth_args, "_error_detail")
+        truth_args._error_detail = "  handled\nneighbor failure  "
+        return 1
+
+    def report():
+        assert not hasattr(args, "_error_detail")
+        return 0
+
+    monkeypatch.setattr(cli_module, "_record_run", record)
+    assert (
+        cli_module._run_pipeline_steps(
+            config,
+            args,
+            (("truth-qc", fail_qc), ("report", report)),
+            continue_on_failure=frozenset({"truth-qc"}),
+            stage_args={"truth-qc": truth_args},
+        )
+        == 1
+    )
+    assert recorded[0][0] == {"days": 17, "command": "truth-qc"}
+    assert recorded[0][1]["error_detail"] == "  handled\nneighbor failure  "
+    assert recorded[1][1]["error_detail"] is None
+    assert all(metadata["failure_kind"] is None for _, metadata in recorded)
+    assert all(
+        metadata["parent_run_id"] == cli_module._parent_run_id(args)
+        for _, metadata in recorded
+    )
+    rows = load_runs(runs_path(config))
+    assert rows["error_detail"].to_list() == ["handled neighbor failure", None]
+    assert args._failure_kind == "parent-only"
+
+
 @pytest.mark.parametrize("rule", ["mcs", "legacy", "seq_mcs"])
 @pytest.mark.parametrize("previous_artifact", [False, True])
 def test_neighbor_fetch_failure_still_refreshes_real_report(
