@@ -7,6 +7,7 @@ import os
 import shutil
 import subprocess
 import sys
+from datetime import UTC, datetime
 from pathlib import Path
 from types import ModuleType
 
@@ -123,9 +124,225 @@ def test_output_path_contract_from_another_cwd(benchmark, tmp_path, monkeypatch,
     )
     destination = benchmark.output_path(REPO, supplied)
     if supplied is None:
-        assert destination == REPO / "docs/research/fit-diagnostics-2026-10-13.jsonl"
+        assert destination.parent == REPO / "reports/benchmarks"
         assert destination.is_absolute()
+        stamp, identifier = destination.stem.removeprefix("fit-diagnostics-").split("-")
+        assert datetime.strptime(stamp, "%Y%m%dT%H%M%S%fZ").replace(
+            tzinfo=UTC
+        ) <= datetime.now(UTC)
+        assert len(identifier) == 32
+        assert destination != benchmark.output_path(REPO, None)
     else:
         assert destination == supplied
         if not supplied.is_absolute():
             assert destination.resolve() == tmp_path / supplied
+
+
+@pytest.mark.parametrize("artifact", [0, 1])
+@pytest.mark.parametrize("kind", ["file", "directory", "symlink", "broken_symlink"])
+def test_existing_destination_rejected_before_workers(
+    benchmark, tmp_path, monkeypatch, artifact, kind
+):
+    output = tmp_path / "samples.jsonl"
+    collision = benchmark.artifact_paths(output)[artifact]
+    if kind == "file":
+        collision.write_bytes(b"previous evidence")
+    elif kind == "directory":
+        collision.mkdir()
+    else:
+        target = tmp_path / "target"
+        if kind == "symlink":
+            target.write_bytes(b"previous evidence")
+        collision.symlink_to(target)
+    monkeypatch.setattr(sys, "argv", [str(SCRIPT), "--output", str(output)])
+
+    def no_workers(*_args, **_kwargs):
+        pytest.fail("preflight collision must stop before git or workers")
+
+    monkeypatch.setattr(benchmark.subprocess, "check_output", no_workers)
+    with pytest.raises(SystemExit) as error:
+        benchmark.main()
+    assert error.value.code == 2
+    assert collision.exists() or collision.is_symlink()
+    if kind in {"file", "symlink"}:
+        assert collision.read_bytes() == b"previous evidence"
+
+
+@pytest.mark.parametrize("output", [".", "/"])
+def test_nameless_directory_output_is_an_existing_destination(
+    benchmark, tmp_path, monkeypatch, output
+):
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(sys, "argv", [str(SCRIPT), "--output", output])
+    with pytest.raises(SystemExit) as error:
+        benchmark.main()
+    assert error.value.code == 2
+
+
+@pytest.mark.parametrize("artifact", [0, 1])
+def test_late_collision_preserves_existing_bytes_and_removes_only_owned_outputs(
+    benchmark, tmp_path, artifact
+):
+    output = tmp_path / "samples.jsonl"
+    benchmark.check_output_paths(output)
+    collision = benchmark.artifact_paths(output)[artifact]
+    collision.write_bytes(b"late evidence")
+    with pytest.raises(FileExistsError):
+        benchmark.publish_outputs(output, "new samples", "new summary")
+    assert collision.read_bytes() == b"late evidence"
+    assert not benchmark.artifact_paths(output)[1 - artifact].exists()
+
+
+def test_failed_publication_preserves_replacement_owned_by_another_writer(
+    benchmark, tmp_path, monkeypatch
+):
+    output = tmp_path / "samples.jsonl"
+    summary = benchmark.artifact_paths(output)[1]
+    real_open = Path.open
+
+    def replace_sample(path, *args, **kwargs):
+        if path == summary:
+            output.unlink()
+            output.write_bytes(b"other writer")
+            raise PermissionError("summary permission denied")
+        return real_open(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "open", replace_sample)
+    with pytest.raises(PermissionError, match="summary permission denied"):
+        benchmark.publish_outputs(output, "new samples", "new summary")
+    assert output.read_bytes() == b"other writer"
+    assert not summary.exists()
+
+
+def test_write_failure_removes_both_owned_outputs(benchmark, tmp_path, monkeypatch):
+    output = tmp_path / "samples.jsonl"
+    real_open = Path.open
+
+    class BrokenWriter:
+        def __init__(self, stream):
+            self.stream = stream
+
+        def __enter__(self):
+            self.stream.__enter__()
+            return self
+
+        def __exit__(self, *args):
+            return self.stream.__exit__(*args)
+
+        def fileno(self):
+            return self.stream.fileno()
+
+        def write(self, content):
+            self.stream.write(content[:2])
+            raise OSError("write failed")
+
+    def broken_open(path, *args, **kwargs):
+        return BrokenWriter(real_open(path, *args, **kwargs))
+
+    monkeypatch.setattr(Path, "open", broken_open)
+    with pytest.raises(OSError, match="write failed"):
+        benchmark.publish_outputs(output, "samples", "summary")
+    assert all(not path.exists() for path in benchmark.artifact_paths(output))
+
+
+def test_exclusive_publication_writes_both_outputs(benchmark, tmp_path):
+    output = tmp_path / "new/samples.jsonl"
+    benchmark.publish_outputs(output, "samples\n", "summary\n")
+    assert [path.read_text() for path in benchmark.artifact_paths(output)] == [
+        "samples\n",
+        "summary\n",
+    ]
+
+
+@pytest.mark.parametrize("fail", [False, True])
+def test_main_reports_artifact_paths_or_publication_failure(
+    benchmark, tmp_path, monkeypatch, capsys, fail
+):
+    output = tmp_path / "samples.jsonl"
+    monkeypatch.setattr(
+        sys, "argv", [str(SCRIPT), "--runs", "1", "--output", str(output)]
+    )
+    real_output = subprocess.check_output
+
+    def worker_output(command, **kwargs):
+        if "--worker" in command:
+            return json.dumps(
+                {
+                    "workload": command[command.index("--workload") + 1],
+                    "rows": int(command[command.index("--rows") + 1]),
+                    "median_ms": 1.0,
+                    "payload": {"same": True},
+                }
+            )
+        return real_output(command, **kwargs)
+
+    monkeypatch.setattr(benchmark.subprocess, "check_output", worker_output)
+    if fail:
+
+        def collision(*_args):
+            raise FileExistsError("late collision")
+
+        monkeypatch.setattr(benchmark, "publish_outputs", collision)
+        with pytest.raises(SystemExit) as error:
+            benchmark.main()
+        assert error.value.code == 1
+        assert (
+            "could not publish benchmark outputs: late collision"
+            in capsys.readouterr().err
+        )
+    else:
+        benchmark.main()
+        printed = capsys.readouterr().out
+        assert all(
+            f"wrote {path}" in printed for path in benchmark.artifact_paths(output)
+        )
+
+
+def test_origin_checks_skip_blocked_imports(benchmark, monkeypatch):
+    monkeypatch.setitem(sys.modules, "grounded_weather_forecast.blocked", None)
+    origins = benchmark.module_origins((REPO / "src").resolve())
+    assert "grounded_weather_forecast.blocked" not in origins
+
+
+def test_vanished_origin_is_actionable_and_chained(benchmark, tmp_path, monkeypatch):
+    module = ModuleType("vanished")
+    module.__file__ = str(tmp_path / "vanished.py")
+    monkeypatch.setitem(sys.modules, "grounded_weather_forecast.vanished", module)
+    with pytest.raises(
+        RuntimeError, match=r"cannot resolve module origin.*vanished"
+    ) as error:
+        benchmark.module_origins((REPO / "src").resolve())
+    assert isinstance(error.value.__cause__, FileNotFoundError)
+
+
+def test_worker_rechecks_origins_after_warmup(source_tree, tmp_path, benchmark):
+    probe = tmp_path / "probe.py"
+    probe.write_text(f"""import argparse
+import importlib.util
+from pathlib import Path
+spec = importlib.util.spec_from_file_location("benchmark", {str(SCRIPT)!r})
+benchmark = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(benchmark)
+real = benchmark.module_origins
+checks = []
+def verify(source):
+    checks.append(source)
+    if len(checks) == 2:
+        raise RuntimeError("foreign origin discovered after warmup")
+    return real(source)
+def timed():
+    raise AssertionError("timing began before origin validation")
+benchmark.module_origins = verify
+benchmark.time.perf_counter = timed
+benchmark.worker(argparse.Namespace(source=Path({str(source_tree)!r}), rows=3, workload="successful_fit"))
+""")
+    completed = subprocess.run(  # noqa: S603 -- local worker and fixture argv
+        [sys.executable, str(probe)],
+        env=os.environ | benchmark.THREADS,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    assert completed.returncode != 0
+    assert "foreign origin discovered after warmup" in completed.stderr
+    assert "timing began" not in completed.stderr

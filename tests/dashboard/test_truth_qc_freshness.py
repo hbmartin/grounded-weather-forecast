@@ -233,6 +233,9 @@ def test_qc_chips_describe_their_own_conditions(tmp_path, hours, unknown, failed
 
 
 def test_shared_qc_assessment_drives_panel_and_single_alert(tmp_path, monkeypatch):
+    from grounded_weather_forecast.dashboard import derive as derivation
+    from grounded_weather_forecast.dashboard import writer
+    from grounded_weather_forecast.dashboard.truth_qc import truth_qc_freshness
     from grounded_weather_forecast.dashboard.derive import derive
     from grounded_weather_forecast.dashboard.writer import _alert_inputs
     from grounded_weather_forecast.dashboard.zones import data_trust
@@ -243,7 +246,19 @@ def test_shared_qc_assessment_drives_panel_and_single_alert(tmp_path, monkeypatc
         generated_at=(NOW - timedelta(hours=49)).isoformat(),
         runs=[attempt(detail="HTTP unavailable")],
     )
+    calls = []
+
+    def assess(received):
+        assert received is ctx
+        calls.append(received)
+        return truth_qc_freshness(received)
+
+    monkeypatch.setattr(derivation, "truth_qc_freshness", assess)
     derived = derive(ctx)
+    assert calls == [ctx]
+    monkeypatch.setattr(
+        writer, "truth_qc_freshness", lambda _ctx: pytest.fail("assessment recomputed")
+    )
     monkeypatch.setattr(
         data_trust,
         "truth_qc_freshness",
@@ -281,7 +296,9 @@ def test_error_details_are_html_escaped(tmp_path):
 
 
 @pytest.mark.parametrize("state", ["fresh", "stale", "unknown", "failed", "missing"])
-def test_direct_alert_inputs_fallback_agrees_with_panel(tmp_path, state):
+def test_direct_alert_inputs_fallback_agrees_with_panel(tmp_path, monkeypatch, state):
+    from grounded_weather_forecast.dashboard import writer
+    from grounded_weather_forecast.dashboard.truth_qc import truth_qc_freshness
     from grounded_weather_forecast.dashboard.derive import Derived
     from grounded_weather_forecast.dashboard.writer import _alert_inputs
     from grounded_weather_forecast.reports.alerts import evaluate_alerts
@@ -295,7 +312,16 @@ def test_direct_alert_inputs_fallback_agrees_with_panel(tmp_path, state):
     )
     if state == "missing":
         ctx = replace(ctx, truth_qc=None)
+    calls = []
+
+    def assess(received):
+        assert received is ctx
+        calls.append(received)
+        return truth_qc_freshness(received)
+
+    monkeypatch.setattr(writer, "truth_qc_freshness", assess)
     inputs = _alert_inputs(ctx, Derived())
+    assert calls == [ctx]
     assert inputs.truth_qc_freshness is not None
     panel = _truth_cross_check(ctx)
     alerts = [a for a in evaluate_alerts(inputs) if a.panel_id == "truth-qc-freshness"]

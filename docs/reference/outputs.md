@@ -152,9 +152,23 @@ migration or rewriting.
 Warnings display class and detail together when both exist. Maintenance's
 parent run retains its options, while the linked QC stage records `{"days": N}`;
 unrelated child stages do not inherit the parent's private failure kind.
+Child stage arguments contain public options only. Failure kind and handled
+detail are passed explicitly; an active exception supplies its class and message
+in preference to a handled detail. Details are normalized when persisted.
 Build/backtest failures and unexpected exceptions still stop
 maintenance. Source changes alter the code fingerprint: generate fresh live
 backtest and report evidence with the updated code before rollout.
+
+### Fitting benchmark scratch outputs
+
+`scripts/benchmark_fit_diagnostics.py` defaults to unique UTC timestamp-and-UUID
+sample names under the repository's ignored `reports/benchmarks/`, with a summary
+beside each JSONL. It prints both paths. Explicit relative destinations use the
+caller's working directory. Existing sample or summary destinations are refused
+before measuring (exit `2`); exclusive creation also protects late collisions.
+Publication failures return nonzero and clean up only that invocation's files.
+Use a new explicit destination to retain evidence; ordinary runs do not replace
+committed research artifacts.
 
 ### The history ledgers
 

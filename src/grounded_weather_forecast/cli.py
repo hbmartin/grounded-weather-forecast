@@ -1472,8 +1472,13 @@ def _run_pipeline_steps(
             )
             if kind:
                 vars(args)["_failure_kind"] = kind
-            stage = argparse.Namespace(**vars(record_args))
-            vars(stage).pop("_failure_kind", None)
+            stage = argparse.Namespace(
+                **{
+                    key: value
+                    for key, value in vars(record_args).items()
+                    if not key.startswith("_")
+                }
+            )
             stage.command = name.split()[0]
             _record_run(
                 config,
@@ -1483,6 +1488,7 @@ def _run_pipeline_steps(
                 record_kind="stage",
                 parent_run_id=_parent_run_id(args),
                 failure_kind=kind,
+                error_detail=getattr(record_args, "_error_detail", None),
             )
         if result:
             first_failure = first_failure or result
@@ -1700,6 +1706,7 @@ def _record_run(
     record_kind: str = "invocation",
     parent_run_id: str | None = None,
     failure_kind: str | None = None,
+    error_detail: str | None = None,
 ) -> None:
     """Append this invocation to the run ledger; never raises."""
     try:
@@ -1733,12 +1740,8 @@ def _record_run(
             code_version=__version__,
             record_kind=record_kind,
             parent_run_id=parent_run_id,
-            failure_kind=failure_kind or getattr(args, "_failure_kind", None),
-            error_detail=(
-                str(error)
-                if error is not None
-                else getattr(args, "_error_detail", None)
-            ),
+            failure_kind=failure_kind,
+            error_detail=(str(error) if error is not None else error_detail),
         )
         runs.append_run(record, runs.runs_path(config))
     except (Exception,):  # noqa: B013 - project style requires tuple clauses
@@ -1760,7 +1763,14 @@ def main(argv: Sequence[str] | None = None) -> int:
         exit_code = _dispatch(config, args, parser)
         return exit_code  # noqa: RET504 - the finally block reads exit_code
     finally:
-        _record_run(config, args, started_at=started_at, exit_code=exit_code)
+        _record_run(
+            config,
+            args,
+            started_at=started_at,
+            exit_code=exit_code,
+            failure_kind=getattr(args, "_failure_kind", None),
+            error_detail=getattr(args, "_error_detail", None),
+        )
 
 
 if __name__ == "__main__":  # pragma: no cover

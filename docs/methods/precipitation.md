@@ -212,6 +212,7 @@ temperature.
 `serve/predict.py::_point_fields`; `serve/predict.py::_blend_variable`;
 `serve/predict.py::_fit_methods`;
 `serve/diagnostics.py::UnavailableFit`; `serve/diagnostics.py::FitDiagnostics`;
+`serve/diagnostics.py::FitDiagnostics.resolve_training`;
 `serve/selection.py::no_evidence_reason`;
 `dataset/truth.py::observed_rainfall`;
 `dataset/providers.py::align_hourly_rain`; `dataset/matrix.py`;
@@ -312,9 +313,16 @@ never training frames, performs no extra matrix reads, and is not serialized.
 Promoted failures belong to that product snapshot: later unpromoted or successful
 attempts do not erase them. Each failure keeps its actual branch and truth column
 while waiting for resolution, so later attempt metadata cannot change its cause.
-Output records are sorted and deduplicated by scope/cause. Internal callers must
-capture training before fitting and resolve after all fits while raw history is
-local. Capturing a new snapshot resets only that product's failures. It remains
+Output records are sorted and deduplicated by scope/cause. Unresolved empty-slice
+attempts remain pending, without a provisional unknown-history diagnosis. The
+compatibility availability flag includes them; reading `failures` before
+resolution raises `RuntimeError`, naming the pending products and required
+`resolve_training` step. Branchless unknown-history records are already final.
+Internal callers must capture training before fitting and resolve after all fits
+while raw history is local. Incremental resolution merges facts and aggregates
+only truth columns not yet cached, once per snapshot. The raw matrix and issuance
+cutoff must stay fixed until the next capture. Capturing a new snapshot resets
+only that product's facts and failures. It remains
 separate from rainfall effects. Archive absence and identity mismatches keep
 their precedence; when identities match, the document names only the unavailable
 fits, without claiming that all training or every forecast is unavailable.

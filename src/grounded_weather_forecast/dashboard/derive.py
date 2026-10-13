@@ -15,11 +15,9 @@ from grounded_weather_forecast.contracts import (
     hourly_variable,
 )
 from grounded_weather_forecast.dashboard.context import DashboardContext
+from grounded_weather_forecast.dashboard.truth_qc import truth_qc_freshness
 from grounded_weather_forecast.reports.correlation import error_correlation
-from grounded_weather_forecast.reports.truth_qc import (
-    TruthQCFreshness,
-    truth_qc_freshness,
-)
+from grounded_weather_forecast.reports.truth_qc import TruthQCFreshness
 from grounded_weather_forecast.reports.verification import (
     compare_to_backtest,
     verify_history,
@@ -123,5 +121,5 @@ def derive(ctx: DashboardContext) -> Derived:
         correlation=correlation,
         k_eff=k_eff,
         live_scores_unusable=live_unusable,
-        truth_qc_freshness=truth_qc_freshness(ctx.truth_qc, ctx.runs, ctx.now),
+        truth_qc_freshness=truth_qc_freshness(ctx),
     )

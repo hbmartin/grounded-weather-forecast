@@ -21,14 +21,14 @@ def history():
     )
 
 
-def attempt(diagnostics, branch, *, promoted=True, product="hourly"):
-    diagnostics.start_fit(product, "temp_c", "inst")
+def attempt(diagnostics, branch, *, promoted=True, product="hourly", variable="temp_c"):
+    diagnostics.start_fit(product, variable, "inst")
     if branch is not None:
-        diagnostics.note_branch(product, "temp_c", "inst", branch)
+        diagnostics.note_branch(product, variable, "inst", branch)
     diagnostics.record_unavailable(
         ["release" if promoted else None],
         product=product,
-        variable="temp_c",
+        variable=variable,
         truth_semantics="inst",
         truth_column="t__temp_c__inst",
     )
@@ -117,3 +117,106 @@ def test_different_branches_with_same_scoped_cause_are_deduplicated():
     diagnostics.resolve_training("hourly", raw, NOW)
     assert len(diagnostics.failures) == 1
     assert diagnostics.failures[0].cause == FitUnavailableCause.EMPTY_MATRIX
+
+
+def test_pending_is_not_a_completed_unknown_history_diagnosis():
+    raw = history()
+    diagnostics = FitDiagnostics()
+    for product in ("hourly", "daily"):
+        diagnostics.capture_training(product, raw)
+        attempt(diagnostics, FitUnavailableBranch.EMPTY_SLICE, product=product)
+    assert diagnostics.promoted_fit_unavailable
+    assert not diagnostics.unavailable
+    with pytest.raises(RuntimeError, match="daily, hourly; call resolve_training"):
+        _ = diagnostics.failures
+    diagnostics.resolve_training("hourly", raw, NOW)
+    with pytest.raises(RuntimeError, match="pending for daily; call resolve_training"):
+        _ = diagnostics.failures
+    diagnostics.resolve_training("daily", raw, NOW)
+    assert len(diagnostics.failures) == 2
+    assert diagnostics.promoted_fit_unavailable
+
+
+def test_reset_discards_pending_only_for_that_product():
+    raw = history()
+    diagnostics = FitDiagnostics()
+    for product in ("hourly", "daily"):
+        diagnostics.capture_training(product, raw)
+        attempt(diagnostics, FitUnavailableBranch.EMPTY_SLICE, product=product)
+    diagnostics.capture_training("hourly", raw)
+    with pytest.raises(RuntimeError, match="pending for daily;"):
+        _ = diagnostics.failures
+    diagnostics.capture_training("daily", raw)
+    assert not diagnostics.promoted_fit_unavailable
+    assert diagnostics.failures == ()
+
+
+def test_branchless_unknown_history_is_already_finalized():
+    diagnostics = FitDiagnostics()
+    diagnostics.capture_training("hourly", history())
+    attempt(diagnostics, None)
+    assert not diagnostics.pending
+    assert diagnostics.failures[0].cause == FitUnavailableCause.UNKNOWN_HISTORY
+
+
+@pytest.mark.parametrize("empty", [False, True])
+def test_incremental_resolution_accumulates_facts_and_reuses_columns(
+    monkeypatch, empty
+):
+    raw = history().with_columns(pl.lit(None, dtype=pl.Float64).alias("t__rain__inst"))
+    if empty:
+        raw = raw.head(0)
+    diagnostics = FitDiagnostics()
+    diagnostics.capture_training("hourly", raw)
+    real = module._truth_availability
+    calls = []
+
+    def count(frame, columns, issue):
+        assert frame is raw
+        assert issue == NOW
+        calls.append(tuple(columns))
+        return real(frame, columns, issue)
+
+    monkeypatch.setattr(module, "_truth_availability", count)
+    attempt(diagnostics, FitUnavailableBranch.EMPTY_SLICE)
+    diagnostics.resolve_training("hourly", raw, NOW)
+    temp_facts = diagnostics.training["hourly"].truth["t__temp_c__inst"]
+    diagnostics.start_fit("hourly", "rain", "inst")
+    diagnostics.note_branch("hourly", "rain", "inst", FitUnavailableBranch.EMPTY_SLICE)
+    diagnostics.record_unavailable(
+        ["release"],
+        product="hourly",
+        variable="rain",
+        truth_semantics="inst",
+        truth_column="t__rain__inst",
+    )
+    diagnostics.resolve_training("hourly", raw, NOW)
+    assert diagnostics.training["hourly"].truth["t__temp_c__inst"] == temp_facts
+    # A distinct target sharing an already resolved column needs no new scan.
+    attempt(diagnostics, FitUnavailableBranch.EMPTY_SLICE, variable="other_temp")
+    diagnostics.resolve_training("hourly", raw, NOW)
+    expected_temp = (
+        FitUnavailableCause.EMPTY_MATRIX
+        if empty
+        else FitUnavailableCause.CAUSAL_EXCLUSION
+    )
+    assert [(failure.variable, failure.cause) for failure in diagnostics.failures] == [
+        ("other_temp", expected_temp),
+        (
+            "rain",
+            FitUnavailableCause.EMPTY_MATRIX
+            if empty
+            else FitUnavailableCause.NO_FINITE_TRUTH,
+        ),
+        ("temp_c", expected_temp),
+    ]
+    assert calls == [("t__temp_c__inst",), ("t__rain__inst",)]
+    assert set(diagnostics.training["hourly"].truth) == {
+        "t__temp_c__inst",
+        "t__rain__inst",
+    }
+    diagnostics.capture_training("hourly", raw)
+    attempt(diagnostics, FitUnavailableBranch.EMPTY_SLICE)
+    diagnostics.resolve_training("hourly", raw, NOW)
+    assert calls[-1] == ("t__temp_c__inst",)
+    assert len(calls) == 3
