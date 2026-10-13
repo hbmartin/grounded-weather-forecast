@@ -30,6 +30,10 @@ from grounded_weather_forecast.leads import (
     HOURLY_BUCKET_LABELS,
 )
 from grounded_weather_forecast.reports.leaderboard import CONSUMER_TOLERANCES
+from grounded_weather_forecast.reports.truth_qc import (
+    TRUTH_QC_MAX_AGE,
+    TruthQCFreshness,
+)
 
 type Severity = Literal["red", "amber", "info"]
 
@@ -74,6 +78,7 @@ class AlertInputs:
     observability_history: pl.DataFrame = field(default_factory=pl.DataFrame)
     archive_location: tuple[float, float] | None = None
     unreadable_artifacts: tuple[str, ...] = ()
+    truth_qc_freshness: TruthQCFreshness | None = None
 
 
 def _not_evaluable(zone: str, panel_id: str, message: str, threshold: str) -> Alert:
@@ -875,6 +880,32 @@ def _unreadable_artifact_alerts(inputs: AlertInputs) -> tuple[Alert, ...]:
     )
 
 
+def _truth_qc_alerts(inputs: AlertInputs) -> tuple[Alert, ...]:
+    freshness = inputs.truth_qc_freshness
+    threshold = (
+        f"reports/operations.py::FRESHNESS_THRESHOLDS[truth_qc_age_minutes] = "
+        f"{TRUTH_QC_MAX_AGE.total_seconds() / 3600:g} hours; "
+        "unknown refresh time or latest completed refresh failure"
+    )
+    if freshness is not None and freshness.warnings:
+        return (
+            Alert(
+                "amber",
+                "B",
+                "truth-qc-freshness",
+                "; ".join(freshness.warnings),
+                threshold,
+            ),
+        )
+    if freshness is None or not freshness.has_verdict:
+        return (
+            _not_evaluable(
+                "B", "truth-qc-freshness", "no truth-QC verdict yet", threshold
+            ),
+        )
+    return ()
+
+
 def evaluate_alerts(inputs: AlertInputs) -> tuple[Alert, ...]:
     """Every alert family, most severe first; evaluable ones before info."""
     alerts = (
@@ -892,6 +923,7 @@ def evaluate_alerts(inputs: AlertInputs) -> tuple[Alert, ...]:
         *_serving_alerts(inputs),
         *_lineage_alerts(inputs),
         *_unreadable_artifact_alerts(inputs),
+        *_truth_qc_alerts(inputs),
     )
     return tuple(
         sorted(

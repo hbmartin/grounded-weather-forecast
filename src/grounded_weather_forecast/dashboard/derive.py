@@ -16,6 +16,10 @@ from grounded_weather_forecast.contracts import (
 )
 from grounded_weather_forecast.dashboard.context import DashboardContext
 from grounded_weather_forecast.reports.correlation import error_correlation
+from grounded_weather_forecast.reports.truth_qc import (
+    TruthQCFreshness,
+    truth_qc_freshness,
+)
 from grounded_weather_forecast.reports.verification import (
     compare_to_backtest,
     verify_history,
@@ -32,6 +36,7 @@ class Derived:
     k_eff: float | None = None
     live_scores_unusable: bool = False
     """A live score file exists but could not be read or scored."""
+    truth_qc_freshness: TruthQCFreshness | None = None
 
 
 def _k_eff(correlation: pl.DataFrame) -> float | None:
@@ -118,4 +123,5 @@ def derive(ctx: DashboardContext) -> Derived:
         correlation=correlation,
         k_eff=k_eff,
         live_scores_unusable=live_unusable,
+        truth_qc_freshness=truth_qc_freshness(ctx.truth_qc, ctx.runs, ctx.now),
     )

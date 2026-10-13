@@ -80,7 +80,11 @@ and a failed refresh. It is amber after a failed QC attempt, beyond 48 hours,
 or when freshness is unknown; latched drift stays red. New QC artifacts include
 UTC `generated_at`; older verdict dates are labeled date-only and use a
 conservative age bound. File mtime never makes an old verdict look fresh, and
-these display warnings do not change fitting quarantine.
+these operational warnings do not change fitting quarantine. Verdict, refresh time,
+age, and failed-attempt chips use independent statuses; unknown refresh time
+is amber, while a quiet verdict stays green. The same derived assessment feeds
+one central amber alert combining freshness/failure warnings. Failure chips and
+alerts include the bounded run-ledger detail when available.
 
 **C — Learning readiness.** Archive issue-time span versus the
 `initial_train_days + step_days` a first rolling-origin fold needs (a

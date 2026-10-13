@@ -354,7 +354,11 @@ def test_compatible_promotion_without_training_names_fitting_failure(
     expected_cause = (
         "no finite training truth; wait for valid truth and rebuild once it is incorporated"
         if rain
-        else "finite training truth is excluded by the issue-time cutoff; keep polling"
+        else (
+            "training truth on already-issued rows is not yet available at the requested issuance; "
+            "keep polling as live issuance advances; repeating a fixed historical --now "
+            "cannot admit future evidence"
+        )
     )
     assert document.status_reason == (
         "some compatible promoted selections could not be fitted at issuance: "
@@ -715,6 +719,96 @@ def test_boolean_fit_diagnostic_compatibility_uses_conditional_advice(config):
     )
     assert reason.startswith("at least one compatible promoted selection")
     assert "rebuild only when" in reason
+
+
+@pytest.mark.parametrize("daily", [False, True])
+@pytest.mark.parametrize("mixed", [False, True])
+def test_training_cutoffs_distinguish_later_issuance_and_pending_truth(
+    config_no_provider_qc, daily, mixed
+):
+    import polars as pl
+    import grounded_weather_forecast.serve.predict as module
+    from grounded_weather_forecast.contracts import daily_variable, hourly_variable
+    from grounded_weather_forecast.serve.diagnostics import (
+        FitDiagnostics,
+        FitUnavailableCause,
+        describe_fit_failures,
+    )
+
+    config = config_no_provider_qc
+    product = "daily" if daily else "hourly"
+    name = "temp_max_c" if daily else "temp_c"
+    raw = (
+        scoreable_rain_training(daily=daily)
+        .head(2 if mixed else 1)
+        .with_columns(
+            pl.Series(
+                "issue_time",
+                [NOW + timedelta(hours=1), NOW - timedelta(hours=1)]
+                if mixed
+                else [NOW + timedelta(hours=1)],
+            ),
+            pl.lit(NOW.date()).alias("forecast_date")
+            if daily
+            else pl.lit(NOW).alias("valid_time"),
+        )
+    )
+    diagnostics = FitDiagnostics()
+    train = module._training_matrix(
+        config, product, NOW, frame=raw, fit_diagnostics=diagnostics
+    )
+    assert train.is_empty()
+    snapshot = build_snapshot(config, NOW)
+    module._blend_variable(
+        train,
+        snapshot.daily if daily else snapshot.hourly,
+        daily_variable(name) if daily else hourly_variable(name),
+        compatible_promotion(config, product, name, "equal_weight"),
+        config,
+        daily=daily,
+        semantics=TruthSemantics.INSTANTANEOUS,
+        fit_diagnostics=diagnostics,
+    )
+    assert diagnostics.failures[0].cause == (
+        FitUnavailableCause.CAUSAL_EXCLUSION
+        if mixed
+        else FitUnavailableCause.LATER_ISSUANCE
+    )
+    reason = describe_fit_failures(diagnostics.failures)
+    assert "fixed historical --now" in reason
+    assert ("later-issued archive rows" in reason) == (not mixed)
+    assert module._training_matrix(config, product, NOW, frame=raw).is_empty()
+
+
+def test_unavailable_fit_without_authoritative_branch_is_unknown(config, monkeypatch):
+    import polars as pl
+    import grounded_weather_forecast.serve.predict as module
+    from grounded_weather_forecast.contracts import hourly_variable
+    from grounded_weather_forecast.serve.diagnostics import (
+        FitDiagnostics,
+        FitUnavailableCause,
+    )
+
+    diagnostics = FitDiagnostics()
+    train = module._training_matrix(
+        config,
+        "hourly",
+        NOW,
+        frame=scoreable_rain_training(),
+        fit_diagnostics=diagnostics,
+    )
+    monkeypatch.setattr(module, "_fit_methods", lambda *_args, **_kwargs: None)
+    module._blend_variable(
+        train,
+        build_snapshot(config, NOW).hourly,
+        hourly_variable("temp_c"),
+        compatible_promotion(config, "hourly", "temp_c", "equal_weight"),
+        config,
+        daily=False,
+        semantics=TruthSemantics.INSTANTANEOUS,
+        fit_diagnostics=diagnostics,
+    )
+    assert diagnostics.failures[0].cause == FitUnavailableCause.UNKNOWN_HISTORY
 
 
 @pytest.mark.parametrize("provider_available", [False, True])

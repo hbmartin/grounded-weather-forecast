@@ -19,6 +19,7 @@ from grounded_weather_forecast.storage import atomic_write_parquet, locked_path
 _LOCK_TIMEOUT_SECONDS = 5.0
 _RETENTION_DAYS = 90
 _MAX_ROWS = 50_000
+ERROR_DETAIL_MAX_CHARS = 400
 
 RUNS_SCHEMA = pl.Schema(
     {
@@ -36,6 +37,7 @@ RUNS_SCHEMA = pl.Schema(
         "record_kind": pl.String(),
         "parent_run_id": pl.String(),
         "failure_kind": pl.String(),
+        "error_detail": pl.String(),
     }
 )
 
@@ -57,6 +59,16 @@ class RunRecord:
     record_kind: str = "invocation"
     parent_run_id: str | None = None
     failure_kind: str | None = None
+    error_detail: str | None = None
+
+
+def normalize_error_detail(detail: object) -> str | None:
+    if detail is None:
+        return None
+    text = " ".join(str(detail).split())
+    if len(text) > ERROR_DETAIL_MAX_CHARS:
+        text = text[: ERROR_DETAIL_MAX_CHARS - 3] + "..."
+    return text or None
 
 
 def run_id_for(command: str, started_at: datetime) -> str:
@@ -167,5 +179,6 @@ def _to_frame(record: RunRecord) -> pl.DataFrame:
         "record_kind": record.record_kind,
         "parent_run_id": record.parent_run_id,
         "failure_kind": record.failure_kind,
+        "error_detail": normalize_error_detail(record.error_detail),
     }
     return pl.DataFrame([row], schema=RUNS_SCHEMA)

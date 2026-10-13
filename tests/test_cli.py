@@ -28,6 +28,21 @@ def test_backfill_start_and_truth_qc_days_are_parsed():
     assert truth_qc.days == 45
 
 
+def test_invalid_qc_arguments_record_detail_without_touching_artifact(tmp_path):
+    import argparse
+    from grounded_weather_forecast.cli import _cmd_truth_qc
+    from conftest import write_config
+
+    config = write_config(tmp_path)
+    config.artifacts_dir.mkdir(parents=True)
+    artifact = config.artifacts_dir / "truth_qc.json"
+    artifact.write_bytes(b"previous artifact")
+    args = argparse.Namespace(days=0, _error_detail="stale detail")
+    assert _cmd_truth_qc(config, args) == 1
+    assert vars(args)["_error_detail"] == "--days must be a positive integer"
+    assert artifact.read_bytes() == b"previous artifact"
+
+
 def test_mean_semantics_binds_only_dual_semantics_variables(tmp_path: Path) -> None:
     config = write_config(tmp_path)
 

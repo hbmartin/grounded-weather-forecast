@@ -92,10 +92,13 @@ guard. It does not count as attribution loss. After checking archive provenance
 and dataset/config/code identities, compatible evidence receives the specific
 fitting reason, scoped to product, variable, and truth semantics. The prefix
 “some compatible promoted selections could not be fitted at issuance” permits
-mixed outcomes. Causes distinguish a missing/empty matrix, missing provider
-forecast columns, finite truth excluded by the causal cutoff, and no finite
-training truth. Causal exclusion calls for polling; rebuilding alone is not
-required. Other cases say no promoted release produced a finite hourly or daily
+mixed outcomes. The fitter reports its actual unavailable branch. Causes
+distinguish a missing/empty matrix, missing provider forecast columns, no finite
+training truth, and the two issuance cutoffs. Pending truth on already-issued
+rows calls for polling as live issuance advances. Evidence from later-issued
+rows was unavailable at the requested issuance. Repeating a fixed historical
+`--now` cannot admit future evidence in either case; rebuilding alone is not
+required. Unknown history receives inspection advice. Other cases say no promoted release produced a finite hourly or daily
 forecast. Per-field reasons retain their selection history. Diagnostics retain
 only small counts and failure records and are not serialized.
 

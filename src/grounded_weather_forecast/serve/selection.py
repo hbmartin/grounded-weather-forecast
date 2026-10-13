@@ -991,7 +991,8 @@ def no_evidence_reason(
     if promoted_fit_unavailable:
         return (
             "at least one compatible promoted selection could not be fitted "
-            "from training available at issuance; keep polling, and rebuild "
+            "from training available at issuance; keep polling as live issuance "
+            "advances, and rebuild "
             "only when newly available truth has not yet been incorporated"
         )
     return (

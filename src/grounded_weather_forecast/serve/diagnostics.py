@@ -2,6 +2,7 @@
 
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
+from datetime import datetime
 from enum import StrEnum
 
 import polars as pl
@@ -11,6 +12,7 @@ class FitUnavailableCause(StrEnum):
     EMPTY_MATRIX = "empty_matrix"
     NO_FORECAST_COLUMNS = "no_forecast_columns"
     CAUSAL_EXCLUSION = "causal_exclusion"
+    LATER_ISSUANCE = "later_issuance"
     NO_FINITE_TRUTH = "no_finite_truth"
     UNKNOWN_HISTORY = "unknown_history"
 
@@ -23,47 +25,76 @@ _CAUSE_TEXT = {
         "training matrix has no provider forecast columns; rebuild after forecasts are archived"
     ),
     FitUnavailableCause.CAUSAL_EXCLUSION: (
-        "finite training truth is excluded by the issue-time cutoff; keep polling"
+        "training truth on already-issued rows is not yet available at the requested issuance; "
+        "keep polling as live issuance advances; repeating a fixed historical --now "
+        "cannot admit future evidence"
+    ),
+    FitUnavailableCause.LATER_ISSUANCE: (
+        "finite training truth exists only on later-issued archive rows, unavailable at "
+        "the requested issuance; advance issuance for a live forecast; repeating or "
+        "rebuilding a fixed historical --now cannot admit future evidence"
     ),
     FitUnavailableCause.NO_FINITE_TRUTH: (
         "no finite training truth; wait for valid truth and rebuild once it is incorporated"
     ),
     FitUnavailableCause.UNKNOWN_HISTORY: (
-        "no scoreable training history available at issuance; keep polling and "
-        "rebuild only when new truth has not yet been incorporated"
+        "training availability could not be established at issuance; inspect the "
+        "training history and timestamps before rebuilding"
     ),
 }
 
 
-def _finite_truth_counts(frame: pl.DataFrame) -> dict[str, int]:
-    columns = [
-        name
-        for name, dtype in frame.schema.items()
-        if name.startswith("t__") and dtype.is_numeric()
-    ]
-    if not columns:
+class FitUnavailableBranch(StrEnum):
+    NO_FORECAST_COLUMNS = "no_forecast_columns"
+    EMPTY_SLICE = "empty_slice"
+
+
+type FitKey = tuple[str, str, str]
+
+
+@dataclass(frozen=True, slots=True)
+class TruthAvailability:
+    total: int
+    issued: int
+    future: int
+
+
+def _truth_availability(
+    raw: pl.DataFrame, columns: Sequence[str], issue_time: datetime
+) -> dict[str, TruthAvailability]:
+    if raw.is_empty() or not columns:
         return {}
-    counts = frame.select(pl.col(name).is_finite().sum() for name in columns)
-    return {name: int(value or 0) for name, value in counts.row(0, named=True).items()}
+    finite = raw.select(
+        pl.col("issue_time"),
+        *(pl.col(name).is_finite().alias(name) for name in columns),
+    )
+    counts = finite.select(
+        pl.struct(
+            pl.col(name).sum().alias("total"),
+            (pl.col(name) & (pl.col("issue_time") <= issue_time)).sum().alias("issued"),
+            (pl.col(name) & (pl.col("issue_time") > issue_time)).sum().alias("future"),
+        ).alias(name)
+        for name in columns
+    ).row(0, named=True)
+    return {name: TruthAvailability(**values) for name, values in counts.items()}
 
 
 @dataclass(frozen=True, slots=True)
 class TrainingFacts:
     raw_rows: int
-    has_forecasts: bool
-    raw_truth: Mapping[str, int]
-    eligible_truth: Mapping[str, int]
+    truth: Mapping[str, TruthAvailability] = field(default_factory=dict)
 
     def unavailable_cause(self, truth_column: str) -> FitUnavailableCause:
-        if self.raw_rows == 0:
-            return FitUnavailableCause.EMPTY_MATRIX
-        if not self.has_forecasts:
-            return FitUnavailableCause.NO_FORECAST_COLUMNS
-        if self.raw_truth.get(truth_column, 0) > 0 and not self.eligible_truth.get(
-            truth_column, 0
-        ):
+        facts = self.truth.get(truth_column)
+        if facts is None:
+            return FitUnavailableCause.UNKNOWN_HISTORY
+        if facts.total == 0:
+            return FitUnavailableCause.NO_FINITE_TRUTH
+        if facts.issued > 0:
             return FitUnavailableCause.CAUSAL_EXCLUSION
-        return FitUnavailableCause.NO_FINITE_TRUTH
+        if facts.future > 0:
+            return FitUnavailableCause.LATER_ISSUANCE
+        return FitUnavailableCause.UNKNOWN_HISTORY
 
 
 @dataclass(frozen=True, slots=True, order=True)
@@ -79,7 +110,8 @@ class FitDiagnostics:
     """Retain counts and scoped failures, never the full training frames."""
 
     training: dict[str, TrainingFacts] = field(default_factory=dict)
-    unavailable: dict[tuple[str, str, str], FitFailure] = field(default_factory=dict)
+    unavailable: dict[FitKey, FitFailure] = field(default_factory=dict)
+    branches: dict[FitKey, FitUnavailableBranch] = field(default_factory=dict)
 
     @property
     def promoted_fit_unavailable(self) -> bool:
@@ -93,16 +125,23 @@ class FitDiagnostics:
         self,
         product: str,
         raw: pl.DataFrame,
-        eligible: pl.DataFrame,
+        _eligible: pl.DataFrame,
         *,
-        has_forecasts: bool,
+        issue_time: datetime,
     ) -> None:
+        columns = [
+            name
+            for name, dtype in raw.schema.items()
+            if name.startswith("t__") and dtype.is_numeric()
+        ]
         self.training[product] = TrainingFacts(
-            raw_rows=raw.height,
-            has_forecasts=has_forecasts,
-            raw_truth=_finite_truth_counts(raw),
-            eligible_truth=_finite_truth_counts(eligible),
+            raw_rows=raw.height, truth=_truth_availability(raw, columns, issue_time)
         )
+
+    def note_branch(
+        self, product: str, variable: str, semantics: str, branch: FitUnavailableBranch
+    ) -> None:
+        self.branches[product, variable, semantics] = branch
 
     def record_unavailable(
         self,
@@ -115,13 +154,17 @@ class FitDiagnostics:
     ) -> None:
         if not any(release_id is not None for release_id in release_ids):
             return
-        facts = self.training.get(product)
-        cause = (
-            facts.unavailable_cause(truth_column)
-            if facts is not None
-            else FitUnavailableCause.UNKNOWN_HISTORY
-        )
         key = product, variable, truth_semantics
+        branch = self.branches.get(key)
+        facts = self.training.get(product)
+        cause = FitUnavailableCause.UNKNOWN_HISTORY
+        if branch is not None:
+            if facts is not None and facts.raw_rows == 0:
+                cause = FitUnavailableCause.EMPTY_MATRIX
+            elif branch == FitUnavailableBranch.NO_FORECAST_COLUMNS:
+                cause = FitUnavailableCause.NO_FORECAST_COLUMNS
+            elif facts is not None:
+                cause = facts.unavailable_cause(truth_column)
         self.unavailable[key] = FitFailure(*key, cause=cause)
 
 

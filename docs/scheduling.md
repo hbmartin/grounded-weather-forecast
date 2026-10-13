@@ -85,7 +85,9 @@ unknown. A latched drift verdict remains red; refreshing the dashboard does not
 refresh the underlying QC verdict.
 Maintenance returns the first nonzero stage result after reporting. Failed QC
 refreshes preserve the previous artifact and remain in the run ledger; a fresh
-dashboard can therefore contain an older QC verdict. Unexpected exceptions
+dashboard can therefore contain an older QC verdict. Its central alerts share
+the panel’s freshness assessment, and failed standalone/stage attempts expose
+a bounded ledger detail. Individual chips retain their own status. Unexpected exceptions
 still stop the pipeline. A report read fault preserves available outputs and
 returns failure after truth-QC has been attempted. Corrupt scores are not repaired by pruning or
 automatic quarantine; follow the [manual recovery procedure](reference/cli.md#recovering-from-a-damaged-score-file).

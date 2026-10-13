@@ -295,10 +295,13 @@ Null normalized points omit inherited quantiles and their source; source labels
 require usable emitted quantiles. Internal `FitDiagnostics` separately records
 unavailable promoted fits by product, variable, and truth semantics, capturing
 the selection after method/semantics validation and before rainfall guards.
-Small before/after truth counts distinguish missing/empty training matrices,
-missing provider forecast columns, finite truth excluded by the causal cutoff,
-and no finite truth. Waiting alone can resolve causal exclusion; a rebuild is
-not automatically required. The diagnostic also covers methods returning no
+The fitter records its actual unavailable branch: no provider forecast columns
+or an empty supervised slice. Observed training facts distinguish missing/empty
+matrices, absent finite truth, pending truth on already-issued rows, and finite
+truth available only on later-issued archive rows. Pending truth takes precedence
+when both exclusion types occur. Polling can help as live issuance advances;
+repeating a fixed historical `--now` cannot admit future evidence. A rebuild is
+not automatically required. Unexplained branches use unknown-history advice. The diagnostic also covers methods returning no
 blend, retains no training-frame references, and is not serialized. It remains
 separate from rainfall effects. Archive absence and identity mismatches keep
 their precedence; when identities match, the document names only the unavailable

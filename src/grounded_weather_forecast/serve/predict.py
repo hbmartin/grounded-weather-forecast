@@ -70,7 +70,10 @@ from grounded_weather_forecast.leads import (
     minutely_bucket,
 )
 from grounded_weather_forecast.serve.dataset_snapshot import LiveDatasetSnapshot
-from grounded_weather_forecast.serve.diagnostics import FitDiagnostics
+from grounded_weather_forecast.serve.diagnostics import (
+    FitDiagnostics,
+    FitUnavailableBranch,
+)
 from grounded_weather_forecast.serve.dressing import ResidualDresser, dress_variable
 from grounded_weather_forecast.serve.history import load_archived_forecast
 from grounded_weather_forecast.serve.observability import snapshot_observability
@@ -288,13 +291,28 @@ def _fit_methods(
     semantics: TruthSemantics,
     config: Config | None = None,
     issue_time: datetime | None = None,
+    fit_diagnostics: FitDiagnostics | None = None,
 ) -> tuple[dict[str, BlendResult], ForecastMatrix] | None:
     """Fit each needed method on history and predict the snapshot's rows."""
     truth_sources = matrix_sources(train)
     if not truth_sources:
+        if fit_diagnostics is not None:
+            fit_diagnostics.note_branch(
+                "daily" if daily else "hourly",
+                variable.name,
+                semantics.value,
+                FitUnavailableBranch.NO_FORECAST_COLUMNS,
+            )
         return None
     slice_ = to_supervised_slice(train, variable, daily=daily, semantics=semantics)
     if slice_.x.n_rows == 0:
+        if fit_diagnostics is not None:
+            fit_diagnostics.note_branch(
+                "daily" if daily else "hourly",
+                variable.name,
+                semantics.value,
+                FitUnavailableBranch.EMPTY_SLICE,
+            )
         return None
     x = to_forecast_matrix(predict_frame, variable, daily=daily, sources=truth_sources)
     results: dict[str, BlendResult] = {}
@@ -530,6 +548,7 @@ def _blend_variable(
         semantics=semantics,
         config=config,
         issue_time=issue_time,
+        fit_diagnostics=fit_diagnostics,
     )
     if fitted is None:
         if fit_diagnostics is not None:
@@ -1466,7 +1485,7 @@ def _training_matrix(
         )
     if fit_diagnostics is not None:
         fit_diagnostics.capture_training(
-            product, frame, eligible, has_forecasts=bool(matrix_sources(frame))
+            product, frame, eligible, issue_time=issue_time
         )
     return eligible
 

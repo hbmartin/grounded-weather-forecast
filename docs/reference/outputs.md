@@ -53,8 +53,10 @@ documents replay verbatim; historical forecast files are not rewritten. Null
 points also omit quantiles and their source; source labels require usable
 emitted quantiles. With compatible evidence, unavailable fitting for a promoted
 selection is diagnosed separately from rainfall attribution loss. Reasons name
-the affected product/variable/semantics and distinguish causal exclusion from
-missing matrices, missing forecast columns, and absent finite truth. A fitted
+the affected product/variable/semantics and distinguish pending truth on already-issued
+rows from finite truth on later-issued rows, missing matrices, missing forecast
+columns, and absent finite truth. Polling helps only as live issuance advances;
+repeating a fixed historical `--now` never admits future evidence. A fitted
 variable with unavailable prediction inputs is not mislabeled as an unavailable
 fit, and a surviving attributed finite value keeps the document ready.
 
@@ -137,11 +139,16 @@ A handled truth-QC failure during CLI maintenance preserves the previous
 stage is recorded in `data/runs.parquet`; maintenance returns its first nonzero
 stage result even when report finishes. A refreshed report may therefore use an
 older QC verdict. The dashboard shows its refresh time and age, plus a failed
-refresh warning. A quiet retained verdict becomes amber after a failed refresh,
+refresh warning. The panel becomes amber after a failed refresh,
 when older than 48 hours, or when freshness is unknown; latched drift stays red.
 Legacy `drift_verdict.as_of_date` is displayed as date-only evidence, becoming
 stale only when its latest possible refresh time is beyond 48 hours. File mtime
-is not evidence of refresh. No historical artifacts need migration or rewriting.
+is not evidence of refresh. Chips report independent conditions, so a quiet
+verdict remains green while an unknown refresh time is amber. One central amber
+alert uses the same assessment. Run records add optional `error_detail`, a
+whitespace-normalized message capped at 400 characters; older ledgers null-fill
+it, and `error` retains the exception class. No historical artifacts need
+migration or rewriting.
 Build/backtest failures and unexpected exceptions still stop
 maintenance. Source changes alter the code fingerprint: generate fresh live
 backtest and report evidence with the updated code before rollout.
