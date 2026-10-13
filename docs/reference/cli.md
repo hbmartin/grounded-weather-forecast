@@ -170,22 +170,58 @@ samples. The runner verifies that selection payload hashes agree across all
 variants and repetitions. No memory threshold is enforced in CI. See the
 [dated results](../research/selection-memory-2026-10-07.md) for scope and measurements.
 
+### Benchmark output safety and recovery
+
+The fitting and score-reader runners share output handling. With no `--output`,
+each uses a unique UTC timestamp-and-UUID JSONL under the repository's ignored
+`reports/benchmarks/`, with a `fit-diagnostics-` or `score-readers-` prefix.
+Explicit relative paths use the caller's working directory; absolute paths are
+used as given. Validated runs also write a `.summary.json` and print both paths.
+
+Before Git, fixture generation, or workers, both runners reject existing files,
+directories, or symlinks at registered destinations and create/probe the parent
+with an actual temporary write and flush. Invalid or unwritable output paths
+exit `2`. The score runner also reserves its optional `.payloads.json` path.
+There is no overwrite option.
+
+Publication opens every required output exclusively before writing, so late
+collisions cannot overwrite evidence. Publication failures exit `1` and retain
+destination files, which may be empty or incomplete. They are not rolled back
+or automatically deleted. The runner attempts one rescue to unique ignored
+`*-recovery-...` paths and reports those paths. If rescue also fails, both errors
+and the available sample JSONL are printed to stderr.
+
+Worker or validation failures preserve their original exception after rescuing
+collected samples. Unvalidated runs omit the summary; score payload mismatches
+also save diagnostic payloads. A recovery artifact does not make the run
+successful. Choose new destinations when rerunning and inspect retained files
+before removing them manually. Parent probing cannot guarantee later writes
+will succeed.
+
+Historical research memos describe their recorded runner versions, including
+the output defaults at that time. Current reproduction commands use the safe
+scratch defaults above; saving fresh results requires a new explicit path.
+The dated documents, samples, summaries, and hashes remain historical evidence.
+
+### Score-reader benchmark
+
+Run `uv run python scripts/benchmark_score_readers.py` from a source checkout.
+`--baseline REF` defaults to `6a4933f`; `--runs N` defaults to three fresh
+processes per variant/workload/policy and must be at least three.
+`--evaluations N` defaults to 12, and `--cases N` to 4,000; both must be positive.
+`--output PATH` follows [shared output handling](#benchmark-output-safety-and-recovery).
+Workloads cover selection with many evaluations or mostly incompatible evidence,
+dashboard collection, and report rendering. Fixtures and immutable source trees
+remain temporary, and payload hashes must agree. `full_load_calls` counts eager
+score loads, excluding projected scans and batches. See the
+[dated measurements](../research/score-readers-2026-10-11.md).
+
 ### Fitting diagnostics benchmark
 
 Run `uv run python scripts/benchmark_fit_diagnostics.py` from a source checkout.
 `--baseline REF` defaults to merged PR #54 (`2ccd7e0`); `--runs N` defaults to
-three fresh processes per variant/workload/size; `--output PATH` defaults to a
-unique UTC timestamp-and-UUID filename under the repository's ignored
-`reports/benchmarks/` directory, independent of the caller's working directory.
-An explicitly supplied relative `--output` path
-is relative to the caller's working directory; an absolute path is used as given.
-The runner also writes a `.summary.json` beside the samples and prints both paths.
-Both destinations must be new: an existing file, directory, or symlink causes
-exit `2` before workers start. Publication uses exclusive creation, protecting
-destinations that appear after that check too. Publication failures return
-nonzero and remove only files created by that invocation. There is no overwrite
-option; choose a new explicit path when saving evidence. Historical research
-artifacts remain unchanged by ordinary benchmark runs.
+three fresh processes per variant/workload/size; `--output PATH` follows
+[shared output handling](#benchmark-output-safety-and-recovery).
 Configurations and immutable source snapshots remain
 in temporary directories. Fixed thread settings match the score-reader benchmark.
 

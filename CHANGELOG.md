@@ -8,6 +8,11 @@ adheres to [Semantic Versioning](https://semver.org/).
 
 ### Changed
 
+- Fitting and score-reader benchmarks share unique ignored outputs, writable-parent
+  preflight, and exclusive publication. Failures retain destination files and
+  rescue available samples; validated summaries and mismatch payloads are saved
+  when applicable. Publication tests no longer require historical Git objects.
+
 - Fitting benchmarks default to unique ignored scratch files and refuse existing
   sample or summary destinations, including late collisions. Diagnostic truth
   facts accumulate within a product snapshot; pending promoted fits must be

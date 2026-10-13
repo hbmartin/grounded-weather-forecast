@@ -54,11 +54,6 @@ Three sections, kept deliberately separate:
 
 ### Online learning
 
-The fitting-diagnostic lifecycle is a project operational rule, not a calibration
-method: `serve/diagnostics.py::FitDiagnostics.resolve_training` finalizes pending
-promoted attempts and accumulates required truth facts within a fixed product
-snapshot. Unresolved causes are not emitted as completed diagnoses.
-
 | Reference | Implemented in |
 |---|---|
 | Vovk, V.; Littlestone, N. & Warmuth, M. K. (1994). The weighted majority algorithm. | `blenders/experts.py` — `ewa` |
