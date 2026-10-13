@@ -166,16 +166,30 @@ timestamp-and-UUID JSONLs under the repository's ignored `reports/benchmarks/`.
 Validated results include a `.summary.json`; each written path is printed.
 Explicit relative destinations use the caller's working directory.
 
-Existing sample, summary, or registered optional payload destinations are refused
+Existing primary sample or summary destinations are refused
 before measuring (exit `2`), as are unwritable parents discovered by a temporary
-write/flush probe. Exclusive creation protects late collisions too. Publication
+write/flush probe. Mismatch payload destinations are reserved only during
+recovery; an existing primary payload sidecar does not block a run.
+Exclusive creation protects late collisions too. Publication
 failures exit `1`, retain possibly incomplete destination files, and attempt one
 rescue to unique `*-recovery-...` scratch paths. If rescue fails, the available
 sample JSONL is emitted to stderr. Nothing deletes destination files during
 failure handling.
 
-Worker/validation failures rescue collected samples before propagating their
-original exception. Such results omit an unvalidated summary; score mismatches
+Before Git or workers, each runner exclusively creates and prints a unique
+`*-journal-*.jsonl` in the repository's ignored scratch directory. Each completed
+sample is appended and flushed outside measured worker timings. Journals survive
+process termination after an acknowledged checkpoint; flush without `fsync`
+does not promise power-loss durability. Interrupted writes may leave a partial
+last line. Journals are retained after every run, hold raw possibly unvalidated
+samples, and never include a summary. Journal preparation failures exit `2`;
+checkpoint failures stop measurement and trigger recovery.
+
+Worker/validation failures attempt one rescue of collected samples before
+propagating their original exception and traceback. Secondary failures during
+serialization, rescue, reporting, journal closure, or another interruption do
+not displace the original failure. The printed journal path identifies retained
+samples even when recovery cannot complete. Such results omit an unvalidated summary; score mismatches
 also retain `.payloads.json` diagnostics. Recovery files may describe an
 incomplete experiment and never imply success. Inspect retained destinations
 before removing them manually, and choose a new output path for another run.

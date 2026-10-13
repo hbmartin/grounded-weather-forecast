@@ -4,12 +4,20 @@ import json
 import sys
 import tempfile
 from collections.abc import Iterator, Mapping
-from contextlib import ExitStack, contextmanager
-from dataclasses import dataclass
+from contextlib import ExitStack, contextmanager, suppress
+from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any, Self
+from typing import Any, Self, TextIO
 from uuid import uuid4
+
+THREADS = {
+    "POLARS_MAX_THREADS": "2",
+    "OMP_NUM_THREADS": "1",
+    "OPENBLAS_NUM_THREADS": "1",
+    "MKL_NUM_THREADS": "1",
+    "PYTHONHASHSEED": "0",
+}
 
 
 def output_path(repository: Path, supplied: Path | None, *, prefix: str) -> Path:
@@ -75,6 +83,41 @@ def result_contents(
     return contents
 
 
+def _report(*values: object) -> None:
+    """Failure reporting must never displace the failure being reported."""
+    with suppress(BaseException):
+        print(*values, file=sys.stderr, flush=True)
+
+
+class JournalPreparationError(OSError):
+    """The checkpoint destination could not be prepared before measuring."""
+
+
+@dataclass(slots=True)
+class BenchmarkResults:
+    journal_path: Path
+    journal: TextIO
+    records: list[dict[str, Any]] = field(default_factory=list)
+    payloads: dict[str, Any] = field(default_factory=dict)
+
+    def add_sample(self, record: dict[str, Any]) -> None:
+        """Checkpoint outside worker timings; flush does not promise power-loss safety."""
+        self.records.append(record)
+        self.journal.write(json.dumps(record, sort_keys=True) + "\n")
+        self.journal.flush()
+
+    def record_payloads(self, payloads: Mapping[str, Any]) -> None:
+        self.payloads.update(payloads)
+
+    def contents(
+        self, *, summary: list[dict[str, Any]] | None = None
+    ) -> dict[str, str]:
+        return result_contents(self.records, summary=summary, payloads=self.payloads)
+
+    def close(self) -> None:
+        self.journal.close()
+
+
 @dataclass(frozen=True, slots=True)
 class BenchmarkOutputs:
     repository: Path
@@ -107,38 +150,72 @@ class BenchmarkOutputs:
             )
             publish_artifacts(recovery.paths, contents)
         except (OSError, ValueError) as error:
-            print(f"could not rescue benchmark outputs: {error}", file=sys.stderr)
-            print("available benchmark samples (JSONL):", file=sys.stderr)
-            print(contents["samples"], end="", file=sys.stderr)
+            _report("could not rescue benchmark outputs:", error)
+            _report("available benchmark samples (JSONL):")
+            _report(contents["samples"].rstrip("\n"))
         else:
             for name in contents:
-                print(f"rescued {recovery.paths[name]}", file=sys.stderr)
+                _report("rescued", recovery.paths[name])
+
+    def open_journal(self) -> BenchmarkResults:
+        path = output_path(self.repository, None, prefix=f"{self.prefix}-journal")
+        journal = None
+        try:
+            preflight_artifacts({"journal": path})
+            journal = path.open("x", encoding="utf-8")
+            print(f"journal {path}", flush=True)
+        except (BaseException,) as error:  # noqa: B013 -- preserve preparation failures
+            if journal is not None:
+                try:
+                    journal.close()
+                except (BaseException,) as secondary:  # noqa: B013
+                    _report("could not close benchmark journal:", secondary)
+            if isinstance(error, (OSError, ValueError)):
+                raise JournalPreparationError(
+                    f"could not prepare journal {path}: {error}"
+                ) from error
+            raise
+        return BenchmarkResults(path, journal)
+
+    def _rescue_measurements(self, results: BenchmarkResults) -> None:
+        try:
+            self.rescue(results.contents())
+        except (BaseException,) as error:  # noqa: B013 -- rescue is best effort
+            _report("could not rescue benchmark outputs:", error)
+        _report("retained benchmark journal:", results.journal_path)
 
     @contextmanager
-    def measurements(
-        self,
-        records: list[dict[str, Any]],
-        *,
-        payloads: Mapping[str, Any] | None = None,
-    ) -> Iterator[None]:
+    def measurements(self) -> Iterator[BenchmarkResults]:
+        results = self.open_journal()
         try:
-            yield
+            yield results
+            results.close()
         except (BaseException,) as error:  # noqa: B013 -- project tuple convention
-            print(f"benchmark measurements failed: {error}", file=sys.stderr)
-            self.rescue(result_contents(records, payloads=payloads))
+            _report("benchmark measurements failed:", error)
+            self._rescue_measurements(results)
+            try:
+                results.close()
+            except (BaseException,) as secondary:  # noqa: B013
+                _report("could not close benchmark journal:", secondary)
             raise
 
-    def publish(self, contents: Mapping[str, str]) -> None:
+    def publish(
+        self, contents: Mapping[str, str], *, journal_path: Path | None = None
+    ) -> None:
         try:
             publish_artifacts(self.paths, contents)
         except (OSError,) as error:  # noqa: B013 -- project tuple convention
-            print(f"could not publish benchmark outputs: {error}", file=sys.stderr)
-            print(
+            _report("could not publish benchmark outputs:", error)
+            _report(
                 "destination artifacts may be incomplete; no files were removed: "
                 + ", ".join(str(self.paths[name]) for name in contents),
-                file=sys.stderr,
             )
-            self.rescue(contents)
+            try:
+                self.rescue(contents)
+            except (BaseException,) as secondary:  # noqa: B013
+                _report("could not rescue benchmark outputs:", secondary)
+            if journal_path is not None:
+                _report("retained benchmark journal:", journal_path)
             raise SystemExit(1) from error
         for name in contents:
             print(f"wrote {self.paths[name]}", flush=True)

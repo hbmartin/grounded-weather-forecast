@@ -181,8 +181,25 @@ used as given. Validated runs also write a `.summary.json` and print both paths.
 Before Git, fixture generation, or workers, both runners reject existing files,
 directories, or symlinks at registered destinations and create/probe the parent
 with an actual temporary write and flush. Invalid or unwritable output paths
-exit `2`. The score runner also reserves its optional `.payloads.json` path.
-There is no overwrite option.
+exit `2`. Primary destinations include samples and summary only; mismatch
+`.payloads.json` diagnostics are written exclusively to recovery paths. An
+existing primary payload sidecar does not block a run. There is no overwrite
+option.
+
+Before Git or workers start, each runner exclusively opens a unique
+`*-journal-*.jsonl` under the repository's ignored `reports/benchmarks/` and
+immediately prints its absolute path. Every completed sample is appended and
+flushed outside measured worker timings. Acknowledged checkpoints survive
+process termination, including SIGKILL or OOM-kill of the runner. There is no
+`fsync`, so power-loss durability is not guaranteed. A journal may end in a
+partial line if a write is interrupted; complete preceding lines remain usable.
+Journals are retained after success and failure, contain raw potentially
+unvalidated samples, and never have summaries. Journal preparation failures exit
+`2` before measuring; checkpoint failures stop the run and trigger recovery.
+
+The launchers explicitly resolve sibling tooling, supporting Python `-P`, `-I`,
+and `PYTHONSAFEPATH=1` from another working directory. Workers retain inherited
+environment settings and select their immutable source before package imports.
 
 Publication opens every required output exclusively before writing, so late
 collisions cannot overwrite evidence. Publication failures exit `1` and retain
@@ -191,8 +208,10 @@ or automatically deleted. The runner attempts one rescue to unique ignored
 `*-recovery-...` paths and reports those paths. If rescue also fails, both errors
 and the available sample JSONL are printed to stderr.
 
-Worker or validation failures preserve their original exception after rescuing
-collected samples. Unvalidated runs omit the summary; score payload mismatches
+Worker or validation failures preserve their original exception and traceback
+after one best-effort rescue of collected samples. Secondary serialization,
+recovery, reporting, closure, or interruption failures cannot replace that
+exception. The retained journal remains available if rescue fails. Unvalidated runs omit the summary; score payload mismatches
 also save diagnostic payloads. A recovery artifact does not make the run
 successful. Choose new destinations when rerunning and inspect retained files
 before removing them manually. Parent probing cannot guarantee later writes

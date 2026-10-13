@@ -33,12 +33,14 @@ def source_tree(tmp_path):
 
 
 @pytest.mark.parametrize("workload", ["aggregation", "successful_fit", "pending_fit"])
+@pytest.mark.parametrize("mode", ["normal", "-P", "-I", "environment"])
 def test_worker_reports_verified_snapshot_modules(
-    benchmark, source_tree, tmp_path, workload
+    benchmark, source_tree, tmp_path, workload, mode
 ):
     completed = subprocess.run(  # noqa: S603 -- local worker and fixture argv
         [
             sys.executable,
+            *([mode] if mode in {"-P", "-I"} else []),
             str(SCRIPT),
             "--worker",
             "--source",
@@ -49,7 +51,10 @@ def test_worker_reports_verified_snapshot_modules(
             workload,
         ],
         cwd=tmp_path,
-        env=os.environ | benchmark.THREADS,
+        env=os.environ
+        | benchmark.THREADS
+        | ({"PYTHONSAFEPATH": "1"} if mode == "environment" else {}),
+        timeout=30,
         text=True,
         capture_output=True,
         check=True,
@@ -126,6 +131,15 @@ def test_main_reports_artifact_paths_or_publication_failure(
     script = repository / "scripts/benchmark.py"
     script.parent.mkdir()
     script.write_text("# runner fixture\n")
+    runner_reads = []
+    real_read = Path.read_bytes
+
+    def read(path):
+        if path == script:
+            runner_reads.append(path)
+        return real_read(path)
+
+    monkeypatch.setattr(Path, "read_bytes", read)
     monkeypatch.setattr(benchmark, "__file__", str(script))
     monkeypatch.setattr(
         sys, "argv", [str(SCRIPT), "--runs", "1", "--output", str(output)]
@@ -137,6 +151,9 @@ def test_main_reports_artifact_paths_or_publication_failure(
         if command[:2] == ["git", "archive"]:
             return b"fixture archive"
         if "--worker" in command:
+            assert all(
+                _kwargs["env"][key] == value for key, value in benchmark.THREADS.items()
+            )
             return json.dumps(
                 {
                     "workload": command[command.index("--workload") + 1],
@@ -181,6 +198,7 @@ def test_main_reports_artifact_paths_or_publication_failure(
             f"wrote {path}" in printed
             for path in benchmark_outputs.artifact_paths(output).values()
         )
+    assert runner_reads == [script, script]
 
 
 def test_origin_checks_skip_blocked_imports(benchmark, monkeypatch):
