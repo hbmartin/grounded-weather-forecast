@@ -296,13 +296,7 @@ def test_safe_path_score_workers(tmp_path, mode):
     fixtures.mkdir()
     module.prepare(fixtures, 2, 4)
     arguments = [] if mode == "environment" else [mode]
-    environment = os.environ | {
-        "POLARS_MAX_THREADS": "2",
-        "OMP_NUM_THREADS": "1",
-        "OPENBLAS_NUM_THREADS": "1",
-        "MKL_NUM_THREADS": "1",
-        "PYTHONHASHSEED": "0",
-    }
+    environment = os.environ | module.THREADS
     if mode == "environment":
         environment["PYTHONSAFEPATH"] = "1"
     completed = subprocess.run(  # noqa: S603 -- real local worker and immutable scores

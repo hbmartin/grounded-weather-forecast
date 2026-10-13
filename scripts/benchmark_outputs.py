@@ -11,6 +11,14 @@ from pathlib import Path
 from typing import Any, Self, TextIO
 from uuid import uuid4
 
+THREADS = {
+    "POLARS_MAX_THREADS": "2",
+    "OMP_NUM_THREADS": "1",
+    "OPENBLAS_NUM_THREADS": "1",
+    "MKL_NUM_THREADS": "1",
+    "PYTHONHASHSEED": "0",
+}
+
 
 def output_path(repository: Path, supplied: Path | None, *, prefix: str) -> Path:
     if supplied is not None:

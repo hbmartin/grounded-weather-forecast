@@ -22,14 +22,23 @@ def outputs(monkeypatch):
     return importlib.import_module("benchmark_outputs")
 
 
-@pytest.fixture(params=["fit_diagnostics", "score_readers"])
-def runner(request, monkeypatch):
+def load_runner(name, monkeypatch):
     monkeypatch.syspath_prepend(str(SCRIPTS))
-    path = SCRIPTS / f"benchmark_{request.param}.py"
-    spec = importlib.util.spec_from_file_location(f"benchmark_{request.param}", path)
+    path = SCRIPTS / f"benchmark_{name}.py"
+    spec = importlib.util.spec_from_file_location(f"benchmark_{name}", path)
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     return module
+
+
+@pytest.fixture(params=["fit_diagnostics", "score_readers"])
+def runner(request, monkeypatch):
+    return load_runner(request.param, monkeypatch)
+
+
+@pytest.fixture
+def fitting_runner(monkeypatch):
+    return load_runner("fit_diagnostics", monkeypatch)
 
 
 @pytest.mark.parametrize("prefix", ["fit-diagnostics", "score-readers"])
@@ -363,9 +372,14 @@ def stub_score_processes(module, monkeypatch, mode):
         if command[:2] == ["git", "archive"]:
             return buffer.getvalue()
         assert "--worker" in command
+        assert all(
+            _kwargs["env"][key] == value for key, value in module.THREADS.items()
+        )
         workers.append(command)
         if mode == "worker_failure" and len(workers) == 2:
             raise failure
+        if mode == "runner_change" and len(workers) == 2:
+            Path(module.__file__).write_text("# changed runner\n")
         workload = command[command.index("--workload") + 1]
         policy = command[command.index("--policy") + 1]
         payload = {"same": policy if mode == "mismatch" else True}
@@ -419,7 +433,9 @@ def test_score_runner_publishes_validated_samples_without_payload_diagnostics(
     )
 
 
-@pytest.mark.parametrize("mode", ["worker_failure", "mismatch", "publication_failure"])
+@pytest.mark.parametrize(
+    "mode", ["worker_failure", "mismatch", "publication_failure", "runner_change"]
+)
 def test_score_runner_failure_retains_results_and_original_failure(
     score_runner, outputs, tmp_path, monkeypatch, capsys, mode
 ):
@@ -463,13 +479,20 @@ def test_score_runner_failure_retains_results_and_original_failure(
         assert output.read_bytes() == b""
         assert output.with_suffix(".summary.json").read_bytes() == b"other writer"
     else:
-        assert "payloads differ" in str(error.value)
+        assert (
+            "runner changed" if mode == "runner_change" else "payloads differ"
+        ) in str(error.value)
     recovery = next(
         (tmp_path / "repository/reports/benchmarks").glob("*recovery-*.jsonl")
     )
     assert (
         len(recovery.read_text().splitlines())
-        == {"worker_failure": 1, "mismatch": 12, "publication_failure": 48}[mode]
+        == {
+            "worker_failure": 1,
+            "mismatch": 12,
+            "publication_failure": 48,
+            "runner_change": 48,
+        }[mode]
     )
     assert recovery.with_suffix(".summary.json").exists() == (
         mode == "publication_failure"
@@ -479,10 +502,9 @@ def test_score_runner_failure_retains_results_and_original_failure(
 
 
 def test_fitting_validation_failure_rescues_before_propagating(
-    runner, tmp_path, monkeypatch
+    fitting_runner, tmp_path, monkeypatch
 ):
-    if "score_readers" in runner.__name__:
-        pytest.skip("score-runner validation is covered by its mismatch regression")
+    runner = fitting_runner
     repository = tmp_path / "repository"
     monkeypatch.setattr(runner, "__file__", str(repository / "scripts/benchmark.py"))
     monkeypatch.setattr(
@@ -501,3 +523,98 @@ def test_fitting_validation_failure_rescues_before_propagating(
     recovery = next((repository / "reports/benchmarks").glob("*recovery-*.jsonl"))
     assert json.loads(recovery.read_text())["payload"]["point"] == 1.0
     assert not recovery.with_suffix(".summary.json").exists()
+
+
+def test_score_metadata_collected_once_and_runner_revalidated(
+    score_runner, tmp_path, monkeypatch
+):
+    stub_score_processes(score_runner, monkeypatch, "success")
+    runner_reads = []
+    platforms = []
+    real_read = Path.read_bytes
+
+    def read(path):
+        if path == Path(score_runner.__file__):
+            runner_reads.append(path)
+        return real_read(path)
+
+    def platform():
+        platforms.append(True)
+        return "fixture-platform"
+
+    monkeypatch.setattr(Path, "read_bytes", read)
+    monkeypatch.setattr(score_runner.platform, "platform", platform)
+    output = tmp_path / "out.jsonl"
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "benchmark",
+            "--runs",
+            "3",
+            "--evaluations",
+            "2",
+            "--cases",
+            "80",
+            "--output",
+            str(output),
+        ],
+    )
+    score_runner.main()
+    assert len(runner_reads) == 2
+    assert platforms == [True]
+    records = [json.loads(line) for line in output.read_text().splitlines()]
+    assert len({record["runner_sha256"] for record in records}) == 1
+    assert all(record["platform"] == "fixture-platform" for record in records)
+    assert all(
+        record["threads"]
+        == {
+            key: value
+            for key, value in score_runner.THREADS.items()
+            if key != "PYTHONHASHSEED"
+        }
+        for record in records
+    )
+
+
+def test_thread_configuration_shared_by_both_runners(
+    outputs, fitting_runner, score_runner
+):
+    assert fitting_runner.THREADS is score_runner.THREADS is outputs.THREADS
+
+
+@pytest.mark.parametrize("kind", ["file", "directory", "symlink", "broken_symlink"])
+def test_unused_primary_payload_sidecar_does_not_block_score_runner(
+    score_runner, tmp_path, monkeypatch, kind
+):
+    stub_score_processes(score_runner, monkeypatch, "success")
+    destination = tmp_path / "samples.jsonl"
+    sidecar = destination.with_suffix(".payloads.json")
+    if kind == "file":
+        sidecar.write_bytes(b"previous diagnostic")
+    elif kind == "directory":
+        sidecar.mkdir()
+    else:
+        target = tmp_path / "target"
+        if kind == "symlink":
+            target.write_bytes(b"previous diagnostic")
+        sidecar.symlink_to(target)
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "benchmark",
+            "--evaluations",
+            "2",
+            "--cases",
+            "80",
+            "--output",
+            str(destination),
+        ],
+    )
+    score_runner.main()
+    assert len(destination.read_text().splitlines()) == 48
+    assert destination.with_suffix(".summary.json").exists()
+    assert sidecar.exists() or sidecar.is_symlink()
+    if kind in {"file", "symlink"}:
+        assert sidecar.read_bytes() == b"previous diagnostic"

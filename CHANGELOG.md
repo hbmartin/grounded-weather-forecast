@@ -12,7 +12,9 @@ adheres to [Semantic Versioning](https://semver.org/).
   flushed scratch journals before final publication. Recovery failures preserve
   the original exception, safe-path Python launchers resolve sibling tooling,
   and unused primary payload destinations no longer block score comparisons.
-  Journals do not promise power-loss durability.
+  Journals do not promise power-loss durability. Runner metadata is collected
+  once and hashes are revalidated; both benchmarks share thread settings and
+  applicable test parametrizations no longer produce permanent skips.
 
 - Fitting and score-reader benchmarks share unique ignored outputs, writable-parent
   preflight, and exclusive publication. Failures retain destination files and

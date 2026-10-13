@@ -34,6 +34,7 @@ from typing import Any
 # Resolve sibling tooling explicitly, including under -P, -I, and PYTHONSAFEPATH.
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from benchmark_outputs import (
+    THREADS,
     BenchmarkOutputs,
     BenchmarkResults,
     JournalPreparationError,
@@ -267,6 +268,12 @@ def summarize(records: list[dict]) -> list[dict]:
 def collect(
     repository: Path, args: argparse.Namespace, results: BenchmarkResults
 ) -> list[dict]:
+    runner = Path(__file__).resolve()
+    runner_hash = hashlib.sha256(runner.read_bytes()).hexdigest()
+    platform_name = platform.platform()
+    sample_threads = {
+        key: value for key, value in THREADS.items() if key != "PYTHONHASHSEED"
+    }
     baseline_sha = subprocess.check_output(  # noqa: S603 -- Git argv, no shell
         ["git", "rev-parse", args.baseline],  # noqa: S607
         cwd=repository,
@@ -316,13 +323,7 @@ def collect(
             }
             for name in SCENARIOS
         }
-        environment = os.environ | {
-            "POLARS_MAX_THREADS": "2",
-            "OMP_NUM_THREADS": "1",
-            "OPENBLAS_NUM_THREADS": "1",
-            "MKL_NUM_THREADS": "1",
-            "PYTHONHASHSEED": "0",
-        }
+        environment = os.environ | THREADS
         payloads = {}
         for workload in WORKLOADS:
             for repetition in range(args.runs):
@@ -333,7 +334,7 @@ def collect(
                     for policy in policies:
                         command = [
                             sys.executable,
-                            str(Path(__file__).resolve()),
+                            str(runner),
                             "--worker",
                             "--source",
                             str(sources[variant]),
@@ -356,25 +357,15 @@ def collect(
                             variant=variant,
                             run=repetition + 1,
                             source_sha256=hashes[variant],
-                            runner_sha256=hashlib.sha256(
-                                Path(__file__).read_bytes()
-                            ).hexdigest(),
+                            runner_sha256=runner_hash,
                             baseline_sha=baseline_sha,
                             fixture_sha256=fixture_hash,
                             fixture_details=fixture_details,
                             evaluations=args.evaluations,
                             cases=args.cases,
                             feature_json_bytes=8196,
-                            threads={
-                                key: environment[key]
-                                for key in (
-                                    "POLARS_MAX_THREADS",
-                                    "OMP_NUM_THREADS",
-                                    "OPENBLAS_NUM_THREADS",
-                                    "MKL_NUM_THREADS",
-                                )
-                            },
-                            platform=platform.platform(),
+                            threads=sample_threads,
+                            platform=platform_name,
                         )
                         results.add_sample(record)
                         print(
@@ -395,6 +386,8 @@ def collect(
             variant: tree_hash(source) for variant, source in sources.items()
         }:
             raise RuntimeError("benchmark source snapshots changed")
+        if runner_hash != hashlib.sha256(runner.read_bytes()).hexdigest():
+            raise RuntimeError("benchmark runner changed")
         return summarize(results.records)
 
 

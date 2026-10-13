@@ -26,18 +26,11 @@ from pathlib import Path
 # Resolve sibling tooling explicitly, including under -P, -I, and PYTHONSAFEPATH.
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from benchmark_outputs import (
+    THREADS,
     BenchmarkOutputs,
     BenchmarkResults,
     JournalPreparationError,
 )
-
-THREADS = {
-    "POLARS_MAX_THREADS": "2",
-    "OMP_NUM_THREADS": "1",
-    "OPENBLAS_NUM_THREADS": "1",
-    "MKL_NUM_THREADS": "1",
-    "PYTHONHASHSEED": "0",
-}
 
 
 def source_hash(source: Path) -> str:
@@ -200,6 +193,8 @@ dir = "{directory / "data"}"
 def collect(
     repo: Path, args: argparse.Namespace, results: BenchmarkResults
 ) -> list[dict]:
+    runner = Path(__file__).resolve()
+    runner_hash = hashlib.sha256(runner.read_bytes()).hexdigest()
     baseline_sha = subprocess.check_output(  # noqa: S603 -- Git argv, no shell
         ["git", "rev-parse", args.baseline],
         cwd=repo,
@@ -230,7 +225,7 @@ def collect(
                     for variant, source in sources.items():
                         command = [
                             sys.executable,
-                            str(Path(__file__).resolve()),
+                            str(runner),
                             "--worker",
                             "--source",
                             str(source),
@@ -249,9 +244,7 @@ def collect(
                             repetition=repetition + 1,
                             source_sha256=hashes[variant],
                             baseline_sha=baseline_sha,
-                            runner_sha256=hashlib.sha256(
-                                Path(__file__).read_bytes()
-                            ).hexdigest(),
+                            runner_sha256=runner_hash,
                         )
                         results.add_sample(record)
                         print(
@@ -261,6 +254,8 @@ def collect(
         assert hashes["updated"] == source_hash(repo / "src"), (
             "source changed during benchmark"
         )
+    if runner_hash != hashlib.sha256(runner.read_bytes()).hexdigest():
+        raise RuntimeError("benchmark runner changed")
     summary = []
     for workload in ("aggregation", "successful_fit", "pending_fit"):
         for rows in (100_000, 1_000_000):
