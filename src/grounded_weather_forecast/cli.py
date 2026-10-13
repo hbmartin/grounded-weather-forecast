@@ -1734,8 +1734,10 @@ def _record_run(
             record_kind=record_kind,
             parent_run_id=parent_run_id,
             failure_kind=failure_kind or getattr(args, "_failure_kind", None),
-            error_detail=runs.normalize_error_detail(
-                error if error is not None else getattr(args, "_error_detail", None)
+            error_detail=(
+                str(error)
+                if error is not None
+                else getattr(args, "_error_detail", None)
             ),
         )
         runs.append_run(record, runs.runs_path(config))

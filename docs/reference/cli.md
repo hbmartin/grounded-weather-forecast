@@ -189,7 +189,7 @@ selections, and check equivalent point/method/release/quantile outputs.
 Workers reject missing source trees, cached foreign imports, and unverifiable
 module origins before accepting timings. Samples include verified source roots
 and imported module paths, checked before variant selection and after warm-up.
-See the [dated measurements](../research/fit-diagnostics-2026-10-12.md).
+See the [verified dated measurements](../research/fit-diagnostics-2026-10-13.md).
 
 ---
 
