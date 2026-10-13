@@ -112,6 +112,7 @@ class FitDiagnostics:
     training: dict[str, TrainingFacts] = field(default_factory=dict)
     unavailable: dict[FitKey, FitFailure] = field(default_factory=dict)
     branches: dict[FitKey, FitUnavailableBranch] = field(default_factory=dict)
+    pending: dict[FitKey, str] = field(default_factory=dict)
 
     @property
     def promoted_fit_unavailable(self) -> bool:
@@ -121,21 +122,48 @@ class FitDiagnostics:
     def failures(self) -> tuple[FitFailure, ...]:
         return tuple(sorted(self.unavailable.values()))
 
-    def capture_training(
-        self,
-        product: str,
-        raw: pl.DataFrame,
-        _eligible: pl.DataFrame,
-        *,
-        issue_time: datetime,
+    def capture_training(self, product: str, raw: pl.DataFrame) -> None:
+        self.training[product] = TrainingFacts(raw_rows=raw.height)
+        for records in (self.branches, self.unavailable, self.pending):
+            for key in tuple(records):
+                if key[0] == product:
+                    del records[key]
+
+    def start_fit(self, product: str, variable: str, semantics: str) -> None:
+        key = product, variable, semantics
+        self.branches.pop(key, None)
+        self.unavailable.pop(key, None)
+        self.pending.pop(key, None)
+
+    def resolve_training(
+        self, product: str, raw: pl.DataFrame, issue_time: datetime
     ) -> None:
-        columns = [
-            name
-            for name, dtype in raw.schema.items()
-            if name.startswith("t__") and dtype.is_numeric()
-        ]
+        targets = {
+            key: column for key, column in self.pending.items() if key[0] == product
+        }
+        if not targets:
+            return
+        columns = sorted(set(targets.values()))
         self.training[product] = TrainingFacts(
             raw_rows=raw.height, truth=_truth_availability(raw, columns, issue_time)
+        )
+        for key, column in targets.items():
+            self.unavailable[key] = FitFailure(*key, cause=self._cause(key, column))
+            del self.pending[key]
+
+    def _cause(self, key: FitKey, truth_column: str) -> FitUnavailableCause:
+        branch = self.branches.get(key)
+        facts = self.training.get(key[0])
+        if branch is None:
+            return FitUnavailableCause.UNKNOWN_HISTORY
+        if facts is not None and facts.raw_rows == 0:
+            return FitUnavailableCause.EMPTY_MATRIX
+        if branch == FitUnavailableBranch.NO_FORECAST_COLUMNS:
+            return FitUnavailableCause.NO_FORECAST_COLUMNS
+        return (
+            facts.unavailable_cause(truth_column)
+            if facts is not None
+            else FitUnavailableCause.UNKNOWN_HISTORY
         )
 
     def note_branch(
@@ -155,17 +183,9 @@ class FitDiagnostics:
         if not any(release_id is not None for release_id in release_ids):
             return
         key = product, variable, truth_semantics
-        branch = self.branches.get(key)
-        facts = self.training.get(product)
-        cause = FitUnavailableCause.UNKNOWN_HISTORY
-        if branch is not None:
-            if facts is not None and facts.raw_rows == 0:
-                cause = FitUnavailableCause.EMPTY_MATRIX
-            elif branch == FitUnavailableBranch.NO_FORECAST_COLUMNS:
-                cause = FitUnavailableCause.NO_FORECAST_COLUMNS
-            elif facts is not None:
-                cause = facts.unavailable_cause(truth_column)
-        self.unavailable[key] = FitFailure(*key, cause=cause)
+        self.unavailable[key] = FitFailure(*key, cause=self._cause(key, truth_column))
+        if self.branches.get(key) == FitUnavailableBranch.EMPTY_SLICE:
+            self.pending[key] = truth_column
 
 
 def describe_fit_failures(failures: Sequence[FitFailure]) -> str:

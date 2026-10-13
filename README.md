@@ -90,6 +90,7 @@ That works on day one. Everything else needs an archive with some history — se
 | `prune-scores` | delete superseded scores files | `--dry-run` |
 | `uv run --group profiling python scripts/profile_memory.py -- <command>` | capture a command's memory allocations and write a peak-memory HTML report | `--output-dir` `--trace-python-allocators` `--no-native` `--no-report` |
 | `uv run python scripts/benchmark_selection_memory.py` | compare full selection runs against a Git baseline in fresh processes | `--baseline` `--runs` `--evaluations` `--cases` |
+| `uv run python scripts/benchmark_fit_diagnostics.py` | compare diagnostic collection and real fitting against a Git baseline in fresh processes | `--baseline` `--runs` `--output` |
 
 Global: `--config PATH` (default `config.toml`), `--version`. Exit codes: `0` ok,
 `1` command failure, `2` config error, `75` lock contention (retry later).

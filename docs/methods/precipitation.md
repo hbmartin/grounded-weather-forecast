@@ -210,6 +210,7 @@ temperature.
 
 *Implemented in: `serve/rainfall.py::RainfallTimeline`; `serve/rainfall.py::RainfallEffects`;
 `serve/predict.py::_point_fields`; `serve/predict.py::_blend_variable`;
+`serve/predict.py::_fit_methods`;
 `serve/diagnostics.py::FitDiagnostics`; `serve/selection.py::no_evidence_reason`;
 `dataset/truth.py::observed_rainfall`;
 `dataset/providers.py::align_hourly_rain`; `dataset/matrix.py`;
@@ -302,7 +303,10 @@ truth available only on later-issued archive rows. Pending truth takes precedenc
 when both exclusion types occur. Polling can help as live issuance advances;
 repeating a fixed historical `--now` cannot admit future evidence. A rebuild is
 not automatically required. Unexplained branches use unknown-history advice. The diagnostic also covers methods returning no
-blend, retains no training-frame references, and is not serialized. It remains
+blend. Raw matrices remain local while each product fits, then only failed
+promoted truth columns are aggregated once to resolve their cause. Successful
+fits request no diagnostic truth scans. The context retains counts and records,
+never training frames, performs no extra matrix reads, and is not serialized. It remains
 separate from rainfall effects. Archive absence and identity mismatches keep
 their precedence; when identities match, the document names only the unavailable
 fits, without claiming that all training or every forecast is unavailable.

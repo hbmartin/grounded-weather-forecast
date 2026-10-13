@@ -165,6 +165,21 @@ samples. The runner verifies that selection payload hashes agree across all
 variants and repetitions. No memory threshold is enforced in CI. See the
 [dated results](../research/selection-memory-2026-10-07.md) for scope and measurements.
 
+### Fitting diagnostics benchmark
+
+Run `uv run python scripts/benchmark_fit_diagnostics.py` from a source checkout.
+`--baseline REF` defaults to merged PR #54 (`2ccd7e0`); `--runs N` defaults to
+three fresh processes per variant/workload/size; `--output PATH` defaults to
+`docs/research/fit-diagnostics-2026-10-12.jsonl`. The runner also writes a summary
+JSON beside the samples. Configurations and immutable source snapshots remain
+in temporary directories. Fixed thread settings match the score-reader benchmark.
+
+The workloads measure isolated diagnostic collection and real successful/pending
+hourly fitting with 100,000 and one million raw rows. They exclude matrix I/O and
+full forecast assembly, assert the fitting fixtures actually contain promoted
+selections, and check equivalent point/method/release/quantile outputs.
+See the [dated measurements](../research/fit-diagnostics-2026-10-12.md).
+
 ---
 
 ## `qc`

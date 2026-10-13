@@ -528,6 +528,8 @@ def test_causal_fit_becomes_available_without_rebuilding(config_no_provider_qc, 
     assert later_blend is not None and any(
         value is not None for value in later_blend.release_ids
     )
+    first.resolve_training(product, raw, known - timedelta(microseconds=1))
+    later.resolve_training(product, raw, known)
     assert first.failures[0].cause == FitUnavailableCause.CAUSAL_EXCLUSION
     assert not later.failures
     assert raw.serialize() == original
@@ -572,6 +574,7 @@ def test_unavailable_fit_classifies_observed_training_facts(
         semantics=TruthSemantics.INSTANTANEOUS,
         fit_diagnostics=diagnostics,
     )
+    diagnostics.resolve_training("hourly", raw, NOW)
     assert [
         (
             failure.product,
@@ -705,6 +708,7 @@ def test_training_cause_is_specific_to_truth_semantics(config_no_provider_qc):
             semantics=semantics,
             fit_diagnostics=diagnostics,
         )
+    diagnostics.resolve_training("hourly", raw, NOW)
     assert [
         (failure.truth_semantics, failure.cause) for failure in diagnostics.failures
     ] == [("inst", FitUnavailableCause.CAUSAL_EXCLUSION)]
@@ -769,6 +773,7 @@ def test_training_cutoffs_distinguish_later_issuance_and_pending_truth(
         semantics=TruthSemantics.INSTANTANEOUS,
         fit_diagnostics=diagnostics,
     )
+    diagnostics.resolve_training(product, raw, NOW)
     assert diagnostics.failures[0].cause == (
         FitUnavailableCause.CAUSAL_EXCLUSION
         if mixed
@@ -808,6 +813,148 @@ def test_unavailable_fit_without_authoritative_branch_is_unknown(config, monkeyp
         semantics=TruthSemantics.INSTANTANEOUS,
         fit_diagnostics=diagnostics,
     )
+    assert diagnostics.failures[0].cause == FitUnavailableCause.UNKNOWN_HISTORY
+
+
+def test_successful_fits_do_not_aggregate_diagnostic_truth(
+    config_no_provider_qc, monkeypatch
+):
+    import grounded_weather_forecast.serve.diagnostics as diagnostics_module
+    import grounded_weather_forecast.serve.predict as module
+    from grounded_weather_forecast.contracts import hourly_variable
+
+    config = config_no_provider_qc
+    raw = scoreable_rain_training()
+    diagnostics = diagnostics_module.FitDiagnostics()
+    monkeypatch.setattr(
+        diagnostics_module,
+        "_truth_availability",
+        lambda *_args: pytest.fail("successful fits requested diagnostic scans"),
+    )
+    train = module._training_matrix(
+        config, "hourly", NOW, frame=raw, fit_diagnostics=diagnostics
+    )
+    result = module._blend_variable(
+        train,
+        build_snapshot(config, NOW).hourly,
+        hourly_variable("temp_c"),
+        compatible_promotion(config, "hourly", "temp_c", "equal_weight"),
+        config,
+        daily=False,
+        semantics=TruthSemantics.INSTANTANEOUS,
+        fit_diagnostics=diagnostics,
+    )
+    assert result is not None and any(result.release_ids)
+    diagnostics.resolve_training("hourly", raw, NOW)
+    assert not diagnostics.failures
+
+
+def test_failed_fits_scan_only_required_columns_once(
+    config_no_provider_qc, monkeypatch
+):
+    import polars as pl
+    import grounded_weather_forecast.serve.diagnostics as diagnostics_module
+    import grounded_weather_forecast.serve.predict as module
+    from grounded_weather_forecast.contracts import hourly_variable
+
+    config = config_no_provider_qc
+    raw = scoreable_rain_training().with_columns(pl.lit(NOW).alias("valid_time"))
+    diagnostics = diagnostics_module.FitDiagnostics()
+    real = diagnostics_module._truth_availability
+    calls = []
+
+    def count(raw, columns, issue):
+        calls.append(tuple(columns))
+        return real(raw, columns, issue)
+
+    monkeypatch.setattr(diagnostics_module, "_truth_availability", count)
+    train = module._training_matrix(
+        config, "hourly", NOW, frame=raw, fit_diagnostics=diagnostics
+    )
+    assert not calls
+    snapshot = build_snapshot(config, NOW)
+    for name in ("temp_c", "wind_speed_ms", "temp_c"):
+        module._blend_variable(
+            train,
+            snapshot.hourly,
+            hourly_variable(name),
+            compatible_promotion(config, "hourly", name, "equal_weight"),
+            config,
+            daily=False,
+            semantics=TruthSemantics.INSTANTANEOUS,
+            fit_diagnostics=diagnostics,
+        )
+    assert not calls
+    diagnostics.resolve_training("hourly", raw, NOW)
+    diagnostics.resolve_training("hourly", raw, NOW)
+    assert calls == [("t__temp_c__inst", "t__wind_speed_ms__inst")]
+    assert len(diagnostics.failures) == 2
+    assert all(
+        f.cause == diagnostics_module.FitUnavailableCause.CAUSAL_EXCLUSION
+        for f in diagnostics.failures
+    )
+
+
+def test_prediction_releases_raw_hourly_before_loading_daily(
+    config_no_provider_qc, monkeypatch
+):
+    import gc
+    import weakref
+    import polars as pl
+    import grounded_weather_forecast.serve.predict as module
+    from grounded_weather_forecast.dataset.matrix import matrix_path
+
+    config = config_no_provider_qc
+    hourly_path = matrix_path(config.dataset.dir, "hourly", "live")
+    daily_path = matrix_path(config.dataset.dir, "daily", "live")
+    real = pl.read_parquet
+    loaded = []
+    refs = []
+
+    def read(path, *args, **kwargs):
+        if path == daily_path:
+            gc.collect()
+            assert all(reference() is None for reference in refs)
+        frame = real(path, *args, **kwargs)
+        if path in (hourly_path, daily_path):
+            loaded.append(path)
+        if path == hourly_path:
+            refs.append(weakref.ref(frame))
+        return frame
+
+    monkeypatch.setattr(module.pl, "read_parquet", read)
+    module.predict(config, {}, now=NOW)
+    assert loaded == [hourly_path, daily_path]
+
+
+def test_null_issue_times_do_not_default_to_missing_truth(config_no_provider_qc):
+    import polars as pl
+    import grounded_weather_forecast.serve.predict as module
+    from grounded_weather_forecast.contracts import hourly_variable
+    from grounded_weather_forecast.serve.diagnostics import (
+        FitDiagnostics,
+        FitUnavailableCause,
+    )
+
+    config = config_no_provider_qc
+    raw = scoreable_rain_training().with_columns(
+        pl.lit(None, dtype=pl.Datetime("us", "UTC")).alias("issue_time")
+    )
+    diagnostics = FitDiagnostics()
+    train = module._training_matrix(
+        config, "hourly", NOW, frame=raw, fit_diagnostics=diagnostics
+    )
+    module._blend_variable(
+        train,
+        build_snapshot(config, NOW).hourly,
+        hourly_variable("temp_c"),
+        compatible_promotion(config, "hourly", "temp_c", "equal_weight"),
+        config,
+        daily=False,
+        semantics=TruthSemantics.INSTANTANEOUS,
+        fit_diagnostics=diagnostics,
+    )
+    diagnostics.resolve_training("hourly", raw, NOW)
     assert diagnostics.failures[0].cause == FitUnavailableCause.UNKNOWN_HISTORY
 
 
