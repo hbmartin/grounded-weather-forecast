@@ -262,9 +262,12 @@ def test_main_reports_artifact_paths_or_publication_failure(
     monkeypatch.setattr(
         sys, "argv", [str(SCRIPT), "--runs", "1", "--output", str(output)]
     )
-    real_output = subprocess.check_output
 
     def worker_output(command, **kwargs):
+        if command[:2] == ["git", "rev-parse"]:
+            return "0" * 40 + "\n"
+        if command[:2] == ["git", "archive"]:
+            return b"fixture archive"
         if "--worker" in command:
             return json.dumps(
                 {
@@ -274,9 +277,19 @@ def test_main_reports_artifact_paths_or_publication_failure(
                     "payload": {"same": True},
                 }
             )
-        return real_output(command, **kwargs)
+        pytest.fail(f"unexpected subprocess: {command}")
+
+    def extract_archive(command, *, input, check):
+        assert command[:4] == ["tar", "-xf", "-", "-C"]
+        assert input == b"fixture archive"
+        assert check
+        source = Path(command[4]) / "src"
+        source.mkdir()
+        (source / "fixture.py").write_text("# immutable fixture source\n")
+        return subprocess.CompletedProcess(command, 0)
 
     monkeypatch.setattr(benchmark.subprocess, "check_output", worker_output)
+    monkeypatch.setattr(benchmark.subprocess, "run", extract_archive)
     if fail:
 
         def collision(*_args):
