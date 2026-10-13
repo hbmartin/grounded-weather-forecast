@@ -4,8 +4,9 @@ Use uv run python scripts/benchmark_fit_diagnostics.py. All temporary configs an
 matrix fixtures stay outside the checkout; raw samples identify both source trees.
 """
 
-# Worker source selection precedes package imports.
-# ruff: noqa: PLC0415
+# Worker source selection precedes package imports; asserts validate measured results.
+# Git/tar are fixed argv commands; worker source imports intentionally happen later.
+# ruff: noqa: PLC0415, S101, S607
 
 import argparse
 import hashlib
@@ -21,7 +22,6 @@ import tempfile
 import time
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-
 
 THREADS = {
     "POLARS_MAX_THREADS": "2",
@@ -40,10 +40,42 @@ def source_hash(source: Path) -> str:
     return digest.hexdigest()
 
 
+def module_origins(source: Path) -> dict[str, str]:
+    """Reject cached or editable imports outside the requested immutable tree."""
+    origins = {}
+    for name, module in tuple(sys.modules.items()):
+        if name != "grounded_weather_forecast" and not name.startswith(
+            "grounded_weather_forecast."
+        ):
+            continue
+        filename = getattr(module, "__file__", None)
+        if filename is None:
+            raise RuntimeError(f"worker cannot verify module origin: {name}")
+        path = Path(filename).resolve(strict=True)
+        if not path.is_relative_to(source):
+            raise RuntimeError(
+                f"worker imported the wrong source tree: {name} at {path}"
+            )
+        origins[name] = str(path)
+    return origins
+
+
+def output_path(repository: Path, supplied: Path | None) -> Path:
+    return (
+        repository / "docs/research/fit-diagnostics-2026-10-13.jsonl"
+        if supplied is None
+        else supplied
+    )
+
+
 def worker(args: argparse.Namespace) -> dict[str, object]:
-    sys.path.insert(0, str(args.source))
+    source = args.source.resolve(strict=True)
+    if not source.is_dir():
+        raise ValueError(f"worker source must be a directory: {source}")
+    sys.path.insert(0, str(source))
     import numpy as np
     import polars as pl
+
     from grounded_weather_forecast.config import load_config
     from grounded_weather_forecast.contracts import TruthSemantics, hourly_variable
     from grounded_weather_forecast.leads import hourly_bucket
@@ -51,6 +83,7 @@ def worker(args: argparse.Namespace) -> dict[str, object]:
     from grounded_weather_forecast.serve.selection import Selection
 
     module = importlib.import_module("grounded_weather_forecast.serve.predict")
+    module_origins(source)
     now = datetime(2026, 10, 12, 12, tzinfo=UTC)
     truth_names = ["t__temp_c__inst", *(f"t__unused{i}" for i in range(12))]
     raw = pl.DataFrame(
@@ -83,7 +116,7 @@ def worker(args: argparse.Namespace) -> dict[str, object]:
     with tempfile.TemporaryDirectory(prefix="fit-worker-") as temporary:
         directory = Path(temporary)
         config_path = directory / "config.toml"
-        config_path.write_text(f'''[station]
+        config_path.write_text(f"""[station]
 db_path = "{directory / "station.db"}"
 timezone = "UTC"
 latitude = 34.0
@@ -93,7 +126,7 @@ elevation_m = 1400.0
 db_path = "{directory / "forecasts.db"}"
 [dataset]
 dir = "{directory / "data"}"
-''')
+""")
         config = load_config(config_path)
         eligible = raw.head(int(args.rows * 0.9))
 
@@ -136,6 +169,7 @@ dir = "{directory / "data"}"
             }
 
         payload = run()
+        origins = module_origins(source)
         times = []
         for _ in range(9):
             started = time.perf_counter()
@@ -151,6 +185,8 @@ dir = "{directory / "data"}"
         "python": platform.python_version(),
         "polars": pl.__version__,
         "threads": THREADS,
+        "source_root": str(source),
+        "module_origins": origins,
     }
 
 
@@ -161,7 +197,7 @@ def main() -> None:
     parser.add_argument(
         "--output",
         type=Path,
-        default=Path("docs/research/fit-diagnostics-2026-10-12.jsonl"),
+        help="output JSONL path; defaults to the repository's dated experiment path",
     )
     parser.add_argument("--worker", action="store_true")
     parser.add_argument("--source", type=Path)
@@ -174,19 +210,25 @@ def main() -> None:
         print(json.dumps(worker(args)))
         return
     repo = Path(__file__).resolve().parents[1]
-    baseline_sha = subprocess.check_output(
-        ["git", "rev-parse", args.baseline], cwd=repo, text=True
+    destination = output_path(repo, args.output)
+    baseline_sha = subprocess.check_output(  # noqa: S603 -- Git argv, no shell
+        ["git", "rev-parse", args.baseline],
+        cwd=repo,
+        text=True,
     ).strip()
     records = []
     with tempfile.TemporaryDirectory(prefix="fit-benchmark-") as temporary:
         root = Path(temporary)
         baseline = root / "baseline"
         baseline.mkdir()
-        archive = subprocess.check_output(
-            ["git", "archive", baseline_sha, "src"], cwd=repo
+        archive = subprocess.check_output(  # noqa: S603 -- resolved Git commit
+            ["git", "archive", baseline_sha, "src"],
+            cwd=repo,
         )
-        subprocess.run(
-            ["tar", "-xf", "-", "-C", str(baseline)], input=archive, check=True
+        subprocess.run(  # noqa: S603 -- archive generated by Git above
+            ["tar", "-xf", "-", "-C", str(baseline)],
+            input=archive,
+            check=True,
         )
         updated = root / "updated"
         shutil.copytree(
@@ -210,7 +252,7 @@ def main() -> None:
                             str(rows),
                         ]
                         record = json.loads(
-                            subprocess.check_output(
+                            subprocess.check_output(  # noqa: S603 -- isolated worker argv
                                 command, env=os.environ | THREADS, text=True
                             )
                         )
@@ -259,11 +301,11 @@ def main() -> None:
                     "payloads_equal": True,
                 }
             )
-    args.output.parent.mkdir(parents=True, exist_ok=True)
-    args.output.write_text(
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    destination.write_text(
         "".join(json.dumps(record, sort_keys=True) + "\n" for record in records)
     )
-    args.output.with_suffix(".summary.json").write_text(
+    destination.with_suffix(".summary.json").write_text(
         json.dumps(summary, indent=2) + "\n"
     )
 

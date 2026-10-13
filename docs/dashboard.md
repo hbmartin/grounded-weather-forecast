@@ -84,7 +84,10 @@ these operational warnings do not change fitting quarantine. Verdict, refresh ti
 age, and failed-attempt chips use independent statuses; unknown refresh time
 is amber, while a quiet verdict stays green. The same derived assessment feeds
 one central amber alert combining freshness/failure warnings. Failure chips and
-alerts include the bounded run-ledger detail when available.
+alerts include the exception class and bounded run-ledger detail together when
+available. Direct panel and alert-input callers compute the same assessment
+when derived data was omitted. An unsupplied assessment on raw alert inputs is
+informational; it does not establish that the verdict is absent.
 
 **C — Learning readiness.** Archive issue-time span versus the
 `initial_train_days + step_days` a first rolling-origin fold needs (a

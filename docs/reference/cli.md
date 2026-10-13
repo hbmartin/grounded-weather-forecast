@@ -16,6 +16,11 @@ configuration failures occur before ledgering. The optional `error_detail` store
 a single-line failure message capped at 400 characters, separately from the
 exception class in `error`. Older ledgers read with null detail. Handled truth-QC
 failures record the message for both standalone invocations and maintenance stages.
+When present, exception class and detail appear together in QC refresh warnings.
+Maintenance stages link to the parent invocation through `parent_run_id`. The
+parent keeps its maintenance options; the QC child records its own `{"days": N}`
+options. `failure_kind` belongs to the originating stage and is not inherited by
+unrelated child stages.
 
 ---
 
@@ -170,7 +175,10 @@ variants and repetitions. No memory threshold is enforced in CI. See the
 Run `uv run python scripts/benchmark_fit_diagnostics.py` from a source checkout.
 `--baseline REF` defaults to merged PR #54 (`2ccd7e0`); `--runs N` defaults to
 three fresh processes per variant/workload/size; `--output PATH` defaults to
-`docs/research/fit-diagnostics-2026-10-12.jsonl`. The runner also writes a summary
+the repository's `docs/research/fit-diagnostics-2026-10-13.jsonl`, independent of
+the caller's working directory. An explicitly supplied relative `--output` path
+is relative to the caller's working directory; an absolute path is used as given.
+The runner also writes a summary
 JSON beside the samples. Configurations and immutable source snapshots remain
 in temporary directories. Fixed thread settings match the score-reader benchmark.
 
@@ -178,7 +186,10 @@ The workloads measure isolated diagnostic collection and real successful/pending
 hourly fitting with 100,000 and one million raw rows. They exclude matrix I/O and
 full forecast assembly, assert the fitting fixtures actually contain promoted
 selections, and check equivalent point/method/release/quantile outputs.
-See the [dated measurements](../research/fit-diagnostics-2026-10-12.md).
+Workers reject missing source trees, cached foreign imports, and unverifiable
+module origins before accepting timings. Samples include verified source roots
+and imported module paths, checked before variant selection and after warm-up.
+See the [verified dated measurements](../research/fit-diagnostics-2026-10-13.md).
 
 ---
 

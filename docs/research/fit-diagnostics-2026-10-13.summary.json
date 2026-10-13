@@ -1,0 +1,56 @@
+[
+  {
+    "workload": "aggregation",
+    "rows": 100000,
+    "median_ms": {
+      "baseline": 1.2029589852318168,
+      "updated": 0.0010410440154373646
+    },
+    "payloads_equal": true
+  },
+  {
+    "workload": "aggregation",
+    "rows": 1000000,
+    "median_ms": {
+      "baseline": 10.652749973814934,
+      "updated": 0.00104197533801198
+    },
+    "payloads_equal": true
+  },
+  {
+    "workload": "successful_fit",
+    "rows": 100000,
+    "median_ms": {
+      "baseline": 3.100292000453919,
+      "updated": 1.9993340247310698
+    },
+    "payloads_equal": true
+  },
+  {
+    "workload": "successful_fit",
+    "rows": 1000000,
+    "median_ms": {
+      "baseline": 30.277542013209313,
+      "updated": 17.8602910018526
+    },
+    "payloads_equal": true
+  },
+  {
+    "workload": "pending_fit",
+    "rows": 100000,
+    "median_ms": {
+      "baseline": 1.2152499984949827,
+      "updated": 1.021792006213218
+    },
+    "payloads_equal": true
+  },
+  {
+    "workload": "pending_fit",
+    "rows": 1000000,
+    "median_ms": {
+      "baseline": 6.910916999913752,
+      "updated": 2.284458023495972
+    },
+    "payloads_equal": true
+  }
+]

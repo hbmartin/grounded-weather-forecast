@@ -31,8 +31,8 @@ from grounded_weather_forecast.leads import (
 )
 from grounded_weather_forecast.reports.leaderboard import CONSUMER_TOLERANCES
 from grounded_weather_forecast.reports.truth_qc import (
-    TRUTH_QC_MAX_AGE,
     TruthQCFreshness,
+    truth_qc_age_limit,
 )
 
 type Severity = Literal["red", "amber", "info"]
@@ -884,7 +884,7 @@ def _truth_qc_alerts(inputs: AlertInputs) -> tuple[Alert, ...]:
     freshness = inputs.truth_qc_freshness
     threshold = (
         f"reports/operations.py::FRESHNESS_THRESHOLDS[truth_qc_age_minutes] = "
-        f"{TRUTH_QC_MAX_AGE.total_seconds() / 3600:g} hours; "
+        f"{truth_qc_age_limit()}; "
         "unknown refresh time or latest completed refresh failure"
     )
     if freshness is not None and freshness.warnings:
@@ -897,7 +897,16 @@ def _truth_qc_alerts(inputs: AlertInputs) -> tuple[Alert, ...]:
                 threshold,
             ),
         )
-    if freshness is None or not freshness.has_verdict:
+    if freshness is None:
+        return (
+            _not_evaluable(
+                "B",
+                "truth-qc-freshness",
+                "truth-QC freshness assessment was not supplied",
+                threshold,
+            ),
+        )
+    if not freshness.has_verdict:
         return (
             _not_evaluable(
                 "B", "truth-qc-freshness", "no truth-QC verdict yet", threshold

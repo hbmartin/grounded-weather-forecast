@@ -43,6 +43,45 @@ def test_invalid_qc_arguments_record_detail_without_touching_artifact(tmp_path):
     assert artifact.read_bytes() == b"previous artifact"
 
 
+@pytest.mark.parametrize("unexpected", [False, True])
+def test_cli_failure_detail_normalizes_once_at_persistence(
+    tmp_path, monkeypatch, unexpected
+):
+    from grounded_weather_forecast import runs
+
+    config = write_config(tmp_path)
+    calls = []
+    normalize = runs.normalize_error_detail
+
+    def count(detail):
+        calls.append(detail)
+        return normalize(detail)
+
+    monkeypatch.setattr(runs, "normalize_error_detail", count)
+    argv = ["--config", str(tmp_path / "config.toml"), "truth-qc", "--days", "0"]
+    if unexpected:
+        raw = "  neighbor\n unavailable\t" + "x" * 500
+
+        def fail(*_args):
+            raise RuntimeError(raw)
+
+        monkeypatch.setattr(cli_module, "_cmd_truth_qc", fail)
+        with pytest.raises(RuntimeError):
+            main(argv)
+    else:
+        raw = "--days must be a positive integer"
+        assert main(argv) == 1
+    assert calls == [raw]
+    record = load_runs(runs.runs_path(config)).row(0, named=True)
+    assert record["error"] == ("RuntimeError" if unexpected else None)
+    if unexpected:
+        assert record["error_detail"].startswith("neighbor unavailable ")
+        assert len(record["error_detail"]) == 400
+        assert record["error_detail"].endswith("...")
+    else:
+        assert record["error_detail"] == raw
+
+
 def test_mean_semantics_binds_only_dual_semantics_variables(tmp_path: Path) -> None:
     config = write_config(tmp_path)
 
@@ -240,15 +279,14 @@ def test_report_skips_any_self_verification_failure(
     empty = pl.DataFrame()
     written_sections = []
 
-    monkeypatch.setattr(
-        "grounded_weather_forecast.backtest.scores.load_scores",
-        lambda _path, **_kwargs: scores,
-    )
-    # dashboard.context binds load_scores at import; patching through the
-    # string target imports it NOW so the mock cannot become its permanent
-    # module-level binding when this test is the first to touch it.
+    # Import the collector before mocking the underlying loader, so teardown
+    # restores its real binding even when this is the first collector import.
     monkeypatch.setattr(
         "grounded_weather_forecast.dashboard.context.load_scores",
+        lambda _path, **_kwargs: scores,
+    )
+    monkeypatch.setattr(
+        "grounded_weather_forecast.backtest.scores.load_scores",
         lambda _path, **_kwargs: scores,
     )
     monkeypatch.setattr(
