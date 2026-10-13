@@ -101,6 +101,9 @@ rows was unavailable at the requested issuance. Repeating a fixed historical
 required. Unknown history receives inspection advice. Other cases say no promoted release produced a finite hourly or daily
 forecast. Per-field reasons retain their selection history. Diagnostics retain
 only small counts and failure records and are not serialized.
+Within a product snapshot, later successful or unpromoted attempts do not erase
+earlier promoted-fit failures. A surviving finite attributed forecast still
+keeps the document ready; these records do not independently demote readiness.
 
 Degraded status is also printed to **stderr**, so `--out -` still yields clean
 JSON on stdout. See the [FAQ](../faq.md#why-does-my-forecast-say-degraded).

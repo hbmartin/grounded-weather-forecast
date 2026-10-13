@@ -233,6 +233,52 @@ def test_maintain_unexpected_exception_still_propagates(tmp_path, monkeypatch, s
     assert stages["exit_code"][-1] is None
 
 
+def test_qc_stage_records_child_arguments_and_parent_keeps_invocation(
+    tmp_path, monkeypatch
+):
+    import json
+
+    config = write_config(tmp_path)
+    monkeypatch.setattr(cli_module, "_cmd_build_dataset", lambda *_args: 0)
+    monkeypatch.setattr(cli_module, "_cmd_backtest", lambda *_args: 0)
+    monkeypatch.setattr(cli_module, "_cmd_truth_qc", lambda *_args: 0)
+    monkeypatch.setattr(cli_module, "_cmd_report", lambda *_args: 0)
+    assert (
+        main(
+            [
+                "--config",
+                str(tmp_path / "config.toml"),
+                "maintain",
+                "--truth-qc-days",
+                "17",
+            ]
+        )
+        == 0
+    )
+    rows = load_runs(runs_path(config))
+    parent = rows.filter(pl.col("record_kind") == "invocation").row(0, named=True)
+    qc = rows.filter(pl.col("command") == "truth-qc").row(0, named=True)
+    assert json.loads(qc["args_json"]) == {"days": 17}
+    assert json.loads(parent["args_json"])["truth_qc_days"] == 17
+    assert qc["parent_run_id"] == parent["run_id"]
+
+
+def test_pipeline_child_records_do_not_inherit_parent_failure_kind(tmp_path):
+    import argparse
+
+    config = write_config(tmp_path)
+    args = argparse.Namespace(command="maintain", _failure_kind="parent-only")
+    assert (
+        cli_module._run_pipeline_steps(
+            config, args, (("truth-qc", lambda: 0), ("report", lambda: 0))
+        )
+        == 0
+    )
+    rows = load_runs(runs_path(config))
+    assert rows["failure_kind"].to_list() == [None, None]
+    assert args._failure_kind == "parent-only"
+
+
 @pytest.mark.parametrize("rule", ["mcs", "legacy", "seq_mcs"])
 @pytest.mark.parametrize("previous_artifact", [False, True])
 def test_neighbor_fetch_failure_still_refreshes_real_report(

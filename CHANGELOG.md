@@ -8,6 +8,11 @@ adheres to [Semantic Versioning](https://semver.org/).
 
 ### Changed
 
+- Promoted-fit failures survive later attempts within a product snapshot. QC
+  alerts distinguish missing assessments from absent verdicts and display both
+  exception class and detail. Benchmark workers verify imported source origins,
+  and their default output is anchored to the repository.
+
 - Truth-QC chips now describe independent conditions and share freshness with
   central alerts. Run ledgers retain bounded handled-failure details. Unavailable
   fits report authoritative fitting branches and distinguish pending truth from

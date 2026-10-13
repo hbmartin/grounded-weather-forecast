@@ -11,6 +11,11 @@ from grounded_weather_forecast.reports.operations import FRESHNESS_THRESHOLDS
 TRUTH_QC_MAX_AGE = timedelta(minutes=FRESHNESS_THRESHOLDS["truth_qc_age_minutes"])
 
 
+def truth_qc_age_limit() -> str:
+    """The duration used by both assessment warnings and alert provenance."""
+    return f"{TRUTH_QC_MAX_AGE.total_seconds() / 3600:g} hours"
+
+
 @dataclass(frozen=True, slots=True)
 class RefreshTime:
     earliest: datetime
@@ -95,7 +100,10 @@ def _failed_attempt(
         if attempt["exit_code"] is not None
         else "no successful exit recorded"
     )
-    error = attempt.get("error_detail") or attempt.get("error")
+    error = attempt.get("error")
+    detail = attempt.get("error_detail")
+    if detail and detail != error:
+        error = f"{error}: {detail}" if error else detail
     return f"{ended.isoformat()} ({outcome}" + (f": {error})" if error else ")")
 
 
@@ -123,7 +131,7 @@ def truth_qc_freshness(
             )
             age_unusable = elapsed > TRUTH_QC_MAX_AGE
             if age_unusable:
-                warnings.append("truth-QC verdict is over 48 hours old")
+                warnings.append(f"truth-QC verdict is over {truth_qc_age_limit()} old")
     if failed is not None:
         availability = (
             "showing the available verdict"

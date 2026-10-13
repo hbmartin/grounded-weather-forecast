@@ -19,6 +19,7 @@ from grounded_weather_forecast.dashboard.html import render_page
 from grounded_weather_forecast.dashboard.score_summary import ScoreSummary
 from grounded_weather_forecast.dashboard.zones import ALL_ZONES
 from grounded_weather_forecast.reports.alerts import AlertInputs, evaluate_alerts
+from grounded_weather_forecast.reports.truth_qc import truth_qc_freshness
 
 _MINUTELY_CAP = 120
 type ProviderInputs = dict[str, dict[str, float | None]]
@@ -53,7 +54,11 @@ def _alert_inputs(ctx: DashboardContext, derived: Derived) -> AlertInputs:
         now=ctx.now,
         manifest=ctx.manifest,
         runs=ctx.runs,
-        truth_qc_freshness=derived.truth_qc_freshness,
+        truth_qc_freshness=(
+            derived.truth_qc_freshness
+            if derived.truth_qc_freshness is not None
+            else truth_qc_freshness(ctx.truth_qc, ctx.runs, ctx.now)
+        ),
         minute_truth=ctx.truth_minute if ctx.truth_minute is not None else _empty(),
         hourly_truth=ctx.truth_hourly if ctx.truth_hourly is not None else _empty(),
         daily_truth=ctx.truth_daily if ctx.truth_daily is not None else _empty(),

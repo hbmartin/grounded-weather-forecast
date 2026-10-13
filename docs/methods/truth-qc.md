@@ -206,7 +206,8 @@ default: a wrong quarantine silently deletes truth.
 
 *Implemented in: `cli.py::_cmd_truth_qc`;
 `reports/truth_qc.py::truth_qc_freshness`;
-`reports/operations.py::FRESHNESS_THRESHOLDS`; `reports/alerts.py::_truth_qc_alerts`;
+`reports/operations.py::FRESHNESS_THRESHOLDS`; `reports/truth_qc.py::truth_qc_age_limit`;
+`reports/alerts.py::_truth_qc_alerts`;
 `dashboard/zones/data_trust.py::_truth_cross_check`*
 
 New schema-v3 QC artifacts carry a UTC ISO `generated_at` timestamp.
@@ -222,7 +223,12 @@ alerts. Verdict, refresh-time, age, and failed-attempt chips use independent
 conditions; failures do not change a fresh age’s color. One amber alert combines
 all freshness warnings. Failed attempts use the optional run-ledger
 `error_detail`, normalized to one line and at most 400 characters; legacy records
-fall back to exception class and exit code.
+fall back to exception class and exit code. Unexpected exceptions display class
+and detail together; identical class/detail strings are shown once. Stale warning
+text and alert provenance format the same policy duration. The shared policy
+mapping covers pipeline collectors and central alerts; QC adds no pipeline-history
+columns. Missing alert assessments remain distinguishable from an assessed
+absence of a QC verdict.
 
 Older `drift_verdict.as_of_date` values establish only a UTC date. The panel
 labels that precision and calls them stale only after the latest possible time

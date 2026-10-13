@@ -211,7 +211,8 @@ temperature.
 *Implemented in: `serve/rainfall.py::RainfallTimeline`; `serve/rainfall.py::RainfallEffects`;
 `serve/predict.py::_point_fields`; `serve/predict.py::_blend_variable`;
 `serve/predict.py::_fit_methods`;
-`serve/diagnostics.py::FitDiagnostics`; `serve/selection.py::no_evidence_reason`;
+`serve/diagnostics.py::UnavailableFit`; `serve/diagnostics.py::FitDiagnostics`;
+`serve/selection.py::no_evidence_reason`;
 `dataset/truth.py::observed_rainfall`;
 `dataset/providers.py::align_hourly_rain`; `dataset/matrix.py`;
 `dataset/ensembles.py::ensemble_features`*
@@ -306,7 +307,14 @@ not automatically required. Unexplained branches use unknown-history advice. The
 blend. Raw matrices remain local while each product fits, then only failed
 promoted truth columns are aggregated once to resolve their cause. Successful
 fits request no diagnostic truth scans. The context retains counts and records,
-never training frames, performs no extra matrix reads, and is not serialized. It remains
+never training frames, performs no extra matrix reads, and is not serialized.
+
+Promoted failures belong to that product snapshot: later unpromoted or successful
+attempts do not erase them. Each failure keeps its actual branch and truth column
+while waiting for resolution, so later attempt metadata cannot change its cause.
+Output records are sorted and deduplicated by scope/cause. Internal callers must
+capture training before fitting and resolve after all fits while raw history is
+local. Capturing a new snapshot resets only that product's failures. It remains
 separate from rainfall effects. Archive absence and identity mismatches keep
 their precedence; when identities match, the document names only the unavailable
 fits, without claiming that all training or every forecast is unavailable.

@@ -1473,6 +1473,7 @@ def _run_pipeline_steps(
             if kind:
                 vars(args)["_failure_kind"] = kind
             stage = argparse.Namespace(**vars(record_args))
+            vars(stage).pop("_failure_kind", None)
             stage.command = name.split()[0]
             _record_run(
                 config,

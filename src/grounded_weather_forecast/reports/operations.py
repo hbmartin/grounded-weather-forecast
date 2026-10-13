@@ -76,8 +76,8 @@ _HOURLY_LEAD_CONTRACTION_HOURS = 12.0
 _REDACTED_MARKERS = ("token", "secret", "password")
 _DETAIL_MAX_CHARS = 400
 
-# Shared with the dashboard operations zone so panel statuses and report
-# alarms can never disagree about what "stale" means.
+# Shared freshness policy for pipeline collectors, dashboard panels and central
+# alerts. Truth-QC freshness is assessed separately, without pipeline columns.
 FRESHNESS_THRESHOLDS: Mapping[str, float] = {
     "truth_age_minutes": _TRUTH_AGE_ALARM_MINUTES,
     "collector_age_minutes": _COLLECTOR_AGE_ALARM_MINUTES,

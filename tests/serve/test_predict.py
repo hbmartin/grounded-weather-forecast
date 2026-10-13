@@ -895,6 +895,96 @@ def test_failed_fits_scan_only_required_columns_once(
     )
 
 
+@pytest.mark.parametrize("daily", [False, True])
+@pytest.mark.parametrize("later_promoted", [False, True])
+def test_later_real_fit_retains_earlier_promoted_failure(
+    config_no_provider_qc, daily, later_promoted
+):
+    import grounded_weather_forecast.serve.predict as module
+    from grounded_weather_forecast.contracts import daily_variable, hourly_variable
+    from grounded_weather_forecast.serve.diagnostics import (
+        FitDiagnostics,
+        FitUnavailableCause,
+    )
+
+    config = config_no_provider_qc
+    product, name = ("daily", "temp_max_c") if daily else ("hourly", "temp_c")
+    variable = daily_variable(name) if daily else hourly_variable(name)
+    raw = scoreable_rain_training(daily=daily)
+    snapshot = build_snapshot(config, NOW)
+    frame = snapshot.daily if daily else snapshot.hourly
+    selections = compatible_promotion(config, product, name, "equal_weight")
+    diagnostics = FitDiagnostics()
+    diagnostics.capture_training(product, raw)
+    module._blend_variable(
+        raw.drop(
+            column for column in raw.columns if column.startswith(("fx__", "fxd__"))
+        ),
+        frame,
+        variable,
+        selections,
+        config,
+        daily=daily,
+        semantics=TruthSemantics.INSTANTANEOUS,
+        fit_diagnostics=diagnostics,
+    )
+    result = module._blend_variable(
+        raw,
+        frame,
+        variable,
+        selections if later_promoted else {},
+        config,
+        daily=daily,
+        semantics=TruthSemantics.INSTANTANEOUS,
+        fit_diagnostics=diagnostics,
+    )
+    assert result is not None
+    assert any(math.isfinite(value) for value in result.point)
+    if later_promoted:
+        assert any(result.release_ids)
+    diagnostics.resolve_training(product, raw, NOW)
+    assert len(diagnostics.failures) == 1
+    assert diagnostics.failures[0].cause == FitUnavailableCause.NO_FORECAST_COLUMNS
+
+
+def test_retained_prior_failure_does_not_demote_ready_forecast(
+    config_no_provider_qc, monkeypatch
+):
+    import grounded_weather_forecast.serve.predict as module
+    from grounded_weather_forecast.contracts import hourly_variable
+    from grounded_weather_forecast.dataset.matrix import matrix_path
+
+    config = config_no_provider_qc
+    scoreable_rain_training().write_parquet(
+        matrix_path(config.dataset.dir, "hourly", "live")
+    )
+    selections = compatible_promotion(config, "hourly", "temp_c", "equal_weight")
+    original = module.hourly_product
+    contexts = []
+
+    def with_prior_failure(snapshot, train, selections, config, *args, **kwargs):
+        diagnostics = kwargs["fit_diagnostics"]
+        contexts.append(diagnostics)
+        module._blend_variable(
+            train.drop(column for column in train.columns if column.startswith("fx__")),
+            snapshot.hourly,
+            hourly_variable("temp_c"),
+            selections,
+            config,
+            daily=False,
+            semantics=TruthSemantics.INSTANTANEOUS,
+            fit_diagnostics=diagnostics,
+        )
+        return original(snapshot, train, selections, config, *args, **kwargs)
+
+    monkeypatch.setattr(module, "hourly_product", with_prior_failure)
+    document = module.predict(config, selections, now=NOW)
+    assert contexts[0].failures
+    assert document.status == "ready"
+    assert document.status_reason is None
+    assert document.release_ids
+
+
 def test_prediction_releases_raw_hourly_before_loading_daily(
     config_no_provider_qc, monkeypatch
 ):

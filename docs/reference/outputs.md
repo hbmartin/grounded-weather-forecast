@@ -149,6 +149,9 @@ alert uses the same assessment. Run records add optional `error_detail`, a
 whitespace-normalized message capped at 400 characters; older ledgers null-fill
 it, and `error` retains the exception class. No historical artifacts need
 migration or rewriting.
+Warnings display class and detail together when both exist. Maintenance's
+parent run retains its options, while the linked QC stage records `{"days": N}`;
+unrelated child stages do not inherit the parent's private failure kind.
 Build/backtest failures and unexpected exceptions still stop
 maintenance. Source changes alter the code fingerprint: generate fresh live
 backtest and report evidence with the updated code before rollout.

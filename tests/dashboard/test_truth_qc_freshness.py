@@ -278,3 +278,102 @@ def test_error_details_are_html_escaped(tmp_path):
     html = render_panel(panel)
     assert "<script>alert" not in html
     assert "&lt;script&gt;" in html
+
+
+@pytest.mark.parametrize("state", ["fresh", "stale", "unknown", "failed", "missing"])
+def test_direct_alert_inputs_fallback_agrees_with_panel(tmp_path, state):
+    from grounded_weather_forecast.dashboard.derive import Derived
+    from grounded_weather_forecast.dashboard.writer import _alert_inputs
+    from grounded_weather_forecast.reports.alerts import evaluate_alerts
+
+    ctx = context(
+        tmp_path,
+        generated_at=None
+        if state == "unknown"
+        else (NOW - timedelta(hours=49 if state == "stale" else 1)).isoformat(),
+        runs=[attempt(detail="neighbor unavailable")] if state == "failed" else [],
+    )
+    if state == "missing":
+        ctx = replace(ctx, truth_qc=None)
+    inputs = _alert_inputs(ctx, Derived())
+    assert inputs.truth_qc_freshness is not None
+    panel = _truth_cross_check(ctx)
+    alerts = [a for a in evaluate_alerts(inputs) if a.panel_id == "truth-qc-freshness"]
+    if state == "fresh":
+        assert panel.status == "ok" and not alerts
+    else:
+        (alert,) = alerts
+        assert alert.severity == panel.status
+        for warning in inputs.truth_qc_freshness.warnings:
+            assert warning in (panel.intro or panel.empty_reason)
+            assert warning in alert.message
+
+
+def test_unsupplied_assessment_does_not_assert_missing_verdict(tmp_path):
+    from grounded_weather_forecast.reports.alerts import AlertInputs, evaluate_alerts
+
+    ctx = context(tmp_path)
+    (alert,) = [
+        a
+        for a in evaluate_alerts(AlertInputs(ctx.config, NOW))
+        if a.panel_id == "truth-qc-freshness"
+    ]
+    assert alert.severity == "info" and not alert.evaluable
+    assert "assessment was not supplied" in alert.message
+    assert "no truth-QC verdict" not in alert.message
+
+
+def test_threshold_decision_warning_and_alert_provenance_share_policy(
+    tmp_path, monkeypatch
+):
+    from grounded_weather_forecast.reports import truth_qc
+    from grounded_weather_forecast.dashboard.derive import derive
+    from grounded_weather_forecast.dashboard.writer import _alert_inputs
+    from grounded_weather_forecast.reports.alerts import evaluate_alerts
+
+    monkeypatch.setattr(truth_qc, "TRUTH_QC_MAX_AGE", timedelta(hours=24))
+    ctx = context(tmp_path, generated_at=(NOW - timedelta(hours=30)).isoformat())
+    panel = _truth_cross_check(ctx)
+    (alert,) = [
+        a
+        for a in evaluate_alerts(_alert_inputs(ctx, derive(ctx)))
+        if a.panel_id == "truth-qc-freshness"
+    ]
+    assert panel.status == alert.severity == "amber"
+    assert "over 24 hours old" in panel.intro
+    assert "over 24 hours old" in alert.message
+    assert "24 hours" in alert.threshold
+    assert "48 hours" not in alert.message + alert.threshold
+
+
+@pytest.mark.parametrize(
+    "error,detail,expected",
+    [
+        ("RuntimeError", "neighbor unavailable", "RuntimeError: neighbor unavailable"),
+        (None, "handled failure", "handled failure"),
+        ("OSError", None, "OSError"),
+        ("OSError", "", "OSError"),
+        ("OSError", "OSError", "OSError"),
+        (None, None, "exit 1"),
+    ],
+)
+def test_failed_refresh_preserves_class_and_detail(tmp_path, error, detail, expected):
+    from grounded_weather_forecast.dashboard.derive import derive
+    from grounded_weather_forecast.dashboard.writer import _alert_inputs
+    from grounded_weather_forecast.reports.alerts import evaluate_alerts
+
+    ctx = context(
+        tmp_path,
+        generated_at=(NOW - timedelta(hours=1)).isoformat(),
+        runs=[attempt(error=error, detail=detail)],
+    )
+    panel = _truth_cross_check(ctx)
+    chip = next(stat for stat in panel.stats if stat.label == "failed refresh")
+    (alert,) = [
+        a
+        for a in evaluate_alerts(_alert_inputs(ctx, derive(ctx)))
+        if a.panel_id == "truth-qc-freshness"
+    ]
+    assert expected in chip.value and expected in alert.message
+    if error is not None and error == detail:
+        assert chip.value.count(error) == 1
