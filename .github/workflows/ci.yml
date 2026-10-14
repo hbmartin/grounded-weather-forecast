@@ -69,7 +69,7 @@ jobs:
         run: |
           uv run deptry src --github-output
 
-      - name: Check package metadata with Pyroma
+      - name: Check package metadata with pyroma621
         run: |
           uv run pyroma --min 8 .
 
