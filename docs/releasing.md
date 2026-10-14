@@ -53,7 +53,7 @@ creates the project when a pending publisher is configured.
    uv run pyrefly check src
    uv run ty check src
    uv run deptry src
-   uv run pyroma --min 8 .
+   uv run pyroma --strict --min 10 .
    uv run lizard -Eduplicate -C 27 -x "*/dashboard/assets/*" src
    uv run pytest tests/ --cov=src --cov-report=term-missing
    uv build --no-sources
