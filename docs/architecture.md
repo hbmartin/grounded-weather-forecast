@@ -224,6 +224,20 @@ winner-selection is a `group_by` over this frame, computed downstream. That is
 what makes it possible to add a new report without re-running a 45-fold backtest,
 and what keeps the engine from ever being tempted to declare a winner.
 
+CLI backtests persist scores incrementally. Hourly/daily and minutely iterators
+slice each method's predictions before stamping, producing at most 65,536 rows
+per batch. Repeated text uses categorical codes internally; per-case quantile
+JSON retains its string representation. A PyArrow writer combines compact
+batches into row groups of at most 65,536 rows, closes one temporary Parquet
+file, then publishes it atomically. Stored columns keep their existing types
+and filenames, so older score files and readers remain compatible.
+
+Each CLI product owns its matrices, models and generator in a helper scope;
+only scalar results survive into the next product and promotion. The library
+`run_backtest` and `run_minutely_backtest` APIs still materialize a complete
+string-typed DataFrame. Streaming bounds score retention, not the matrix,
+fold-plan or model-training working sets.
+
 ---
 
 ## 5. Blenders and the registry

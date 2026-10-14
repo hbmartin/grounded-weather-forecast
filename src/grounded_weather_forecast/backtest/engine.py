@@ -6,7 +6,8 @@ rows whose truth was knowable at the fold origin, and evaluated on the
 snapshots issued in the following step. Output is the scores frame.
 """
 
-from collections.abc import Sequence
+from collections.abc import Generator, Sequence
+from contextlib import closing
 from dataclasses import dataclass
 
 import polars as pl
@@ -14,7 +15,7 @@ import polars as pl
 from grounded_weather_forecast.backtest.scores import (
     SCORES_SCHEMA,
     empty_scores,
-    stamped_scores,
+    stamped_score_batches,
 )
 from grounded_weather_forecast.backtest.splits import (
     WindowMode,
@@ -76,20 +77,20 @@ def _lead_and_valid(
     return frame.select("issue_time", "valid_time", "lead_hours", "lead_bucket")
 
 
-def run_backtest(
+def iter_backtest_scores(
     matrix: pl.DataFrame,
     request: BacktestRequest,
     config: Config,
     *,
     factories: dict[str, BlenderFactory] | None = None,
-) -> pl.DataFrame:
-    """Run all folds x variables x methods; returns the scores frame.
+) -> Generator[pl.DataFrame, None, None]:
+    """Yield bounded categorical scores in fold/variable/method order.
 
     ``factories`` overrides registry lookup (used by leakage tests to observe
     instance lifecycles).
     """
     if matrix.is_empty():
-        return empty_scores()
+        return
     kind = assert_single_kind(matrix)
     product = "daily" if request.daily else "hourly"
     product_kind = Product.DAILY if request.daily else Product.HOURLY
@@ -114,7 +115,6 @@ def run_backtest(
     folds = fold_plans(
         matrix["issue_time"], truth_known, config.backtest, request.window
     )
-    results: list[pl.DataFrame] = []
     for fold in folds:
         train_frame = matrix[fold.train_rows]
         test_frame = matrix[fold.test_rows]
@@ -148,27 +148,39 @@ def run_backtest(
                 )
                 blender = factory().fit(train_slice)
                 prediction = blender.predict(test_slice.x)
-                results.append(
-                    stamped_scores(
-                        keys,
-                        evaluation,
-                        method_id=method_id,
-                        variable=variable.name,
-                        product=product,
-                        source_kind=kind,
-                        semantics=semantics.value,
-                        window=request.window,
-                        fold_origin=fold.origin,
-                        y_pred=prediction.point,
-                        y_true=test_slice.y,
-                        quantile_levels=prediction.quantile_levels,
-                        quantiles=prediction.quantiles,
-                    )
+                yield from stamped_score_batches(
+                    keys,
+                    evaluation,
+                    method_id=method_id,
+                    variable=variable.name,
+                    product=product,
+                    source_kind=kind,
+                    semantics=semantics.value,
+                    window=request.window,
+                    fold_origin=fold.origin,
+                    y_pred=prediction.point,
+                    y_true=test_slice.y,
+                    quantile_levels=prediction.quantile_levels,
+                    quantiles=prediction.quantiles,
                 )
-    if not results:
-        return empty_scores()
-    scores = pl.concat(results)
-    return scores.cast(SCORES_SCHEMA)
+
+
+def run_backtest(
+    matrix: pl.DataFrame,
+    request: BacktestRequest,
+    config: Config,
+    *,
+    factories: dict[str, BlenderFactory] | None = None,
+) -> pl.DataFrame:
+    """Materialize all scores with the historical String schema.
+
+    Use ``iter_backtest_scores`` and ``write_score_batches`` for bounded output.
+    """
+    with closing(
+        iter_backtest_scores(matrix, request, config, factories=factories)
+    ) as batches:
+        results = list(batches)
+    return pl.concat(results).cast(SCORES_SCHEMA) if results else empty_scores()
 
 
 def variables_from_names(

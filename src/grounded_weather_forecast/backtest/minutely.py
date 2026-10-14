@@ -27,6 +27,8 @@ promotion, selection keys, self-verification joins) absorbs the new product
 by construction.
 """
 
+from collections.abc import Generator
+from contextlib import closing
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from typing import Protocol, Self
@@ -37,7 +39,7 @@ import polars as pl
 from grounded_weather_forecast.backtest.scores import (
     SCORES_SCHEMA,
     empty_scores,
-    stamped_scores,
+    stamped_score_batches,
 )
 from grounded_weather_forecast.backtest.splits import (
     WindowMode,
@@ -383,15 +385,15 @@ def _snapshot_clock(path_rows: pl.DataFrame) -> pl.DataFrame:
     )
 
 
-def run_minutely_backtest(
+def iter_minutely_scores(
     matrix: pl.DataFrame,
     truth_grid: pl.DataFrame,
     request: MinutelyRequest,
     config: Config,
-) -> pl.DataFrame:
-    """Rolling-origin evaluation of the path constructions; standard scores."""
+) -> Generator[pl.DataFrame, None, None]:
+    """Yield bounded categorical scores for the minutely path constructions."""
     if matrix.is_empty() or truth_grid.is_empty():
-        return empty_scores()
+        return
     kind = assert_single_kind(matrix)
     methods = minutely_methods()
     evaluation = EvaluationRun.create(
@@ -408,7 +410,7 @@ def run_minutely_backtest(
         "issue_time", "lead_hours"
     )
     if path_rows.is_empty():
-        return empty_scores()
+        return
     snapshots = _snapshot_clock(path_rows)
     folds = fold_plans(
         snapshots["issue_time"],
@@ -417,7 +419,6 @@ def run_minutely_backtest(
         request.window,
     )
     hourly_known = hourly_truth_known_at(matrix)
-    results: list[pl.DataFrame] = []
     for fold in folds:
         test_issues = snapshots["issue_time"][fold.test_rows]
         train_issues = snapshots["issue_time"][fold.train_rows]
@@ -491,21 +492,28 @@ def run_minutely_backtest(
             for method in minutely_methods():
                 fitted = method.fit(train_frame)
                 prediction = fitted.predict(test_frame)
-                results.append(
-                    stamped_scores(
-                        keys,
-                        evaluation,
-                        method_id=method.method_id,
-                        variable=variable_name,
-                        product="minutely",
-                        source_kind=kind,
-                        semantics=TruthSemantics.INSTANTANEOUS.value,
-                        window=request.window,
-                        fold_origin=fold.origin,
-                        y_pred=prediction,
-                        y_true=test_frame.y_true,
-                    )
+                yield from stamped_score_batches(
+                    keys,
+                    evaluation,
+                    method_id=method.method_id,
+                    variable=variable_name,
+                    product="minutely",
+                    source_kind=kind,
+                    semantics=TruthSemantics.INSTANTANEOUS.value,
+                    window=request.window,
+                    fold_origin=fold.origin,
+                    y_pred=prediction,
+                    y_true=test_frame.y_true,
                 )
-    if not results:
-        return empty_scores()
-    return pl.concat(results).cast(SCORES_SCHEMA)
+
+
+def run_minutely_backtest(
+    matrix: pl.DataFrame,
+    truth_grid: pl.DataFrame,
+    request: MinutelyRequest,
+    config: Config,
+) -> pl.DataFrame:
+    """Materialize minutely scores with the historical String schema."""
+    with closing(iter_minutely_scores(matrix, truth_grid, request, config)) as batches:
+        results = list(batches)
+    return pl.concat(results).cast(SCORES_SCHEMA) if results else empty_scores()

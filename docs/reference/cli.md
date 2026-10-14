@@ -170,11 +170,46 @@ samples. The runner verifies that selection payload hashes agree across all
 variants and repetitions. No memory threshold is enforced in CI. See the
 [dated results](../research/selection-memory-2026-10-07.md) for scope and measurements.
 
+### Backtest memory benchmark
+
+Compare score construction and persistence using an immutable pre-streaming
+source snapshot and the current source tree:
+
+```bash
+uv run python scripts/benchmark_backtest_memory.py \
+  --baseline ee93d83 --runs 3 --rows 500000 2000000
+```
+
+| Flag | Default | Meaning |
+|---|---|---|
+| `--baseline REF` | `ee93d83` | local Git revision whose `src` tree is extracted for comparison |
+| `--runs N` | `3` | fresh processes per variant and row count; minimum three |
+| `--rows N [N ...]` | `500000 2000000` | distinct positive output row counts |
+| `--output PATH` | unique ignored path | new JSONL destination; follows the output handling below |
+
+The fixed workload alternates point scores with 19-level quantile scores and
+repeats an 8,449-byte feature-description JSON value. Inputs are generated in
+16,384-row chunks with fixed clocks and identities. Workers verify source
+origins; the runner checks immutable source and runner hashes and exact logical
+score-value hashes, including row order, schema and nulls. Parquet bytes may
+differ because row groups and encodings differ. No live dataset is modified.
+
+Samples report elapsed time, file size and peak RSS. On macOS they additionally
+record `vmmap` peak physical footprint and current compressed memory, before
+verification readers allocate buffers. With the default row counts, acceptance
+requires at least 50% lower median peak physical footprint at two million rows
+and no more than 128 MiB growth when the candidate output grows fourfold.
+Failed acceptance returns exit 1 after publishing measurements. Other platforms
+report RSS but leave physical-footprint acceptance unassessed. These thresholds
+apply to score construction/writing, not model-fitting memory, and are not CI
+performance gates.
+
 ### Benchmark output safety and recovery
 
-The fitting and score-reader runners share output handling. With no `--output`,
+The fitting, score-reader and backtest-memory runners share output handling. With no `--output`,
 each uses a unique UTC timestamp-and-UUID JSONL under the repository's ignored
-`reports/benchmarks/`, with a `fit-diagnostics-` or `score-readers-` prefix.
+`reports/benchmarks/`, with a `fit-diagnostics-`, `score-readers-` or
+`backtest-memory-` prefix.
 Explicit relative paths use the caller's working directory; absolute paths are
 used as given. Validated runs also write a `.summary.json` and print both paths.
 
@@ -340,6 +375,16 @@ Notes that matter:
 
 **Writes** `data/scores/scores_{product}_{kind}_{window}_{evaluation_id}.parquet`.
 On live sources it then runs method selection and prints the promoted release ids.
+
+All products write compact score batches incrementally, with at most 65,536 rows
+per batch/row group. The writer closes a temporary file before atomic publication;
+a handled failure or interruption preserves an existing destination and removes
+the temporary file. Abrupt process termination can leave an unpublished hidden
+temporary file. Product-owned matrices and score generators are released before
+the next product and before promotion. Stored schemas, quantile JSON and CLI
+output are unchanged. The batch limit is internal and has no CLI/config knob.
+Library callers of `run_backtest`/`run_minutely_backtest` still receive a complete
+DataFrame; model fitting and fold plans retain their existing working sets.
 
 ---
 

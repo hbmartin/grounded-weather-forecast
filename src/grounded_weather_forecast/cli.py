@@ -945,11 +945,10 @@ def _run_minutely_backtest(config: Config, args: argparse.Namespace) -> int | No
     from grounded_weather_forecast.backtest.minutely import (  # noqa: PLC0415
         MINUTELY_SCORE_VARIABLES,
         MinutelyRequest,
-        run_minutely_backtest,
+        iter_minutely_scores,
     )
     from grounded_weather_forecast.backtest.scores import (  # noqa: PLC0415
-        scores_path,
-        write_scores,
+        write_score_batches,
     )
     from grounded_weather_forecast.dataset.matrix import matrix_path  # noqa: PLC0415
     from grounded_weather_forecast.dataset.truth import (  # noqa: PLC0415
@@ -973,32 +972,79 @@ def _run_minutely_backtest(config: Config, args: argparse.Namespace) -> int | No
     matrix = pl.read_parquet(matrix_file)
     grid = truth_minute_grid(pl.read_parquet(truth_file), MINUTELY_SCORE_VARIABLES)
     request = MinutelyRequest(window=args.window)
-    scores = run_minutely_backtest(matrix, grid, request, config)
-    evaluation_id = str(scores["evaluation_id"][0]) if not scores.is_empty() else None
-    path = scores_path(
-        config.dataset.dir / "scores", "minutely", "live", args.window, evaluation_id
+    result = write_score_batches(
+        iter_minutely_scores(matrix, grid, request, config),
+        config.dataset.dir / "scores",
+        "minutely",
+        "live",
+        args.window,
     )
-    write_scores(scores, path)
-    print(f"minutely: {scores.height} score rows -> {path}")
-    return scores.height
+    print(f"minutely: {result.row_count} score rows -> {result.path}")
+    return result.row_count
 
 
-def _cmd_backtest(config: Config, args: argparse.Namespace) -> int:
+def _run_matrix_backtest(
+    config: Config,
+    args: argparse.Namespace,
+    product: str,
+    methods: tuple[str, ...],
+) -> int | None:
+    """Own one product's matrices and generator until its score file is closed."""
     from grounded_weather_forecast.backtest.engine import (  # noqa: PLC0415
         BacktestRequest,
-        run_backtest,
+        iter_backtest_scores,
         variables_from_names,
     )
     from grounded_weather_forecast.backtest.scores import (  # noqa: PLC0415
-        scores_path,
-        write_scores,
+        write_score_batches,
     )
-    from grounded_weather_forecast.blenders import available_methods  # noqa: PLC0415
     from grounded_weather_forecast.contracts import (  # noqa: PLC0415
         DAILY_VARIABLES,
         HOURLY_VARIABLES,
     )
     from grounded_weather_forecast.dataset.matrix import matrix_path  # noqa: PLC0415
+
+    daily = product == "daily"
+    matrix_file = matrix_path(config.dataset.dir, product, args.source)
+    if not matrix_file.exists():
+        source_hint = "backfill" if args.source == "synthetic" else "build-dataset"
+        print(f"missing {matrix_file}; run {source_hint} first")
+        return None
+    matrix = pl.read_parquet(matrix_file)
+    if matrix.is_empty():
+        print(f"{product}: matrix is empty, skipping")
+        return 0
+    kinds = matrix["source_kind"].unique().to_list()
+    if kinds != [args.source]:
+        print(f"{product}: matrix carries {kinds}, expected [{args.source}]")
+        return None
+    names = _split_csv(args.daily_variables if daily else args.hourly_variables)
+    variables = variables_from_names(
+        names, DAILY_VARIABLES if daily else HOURLY_VARIABLES
+    )
+    semantics = _semantics_by_variable(config, args.semantics, variables)
+    request = BacktestRequest(
+        variables=variables,
+        methods=methods,
+        window=args.window,
+        daily=daily,
+        semantics=semantics,
+    )
+    result = write_score_batches(
+        iter_backtest_scores(matrix, request, config),
+        config.dataset.dir / "scores",
+        product,
+        args.source,
+        args.window,
+    )
+    print(f"{product}: {result.row_count} score rows -> {result.path}")
+    if not result.row_count:
+        _explain_no_folds(config, matrix, product)
+    return result.row_count
+
+
+def _cmd_backtest(config: Config, args: argparse.Namespace) -> int:
+    from grounded_weather_forecast.blenders import available_methods  # noqa: PLC0415
 
     methods = available_methods() if args.methods == "all" else _split_csv(args.methods)
     products = _split_csv(args.products)
@@ -1009,52 +1055,11 @@ def _cmd_backtest(config: Config, args: argparse.Namespace) -> int:
     for product in products:
         if product == "minutely":
             rows = _run_minutely_backtest(config, args)
-            if rows is None:
-                return 1
-            total += rows
-            continue
-        daily = product == "daily"
-        matrix_file = matrix_path(config.dataset.dir, product, args.source)
-        if not matrix_file.exists():
-            source_hint = "backfill" if args.source == "synthetic" else "build-dataset"
-            print(f"missing {matrix_file}; run {source_hint} first")
+        else:
+            rows = _run_matrix_backtest(config, args, product, methods)
+        if rows is None:
             return 1
-        matrix = pl.read_parquet(matrix_file)
-        if matrix.is_empty():
-            print(f"{product}: matrix is empty, skipping")
-            continue
-        kinds = matrix["source_kind"].unique().to_list()
-        if kinds != [args.source]:
-            print(f"{product}: matrix carries {kinds}, expected [{args.source}]")
-            return 1
-        names = _split_csv(args.daily_variables if daily else args.hourly_variables)
-        variables = variables_from_names(
-            names, DAILY_VARIABLES if daily else HOURLY_VARIABLES
-        )
-        semantics = _semantics_by_variable(config, args.semantics, variables)
-        request = BacktestRequest(
-            variables=variables,
-            methods=methods,
-            window=args.window,
-            daily=daily,
-            semantics=semantics,
-        )
-        scores = run_backtest(matrix, request, config)
-        evaluation_id = (
-            str(scores["evaluation_id"][0]) if not scores.is_empty() else None
-        )
-        path = scores_path(
-            config.dataset.dir / "scores",
-            product,
-            args.source,
-            args.window,
-            evaluation_id,
-        )
-        write_scores(scores, path)
-        print(f"{product}: {scores.height} score rows -> {path}")
-        if scores.is_empty():
-            _explain_no_folds(config, matrix, product)
-        total += scores.height
+        total += rows
     if total and args.source == "live":
         from grounded_weather_forecast.serve.selection import (  # noqa: PLC0415
             select_methods,

@@ -130,6 +130,7 @@ papers and are kept separate so the bibliography above stays a literature claim.
 
 | System | Informs |
 |---|---|
+| [Polars categorical data guide](https://docs.pola.rs/user-guide/expressions/categorical-data-and-enums/) and [PyArrow ParquetWriter](https://arrow.apache.org/docs/python/generated/pyarrow.parquet.ParquetWriter.html) | `backtest/scores.py` — compact score batches, 65,536-row groups, Zstandard level 3 and atomic compatible Parquet publication; persistence changes no statistical method. |
 | **NOAA National Blend of Models (NBM)** | The whole architecture: bias-correct, weight by lead time, anchor to observations at short lead. `blenders/combine.py`, `cluster.py`, `ewma_grounding.py` |
 | **NCEP decaying-average bias correction** (operational since 2006) | `blenders/ewma_grounding.py` |
 | **LAMP** (Localized Aviation MOS Program) | `blenders/anchoring.py` |

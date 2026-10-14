@@ -1,9 +1,11 @@
 """The minutely path-construction backtest: math, methods, runner, direction."""
 
+from dataclasses import replace
 from datetime import timedelta
 
 import numpy as np
 import polars as pl
+import pytest
 from conftest import synthetic_hourly_matrix, utc, write_config
 
 from grounded_weather_forecast.backtest.minutely import (
@@ -15,12 +17,18 @@ from grounded_weather_forecast.backtest.minutely import (
     ObsPersistence,
     _FittedResponse,
     anchor_weight,
+    iter_minutely_scores,
     lead_zero_path,
     minutely_methods,
     now_forecast,
     run_minutely_backtest,
 )
-from grounded_weather_forecast.backtest.scores import SCORES_SCHEMA
+from grounded_weather_forecast.backtest.scores import (
+    SCORES_SCHEMA,
+    load_scores,
+    write_score_batches,
+)
+from grounded_weather_forecast.evaluation import EvaluationRun
 from grounded_weather_forecast.leads import MINUTELY_BUCKET_LABELS
 
 
@@ -255,6 +263,33 @@ class TestRunner:
         empty = run_minutely_backtest(matrix.head(0), grid, MinutelyRequest(), config)
         assert empty.is_empty()
         assert empty.schema == SCORES_SCHEMA
+
+
+@pytest.mark.parametrize("window", ["expanding", "rolling"])
+def test_minutely_stream_matches_materialized_api(tmp_path, monkeypatch, window):
+    config = write_config(
+        tmp_path,
+        extra_toml="\n[backtest]\ninitial_train_days = 10\nstep_days = 5\nrolling_window_days = 12\n",
+    )
+    matrix, grid = minutely_case()
+    create = EvaluationRun.create
+
+    def fixed_create(_cls, *args, **kwargs):
+        return replace(
+            create(*args, **kwargs),
+            evaluation_id="fixed",
+            created_at="2026-10-14T00:00:00+00:00",
+        )
+
+    monkeypatch.setattr(EvaluationRun, "create", classmethod(fixed_create))
+    request = MinutelyRequest(window=window)
+    expected = run_minutely_backtest(matrix, grid, request, config)
+    stream = iter_minutely_scores(matrix, grid, request, config)
+    result = write_score_batches(
+        stream, tmp_path / "scores", "minutely", "live", window
+    )
+    assert load_scores(result.path).equals(expected)
+    assert stream.gi_frame is None
 
 
 def test_runner_never_emits_unscoreable_rows(tmp_path):
