@@ -90,6 +90,7 @@ That works on day one. Everything else needs an archive with some history — se
 | `prune-scores` | delete superseded scores files | `--dry-run` |
 | `uv run --group profiling python scripts/profile_memory.py -- <command>` | capture a command's memory allocations and write a peak-memory HTML report | `--output-dir` `--trace-python-allocators` `--no-native` `--no-report` |
 | `uv run python scripts/benchmark_selection_memory.py` | compare full selection runs against a Git baseline in fresh processes | `--baseline` `--runs` `--evaluations` `--cases` |
+| `uv run python scripts/benchmark_backtest_memory.py` | compare streamed score generation and writing against an immutable Git baseline | `--baseline` `--runs` `--rows` `--output` |
 | `uv run python scripts/benchmark_fit_diagnostics.py` | compare diagnostic collection and real fitting with verified source imports; journal completed samples, refuse overwrites, and rescue failed runs | `--baseline` `--runs` `--output` |
 | `uv run python scripts/benchmark_score_readers.py` | compare selection, dashboard, and report score readers; journal completed samples, use unique ignored outputs, and rescue failed runs | `--baseline` `--runs` `--evaluations` `--cases` `--output` |
 

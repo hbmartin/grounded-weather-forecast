@@ -9,6 +9,7 @@ dependencies = [
     "lightgbm>=4.6.0",
     "numpy>=2.5.1",
     "polars>=1.42.1",
+    "pyarrow>=26.0.0",
     "scipy>=1.18.0",
     "scoringrules>=0.11.0",
 ]

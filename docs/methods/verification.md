@@ -187,6 +187,32 @@ Fold plans are computed in epoch microseconds. Both **expanding** and **rolling*
 different questions: expanding asks *what do you know?*, rolling asks *what have
 you learned lately?*
 
+### Bounded score persistence
+
+*Implemented in: `backtest/engine.py::iter_backtest_scores`,
+`backtest/minutely.py::iter_minutely_scores`, `backtest/scores.py`, `storage.py`*
+
+The CLI retains the same fold/variable/method order and fits exactly the same
+models. `SCORE_BATCH_ROWS = 65_536` slices predictions before stamping or quantile
+JSON serialization. All string columns except `quantiles_json` use dynamic
+categorical codes inside these batches. The writer buffers at most 65,536 rows
+and writes one Parquet row group per full buffer, then the final partial buffer.
+
+PyArrow writes with Zstandard level 3, dictionary encoding for categorical
+columns and `store_schema=False`; omitting Arrow schema metadata preserves the
+existing String columns when Polars reads the stored file. UTC timestamps,
+nulls, Float64 predictions and quantile JSON retain their existing meanings.
+One evaluation ID spans each product's batches. Schema or identity mismatch,
+iteration/write/close failure, or handled interruption aborts publication.
+The producer and writer close before atomic replacement, with existing output
+permissions preserved. Empty score streams retain the historical empty schema.
+
+The DataFrame-returning library APIs remain materializing compatibility paths.
+The [backtest memory benchmark](../reference/cli.md#backtest-memory-benchmark)
+measures score construction and writing separately from model fitting.
+The encoding follows the [Polars categorical data guide](https://docs.pola.rs/user-guide/expressions/categorical-data-and-enums/)
+and [PyArrow Parquet writer documentation](https://arrow.apache.org/docs/python/generated/pyarrow.parquet.ParquetWriter.html).
+
 ---
 
 ## 6. Leakage: assumed present until proven absent

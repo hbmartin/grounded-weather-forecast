@@ -121,6 +121,26 @@ def atomic_write_parquet(frame: pl.DataFrame, path: Path) -> None:
         temporary.unlink(missing_ok=True)
 
 
+@contextmanager
+def atomic_parquet_destination(path: Path) -> Iterator[Path]:
+    """Publish a staged Parquet file only after its writer has closed.
+
+    The caller owns encoding and closing. Interrupted writes leave the existing
+    destination intact; cleanup errors annotate rather than replace the failure.
+    """
+    temporary = _temporary_sibling(path)
+    try:
+        yield temporary
+        _preserve_mode(temporary, path)
+        temporary.replace(path)
+    except (BaseException,) as error:  # noqa: B013 -- project tuple convention
+        try:
+            temporary.unlink(missing_ok=True)
+        except (OSError,) as cleanup:  # noqa: B013
+            error.add_note(f"could not remove staged Parquet {temporary}: {cleanup}")
+        raise
+
+
 def atomic_write_text(text: str, path: Path) -> None:
     """Write text beside its destination, then replace it atomically."""
     temporary = stage_text(text, path)
