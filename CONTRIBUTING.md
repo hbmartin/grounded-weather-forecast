@@ -69,7 +69,12 @@ uv run pytest tests/ --cov=src --cov-report=term-missing
 |---|---|
 | Coverage | **`fail_under = 88`** in `pyproject.toml` — that file is authoritative |
 | Lizard cyclomatic complexity | **27** — refactor rather than raising it |
-| Pyroma | minimum score 8 |
+| pyroma621 | minimum score 8 |
+
+The packaging gate uses [pyroma621](https://hbmartin.github.io/pyroma621/),
+which installs the `pyroma` command. It checks package metadata and build
+configuration. Advisory findings do not affect the minimum score unless
+`--strict` is explicitly enabled.
 
 If the docs changed, also:
 
