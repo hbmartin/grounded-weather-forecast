@@ -186,14 +186,14 @@ uvx --from semgrep==1.170.0 semgrep scan --test --config semgrep/artifact-pointe
 uvx --from semgrep==1.170.0 semgrep scan --metrics=off --error --config semgrep/artifact-pointer-paths.yml src/grounded_weather_forecast/artifacts.py
 uv run pyrefly check src && uv run ty check src
 uv run deptry src
-uv run pyroma --min 8 .
+uv run pyroma --strict --min 10 .
 uv run lizard -Eduplicate -C 27 -x "*/dashboard/assets/*" src
 uv run pytest tests/ --cov=src --cov-report=term-missing
 ```
 
 The packaging check uses [pyroma621](https://hbmartin.github.io/pyroma621/),
 installed with the development dependencies as the `pyroma` command. CI
-requires a score of at least 8/10; advisory findings do not affect that score.
+requires a score of 10/10 with `--strict`, including advisory checks.
 
 See the [release guide](https://github.com/hbmartin/grounded-weather-forecast/blob/main/docs/releasing.md)
 for the TestPyPI and PyPI trusted publishing setup and checklist.

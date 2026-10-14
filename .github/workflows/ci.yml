@@ -71,7 +71,7 @@ jobs:
 
       - name: Check package metadata with pyroma621
         run: |
-          uv run pyroma --min 8 .
+          uv run pyroma --strict --min 10 .
 
       - name: Check complexity and duplication with Lizard
         run: |
