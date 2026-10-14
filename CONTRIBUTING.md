@@ -56,7 +56,7 @@ uv run ty check src
 
 # 5. Packaging and dependency hygiene
 uv run deptry src
-uv run pyroma --min 8 .
+uv run pyroma --strict --min 10 .
 
 # 6. Complexity and duplication (ceiling 27; the exclusion skips vendored Chart.js)
 uv run lizard -Eduplicate -C 27 -x "*/dashboard/assets/*" src
@@ -69,12 +69,12 @@ uv run pytest tests/ --cov=src --cov-report=term-missing
 |---|---|
 | Coverage | **`fail_under = 88`** in `pyproject.toml` — that file is authoritative |
 | Lizard cyclomatic complexity | **27** — refactor rather than raising it |
-| pyroma621 | minimum score 8 |
+| pyroma621 | minimum score 10 with `--strict` |
 
 The packaging gate uses [pyroma621](https://hbmartin.github.io/pyroma621/),
 which installs the `pyroma` command. It checks package metadata and build
-configuration. Advisory findings do not affect the minimum score unless
-`--strict` is explicitly enabled.
+configuration. The gate runs with `--strict`, so advisory checks contribute
+to the required 10/10 score.
 
 If the docs changed, also:
 

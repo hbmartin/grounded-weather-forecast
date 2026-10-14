@@ -1,6 +1,6 @@
 - `CONTRIBUTING.md` is the canonical description of the dev workflow and every CI gate, including the exact Semgrep invocations. Read it first; the notes below are the short form.
 - Always run `uv run ruff check src --fix; uv run ruff format src tests; uv run pyrefly check src; uv run ty check src` after making changes.
-- Run `uv run deptry src; uv run pyroma --min 8 .; uv run lizard -Eduplicate -C 27 -x "*/dashboard/assets/*" src; uv run pytest tests/ --cov=src --cov-report=term-missing` after finishing implementation.
+- Run `uv run deptry src; uv run pyroma --strict --min 10 .; uv run lizard -Eduplicate -C 27 -x "*/dashboard/assets/*" src; uv run pytest tests/ --cov=src --cov-report=term-missing` after finishing implementation.
 - Any user facing change (e.g. a new CLI flag) must be documented in **both** `README.md` (a row in the commands-at-a-glance table, naming the flag) and `docs/reference/cli.md` (full semantics). New config keys go in `docs/reference/configuration.md`.
 - New or changed methods must be documented in `docs/methods/`, with an `Implemented in:` line and the actual constants, plus a citation in `docs/methods/bibliography.md`. `docs/theory.md` owns *why*; `docs/methods/` owns *what exactly* — never put the same formula in both.
 - If docs changed, run `uv run zensical build --strict --clean`; it validates internal links and heading anchors.
