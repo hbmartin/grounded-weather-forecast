@@ -21,6 +21,7 @@ from grounded_weather_forecast.backtest import engine, score_storage, scores
 from grounded_weather_forecast.backtest.score_storage import (
     SCORE_STAGE_NAMESPACE,
     SCORE_WRITE_LOCK,
+    ScoreCoordinationReleaseError,
     ScoreCoordinationTimeout,
     cleanup_score_temporaries,
     score_write_lock,
@@ -80,11 +81,15 @@ def observed_stage(path):
             pause()
 scores.score_parquet_destination = observed_stage
 if phase == 'legacy':
-    from grounded_weather_forecast.storage import atomic_parquet_destination
+    from grounded_weather_forecast.storage import stage_parquet, publish_parquet
     print('WAITING', flush=True)
-    with atomic_parquet_destination(directory / 'scores_legacy.parquet') as temporary:
-        frame.write_parquet(temporary)
+    path = directory / 'scores_legacy.parquet'
+    temporary = stage_parquet(frame, path)
+    try:
         pause()
+        publish_parquet(temporary, path)
+    finally:
+        temporary.unlink(missing_ok=True)
 elif sys.argv[2] == 'stream':
     scores.SCORE_BATCH_ROWS = 1
     scores.write_score_batches(iter([frame]), directory, 'hourly', 'live', 'expanding')
@@ -300,7 +305,8 @@ def test_disappeared_temporary_is_harmless(tmp_path, monkeypatch):
 
     def disappeared(path, *args, **kwargs):
         unlink(path, *args, **kwargs)
-        raise FileNotFoundError(path)
+        if not kwargs.get("missing_ok", False):
+            raise FileNotFoundError(path)
 
     monkeypatch.setattr(Path, "unlink", disappeared)
     result = cleanup_score_temporaries(tmp_path)
@@ -488,7 +494,7 @@ def test_old_reaper_cannot_match_new_namespace_and_new_reaper_ignores_legacy(tmp
     assert not cleanup_score_temporaries(tmp_path).deleted
 
 
-@pytest.mark.parametrize("command", ["backtest", "maintain"])
+@pytest.mark.parametrize("command", ["backtest", "maintain", "recover"])
 def test_cli_coordination_timeout_closes_producer_and_releases_pipeline(
     tmp_path, writer_processes, monkeypatch, capsys, command
 ):
@@ -525,17 +531,17 @@ def test_cli_coordination_timeout_closes_producer_and_releases_pipeline(
     # Keep the real maintain dispatcher and journal, bypass preceding work only.
     for name in ("_cmd_build_dataset", "_cmd_truth_qc"):
         monkeypatch.setattr(cli, name, lambda *_a, **_k: 0)
-    code = cli.main(
-        [
-            "--config",
-            str(tmp_path / "config.toml"),
-            command,
-            "--products",
-            "hourly",
-            "--methods",
-            "equal_weight",
-        ]
-    )
+    monkeypatch.setattr(cli, "_recovery_needed", lambda *_a, **_k: True)
+    arguments = [
+        "--config",
+        str(tmp_path / "config.toml"),
+        command,
+        "--methods",
+        "equal_weight",
+    ]
+    if command != "recover":
+        arguments.extend(["--products", "hourly"])
+    code = cli.main(arguments)
     assert code == 75
     assert closed == [True]
     assert not promoted
@@ -588,6 +594,10 @@ def test_cleanup_preserves_deleted_accounting_on_release_failure(
             return original(path, *args, **kwargs)
 
         monkeypatch.setattr(Path, "unlink", unlink)
+    if phase == "companion" and error_type is RuntimeError:
+        with pytest.raises(RuntimeError, match="release fixture"):
+            cleanup_score_temporaries(tmp_path)
+        return
     result = cleanup_score_temporaries(tmp_path)
     assert result.deleted == (staged,)
     assert result.freed_mb == 9 / 1e6
@@ -695,7 +705,9 @@ def test_directory_release_error_preserves_failure_or_commit(
 
     monkeypatch.setattr(score_storage, "locked_path", guard)
     if phase == "allocation":
-        with pytest.raises(OSError, match="guard release fixture"):
+        with pytest.raises(
+            ScoreCoordinationReleaseError, match="guard release fixture"
+        ):
             write_scores(empty_scores(), tmp_path / DESTINATION)
         assert not (tmp_path / DESTINATION).exists()
     else:
@@ -728,7 +740,7 @@ def test_primary_interrupt_survives_failed_lease_release(
     with pytest.raises(interrupt) as caught:
         write_scores(empty_scores(), tmp_path / DESTINATION)
     assert caught.value.args == (23,)
-    assert "lease release fixture" in caught.value.__notes__[0]
+    assert any("lease release fixture" in note for note in caught.value.__notes__)
 
 
 def test_competing_directory_guard_waits_then_proceeds(tmp_path, writer_processes):

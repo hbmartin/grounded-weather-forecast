@@ -39,7 +39,7 @@ unrelated child stages.
 | `0` | success |
 | `1` | command-level failure — missing inputs, no scores to report, a backfill error |
 | `2` | configuration error, or an unknown command |
-| `75` | pipeline, dataset-publication, or automatic-recovery lock contention (EX_TEMPFAIL — retry later) |
+| `75` | pipeline, dataset-publication, score-directory, or automatic-recovery lock contention (EX_TEMPFAIL — retry later) |
 
 Note that `truth-qc` returns `0` even when it finds no evaluable checks. A cold
 start is not a fault, and an operator's cron should not page on one.
@@ -378,10 +378,13 @@ On live sources it then runs method selection and prints the promoted release id
 
 All products write compact score batches incrementally, with at most 65,536 rows
 per batch/row group. The writer closes a temporary file before atomic publication;
-a handled failure or interruption preserves an existing destination and removes
-the temporary file. Abrupt process termination can leave an unpublished hidden
-temporary file; the next backtest or `prune-scores` reclaims it before processing
-published evidence. Each writer leases its own private stage at
+a handled failure or interruption preserves an existing destination and attempts
+to remove the temporary file. Disposal makes one zero-wait directory-guard
+attempt. Contention or cleanup errors can leave a payload and/or lease companion
+even after a handled failure or successful publication. These leftovers, like
+those from abrupt termination, are eligible for a later backtest or `prune-scores`
+recovery pass. Recovery is best effort and may defer work when coordination is busy.
+Each writer leases its own private stage at
 `.score-stage-v1.<score filename>.<16 lowercase hex>.tmp`, with a `.lease`
 companion held through producer closure and atomic publication. Independent
 files can be written concurrently in the same directory. Concurrent writers to
@@ -391,8 +394,11 @@ The persistent `.score-stage-v1.lock` coordinates only allocation, publication
 and removal; it is never held during fitting, prediction or bulk writing.
 Nested calls in the same process/thread share this short guard, including through
 directory aliases. Each coordination acquisition waits at most **60 seconds**;
-contention produces a score-specific diagnostic and exit code **75** from
-`backtest` or `maintain`, releases the pipeline lock and suppresses promotion.
+allocation and publication have independent budgets, so their combined waits
+can approach **120 seconds**, excluding computation and other locks. Contention
+that times out allocation or publication produces a score-specific diagnostic and exit code
+**75** (`EXIT_CONTENTION`) from `backtest`, `maintain` or `recover`, releases
+the pipeline lock and suppresses promotion. This is not a total command timeout.
 Cleanup never waits behind another writer. Readers remain lock-free.
 SIGTERM behavior is unchanged; SIGTERM, SIGKILL and OOM leftovers use next-run
 recovery. Product-owned matrices and score generators are released before
@@ -740,8 +746,12 @@ never deleted.
 
 Only private `.score-stage-v1.scores_*.parquet.<16 lowercase hex>.tmp`
 payloads and their `.lease` companions participate in automatic recovery.
-Recovery takes the short directory guard and probes each lease without waiting,
-reporting active stages while reclaiming inactive ones. Payload-only allocation
+Recovery discovers candidate names outside the guard, then coordinates one
+candidate at a time, revalidating it and probing a fresh lease without waiting.
+It releases the guard between candidates, reports active stages and reclaims
+inactive ones. A busy directory guard defers the remaining candidates; a
+directory-guard release failure stops the pass because ownership is uncertain.
+Payload-only allocation
 remnants and lease-only post-publication remnants are safe to reclaim under this
 protocol. Only regular, non-symlink files are eligible. Recovery is independent
 of the catalog and active release, because these payloads were never published.
@@ -753,8 +763,13 @@ legacy leftovers manually only after verifying their writers have stopped.
 companions; lock metadata and normal command telemetry may still be created.
 Temporary-file paths, counts and freed bytes describe payloads only and are
 reported separately from completed evaluations. Lease housekeeping does not add
-to these counts. Cleanup failures are reported and do not prevent other cleanup
-or normal work; successful deletions remain counted even if lock release fails.
+to these counts. Expected per-file I/O failures are reported and processing
+continues with other candidates. Successful deletions remain counted even if
+lock release fails; guard contention or release failure stops the remaining pass.
+Unexpected programming errors in discovery, validation or deletion propagate
+and fail the command. Diagnostics identify directory-guard release, payload
+removal, lease release and companion removal failures separately. A committed
+publication remains successful after ordinary housekeeping errors, with a warning.
 
 Always run `--dry-run` first. Deleting an evaluation still referenced by a live
 release would leave serving unable to justify what it is doing.
