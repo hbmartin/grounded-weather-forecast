@@ -1,7 +1,9 @@
-"""Score publication ownership and recovery of unpublished temporary files."""
+"""Independent score publication leases and recovery of unpublished files."""
 
-import re
+import logging
+import os
 import stat
+import threading
 from collections.abc import Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -9,69 +11,219 @@ from pathlib import Path
 
 from filelock import FileLock, Timeout
 
-SCORE_WRITE_LOCK = ".scores-write.lock"
-_SCORE_TEMPORARY = re.compile(r"\.scores_.*\.parquet\.[0-9a-f]{16}\.tmp")
+from grounded_weather_forecast.storage import (
+    locked_path,
+    publish_parquet,
+    temporary_destination,
+    temporary_sibling,
+)
+
+SCORE_STAGE_NAMESPACE = "score-stage-v1"
+SCORE_WRITE_LOCK = f".{SCORE_STAGE_NAMESPACE}.lock"
+SCORE_COORDINATION_TIMEOUT_S = 60.0
+_held = threading.local()
+_logger = logging.getLogger(__name__)
+
+
+class ScoreCoordinationTimeout(Timeout):
+    """A brief score-directory bookkeeping lock could not be acquired in time."""
 
 
 @contextmanager
-def score_write_lock(directory: Path, *, timeout: float = -1) -> Iterator[None]:
-    """Serialize score publishers and reclamation; readers never take this lock.
+def score_write_lock(
+    directory: Path, *, timeout: float | None = None
+) -> Iterator[None]:
+    """Brief directory coordination, reentrant only on this process and thread.
 
-    Keep the small lock file after release: unlinking a live lock's inode would
-    let another process lock a different inode under the same name.
+    Filesystem identity makes directory aliases equivalent. Payload leases use
+    fresh lock objects instead, including during recovery in the writer thread.
     """
     directory.mkdir(parents=True, exist_ok=True)
-    with FileLock(directory / SCORE_WRITE_LOCK, timeout=timeout):
+    metadata = directory.stat()
+    identity = (os.getpid(), metadata.st_dev, metadata.st_ino)
+    held = getattr(_held, "directories", set())
+    if identity in held:
         yield
+        return
+    guard = locked_path(
+        directory / f".{SCORE_STAGE_NAMESPACE}",
+        SCORE_COORDINATION_TIMEOUT_S if timeout is None else timeout,
+    )
+    try:
+        guard.__enter__()
+    except (Timeout,) as error:  # noqa: B013 -- translate acquisition only
+        raise ScoreCoordinationTimeout(error.lock_file) from error
+    _held.directories = held | {identity}
+    try:
+        yield
+    except (BaseException,) as error:  # noqa: B013
+        try:
+            guard.__exit__(None, None, None)
+        except (Exception,) as secondary:  # noqa: B013
+            error.add_note(f"score coordination release failed: {secondary}")
+        raise
+    else:
+        guard.__exit__(None, None, None)
+    finally:
+        _held.directories = held
+
+
+def _lease_path(temporary: Path) -> Path:
+    return temporary.with_name(f"{temporary.name}.lease")
+
+
+def _dispose_stage(temporary: Path, lease: FileLock) -> None:
+    """Release ownership even when bookkeeping fails; leftovers are recoverable."""
+    try:
+        with score_write_lock(temporary.parent, timeout=0):
+            temporary.unlink(missing_ok=True)
+            lease.release()
+            _lease_path(temporary).unlink(missing_ok=True)
+    except (BaseException,) as error:  # noqa: B013
+        if lease.is_locked:
+            try:
+                lease.release()
+            except (Exception,) as secondary:  # noqa: B013
+                error.add_note(f"score lease release failed: {secondary}")
+        raise
+
+
+@contextmanager
+def score_parquet_destination(path: Path) -> Iterator[Path]:
+    """Own one payload through encoding, producer closure and atomic publication.
+
+    Other payloads can be written in parallel, even to the same destination.
+    Publication keeps atomic last-replacement-wins semantics. Only allocation,
+    replacement and removal use the short directory guard.
+    """
+    temporary: Path | None = None
+    lease: FileLock | None = None
+    committed = False
+    try:
+        with score_write_lock(path.parent):
+            temporary = temporary_sibling(path, namespace=SCORE_STAGE_NAMESPACE)
+            lease = FileLock(_lease_path(temporary))
+            lease.acquire(timeout=0)
+        yield temporary
+        with score_write_lock(path.parent):
+            publish_parquet(temporary, path)
+            committed = True
+    except (BaseException,) as error:  # noqa: B013
+        if temporary is not None and lease is not None:
+            try:
+                _dispose_stage(temporary, lease)
+            except (Exception,) as secondary:  # noqa: B013
+                error.add_note(f"score stage cleanup failed: {secondary}")
+        if committed and isinstance(error, Exception):
+            _logger.warning("published %s; score stage cleanup failed: %s", path, error)
+        else:
+            raise
+    else:
+        try:
+            _dispose_stage(temporary, lease)
+        except (Exception,) as error:  # noqa: B013
+            # The destination is already committed. Do not report it as failed.
+            _logger.warning("published %s; score stage cleanup failed: %s", path, error)
 
 
 @dataclass(frozen=True, slots=True)
 class ScoreTempCleanup:
-    """Removed (or dry-run eligible) files, independent of published evidence."""
+    """Removed (or dry-run eligible) payloads, independent of published evidence."""
 
     deleted: tuple[Path, ...] = ()
     freed_mb: float = 0.0
     skipped: tuple[str, ...] = ()
 
 
-def _reclaim_temporaries(directory: Path, *, dry_run: bool) -> ScoreTempCleanup:
-    deleted: list[Path] = []
-    skipped: list[str] = []
+def _regular(path: Path) -> bool:
+    return stat.S_ISREG(path.lstat().st_mode)
+
+
+def _stage_payloads(directory: Path) -> list[Path]:
+    payloads: set[Path] = set()
+    for entry in directory.glob(f".{SCORE_STAGE_NAMESPACE}.*"):
+        path = entry.with_name(entry.name.removesuffix(".lease"))
+        destination = temporary_destination(path, namespace=SCORE_STAGE_NAMESPACE)
+        if (
+            destination
+            and destination.name.startswith("scores_")
+            and destination.suffix == ".parquet"
+        ):
+            payloads.add(path)
+    return sorted(payloads)
+
+
+def _reclaim_stage(
+    path: Path, *, dry_run: bool, deleted: list[Path], skipped: list[str]
+) -> int:
+    """Account for payload deletion before releasing a potentially faulty lease."""
+    lease_path = _lease_path(path)
+    if (
+        path.is_symlink()
+        or lease_path.is_symlink()
+        or (path.exists() and not _regular(path))
+        or (lease_path.exists() and not _regular(lease_path))
+    ):
+        return 0
+    lease = FileLock(lease_path)
     freed = 0
-    for path in sorted(directory.glob(".scores_*.tmp")):
-        if _SCORE_TEMPORARY.fullmatch(path.name) is None:
-            continue
-        try:
-            metadata = path.lstat()
-            if not stat.S_ISREG(metadata.st_mode):
-                continue
+    try:
+        lease.acquire(timeout=0)
+    except (Timeout,):  # noqa: B013
+        skipped.append(f"{path.name}: temporary cleanup: score writer is active")
+        return 0
+    try:
+        if path.exists():
+            size = path.stat().st_size
             if not dry_run:
                 path.unlink()
-        except (FileNotFoundError,):  # noqa: B013 -- harmless external removal
-            continue
-        except (OSError,) as error:  # noqa: B013 -- project tuple convention
-            skipped.append(f"{path.name}: temporary cleanup failed: {error}")
-            continue
-        deleted.append(path)
-        freed += metadata.st_size
-    return ScoreTempCleanup(tuple(deleted), freed / 1e6, tuple(skipped))
+            deleted.append(path)
+            freed = size
+    finally:
+        try:
+            lease.release()
+        except (Exception,) as error:  # noqa: B013
+            skipped.append(f"{path.name}: temporary lease release failed: {error}")
+        else:
+            if not dry_run:
+                try:
+                    lease_path.unlink(missing_ok=True)
+                except (FileNotFoundError,):  # noqa: B013
+                    pass
+                except (Exception,) as error:  # noqa: B013
+                    skipped.append(
+                        f"{path.name}: temporary lease cleanup failed: {error}"
+                    )
+    return freed
 
 
 def cleanup_score_temporaries(
     directory: Path, *, dry_run: bool = False
 ) -> ScoreTempCleanup:
-    """Reclaim abandoned scores without waiting behind an active library writer.
+    """Reclaim only inactive v1 stages; leave legacy/uncooperative writers alone.
 
-    CLI callers also hold the pipeline lock, coordinating with older CLI
-    publishers. All current score publishers participate in the directory lock.
-    No age test is needed while exclusive ownership proves no publisher is live.
+    Directory and individual lease acquisition are nonblocking. A dry run may
+    create lock metadata, but never explicitly unlinks payloads or companions.
+    Deletion accounting survives ordinary errors while releasing either lock.
     """
     if not directory.exists():
         return ScoreTempCleanup()
+    deleted: list[Path] = []
+    skipped: list[str] = []
+    freed = 0
     try:
         with score_write_lock(directory, timeout=0):
-            return _reclaim_temporaries(directory, dry_run=dry_run)
-    except (Timeout,):  # noqa: B013 -- project tuple convention
-        return ScoreTempCleanup(skipped=("temporary cleanup: score writer is active",))
-    except (OSError,) as error:  # noqa: B013
-        return ScoreTempCleanup(skipped=(f"temporary cleanup failed: {error}",))
+            for path in _stage_payloads(directory):
+                try:
+                    freed += _reclaim_stage(
+                        path, dry_run=dry_run, deleted=deleted, skipped=skipped
+                    )
+                except (FileNotFoundError,):  # noqa: B013
+                    continue
+                except (Exception,) as error:  # noqa: B013
+                    skipped.append(f"{path.name}: temporary cleanup failed: {error}")
+    except (ScoreCoordinationTimeout,):  # noqa: B013
+        skipped.append("temporary cleanup: score directory coordination is busy")
+    except (Exception,) as error:  # noqa: B013
+        skipped.append(f"temporary cleanup failed: {error}")
+    return ScoreTempCleanup(tuple(deleted), freed / 1e6, tuple(skipped))

@@ -35,7 +35,11 @@ from grounded_weather_forecast.backtest.scores import (
     stamped_scores,
     write_score_batches,
 )
-from grounded_weather_forecast.contracts import daily_variable, hourly_variable
+from grounded_weather_forecast.contracts import (
+    BlendResult,
+    daily_variable,
+    hourly_variable,
+)
 from grounded_weather_forecast.dataset import truth
 from grounded_weather_forecast.evaluation import EvaluationRun
 from grounded_weather_forecast.serve import selection
@@ -655,3 +659,143 @@ def test_publication_lock_spans_writer_and_producer_close_and_replace(
     write_score_batches(Producer(), tmp_path, "hourly", "live", "expanding")
     assert events == ["writer", "producer", "replace"]
     assert not cleanup_score_temporaries(tmp_path).skipped
+
+
+@pytest.mark.parametrize("count", [0, 1, SCORE_BATCH_ROWS, SCORE_BATCH_ROWS + 1])
+@pytest.mark.parametrize(
+    ("levels", "width", "error"),
+    [
+        (None, 1, ValueError),
+        ((), 0, ValueError),
+        ((0.5,), 2, pl.exceptions.ShapeError),
+        ((0.5, 0.5), 2, ValueError),
+        ((0.9, 0.1), 2, ValueError),
+        ((0.0,), 1, ValueError),
+        ((1.0,), 1, ValueError),
+        ((float("nan"),), 1, ValueError),
+        ((float("inf"),), 1, ValueError),
+    ],
+)
+def test_quantile_metadata_validated_before_first_yield(
+    tmp_path, evaluation, count, levels, width, error
+):
+    keys, evaluation, arguments = predictions(
+        count, evaluation, quantile_levels=levels, quantiles=np.zeros((count, width))
+    )
+    with pytest.raises(error):
+        stamped_scores(keys, evaluation, **arguments)
+    with pytest.raises(error):
+        write_score_batches(
+            stamped_score_batches(keys, evaluation, **arguments),
+            tmp_path,
+            "hourly",
+            "live",
+            "expanding",
+        )
+    assert not score_outputs(tmp_path)
+
+
+@pytest.mark.parametrize("levels", [None, (), (0.5,)])
+def test_point_level_metadata_preserves_null_and_empty_json(evaluation, levels):
+    keys, evaluation, arguments = predictions(1, evaluation, quantile_levels=levels)
+    if levels:
+        with pytest.raises(ValueError, match="require quantiles"):
+            stamped_scores(keys, evaluation, **arguments)
+        with pytest.raises(ValueError, match="require quantiles"):
+            next(stamped_score_batches(keys, evaluation, **arguments))
+    else:
+        assert stamped_scores(keys, evaluation, **arguments)["quantile_levels_json"][
+            0
+        ] == ("null" if levels is None else "[]")
+
+
+@pytest.mark.parametrize("zone", [None, "America/Los_Angeles", "UTC"])
+def test_timestamp_timezone_normalization_is_explicit(tmp_path, evaluation, zone):
+    keys, evaluation, arguments = predictions(1, evaluation)
+    if zone is None:
+        keys = keys.with_columns(
+            pl.col("issue_time", "valid_time").dt.replace_time_zone(None)
+        )
+        arguments["fold_origin"] = arguments["fold_origin"].replace(tzinfo=None)
+        evaluation = replace(evaluation, created_at="2026-10-14T00:00:00")
+    else:
+        keys = keys.with_columns(
+            pl.col("issue_time", "valid_time").dt.convert_time_zone(zone)
+        )
+    expected = stamped_scores(keys, evaluation, **arguments).cast(SCORES_SCHEMA)
+    result = write_score_batches(
+        stamped_score_batches(keys, evaluation, **arguments),
+        tmp_path,
+        "hourly",
+        "live",
+        "expanding",
+    )
+    actual = load_scores(result.path)
+    assert actual.equals(expected)
+    assert actual["issue_time"][0] == datetime(2026, 10, 14, tzinfo=UTC)
+
+
+@pytest.mark.parametrize("daily", [False, True])
+@pytest.mark.parametrize("all_invalid", [False, True])
+def test_engine_filters_nonfinite_truth_before_keys_and_fitting(
+    tmp_path, daily, all_invalid
+):
+    config = write_config(
+        tmp_path, extra_toml="\n[backtest]\ninitial_train_days = 10\nstep_days = 5\n"
+    )
+    matrix = synthetic_hourly_matrix(days=25, max_lead=6)
+    column = "t__temp_c__inst"
+    variable = hourly_variable("temp_c")
+    if daily:
+        matrix = matrix.rename(
+            {
+                "fx__alpha__temp_c": "fxd__alpha__temp_max_c",
+                "fx__beta__temp_c": "fxd__beta__temp_max_c",
+                column: "t__temp_max_c",
+            }
+        ).with_columns(
+            pl.col("valid_time").dt.date().alias("forecast_date"),
+            pl.lit(1).alias("lead_days"),
+        )
+        column = "t__temp_max_c"
+        variable = daily_variable("temp_max_c")
+    values = matrix[column].to_numpy().copy()
+    for index, invalid in enumerate([np.nan, np.inf, -np.inf]):
+        values[index :: (3 if all_invalid else 7)] = invalid
+    matrix = matrix.with_columns(pl.Series(column, values))
+
+    class FiniteBlender:
+        def fit(self, training):
+            assert np.isfinite(training.y).all()
+            assert training.y.size
+            return self
+
+        def predict(self, x):
+            return BlendResult(point=np.zeros(x.values.shape[0]))
+
+    # The truth values themselves identify their matching keys.
+    request = BacktestRequest(
+        variables=(variable,), methods=("equal_weight",), daily=daily
+    )
+    frames = list(
+        iter_backtest_scores(
+            matrix, request, config, factories={"equal_weight": FiniteBlender}
+        )
+    )
+    if all_invalid:
+        assert not frames
+    else:
+        actual = pl.concat(frames).select("issue_time", "valid_time", "y_true")
+        finite = matrix.filter(pl.col(column).is_finite())
+        expected = (
+            engine._lead_and_valid(
+                finite, daily=daily, timezone_name=config.station.timezone
+            )
+            .with_columns(finite[column].alias("y_true"))
+            .select("issue_time", "valid_time", "y_true")
+        )
+        assert actual.height > 0
+        assert actual.join(
+            expected, on=["issue_time", "valid_time", "y_true"], how="anti"
+        ).is_empty()
+        assert actual["y_true"].is_finite().all()

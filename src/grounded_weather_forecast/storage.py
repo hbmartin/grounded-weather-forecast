@@ -1,6 +1,7 @@
 """Locked, atomic filesystem writes shared by persistent artifact stores."""
 
 import os
+import re
 import secrets
 import stat
 from collections.abc import Iterator
@@ -58,11 +59,12 @@ def locked_path(path: Path, timeout: float = -1) -> Iterator[None]:
         yield
 
 
-def _temporary_sibling(path: Path) -> Path:
+def temporary_sibling(path: Path, *, namespace: str | None = None) -> Path:
     """Create an exclusive sibling using normal umask-derived permissions."""
     path.parent.mkdir(parents=True, exist_ok=True)
     for _ in range(100):
-        candidate = path.with_name(f".{path.name}.{secrets.token_hex(8)}.tmp")
+        prefix = f".{namespace}." if namespace else "."
+        candidate = path.with_name(f"{prefix}{path.name}.{secrets.token_hex(8)}.tmp")
         try:
             descriptor = os.open(
                 candidate,
@@ -75,6 +77,14 @@ def _temporary_sibling(path: Path) -> Path:
         return candidate
     msg = f"could not allocate a temporary sibling for {path}"
     raise FileExistsError(msg)
+
+
+def temporary_destination(path: Path, *, namespace: str) -> Path | None:
+    """Recognize exactly the names allocated in one private staging namespace."""
+    match = re.fullmatch(
+        rf"\.{re.escape(namespace)}\.(.+)\.[0-9a-f]{{16}}\.tmp", path.name
+    )
+    return path.with_name(match[1]) if match else None
 
 
 def _preserve_mode(temporary: Path, destination: Path) -> None:
@@ -90,7 +100,7 @@ def output_target(path: Path) -> Path:
 
 def stage_parquet(frame: pl.DataFrame, path: Path) -> Path:
     """Write parquet to a uniquely named sibling without replacing ``path``."""
-    temporary = _temporary_sibling(path)
+    temporary = temporary_sibling(path)
     try:
         frame.write_parquet(temporary)
         _preserve_mode(temporary, path)
@@ -102,7 +112,7 @@ def stage_parquet(frame: pl.DataFrame, path: Path) -> Path:
 
 def stage_text(text: str, path: Path) -> Path:
     """Write text to a uniquely named sibling without replacing ``path``."""
-    temporary = _temporary_sibling(path)
+    temporary = temporary_sibling(path)
     try:
         temporary.write_text(text, encoding="utf-8")
         _preserve_mode(temporary, path)
@@ -128,17 +138,22 @@ def atomic_parquet_destination(path: Path) -> Iterator[Path]:
     The caller owns encoding and closing. Interrupted writes leave the existing
     destination intact; cleanup errors annotate rather than replace the failure.
     """
-    temporary = _temporary_sibling(path)
+    temporary = temporary_sibling(path)
     try:
         yield temporary
-        _preserve_mode(temporary, path)
-        temporary.replace(path)
+        publish_parquet(temporary, path)
     except (BaseException,) as error:  # noqa: B013 -- project tuple convention
         try:
             temporary.unlink(missing_ok=True)
         except (OSError,) as cleanup:  # noqa: B013
             error.add_note(f"could not remove staged Parquet {temporary}: {cleanup}")
         raise
+
+
+def publish_parquet(temporary: Path, path: Path) -> None:
+    """Publish a closed staged file with the existing destination's permissions."""
+    _preserve_mode(temporary, path)
+    temporary.replace(path)
 
 
 def atomic_write_text(text: str, path: Path) -> None:

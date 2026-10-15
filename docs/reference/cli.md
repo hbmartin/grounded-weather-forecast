@@ -381,11 +381,19 @@ per batch/row group. The writer closes a temporary file before atomic publicatio
 a handled failure or interruption preserves an existing destination and removes
 the temporary file. Abrupt process termination can leave an unpublished hidden
 temporary file; the next backtest or `prune-scores` reclaims it before processing
-published evidence. Both library score writers hold an exclusive lock at
-`<scores directory>/.scores-write.lock` until publication finishes. Writers to
-the same directory wait interruptibly; readers remain lock-free. Recovery takes
-the lock without waiting and reports a skip when a library writer is active.
-The small lock file persists so every process continues locking the same inode.
+published evidence. Each writer leases its own private stage at
+`.score-stage-v1.<score filename>.<16 lowercase hex>.tmp`, with a `.lease`
+companion held through producer closure and atomic publication. Independent
+files can be written concurrently in the same directory. Concurrent writers to
+the same destination retain atomic last-replacement-wins semantics.
+
+The persistent `.score-stage-v1.lock` coordinates only allocation, publication
+and removal; it is never held during fitting, prediction or bulk writing.
+Nested calls in the same process/thread share this short guard, including through
+directory aliases. Each coordination acquisition waits at most **60 seconds**;
+contention produces a score-specific diagnostic and exit code **75** from
+`backtest` or `maintain`, releases the pipeline lock and suppresses promotion.
+Cleanup never waits behind another writer. Readers remain lock-free.
 SIGTERM behavior is unchanged; SIGTERM, SIGKILL and OOM leftovers use next-run
 recovery. Product-owned matrices and score generators are released before
 the next product and before promotion. Stored schemas, quantile JSON and CLI
@@ -730,13 +738,23 @@ deletion, so the history ledgers stay intact — only the bulky per-case scores 
 removed. Published files the evaluations catalog has never seen are skipped,
 never deleted.
 
-Abandoned unpublished files matching `.scores_*.parquet.<16 lowercase hex>.tmp`
-are reclaimed independently of the catalog and release pointer. Only regular
-non-symlink files are eligible, and an exclusive score-directory lock proves no
-participating publisher is active, so recovery needs no age threshold.
-`--dry-run` lists eligible temporary files without deleting them. Temporary-file
-counts and freed bytes are reported separately from completed evaluations.
-Unlink failures are reported and do not prevent other cleanup or normal work.
+Only private `.score-stage-v1.scores_*.parquet.<16 lowercase hex>.tmp`
+payloads and their `.lease` companions participate in automatic recovery.
+Recovery takes the short directory guard and probes each lease without waiting,
+reporting active stages while reclaiming inactive ones. Payload-only allocation
+remnants and lease-only post-publication remnants are safe to reclaim under this
+protocol. Only regular, non-symlink files are eligible. Recovery is independent
+of the catalog and active release, because these payloads were never published.
+Legacy `.scores_*.parquet.<token>.tmp` and other atomic-store temporary files
+remain untouched: an older or uncooperative writer may still own them. Remove
+legacy leftovers manually only after verifying their writers have stopped.
+
+`--dry-run` lists eligible payloads without explicitly deleting payloads or lease
+companions; lock metadata and normal command telemetry may still be created.
+Temporary-file paths, counts and freed bytes describe payloads only and are
+reported separately from completed evaluations. Lease housekeeping does not add
+to these counts. Cleanup failures are reported and do not prevent other cleanup
+or normal work; successful deletions remain counted even if lock release fails.
 
 Always run `--dry-run` first. Deleting an evaluation still referenced by a live
 release would leave serving unable to justify what it is doing.
