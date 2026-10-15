@@ -4,8 +4,8 @@ import logging
 import os
 import stat
 import threading
-from collections.abc import Iterator
-from contextlib import contextmanager
+from collections.abc import Callable, Iterator
+from contextlib import AbstractContextManager, contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -21,12 +21,42 @@ from grounded_weather_forecast.storage import (
 SCORE_STAGE_NAMESPACE = "score-stage-v1"
 SCORE_WRITE_LOCK = f".{SCORE_STAGE_NAMESPACE}.lock"
 SCORE_COORDINATION_TIMEOUT_S = 60.0
-_held = threading.local()
 _logger = logging.getLogger(__name__)
+
+type _DirectoryIdentity = tuple[int, int, int]
+
+
+class _LockState(threading.local):
+    """Initialize explicitly typed bookkeeping independently for each thread."""
+
+    def __init__(self) -> None:
+        self.directories: frozenset[_DirectoryIdentity] = frozenset()
+
+
+_held = _LockState()
 
 
 class ScoreCoordinationTimeout(Timeout):
     """A brief score-directory bookkeeping lock could not be acquired in time."""
+
+
+class ScoreCoordinationReleaseError(RuntimeError):
+    """A guard release failed; the lock's ownership may be uncertain."""
+
+    def __init__(self, lock_path: Path, cause: Exception) -> None:
+        self.lock_path = lock_path
+        self.cause = cause
+        super().__init__(
+            f"directory guard release failed for {lock_path}; "
+            f"ownership uncertain: {cause}"
+        )
+
+
+def _release_guard(guard: AbstractContextManager[None], lock_path: Path) -> None:
+    try:
+        guard.__exit__(None, None, None)
+    except (Exception,) as error:  # noqa: B013 -- resource release only
+        raise ScoreCoordinationReleaseError(lock_path, error) from error
 
 
 @contextmanager
@@ -41,7 +71,7 @@ def score_write_lock(
     directory.mkdir(parents=True, exist_ok=True)
     metadata = directory.stat()
     identity = (os.getpid(), metadata.st_dev, metadata.st_ino)
-    held = getattr(_held, "directories", set())
+    held = _held.directories
     if identity in held:
         yield
         return
@@ -58,12 +88,12 @@ def score_write_lock(
         yield
     except (BaseException,) as error:  # noqa: B013
         try:
-            guard.__exit__(None, None, None)
+            _release_guard(guard, directory / SCORE_WRITE_LOCK)
         except (Exception,) as secondary:  # noqa: B013
             error.add_note(f"score coordination release failed: {secondary}")
         raise
     else:
-        guard.__exit__(None, None, None)
+        _release_guard(guard, directory / SCORE_WRITE_LOCK)
     finally:
         _held.directories = held
 
@@ -72,19 +102,51 @@ def _lease_path(temporary: Path) -> Path:
     return temporary.with_name(f"{temporary.name}.lease")
 
 
+def _cleanup_action(action: Callable[[], object], phase: str, path: Path) -> None:
+    try:
+        action()
+    except (BaseException,) as error:  # noqa: B013 -- annotate, never suppress
+        error.add_note(f"score {phase} failed for {path}")
+        raise
+
+
+def _cleanup_diagnostic(error: Exception) -> str:
+    return "; ".join((str(error), *getattr(error, "__notes__", ())))
+
+
+def _warn_committed_cleanup(path: Path, error: Exception) -> None:
+    if isinstance(error, ScoreCoordinationTimeout):
+        _logger.warning(
+            "published %s; cleanup deferred: directory guard busy (%s); "
+            "a later backtest or prune-scores can recover leftovers",
+            path,
+            error.lock_file,
+        )
+    else:
+        _logger.warning("published %s; %s", path, _cleanup_diagnostic(error))
+
+
 def _dispose_stage(temporary: Path, lease: FileLock) -> None:
     """Release ownership even when bookkeeping fails; leftovers are recoverable."""
     try:
         with score_write_lock(temporary.parent, timeout=0):
-            temporary.unlink(missing_ok=True)
-            lease.release()
-            _lease_path(temporary).unlink(missing_ok=True)
+            _cleanup_action(
+                lambda: temporary.unlink(missing_ok=True), "payload removal", temporary
+            )
+            _cleanup_action(lease.release, "lease release", _lease_path(temporary))
+            _cleanup_action(
+                lambda: _lease_path(temporary).unlink(missing_ok=True),
+                "lease companion removal",
+                _lease_path(temporary),
+            )
     except (BaseException,) as error:  # noqa: B013
         if lease.is_locked:
             try:
                 lease.release()
             except (Exception,) as secondary:  # noqa: B013
-                error.add_note(f"score lease release failed: {secondary}")
+                error.add_note(
+                    f"score lease release failed for {_lease_path(temporary)}: {secondary}"
+                )
         raise
 
 
@@ -113,9 +175,11 @@ def score_parquet_destination(path: Path) -> Iterator[Path]:
             try:
                 _dispose_stage(temporary, lease)
             except (Exception,) as secondary:  # noqa: B013
-                error.add_note(f"score stage cleanup failed: {secondary}")
+                error.add_note(
+                    f"score stage cleanup failed: {_cleanup_diagnostic(secondary)}"
+                )
         if committed and isinstance(error, Exception):
-            _logger.warning("published %s; score stage cleanup failed: %s", path, error)
+            _warn_committed_cleanup(path, error)
         else:
             raise
     else:
@@ -123,7 +187,7 @@ def score_parquet_destination(path: Path) -> Iterator[Path]:
             _dispose_stage(temporary, lease)
         except (Exception,) as error:  # noqa: B013
             # The destination is already committed. Do not report it as failed.
-            _logger.warning("published %s; score stage cleanup failed: %s", path, error)
+            _warn_committed_cleanup(path, error)
 
 
 @dataclass(frozen=True, slots=True)
@@ -167,6 +231,7 @@ def _reclaim_stage(
         return 0
     lease = FileLock(lease_path)
     freed = 0
+    primary: BaseException | None = None
     try:
         lease.acquire(timeout=0)
     except (Timeout,):  # noqa: B013
@@ -176,24 +241,31 @@ def _reclaim_stage(
         if path.exists():
             size = path.stat().st_size
             if not dry_run:
-                path.unlink()
+                _cleanup_action(path.unlink, "payload removal", path)
             deleted.append(path)
             freed = size
+    except (BaseException,) as error:  # noqa: B013 -- preserve during release
+        primary = error
+        raise
     finally:
         try:
             lease.release()
         except (Exception,) as error:  # noqa: B013
-            skipped.append(f"{path.name}: temporary lease release failed: {error}")
+            note = f"{lease_path}: temporary lease release failed: {error}"
+            if primary is None:
+                skipped.append(note)
+            else:
+                primary.add_note(note)
         else:
             if not dry_run:
                 try:
                     lease_path.unlink(missing_ok=True)
-                except (FileNotFoundError,):  # noqa: B013
-                    pass
-                except (Exception,) as error:  # noqa: B013
-                    skipped.append(
-                        f"{path.name}: temporary lease cleanup failed: {error}"
-                    )
+                except (OSError,) as error:  # noqa: B013
+                    note = f"{lease_path}: temporary lease companion removal failed: {error}"
+                    if primary is None:
+                        skipped.append(note)
+                    else:
+                        primary.add_note(note)
     return freed
 
 
@@ -206,24 +278,42 @@ def cleanup_score_temporaries(
     create lock metadata, but never explicitly unlinks payloads or companions.
     Deletion accounting survives ordinary errors while releasing either lock.
     """
-    if not directory.exists():
-        return ScoreTempCleanup()
     deleted: list[Path] = []
     skipped: list[str] = []
     freed = 0
     try:
-        with score_write_lock(directory, timeout=0):
-            for path in _stage_payloads(directory):
+        if not directory.exists():
+            return ScoreTempCleanup()
+        if not directory.is_dir():
+            return ScoreTempCleanup(
+                skipped=(f"temporary cleanup failed: not a directory: {directory}",)
+            )
+        candidates = _stage_payloads(directory)
+    except (OSError,) as error:  # noqa: B013
+        return ScoreTempCleanup(skipped=(f"temporary discovery failed: {error}",))
+    for path in candidates:
+        try:
+            with score_write_lock(directory, timeout=0):
                 try:
                     freed += _reclaim_stage(
                         path, dry_run=dry_run, deleted=deleted, skipped=skipped
                     )
                 except (FileNotFoundError,):  # noqa: B013
-                    continue
-                except (Exception,) as error:  # noqa: B013
-                    skipped.append(f"{path.name}: temporary cleanup failed: {error}")
-    except (ScoreCoordinationTimeout,):  # noqa: B013
-        skipped.append("temporary cleanup: score directory coordination is busy")
-    except (Exception,) as error:  # noqa: B013
-        skipped.append(f"temporary cleanup failed: {error}")
+                    pass
+                except (OSError,) as error:  # noqa: B013
+                    skipped.append(
+                        f"{path.name}: temporary cleanup failed: {_cleanup_diagnostic(error)}"
+                    )
+        except (ScoreCoordinationTimeout,):  # noqa: B013
+            skipped.append(
+                "temporary cleanup deferred: score directory coordination is busy"
+            )
+            break
+        except (ScoreCoordinationReleaseError,) as error:  # noqa: B013
+            skipped.append(f"temporary cleanup stopped: {error}")
+            break
+        except (OSError,) as error:  # noqa: B013
+            skipped.append(
+                f"{path.name}: temporary cleanup failed: {_cleanup_diagnostic(error)}"
+            )
     return ScoreTempCleanup(tuple(deleted), freed / 1e6, tuple(skipped))

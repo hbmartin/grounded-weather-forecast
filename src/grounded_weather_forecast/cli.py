@@ -1052,7 +1052,7 @@ def _cmd_backtest(config: Config, args: argparse.Namespace) -> int:
         return _backtest_products(config, args)
     except (ScoreCoordinationTimeout,) as error:  # noqa: B013
         print(f"score directory coordination timed out: {error}", file=sys.stderr)
-        return 75
+        return EXIT_CONTENTION
 
 
 def _backtest_products(config: Config, args: argparse.Namespace) -> int:

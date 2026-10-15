@@ -205,7 +205,7 @@ columns and `store_schema=False`; omitting Arrow schema metadata preserves the
 existing String columns when Polars reads the stored file. UTC timestamps,
 nulls, Float64 predictions and quantile JSON retain their existing meanings.
 One evaluation ID spans each product's batches. Schema or identity mismatch,
-iteration/write/close failure, or handled interruption aborts publication.
+iteration/write/close failure, or handled interruption before commit aborts publication.
 The producer and writer close before atomic replacement, with existing output
 permissions preserved. Empty score streams retain the historical empty schema.
 
@@ -232,17 +232,29 @@ filesystem identity; recovery always uses fresh lease handles, so it cannot
 reclaim a live stage even inside the writer thread.
 
 `SCORE_COORDINATION_TIMEOUT_S = 60.0` bounds each publication guard acquisition.
-Only acquisition contention becomes `ScoreCoordinationTimeout`; CLI backtest and
-maintenance return 75, release the pipeline lock and skip promotion. Cleanup
-acquisitions are nonblocking. Readers never take these locks. Backtest startup
-and `prune-scores` reclaim only inactive private stages, including payload-only
-allocation and lease-only publication remnants. Legacy names, unrelated stores,
+Allocation and publication each have that budget (up to 120 seconds combined,
+excluding model computation and other locks). Only acquisition contention becomes
+`ScoreCoordinationTimeout`; CLI backtest, maintenance and recovery return 75,
+release the pipeline lock and skip promotion. Cleanup acquisitions are nonblocking. Readers never take these locks. Backtest startup
+and `prune-scores` discover candidates outside coordination and revalidate each
+under its own short guard and fresh lease. The guard releases between candidates;
+contention defers the remainder. Only inactive private stages are reclaimed,
+including payload-only allocation and lease-only publication remnants. Legacy names, unrelated stores,
 symlinks and malformed names remain untouched. Dry runs may create lock metadata
 but never explicitly unlink payloads or companions. Only payloads contribute to
 temporary counts/bytes, and completed-evaluation retention meanings are unchanged.
 Ordinary housekeeping errors after publication produce diagnostics without
 turning a committed write into failure. Deletion accounting survives release
-errors; new control-flow exceptions during cleanup still propagate.
+errors; `ScoreCoordinationReleaseError` retains the guard path and original cause,
+stopping recovery if guard release fails. Diagnostics identify the affected
+resource and cleanup phase. Unexpected programming errors in recovery work
+propagate; broad ordinary-exception handling is restricted to release and
+secondary-cleanup boundaries. New control-flow exceptions during cleanup still propagate.
+
+Disposal retains its zero-wait guard attempt. Even handled failures or successful
+publications can leave payloads or lease companions when that attempt loses
+contention; a later recovery pass reclaims them. The per-thread reentrancy state
+is explicitly typed and initialized separately for each thread.
 
 The DataFrame-returning library APIs remain materializing compatibility paths.
 The [backtest memory benchmark](../reference/cli.md#backtest-memory-benchmark)
