@@ -198,10 +198,12 @@ def value_digest(path: Path, categorical_columns: Sequence[str]) -> str:
                     ],
                     dtype="S32",
                 )
-                values = tokens[
-                    column.indices.fill_null(0).to_numpy(zero_copy_only=False)
+                values = np.zeros(len(column), dtype="S32")
+                values[valid] = tokens[
+                    column.indices.filter(column.is_valid()).to_numpy(
+                        zero_copy_only=False
+                    )
                 ]
-                values[~valid] = b""
                 digest.update(values.tobytes())
             elif pa.types.is_string(column.type) or pa.types.is_large_string(
                 column.type

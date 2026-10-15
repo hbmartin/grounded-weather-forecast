@@ -40,6 +40,7 @@ from typing import cast
 import polars as pl
 from filelock import Timeout
 
+from grounded_weather_forecast.backtest.score_storage import cleanup_score_temporaries
 from grounded_weather_forecast.config import Config
 from grounded_weather_forecast.dataset.providers import source_slug
 from grounded_weather_forecast.dataset.station import sqlite_uri
@@ -884,6 +885,8 @@ class PruneResult:
     kept: tuple[Path, ...]
     skipped: tuple[str, ...]
     freed_mb: float
+    temporary_deleted: tuple[Path, ...] = ()
+    temporary_freed_mb: float = 0.0
 
 
 def _protected_evaluations(config: Config, *, now: datetime) -> set[str] | None:
@@ -973,14 +976,17 @@ def prune_scores_files(
     """
     moment = now or datetime.now(tz=UTC)
     scores_dir = config.dataset.dir / "scores"
+    temporary = cleanup_score_temporaries(scores_dir, dry_run=dry_run)
     files = sorted(scores_dir.glob("scores_*.parquet")) if scores_dir.exists() else []
     protected = _protected_evaluations(config, now=moment)
     if protected is None:
         return PruneResult(
             deleted=(),
             kept=tuple(files),
-            skipped=("active served release could not be verified",),
+            skipped=(*temporary.skipped, "active served release could not be verified"),
             freed_mb=0.0,
+            temporary_deleted=temporary.deleted,
+            temporary_freed_mb=temporary.freed_mb,
         )
     try:
         cataloged = set(
@@ -1000,7 +1006,7 @@ def prune_scores_files(
         members.sort(key=lambda p: p.stat().st_mtime, reverse=True)
         keep |= set(members[:_KEEP_NEWEST_PER_GROUP])
     deleted: list[Path] = []
-    skipped: list[str] = []
+    skipped: list[str] = list(temporary.skipped)
     freed = 0.0
     for path in files:
         evaluation_id = path.stem.split("_")[-1]
@@ -1018,4 +1024,6 @@ def prune_scores_files(
         kept=tuple(sorted(set(files) - set(deleted))),
         skipped=tuple(skipped),
         freed_mb=freed,
+        temporary_deleted=temporary.deleted,
+        temporary_freed_mb=temporary.freed_mb,
     )
