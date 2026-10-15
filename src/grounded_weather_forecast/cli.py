@@ -1045,6 +1045,18 @@ def _run_matrix_backtest(
 
 def _cmd_backtest(config: Config, args: argparse.Namespace) -> int:
     from grounded_weather_forecast.backtest.score_storage import (  # noqa: PLC0415
+        ScoreCoordinationTimeout,
+    )
+
+    try:
+        return _backtest_products(config, args)
+    except (ScoreCoordinationTimeout,) as error:  # noqa: B013
+        print(f"score directory coordination timed out: {error}", file=sys.stderr)
+        return 75
+
+
+def _backtest_products(config: Config, args: argparse.Namespace) -> int:
+    from grounded_weather_forecast.backtest.score_storage import (  # noqa: PLC0415
         cleanup_score_temporaries,
     )
     from grounded_weather_forecast.blenders import available_methods  # noqa: PLC0415

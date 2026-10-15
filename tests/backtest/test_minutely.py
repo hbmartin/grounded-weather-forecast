@@ -8,6 +8,7 @@ import polars as pl
 import pytest
 from conftest import synthetic_hourly_matrix, utc, write_config
 
+from grounded_weather_forecast.backtest import minutely
 from grounded_weather_forecast.backtest.minutely import (
     AnchorFull,
     AnchorTau,
@@ -309,3 +310,29 @@ def test_runner_never_emits_unscoreable_rows(tmp_path):
     assert scores.height > 0
     assert scores["y_true"].null_count() == 0
     assert scores["y_true"].is_nan().sum() == 0
+
+
+@pytest.mark.parametrize("all_invalid", [False, True])
+def test_proxy_training_uses_only_finite_truth(tmp_path, monkeypatch, all_invalid):
+    config = write_config(
+        tmp_path, extra_toml="\n[backtest]\ninitial_train_days = 10\nstep_days = 5\n"
+    )
+    matrix, grid = minutely_case(days=25)
+    column = "t__temp_c__inst"
+    values = matrix[column].to_numpy().copy()
+    for index, invalid in enumerate([np.nan, np.inf, -np.inf]):
+        values[index :: (3 if all_invalid else 7)] = invalid
+    matrix = matrix.with_columns(pl.Series(column, values))
+    fit = minutely.GroundedEqualWeight.fit
+    calls = []
+
+    def checked_fit(self, training):
+        assert training.y.size > 0
+        assert np.isfinite(training.y).all()
+        calls.append(True)
+        return fit(self, training)
+
+    monkeypatch.setattr(minutely.GroundedEqualWeight, "fit", checked_fit)
+    scores = run_minutely_backtest(matrix, grid, MinutelyRequest(), config)
+    assert scores.is_empty() == all_invalid
+    assert bool(calls) != all_invalid

@@ -123,8 +123,8 @@ def iter_backtest_scores(
             truth_column = truth_column_for(variable, semantics)
             if truth_column not in matrix.columns:
                 continue
-            train_scored = train_frame.filter(pl.col(truth_column).is_not_null())
-            test_scored = test_frame.filter(pl.col(truth_column).is_not_null())
+            train_scored = train_frame.filter(pl.col(truth_column).is_finite())
+            test_scored = test_frame.filter(pl.col(truth_column).is_finite())
             if train_scored.is_empty() or test_scored.is_empty():
                 continue
             train_slice = to_supervised_slice(

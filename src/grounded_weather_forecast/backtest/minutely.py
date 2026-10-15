@@ -431,7 +431,7 @@ def iter_minutely_scores(
             variable = hourly_variable(variable_name)
             truth_column = f"t__{variable_name}__inst"
             train_scored = (
-                train_matrix.filter(pl.col(truth_column).is_not_null())
+                train_matrix.filter(pl.col(truth_column).is_finite())
                 if truth_column in train_matrix.columns
                 else train_matrix.head(0)
             )

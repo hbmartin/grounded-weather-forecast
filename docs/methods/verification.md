@@ -190,7 +190,9 @@ you learned lately?*
 ### Bounded score persistence
 
 *Implemented in: `backtest/engine.py::iter_backtest_scores`,
-`backtest/minutely.py::iter_minutely_scores`, `backtest/scores.py`, `storage.py`*
+`backtest/minutely.py::iter_minutely_scores`, `backtest/scores.py`,
+`backtest/score_storage.py`, `storage.py`,
+`reports/operations.py::prune_scores_files`, `cli.py`*
 
 The CLI retains the same fold/variable/method order and fits exactly the same
 models. `SCORE_BATCH_ROWS = 65_536` slices predictions before stamping or quantile
@@ -208,15 +210,39 @@ The producer and writer close before atomic replacement, with existing output
 permissions preserved. Empty score streams retain the historical empty schema.
 
 Full prediction and truth arrays must have exactly one value per key before
-batching; quantiles must be two-dimensional with the same row count. Each compact
+batching; quantiles must be two-dimensional with the same row count and a width
+matching nonempty quantile levels. Levels must be finite, strictly increasing and
+inside `(0, 1)`; nonempty levels without quantiles are rejected. Point-only
+`None`/empty level metadata retains its historical JSON representation. Hourly
+and daily keys and supervised arrays share the same finite-truth filter, as does
+minutely proxy training; invalid truth is excluded before empty-fold checks. Each compact
 batch is cast directly to the canonical schema, retaining the former timestamp
-and numeric normalization. PyArrow loads only in the writer. Ordinary secondary
+and numeric normalization. Naive datetimes are interpreted as UTC, matching the
+materializing API; aware datetimes convert to UTC while preserving instants.
+PyArrow loads only in the writer. Ordinary secondary
 close failures annotate the original error; a new cancellation or process-exit
 exception during cleanup propagates with its original exception context.
-Both score writers serialize publication through `.scores-write.lock` in their
-output directory, including producer closure and atomic replacement. Backtest
-startup and `prune-scores` use this lock without waiting to reclaim abandoned
-temporary scores from abruptly terminated processes; readers never take it.
+Both score writers use independent OS-backed leases for private
+`.score-stage-v1.<destination>.<16 lowercase hex>.tmp` stages and their `.lease`
+companions. Leases span encoding, producer closure and atomic replacement, while
+`.score-stage-v1.lock` guards only allocation, replacement and removal. Writers
+can encode concurrently, including to the same destination (last replacement
+wins). The guard reenters on the same process/thread using the directory's
+filesystem identity; recovery always uses fresh lease handles, so it cannot
+reclaim a live stage even inside the writer thread.
+
+`SCORE_COORDINATION_TIMEOUT_S = 60.0` bounds each publication guard acquisition.
+Only acquisition contention becomes `ScoreCoordinationTimeout`; CLI backtest and
+maintenance return 75, release the pipeline lock and skip promotion. Cleanup
+acquisitions are nonblocking. Readers never take these locks. Backtest startup
+and `prune-scores` reclaim only inactive private stages, including payload-only
+allocation and lease-only publication remnants. Legacy names, unrelated stores,
+symlinks and malformed names remain untouched. Dry runs may create lock metadata
+but never explicitly unlink payloads or companions. Only payloads contribute to
+temporary counts/bytes, and completed-evaluation retention meanings are unchanged.
+Ordinary housekeeping errors after publication produce diagnostics without
+turning a committed write into failure. Deletion accounting survives release
+errors; new control-flow exceptions during cleanup still propagate.
 
 The DataFrame-returning library APIs remain materializing compatibility paths.
 The [backtest memory benchmark](../reference/cli.md#backtest-memory-benchmark)
