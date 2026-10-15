@@ -1044,8 +1044,15 @@ def _run_matrix_backtest(
 
 
 def _cmd_backtest(config: Config, args: argparse.Namespace) -> int:
+    from grounded_weather_forecast.backtest.score_storage import (  # noqa: PLC0415
+        cleanup_score_temporaries,
+    )
     from grounded_weather_forecast.blenders import available_methods  # noqa: PLC0415
 
+    temporary = cleanup_score_temporaries(config.dataset.dir / "scores")
+    _print_score_temporaries(temporary.deleted, temporary.freed_mb)
+    for note in temporary.skipped:
+        print(f"skipped {note}")
     methods = available_methods() if args.methods == "all" else _split_csv(args.methods)
     products = _split_csv(args.products)
     promotion_semantics = _semantics_by_variable(
@@ -1433,6 +1440,18 @@ def _report_pipeline_health(
     )
 
 
+def _print_score_temporaries(
+    paths: tuple[Path, ...], freed_mb: float, *, dry_run: bool = False
+) -> None:
+    verb = "would delete" if dry_run else "deleted"
+    for path in paths:
+        print(f"{verb} abandoned temporary {path.name}")
+    if paths:
+        print(
+            f"{verb} {len(paths)} abandoned score temporary files ({freed_mb:.1f} MB)"
+        )
+
+
 def _cmd_prune_scores(config: Config, args: argparse.Namespace) -> int:
     from grounded_weather_forecast.reports.operations import (  # noqa: PLC0415
         prune_scores_files,
@@ -1447,6 +1466,9 @@ def _cmd_prune_scores(config: Config, args: argparse.Namespace) -> int:
     print(
         f"{verb} {len(result.deleted)} scores files ({result.freed_mb:.1f} MB), "
         f"kept {len(result.kept)}"
+    )
+    _print_score_temporaries(
+        result.temporary_deleted, result.temporary_freed_mb, dry_run=args.dry_run
     )
     return 0
 

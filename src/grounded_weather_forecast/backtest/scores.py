@@ -5,6 +5,8 @@ declares winners itself. Provenance (live vs synthetic) travels with every row
 and mixed frames are rejected on load unless explicitly allowed.
 """
 
+from __future__ import annotations
+
 import json
 import math
 from collections.abc import Callable, Iterable, Iterator
@@ -16,8 +18,8 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 import polars as pl
-import pyarrow.parquet as pq
 
+from grounded_weather_forecast.backtest.score_storage import score_write_lock
 from grounded_weather_forecast.contracts import FloatArray, MixedProvenanceError
 from grounded_weather_forecast.storage import (
     atomic_parquet_destination,
@@ -25,6 +27,8 @@ from grounded_weather_forecast.storage import (
 )
 
 if TYPE_CHECKING:
+    import pyarrow.parquet as pq
+
     from grounded_weather_forecast.evaluation import EvaluationRun
 
 SCORES_SCHEMA: pl.Schema = pl.Schema(
@@ -82,6 +86,25 @@ def empty_scores() -> pl.DataFrame:
     return pl.DataFrame(schema=SCORES_SCHEMA)
 
 
+def _validate_score_shapes(
+    row_count: int,
+    y_pred: FloatArray,
+    y_true: FloatArray,
+    quantiles: FloatArray | None,
+) -> None:
+    for name, values in (("y_pred", y_pred), ("y_true", y_true)):
+        if values.shape != (row_count,):
+            msg = f"{name} shape {values.shape} != expected {(row_count,)}"
+            raise pl.exceptions.ShapeError(msg)
+    if quantiles is not None and (
+        quantiles.ndim != 2 or quantiles.shape[0] != row_count
+    ):
+        msg = (
+            f"quantiles shape {quantiles.shape} != expected ({row_count}, n_quantiles)"
+        )
+        raise pl.exceptions.ShapeError(msg)
+
+
 def stamped_scores(
     keys: pl.DataFrame,
     evaluation: "EvaluationRun",
@@ -105,6 +128,7 @@ def stamped_scores(
     runner (hourly/daily engine, minutely path runner) shares this stamping
     so a schema change cannot silently fork between products.
     """
+    _validate_score_shapes(keys.height, y_pred, y_true, quantiles)
     scores = keys.with_columns(
         pl.lit(method_id).alias("method_id"),
         pl.lit(variable).alias("variable"),
@@ -139,9 +163,7 @@ def stamped_scores(
         ),
     ).select(list(SCORES_SCHEMA))
     if compact:
-        return scores.with_columns(
-            pl.col(CATEGORICAL_SCORE_COLUMNS).cast(pl.Categorical)
-        )
+        return scores.cast(COMPACT_SCORES_SCHEMA)
     return scores
 
 
@@ -162,6 +184,7 @@ def stamped_score_batches(
     quantiles: FloatArray | None = None,
 ) -> Iterator[pl.DataFrame]:
     """Slice predictions before allocating score columns or quantile JSON."""
+    _validate_score_shapes(keys.height, y_pred, y_true, quantiles)
     for offset in range(0, keys.height, SCORE_BATCH_ROWS):
         selection = slice(offset, offset + SCORE_BATCH_ROWS)
         yield stamped_scores(
@@ -190,7 +213,7 @@ def _close_callback(close: Callable[[], object]) -> Iterator[None]:
     except (BaseException,) as error:  # noqa: B013 -- project tuple convention
         try:
             close()
-        except (BaseException,) as secondary:  # noqa: B013
+        except (Exception,) as secondary:  # noqa: B013
             error.add_note(f"score stream cleanup failed: {secondary}")
         raise
     else:
@@ -275,6 +298,9 @@ def write_score_batches(
     Even an empty stream produces the historical empty score-file schema.
     """
     with ExitStack() as publication, _closing_batches(batches) as incoming:
+        publication.enter_context(score_write_lock(directory))
+        import pyarrow.parquet as pq  # noqa: PLC0415 -- writer-only dependency
+
         validated = _validated_batches(incoming, product, source_kind, window)
         first = next(validated, None)
         evaluation_id = str(first["evaluation_id"][0]) if first is not None else None
@@ -312,7 +338,8 @@ def scores_path(
 def write_scores(scores: pl.DataFrame, path: Path) -> None:
     # Atomic so a concurrent reader (predict's lock-free scan) never sees a
     # half-written file.
-    atomic_write_parquet(scores, path)
+    with score_write_lock(path.parent):
+        atomic_write_parquet(scores, path)
 
 
 def scan_score_file(path: Path, *, compact: bool = True) -> pl.LazyFrame:

@@ -380,7 +380,14 @@ All products write compact score batches incrementally, with at most 65,536 rows
 per batch/row group. The writer closes a temporary file before atomic publication;
 a handled failure or interruption preserves an existing destination and removes
 the temporary file. Abrupt process termination can leave an unpublished hidden
-temporary file. Product-owned matrices and score generators are released before
+temporary file; the next backtest or `prune-scores` reclaims it before processing
+published evidence. Both library score writers hold an exclusive lock at
+`<scores directory>/.scores-write.lock` until publication finishes. Writers to
+the same directory wait interruptibly; readers remain lock-free. Recovery takes
+the lock without waiting and reports a skip when a library writer is active.
+The small lock file persists so every process continues locking the same inode.
+SIGTERM behavior is unchanged; SIGTERM, SIGKILL and OOM leftovers use next-run
+recovery. Product-owned matrices and score generators are released before
 the next product and before promotion. Stored schemas, quantile JSON and CLI
 output are unchanged. The batch limit is internal and has no CLI/config knob.
 Library callers of `run_backtest`/`run_minutely_backtest` still receive a complete
@@ -720,7 +727,16 @@ always kept, as are evaluations referenced by the active release and releases
 within the last **7 days**. If an upgraded installation has no readable active
 pointer, the newest readable release is treated as active. Catalog rows survive
 deletion, so the history ledgers stay intact — only the bulky per-case scores are
-removed. Files the evaluations catalog has never seen are skipped, never deleted.
+removed. Published files the evaluations catalog has never seen are skipped,
+never deleted.
+
+Abandoned unpublished files matching `.scores_*.parquet.<16 lowercase hex>.tmp`
+are reclaimed independently of the catalog and release pointer. Only regular
+non-symlink files are eligible, and an exclusive score-directory lock proves no
+participating publisher is active, so recovery needs no age threshold.
+`--dry-run` lists eligible temporary files without deleting them. Temporary-file
+counts and freed bytes are reported separately from completed evaluations.
+Unlink failures are reported and do not prevent other cleanup or normal work.
 
 Always run `--dry-run` first. Deleting an evaluation still referenced by a live
 release would leave serving unable to justify what it is doing.

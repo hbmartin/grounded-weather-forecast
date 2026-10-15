@@ -38,6 +38,18 @@ def test_value_digest_checks_values_nulls_order_and_schema(tmp_path, benchmark):
         assert benchmark.value_digest(second, ["category"]) != expected
 
 
+@pytest.mark.parametrize("values", [[None] * 8, [None] * 4 + ["a", None, "b", ""]])
+def test_null_only_dictionary_groups(tmp_path, benchmark, values):
+    frame = pl.DataFrame({"category": pl.Series(values, dtype=pl.String)})
+    first, second = tmp_path / "first.parquet", tmp_path / "second.parquet"
+    frame.write_parquet(first, row_group_size=4)
+    frame.write_parquet(second, row_group_size=7)
+    expected = benchmark.value_digest(first, ["category"])
+    assert benchmark.value_digest(second, ["category"]) == expected
+    frame.with_columns(pl.col("category").fill_null("")).write_parquet(second)
+    assert benchmark.value_digest(second, ["category"]) != expected
+
+
 @pytest.mark.parametrize(
     ("ratio", "growth", "passed"),
     [(0.5, 128, True), (0.51, 128, False), (0.5, 129, False)],

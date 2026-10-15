@@ -207,6 +207,17 @@ iteration/write/close failure, or handled interruption aborts publication.
 The producer and writer close before atomic replacement, with existing output
 permissions preserved. Empty score streams retain the historical empty schema.
 
+Full prediction and truth arrays must have exactly one value per key before
+batching; quantiles must be two-dimensional with the same row count. Each compact
+batch is cast directly to the canonical schema, retaining the former timestamp
+and numeric normalization. PyArrow loads only in the writer. Ordinary secondary
+close failures annotate the original error; a new cancellation or process-exit
+exception during cleanup propagates with its original exception context.
+Both score writers serialize publication through `.scores-write.lock` in their
+output directory, including producer closure and atomic replacement. Backtest
+startup and `prune-scores` use this lock without waiting to reclaim abandoned
+temporary scores from abruptly terminated processes; readers never take it.
+
 The DataFrame-returning library APIs remain materializing compatibility paths.
 The [backtest memory benchmark](../reference/cli.md#backtest-memory-benchmark)
 measures score construction and writing separately from model fitting.

@@ -21,6 +21,10 @@ from grounded_weather_forecast.backtest.engine import (
     iter_backtest_scores,
     run_backtest,
 )
+from grounded_weather_forecast.backtest.score_storage import (
+    SCORE_WRITE_LOCK,
+    cleanup_score_temporaries,
+)
 from grounded_weather_forecast.backtest.scores import (
     COMPACT_SCORES_SCHEMA,
     SCORE_BATCH_ROWS,
@@ -83,6 +87,10 @@ def predictions(count, evaluation, **overrides):
 def compact_batch(count, evaluation, **overrides):
     keys, evaluation, arguments = predictions(count, evaluation, **overrides)
     return stamped_scores(keys, evaluation, compact=True, **arguments)
+
+
+def score_outputs(directory):
+    return sorted(path for path in directory.iterdir() if path.name != SCORE_WRITE_LOCK)
 
 
 @pytest.mark.parametrize("count", [0, 1, SCORE_BATCH_ROWS, SCORE_BATCH_ROWS + 1])
@@ -160,7 +168,7 @@ def test_identity_mismatch_aborts_publication(tmp_path, evaluation, column, valu
         write_score_batches(
             iter([first, wrong]), tmp_path, "hourly", "live", "expanding"
         )
-    assert not list(tmp_path.iterdir())
+    assert not score_outputs(tmp_path)
 
 
 @pytest.mark.parametrize("bad", ["schema", "mixed", "null_id", "empty_id"])
@@ -189,7 +197,7 @@ def test_invalid_first_batch_is_rejected_and_producer_closed(tmp_path, evaluatio
     with pytest.raises(ValueError, match="score batch"):
         write_score_batches(producer(), tmp_path, "hourly", "live", "expanding")
     assert closed == [True]
-    assert not list(tmp_path.iterdir())
+    assert not score_outputs(tmp_path)
 
 
 def test_empty_compact_batches_are_valid(tmp_path):
@@ -259,7 +267,7 @@ def test_failures_preserve_destination_and_close_producer(
         write_score_batches(producer(), tmp_path, "hourly", "live", "expanding")
     assert closed == [True]
     assert destination.read_bytes() == b"original"
-    assert list(tmp_path.iterdir()) == [destination]
+    assert score_outputs(tmp_path) == [destination]
 
 
 def test_producer_close_failure_prevents_publication(tmp_path, evaluation):
@@ -278,7 +286,7 @@ def test_producer_close_failure_prevents_publication(tmp_path, evaluation):
 
     with pytest.raises(OSError, match="producer close"):
         write_score_batches(Producer(), tmp_path, "hourly", "live", "expanding")
-    assert not list(tmp_path.iterdir())
+    assert not score_outputs(tmp_path)
 
 
 def test_secondary_close_error_does_not_mask_primary(tmp_path, evaluation, monkeypatch):
@@ -302,7 +310,7 @@ def test_secondary_close_error_does_not_mask_primary(tmp_path, evaluation, monke
             "expanding",
         )
     assert "secondary close" in caught.value.__notes__[0]
-    assert not list(tmp_path.iterdir())
+    assert not score_outputs(tmp_path)
 
 
 @pytest.mark.skipif(os.name == "nt", reason="POSIX mode semantics")
@@ -459,3 +467,191 @@ def test_cli_does_not_promote_failed_stream(tmp_path, monkeypatch):
     with pytest.raises(OSError, match="stream failed"):
         cli._cmd_backtest(config, args)
     assert not promoted
+
+
+@pytest.mark.parametrize("count", [0, 1, SCORE_BATCH_ROWS, SCORE_BATCH_ROWS + 1])
+@pytest.mark.parametrize("column", ["y_pred", "y_true", "quantiles"])
+@pytest.mark.parametrize("difference", [-1, 1])
+def test_shape_mismatch_fails_before_stamping_or_first_yield(
+    tmp_path, evaluation, count, column, difference
+):
+    keys, evaluation, arguments = predictions(count, evaluation)
+    wrong_count = max(0, count + difference) if count else 1
+    arguments[column] = (
+        np.zeros((wrong_count, 3)) if column == "quantiles" else np.zeros(wrong_count)
+    )
+    if column == "quantiles":
+        arguments["quantile_levels"] = (0.1, 0.5, 0.9)
+    with pytest.raises(pl.exceptions.ShapeError, match=f"{column} shape .*expected"):
+        stamped_scores(keys, evaluation, **arguments)
+    stream = stamped_score_batches(keys, evaluation, **arguments)
+    with pytest.raises(pl.exceptions.ShapeError, match=f"{column} shape .*expected"):
+        write_score_batches(stream, tmp_path, "hourly", "live", "expanding")
+    assert not score_outputs(tmp_path)
+
+
+@pytest.mark.parametrize("column", ["y_pred", "y_true", "quantiles"])
+@pytest.mark.parametrize("shape", [(), (2, 1, 1)])
+def test_prediction_dimensions_are_validated(evaluation, column, shape):
+    keys, evaluation, arguments = predictions(2, evaluation)
+    arguments[column] = np.zeros(shape)
+    with pytest.raises(pl.exceptions.ShapeError, match=column):
+        next(stamped_score_batches(keys, evaluation, **arguments))
+
+
+def test_compact_stamping_normalizes_convertible_key_types(tmp_path, evaluation):
+    keys, evaluation, arguments = predictions(3, evaluation)
+    keys = keys.with_columns(
+        pl.col("issue_time").cast(pl.Datetime("ns", "UTC")),
+        pl.col("valid_time").cast(pl.Datetime("ms", "UTC")),
+        pl.col("lead_hours").cast(pl.Float32),
+    )
+    expected = stamped_scores(keys, evaluation, **arguments).cast(SCORES_SCHEMA)
+    result = write_score_batches(
+        stamped_score_batches(keys, evaluation, **arguments),
+        tmp_path,
+        "hourly",
+        "live",
+        "expanding",
+    )
+    assert load_scores(result.path).equals(expected)
+
+
+@pytest.mark.parametrize("lead_dtype", [pl.Int64, pl.Float32])
+def test_engine_stream_accepts_convertible_key_types(tmp_path, monkeypatch, lead_dtype):
+    config = write_config(
+        tmp_path, extra_toml="\n[backtest]\ninitial_train_days = 10\nstep_days = 5\n"
+    )
+    matrix = synthetic_hourly_matrix(days=25, max_lead=6).with_columns(
+        pl.col("lead_hours").cast(lead_dtype),
+        pl.col("valid_time").cast(pl.Datetime("ns", "UTC")),
+    )
+    real_create = EvaluationRun.create
+
+    def create(*args, **kwargs):
+        return replace(
+            real_create(*args, **kwargs),
+            evaluation_id="fixed",
+            created_at="2026-10-14T00:00:00+00:00",
+        )
+
+    monkeypatch.setattr(EvaluationRun, "create", create)
+    request = BacktestRequest(
+        variables=(hourly_variable("temp_c"),), methods=("equal_weight",)
+    )
+    expected = run_backtest(matrix, request, config)
+    result = write_score_batches(
+        iter_backtest_scores(matrix, request, config),
+        tmp_path / "scores",
+        "hourly",
+        "live",
+        "expanding",
+    )
+    assert expected.height > 0
+    assert load_scores(result.path).equals(expected)
+
+
+@pytest.mark.parametrize("phase", ["writer", "producer"])
+@pytest.mark.parametrize("interrupt", [KeyboardInterrupt, SystemExit, GeneratorExit])
+def test_cleanup_control_flow_takes_precedence(
+    tmp_path, evaluation, monkeypatch, phase, interrupt
+):
+    closed = []
+    real_writer = pq.ParquetWriter
+
+    class Writer:
+        def __init__(self, *args, **kwargs):
+            self.writer = real_writer(*args, **kwargs)
+
+        def write_table(self, *_args, **_kwargs):
+            raise ValueError("primary write failure")
+
+        def close(self):
+            self.writer.close()
+            if phase == "writer":
+                raise interrupt("cleanup interrupt")
+
+    class Producer:
+        def __iter__(self):
+            return self
+
+        def __next__(self):
+            if closed:
+                raise StopIteration
+            closed.append("yielded")
+            return compact_batch(1, evaluation)
+
+        def close(self):
+            closed.append("closed")
+            if phase == "producer":
+                raise interrupt("cleanup interrupt")
+
+    monkeypatch.setattr(pq, "ParquetWriter", Writer)
+    destination = scores_path(tmp_path, "hourly", "live", "expanding", "fixed")
+    destination.write_bytes(b"existing")
+    with pytest.raises(interrupt, match="cleanup interrupt") as caught:
+        write_score_batches(Producer(), tmp_path, "hourly", "live", "expanding")
+    assert isinstance(caught.value.__context__, ValueError)
+    assert closed == ["yielded", "closed"]
+    assert score_outputs(tmp_path) == [destination]
+    assert destination.read_bytes() == b"existing"
+
+
+def test_primary_interrupt_survives_ordinary_cleanup_failure():
+    def close():
+        raise OSError("cleanup failure")
+
+    with (
+        pytest.raises(KeyboardInterrupt) as caught,
+        score_module._close_callback(close),
+    ):
+        raise KeyboardInterrupt
+    assert "cleanup failure" in caught.value.__notes__[0]
+
+
+def test_publication_lock_spans_writer_and_producer_close_and_replace(
+    tmp_path, evaluation, monkeypatch
+):
+    events = []
+
+    def assert_owned(event):
+        assert cleanup_score_temporaries(tmp_path).skipped
+        events.append(event)
+
+    real_writer = pq.ParquetWriter
+
+    class Writer:
+        def __init__(self, *args, **kwargs):
+            self.writer = real_writer(*args, **kwargs)
+
+        def write_table(self, *args, **kwargs):
+            self.writer.write_table(*args, **kwargs)
+
+        def close(self):
+            assert_owned("writer")
+            self.writer.close()
+
+    class Producer:
+        def __init__(self):
+            self.frames = iter([compact_batch(1, evaluation)])
+
+        def __iter__(self):
+            return self
+
+        def __next__(self):
+            return next(self.frames)
+
+        def close(self):
+            assert_owned("producer")
+
+    real_replace = Path.replace
+
+    def replace(path, target):
+        assert_owned("replace")
+        return real_replace(path, target)
+
+    monkeypatch.setattr(pq, "ParquetWriter", Writer)
+    monkeypatch.setattr(Path, "replace", replace)
+    write_score_batches(Producer(), tmp_path, "hourly", "live", "expanding")
+    assert events == ["writer", "producer", "replace"]
+    assert not cleanup_score_temporaries(tmp_path).skipped

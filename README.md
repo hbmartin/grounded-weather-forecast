@@ -77,7 +77,7 @@ That works on day one. Everything else needs an archive with some history — se
 |---|---|---|
 | `qc` | summarize station truth quality control | — |
 | `build-dataset` | materialize truth tables and supervised matrices as parquet | — |
-| `backtest` | rolling-origin backtest over the supervised matrices | `--methods` `--hourly-variables` `--daily-variables` `--products` `--window` `--source` `--semantics` |
+| `backtest` | recover abandoned score temporary files, then run a rolling-origin backtest over the supervised matrices | `--methods` `--hourly-variables` `--daily-variables` `--products` `--window` `--source` `--semantics` |
 | `maintain` | run one locked live build → backtest → truth-QC → report transaction; finish report after a handled truth-QC failure, then return failure | `--methods` `--hourly-variables` `--daily-variables` `--products` `--window` `--semantics` `--truth-qc-days` |
 | `report` | leaderboards, evidence ledgers, and dashboard; skip missing scores, show read faults and return nonzero after partial output; one load per file with `mcs`/`legacy` | — |
 | `alignment` | study truth semantics per provider; write the alignment artifact | — |
@@ -87,7 +87,7 @@ That works on day one. Everything else needs an archive with some history — se
 | `predict` | emit schema-6 JSON with rainfall budget conservation and release attribution only on finite values; `--method` bypasses automatic rain safeguards for experiments | `--out` `--method` `--no-history` `--semantics` `--now` |
 | `publish` | safely publish an automatic forecast, holding a matching ready document for up to six hours | `--out` `--semantics` `--recovery-methods` `--recovery-window` |
 | `recover` | recheck degradation, then rebuild live evidence and reports when recovery is still needed | `--semantics` `--methods` `--window` |
-| `prune-scores` | delete superseded scores files | `--dry-run` |
+| `prune-scores` | delete superseded scores and abandoned score temporary files; preview both with `--dry-run` | `--dry-run` |
 | `uv run --group profiling python scripts/profile_memory.py -- <command>` | capture a command's memory allocations and write a peak-memory HTML report | `--output-dir` `--trace-python-allocators` `--no-native` `--no-report` |
 | `uv run python scripts/benchmark_selection_memory.py` | compare full selection runs against a Git baseline in fresh processes | `--baseline` `--runs` `--evaluations` `--cases` |
 | `uv run python scripts/benchmark_backtest_memory.py` | compare streamed score generation and writing against an immutable Git baseline | `--baseline` `--runs` `--rows` `--output` |
