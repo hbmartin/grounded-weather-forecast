@@ -58,7 +58,7 @@ def test_writer_publishes_between_recovery_entries(tmp_path, monkeypatch):
             # The second recovery entry has not been processed yet.
             assert stages[1].exists()
             write_scores(empty_scores(), tmp_path / "scores_writer.parquet")
-        except BaseException as error:
+        except (BaseException,) as error:  # noqa: B013 -- project convention
             failures.append(error)
         finally:
             published.set()
@@ -250,7 +250,7 @@ def test_zero_wait_disposal_and_later_recovery_are_retained(
             with guard(tmp_path):
                 ready.set()
                 assert release.wait(timeout=5)
-        except BaseException as error:
+        except (BaseException,) as error:  # noqa: B013 -- project convention
             failure.append(error)
 
     holder = Thread(target=hold)
@@ -301,7 +301,8 @@ def test_zero_wait_disposal_and_later_recovery_are_retained(
             assert staged_path[0].stat().st_size == 5000
     finally:
         release.set()
-        holder.join(timeout=5)
+        if holder.ident is not None:
+            holder.join(timeout=5)
     assert not holder.is_alive()
     assert not failure
     result = storage.cleanup_score_temporaries(tmp_path)
@@ -362,7 +363,7 @@ def test_repeated_writes_with_concurrent_recovery(
                     assert staged.exists()
                     if failing:
                         raise ValueError("expected producer failure")
-            except ValueError:
+            except (ValueError,):  # noqa: B013 -- project convention
                 if not failing:
                     raise
 
@@ -482,8 +483,9 @@ def test_new_guard_release_interrupt_propagates_with_original_context(
     "primary", [TypeError, KeyboardInterrupt, SystemExit, GeneratorExit]
 )
 @pytest.mark.parametrize("secondary_phase", ["lease", "companion"])
+@pytest.mark.parametrize("secondary_error", [OSError, TypeError, RuntimeError])
 def test_recovery_secondary_failure_annotates_pending_primary(
-    tmp_path, monkeypatch, primary, secondary_phase
+    tmp_path, monkeypatch, primary, secondary_phase, secondary_error
 ):
     staged = orphan(tmp_path)
     unlink, release = Path.unlink, storage.FileLock.release
@@ -492,7 +494,7 @@ def test_recovery_secondary_failure_annotates_pending_primary(
         if path == staged:
             raise primary(23)
         if secondary_phase == "companion" and path.name.endswith(".lease"):
-            raise OSError("secondary fixture")
+            raise secondary_error("secondary fixture")
         return unlink(path, *args, **kwargs)
 
     def fail_release(self, *args, **kwargs):
@@ -503,7 +505,7 @@ def test_recovery_secondary_failure_annotates_pending_primary(
             and held
             and str(self.lock_file).endswith(".lease")
         ):
-            raise RuntimeError("secondary fixture")
+            raise secondary_error("secondary fixture")
 
     monkeypatch.setattr(Path, "unlink", fail_unlink)
     monkeypatch.setattr(storage.FileLock, "release", fail_release)

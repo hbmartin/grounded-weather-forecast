@@ -595,8 +595,10 @@ def test_cleanup_preserves_deleted_accounting_on_release_failure(
 
         monkeypatch.setattr(Path, "unlink", unlink)
     if phase == "companion" and error_type is RuntimeError:
-        with pytest.raises(RuntimeError, match="release fixture"):
+        with pytest.raises(RuntimeError, match="release fixture") as caught:
             cleanup_score_temporaries(tmp_path)
+        assert not staged.exists()
+        assert "1 payloads deleted, 9 bytes" in caught.value.__notes__[-1]
         return
     result = cleanup_score_temporaries(tmp_path)
     assert result.deleted == (staged,)

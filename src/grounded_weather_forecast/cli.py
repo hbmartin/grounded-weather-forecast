@@ -1045,6 +1045,7 @@ def _run_matrix_backtest(
 
 def _cmd_backtest(config: Config, args: argparse.Namespace) -> int:
     from grounded_weather_forecast.backtest.score_storage import (  # noqa: PLC0415
+        ScoreCoordinationReleaseError,
         ScoreCoordinationTimeout,
     )
 
@@ -1053,6 +1054,12 @@ def _cmd_backtest(config: Config, args: argparse.Namespace) -> int:
     except (ScoreCoordinationTimeout,) as error:  # noqa: B013
         print(f"score directory coordination timed out: {error}", file=sys.stderr)
         return EXIT_CONTENTION
+    except (ScoreCoordinationReleaseError,) as error:  # noqa: B013
+        detail = "; ".join((str(error), *getattr(error, "__notes__", ())))
+        print(detail, file=sys.stderr)
+        vars(args)["_failure_kind"] = "score_coordination_release"
+        vars(args)["_error_detail"] = detail
+        return 1
 
 
 def _backtest_products(config: Config, args: argparse.Namespace) -> int:
@@ -1511,6 +1518,9 @@ def _run_pipeline_steps(
             )
             if kind:
                 vars(args)["_failure_kind"] = kind
+                detail = getattr(backtest_args or args, "_error_detail", None)
+                vars(args)["_error_detail"] = detail
+                vars(record_args)["_error_detail"] = detail
             stage = argparse.Namespace(
                 **{
                     key: value
