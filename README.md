@@ -77,7 +77,7 @@ That works on day one. Everything else needs an archive with some history — se
 |---|---|---|
 | `qc` | summarize station truth quality control | — |
 | `build-dataset` | materialize truth tables and supervised matrices as parquet | — |
-| `backtest` | recover abandoned leased score stages, then run a rolling-origin backtest; parallel score writers use independent leases and allocation and publication each wait at most 60 seconds; cleanup is best effort | `--methods` `--hourly-variables` `--daily-variables` `--products` `--window` `--source` `--semantics` |
+| `backtest` | recover abandoned leased score stages, then run a rolling-origin backtest; allocation and publication each wait at most 60 seconds; cleanup is best effort, while an uncommitted guard-release failure returns 1 and suppresses promotion | `--methods` `--hourly-variables` `--daily-variables` `--products` `--window` `--source` `--semantics` |
 | `maintain` | run one locked live build → backtest → truth-QC → report transaction; finish report after a handled truth-QC failure, then return failure | `--methods` `--hourly-variables` `--daily-variables` `--products` `--window` `--semantics` `--truth-qc-days` |
 | `report` | leaderboards, evidence ledgers, and dashboard; skip missing scores, show read faults and return nonzero after partial output; one load per file with `mcs`/`legacy` | — |
 | `alignment` | study truth semantics per provider; write the alignment artifact | — |
@@ -87,7 +87,7 @@ That works on day one. Everything else needs an archive with some history — se
 | `predict` | emit schema-6 JSON with rainfall budget conservation and release attribution only on finite values; `--method` bypasses automatic rain safeguards for experiments | `--out` `--method` `--no-history` `--semantics` `--now` |
 | `publish` | safely publish an automatic forecast, holding a matching ready document for up to six hours | `--out` `--semantics` `--recovery-methods` `--recovery-window` |
 | `recover` | recheck degradation, then rebuild live evidence and reports when recovery is still needed | `--semantics` `--methods` `--window` |
-| `prune-scores` | delete superseded scores and recover inactive leased stages one at a time; preview with `--dry-run` | `--dry-run` |
+| `prune-scores` | delete superseded scores and recover inactive leased stages one at a time; preview with `--dry-run`; unexpected recovery errors propagate with partial counts and bytes | `--dry-run` |
 | `uv run --group profiling python scripts/profile_memory.py -- <command>` | capture a command's memory allocations and write a peak-memory HTML report | `--output-dir` `--trace-python-allocators` `--no-native` `--no-report` |
 | `uv run python scripts/benchmark_selection_memory.py` | compare full selection runs against a Git baseline in fresh processes | `--baseline` `--runs` `--evaluations` `--cases` |
 | `uv run python scripts/benchmark_backtest_memory.py` | compare streamed score generation and writing against an immutable Git baseline | `--baseline` `--runs` `--rows` `--output` |
@@ -96,6 +96,14 @@ That works on day one. Everything else needs an archive with some history — se
 
 Global: `--config PATH` (default `config.toml`), `--version`. Exit codes: `0` ok,
 `1` command failure, `2` config error, `75` lock contention (retry later).
+An uncommitted score guard-release failure returns 1 from backtest, maintain or
+recover, records `score_coordination_release` and its diagnostic in the run journal,
+and suppresses promotion. Recovery preserves pending cancellation during secondary
+cleanup and attaches partial counts/bytes to unexpected errors. It stops on
+directory coordination I/O failure or observed directory disappearance; external
+removal during FileLock acquisition can still recreate lock metadata. Disposal
+remains best effort with a zero-wait guard attempt, even after publication, so
+recoverable payloads or companions may remain. Legacy temporaries stay untouched.
 Pipeline mutators serialize on `<dataset dir>/pipeline.lock`;
 scheduled `maintain` waits for it and holds it across the whole transaction.
 Build and backtest failures stop maintenance immediately. A handled truth-QC

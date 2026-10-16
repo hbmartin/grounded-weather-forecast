@@ -246,10 +246,26 @@ temporary counts/bytes, and completed-evaluation retention meanings are unchange
 Ordinary housekeeping errors after publication produce diagnostics without
 turning a committed write into failure. Deletion accounting survives release
 errors; `ScoreCoordinationReleaseError` retains the guard path and original cause,
-stopping recovery if guard release fails. Diagnostics identify the affected
+supports pickle round trips with notes and cause chaining, and stops recovery if
+guard release fails. An uncommitted writer release failure is handled by CLI
+backtest, maintenance and recovery with exit 1, journal failure kind
+`score_coordination_release`, its diagnostic in `error_detail`, and no promotion.
+Diagnostics identify the affected
 resource and cleanup phase. Unexpected programming errors in recovery work
-propagate; broad ordinary-exception handling is restricted to release and
-secondary-cleanup boundaries. New control-flow exceptions during cleanup still propagate.
+propagate with partial payload counts and bytes in an exception note. One internal
+progress accumulator records these immediately after each successful payload
+action, before housekeeping. Broad ordinary-exception handling is restricted to
+release and secondary-cleanup boundaries: ordinary companion-removal errors
+annotate a pending failure, while new control-flow exceptions propagate with the
+original context. Committed warnings retain all secondary notes and distinguish
+release attempts, retry outcomes and the lease's final reported ownership state.
+
+Directory acquisition I/O errors stop the pass with one directory-level diagnostic;
+per-file I/O errors under coordination can continue. Recovery skips candidates
+whose payload and companion are both absent. It rechecks directory existence
+before each acquisition and stops on observed disappearance. External directory
+removal during FileLock acquisition can still race with parent creation; no strict
+noncreation guarantee or alternative recovery lock backend is introduced.
 
 Disposal retains its zero-wait guard attempt. Even handled failures or successful
 publications can leave payloads or lease companions when that attempt loses
