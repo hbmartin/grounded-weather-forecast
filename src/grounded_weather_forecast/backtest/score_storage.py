@@ -136,7 +136,9 @@ def _warn_committed_cleanup(path: Path, error: Exception) -> None:
 def _dispose_stage(temporary: Path, lease: FileLock) -> None:
     """Release ownership even when bookkeeping fails; leftovers are recoverable."""
     lease_path = _lease_path(temporary)
+    held_on_entry = lease.is_locked
     lease_attempted = False
+    companion_removed = False
     try:
         with score_write_lock(temporary.parent, timeout=0):
             _cleanup_action(
@@ -149,6 +151,7 @@ def _dispose_stage(temporary: Path, lease: FileLock) -> None:
                 "lease companion removal",
                 lease_path,
             )
+            companion_removed = True
     except (BaseException,) as error:  # noqa: B013
         if lease.is_locked:
             attempt = "retry" if lease_attempted else "fallback attempt"
@@ -163,10 +166,15 @@ def _dispose_stage(temporary: Path, lease: FileLock) -> None:
                 error.add_note(
                     f"score lease release {attempt} succeeded for {lease_path}"
                 )
+        ownership = "not held on entry"
+        if lease.is_locked:
+            ownership = "still held"
+        elif held_on_entry:
+            ownership = "reported released"
         error.add_note(
             f"score lease ownership for {lease_path}: "
-            f"{'still held' if lease.is_locked else 'reported released'}; "
-            "companion cleanup may remain deferred"
+            f"{ownership}; companion removal "
+            f"{'completed' if companion_removed else 'not completed'}"
         )
         raise
 
@@ -213,11 +221,12 @@ def score_parquet_destination(path: Path) -> Iterator[Path]:
 
 @dataclass(frozen=True, slots=True)
 class ScoreTempCleanup:
-    """Removed (or dry-run eligible) payloads, independent of published evidence."""
+    """Payload progress and an optional stopped-pass guard-release failure."""
 
     deleted: tuple[Path, ...] = ()
     freed_mb: float = 0.0
     skipped: tuple[str, ...] = ()
+    coordination_release_error: ScoreCoordinationReleaseError | None = None
 
 
 @dataclass
@@ -225,6 +234,7 @@ class _RecoveryProgress:
     deleted: list[Path] = field(default_factory=list)
     freed_bytes: int = 0
     skipped: list[str] = field(default_factory=list)
+    coordination_release_error: ScoreCoordinationReleaseError | None = None
 
     def diagnostic(self, note: str, primary: BaseException | None = None) -> None:
         if primary is None:
@@ -232,9 +242,19 @@ class _RecoveryProgress:
         else:
             primary.add_note(note)
 
+    def annotate(self, error: BaseException, *, dry_run: bool) -> None:
+        error.add_note(
+            f"score temporary recovery partial progress: {len(self.deleted)} "
+            f"payloads {'eligible' if dry_run else 'deleted'}, "
+            f"{self.freed_bytes} bytes"
+        )
+
     def result(self) -> ScoreTempCleanup:
         return ScoreTempCleanup(
-            tuple(self.deleted), self.freed_bytes / 1e6, tuple(self.skipped)
+            tuple(self.deleted),
+            self.freed_bytes / 1e6,
+            tuple(self.skipped),
+            self.coordination_release_error,
         )
 
 
@@ -282,6 +302,8 @@ def _reclaim_stage(path: Path, *, dry_run: bool, progress: _RecoveryProgress) ->
                 _cleanup_action(path.unlink, "payload removal", path)
             progress.deleted.append(path)
             progress.freed_bytes += size
+    except (FileNotFoundError,):  # noqa: B013 -- a vanished payload is benign
+        pass
     except (BaseException,) as error:  # noqa: B013 -- preserve during release
         primary = error
         raise
@@ -331,6 +353,7 @@ def _recover_candidates(
             )
             break
         except (ScoreCoordinationReleaseError,) as error:  # noqa: B013
+            progress.coordination_release_error = error
             progress.diagnostic(
                 f"temporary cleanup stopped: {_cleanup_diagnostic(error)}"
             )
@@ -351,9 +374,11 @@ def cleanup_score_temporaries(
     Directory and individual lease acquisition are nonblocking. A dry run may
     create lock metadata, but never explicitly unlinks payloads or companions.
     Deletion accounting survives ordinary errors while releasing either lock.
-    Unexpected errors propagate with partial counts and bytes in a note.
-    Observed directory disappearance stops recovery; removal during FileLock
-    acquisition can still race with that library's parent-directory creation.
+    A guard-release failure returns its typed error with partial progress so a
+    caller can stop before writing. Unexpected errors propagate with the same
+    partial-progress note. Observed directory disappearance stops recovery;
+    removal after the existence check can race with parent-directory creation
+    by score_write_lock, locked_path or FileLock.
     """
     progress = _RecoveryProgress()
     try:
@@ -371,10 +396,8 @@ def cleanup_score_temporaries(
             return progress.result()
         _recover_candidates(directory, candidates, dry_run=dry_run, progress=progress)
     except (BaseException,) as error:  # noqa: B013 -- annotate, never suppress
-        error.add_note(
-            f"score temporary recovery partial progress: {len(progress.deleted)} "
-            f"payloads {'eligible' if dry_run else 'deleted'}, "
-            f"{progress.freed_bytes} bytes"
-        )
+        progress.annotate(error, dry_run=dry_run)
         raise
+    if progress.coordination_release_error is not None:
+        progress.annotate(progress.coordination_release_error, dry_run=dry_run)
     return progress.result()
