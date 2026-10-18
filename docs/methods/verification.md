@@ -246,10 +246,17 @@ temporary counts/bytes, and completed-evaluation retention meanings are unchange
 Ordinary housekeeping errors after publication produce diagnostics without
 turning a committed write into failure. Deletion accounting survives release
 errors; `ScoreCoordinationReleaseError` retains the guard path and original cause,
-supports pickle round trips with notes and cause chaining, and stops recovery if
-guard release fails. An uncommitted writer release failure is handled by CLI
-backtest, maintenance and recovery with exit 1, journal failure kind
-`score_coordination_release`, its diagnostic in `error_detail`, and no promotion.
+supports ordinary pickle round trips with notes and cause chaining, and stops
+recovery if guard release fails. A process executor substitutes its remote
+traceback as `__cause__`; the original exception remains available as `.cause`.
+`ScoreTempCleanup.coordination_release_error` defaults to `None` and carries a
+stopped pass's original guard-release exception with a partial-counts/bytes note;
+the existing `skipped` diagnostic and payload accounting remain available.
+Backtest startup raises this error before invoking product writers. Both startup
+and uncommitted writer release failures are handled by CLI backtest, maintenance
+and recovery with exit 1, journal failure kind `score_coordination_release`, the
+diagnostic in `error_detail`, and no promotion. `prune-scores` retains its partial
+temporary counts and diagnostic while continuing published-score retention.
 Diagnostics identify the affected
 resource and cleanup phase. Unexpected programming errors in recovery work
 propagate with partial payload counts and bytes in an exception note. One internal
@@ -258,14 +265,19 @@ action, before housekeeping. Broad ordinary-exception handling is restricted to
 release and secondary-cleanup boundaries: ordinary companion-removal errors
 annotate a pending failure, while new control-flow exceptions propagate with the
 original context. Committed warnings retain all secondary notes and distinguish
-release attempts, retry outcomes and the lease's final reported ownership state.
+release attempts, retry outcomes and the lease's final reported ownership state
+(`still held`, `reported released` or `not held on entry`). Companion-removal
+completion is recorded separately, without additional filesystem probes. Expected
+payload disappearance is handled before secondary cleanup, so disappearance alone
+is silent while later release/companion errors follow the standalone-error policy.
 
 Directory acquisition I/O errors stop the pass with one directory-level diagnostic;
 per-file I/O errors under coordination can continue. Recovery skips candidates
 whose payload and companion are both absent. It rechecks directory existence
-before each acquisition and stops on observed disappearance. External directory
-removal during FileLock acquisition can still race with parent creation; no strict
-noncreation guarantee or alternative recovery lock backend is introduced.
+before each acquisition and stops on observed disappearance. Directory removal
+after the existence check can race with parent creation by `score_write_lock`,
+`locked_path` or FileLock; no strict noncreation guarantee or alternative recovery
+lock backend is introduced.
 
 Disposal retains its zero-wait guard attempt. Even handled failures or successful
 publications can leave payloads or lease companions when that attempt loses

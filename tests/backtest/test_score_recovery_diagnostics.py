@@ -2,6 +2,7 @@
 
 import json
 import os
+from collections.abc import Iterator
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 from pathlib import Path
@@ -18,7 +19,7 @@ from grounded_weather_forecast.reports.operations import prune_scores_files
 from grounded_weather_forecast.storage import temporary_sibling
 
 
-def orphan(directory, name="orphan", contents=b"orphan"):
+def orphan(directory: Path, name: str = "orphan", contents: bytes = b"orphan") -> Path:
     path = temporary_sibling(
         directory / f"scores_{name}.parquet", namespace=storage.SCORE_STAGE_NAMESPACE
     )
@@ -235,25 +236,48 @@ def test_committed_warning_identifies_cleanup_phase(
     assert "cleanup fixture" in caplog.text
 
 
+@contextmanager
+def guard_holder(directory: Path) -> Iterator[tuple[Thread, Event]]:
+    """Always release the holder and join it only if the test started it."""
+    ready, release = Event(), Event()
+    guard = storage.score_write_lock
+    failures: list[BaseException] = []
+
+    def hold() -> None:
+        try:
+            with guard(directory):
+                ready.set()
+                assert release.wait(timeout=5)
+        except (BaseException,) as error:  # noqa: B013 -- project convention
+            failures.append(error)
+
+    holder = Thread(target=hold)
+    try:
+        yield holder, ready
+    finally:
+        release.set()
+        if holder.ident is not None:
+            holder.join(timeout=5)
+        assert not holder.is_alive()
+        assert not failures
+
+
+def test_thread_cleanup_preserves_failure_before_start(tmp_path: Path) -> None:
+    with (
+        pytest.raises(ValueError, match="before start fixture"),
+        guard_holder(tmp_path) as (holder, _ready),
+    ):
+        raise ValueError("before start fixture")
+    assert holder.ident is None
+    assert not holder.is_alive()
+
+
 @pytest.mark.parametrize(
     "primary", [None, ValueError, storage.ScoreCoordinationTimeout]
 )
 def test_zero_wait_disposal_and_later_recovery_are_retained(
     tmp_path, primary, monkeypatch, caplog
 ):
-    ready, release = Event(), Event()
-    guard = storage.score_write_lock
-    failure = []
-
-    def hold():
-        try:
-            with guard(tmp_path):
-                ready.set()
-                assert release.wait(timeout=5)
-        except (BaseException,) as error:  # noqa: B013 -- project convention
-            failure.append(error)
-
-    holder = Thread(target=hold)
     dispose = storage._dispose_stage
     staged_path = []
 
@@ -281,7 +305,7 @@ def test_zero_wait_disposal_and_later_recovery_are_retained(
             assert ready.wait(timeout=5)
             monkeypatch.setattr(storage, "_dispose_stage", dispose)
 
-    try:
+    with guard_holder(tmp_path) as (holder, ready):
         if primary is None:
             write_scores(empty_scores(), destination)
             assert "cleanup deferred: directory guard busy" in caplog.text
@@ -299,12 +323,6 @@ def test_zero_wait_disposal_and_later_recovery_are_retained(
         assert list(tmp_path.glob("*.lease"))
         if primary is not None:
             assert staged_path[0].stat().st_size == 5000
-    finally:
-        release.set()
-        if holder.ident is not None:
-            holder.join(timeout=5)
-    assert not holder.is_alive()
-    assert not failure
     result = storage.cleanup_score_temporaries(tmp_path)
     assert not result.skipped
     assert len(result.deleted) == (0 if primary is None else 1)

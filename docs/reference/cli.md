@@ -37,7 +37,7 @@ unrelated child stages.
 | Code | Meaning |
 |---|---|
 | `0` | success |
-| `1` | command-level failure — missing inputs, no scores to report, a backfill error, or an uncommitted score writer's directory-guard release failure |
+| `1` | command-level failure — missing inputs, no scores to report, a backfill error, or a directory-guard release failure during score recovery at startup or an uncommitted score write |
 | `2` | configuration error, or an unknown command |
 | `75` | pipeline, dataset-publication, score-directory, or automatic-recovery lock contention (EX_TEMPFAIL — retry later) |
 
@@ -399,18 +399,23 @@ can approach **120 seconds**, excluding computation and other locks. Contention
 that times out allocation or publication produces a score-specific diagnostic and exit code
 **75** (`EXIT_CONTENTION`) from `backtest`, `maintain` or `recover`, releases
 the pipeline lock and suppresses promotion. This is not a total command timeout.
-An uncommitted writer's directory-guard release failure returns **1** from these
-commands, with `failure_kind="score_coordination_release"` and the diagnostic in
-the run journal's `error_detail`. It closes owned producers, releases the pipeline
-lock and suppresses promotion. Ordinary housekeeping failure after publication
-remains a warning and does not turn a committed write into failure. Warnings
+Directory-guard release failure during startup recovery or an uncommitted write
+returns **1** from these commands, with
+`failure_kind="score_coordination_release"` and the diagnostic in the run journal's
+`error_detail`. Startup recovery reports completed cleanup and partial counts/bytes,
+then stops before invoking product writers. Writer failures close owned producers;
+both paths release the pipeline lock and suppress promotion. Ordinary housekeeping
+failure after publication remains a warning and does not turn a committed write
+into failure. Warnings
 retain secondary exception notes and distinguish release attempts, retry outcomes
-and the lease's final reported ownership state.
+and the lease's final reported ownership state (`still held`, `reported released`
+or `not held on entry`), together with whether companion removal completed.
 Cleanup never waits behind another writer. Readers remain lock-free.
 SIGTERM behavior is unchanged; SIGTERM, SIGKILL and OOM leftovers use next-run
 recovery. Product-owned matrices and score generators are released before
-the next product and before promotion. Stored schemas, quantile JSON and CLI
-output are unchanged. The batch limit is internal and has no CLI/config knob.
+the next product and before promotion. Stored score schemas, quantile JSON and
+successful backtest output are unchanged. The batch limit is internal and has no
+CLI/config knob.
 Library callers of `run_backtest`/`run_minutely_backtest` still receive a complete
 DataFrame; model fitting and fold plans retain their existing working sets.
 
@@ -757,13 +762,16 @@ Recovery discovers candidate names outside the guard, then coordinates one
 candidate at a time, revalidating it and probing a fresh lease without waiting.
 It releases the guard between candidates, reports active stages and reclaims
 inactive ones. A busy directory guard defers the remaining candidates; a
-directory-guard release failure stops the pass because ownership is uncertain.
+directory-guard release failure stops the temporary-recovery pass because ownership
+is uncertain. `prune-scores` retains the partial temporary counts and release
+diagnostic, then continues published-score pruning under its existing retention
+rules. Backtest startup instead fails before starting writers.
 Directory acquisition I/O errors produce one directory-level diagnostic and stop
 the pass. If disappearance of the scores directory is observed before acquisition,
-recovery stops without recreating it. External removal during FileLock acquisition
-can still race with the library's parent-directory creation; this is not a strict
-noncreation guarantee. Candidates whose payload and companion have both vanished
-are skipped without creating a companion, including during dry runs.
+recovery stops without recreating it. Removal after the existence check can race
+with parent-directory creation by `score_write_lock`, `locked_path` or FileLock;
+this is not a strict noncreation guarantee. Candidates whose payload and companion
+have both vanished are skipped without creating a companion, including during dry runs.
 Payload-only allocation
 remnants and lease-only post-publication remnants are safe to reclaim under this
 protocol. Only regular, non-symlink files are eligible. Recovery is independent
@@ -779,6 +787,8 @@ reported separately from completed evaluations. Lease housekeeping does not add
 to these counts. Expected per-file I/O failures are reported and processing
 continues with other candidates. Successful deletions remain counted even if
 lock release fails; guard contention or release failure stops the remaining pass.
+Payload disappearance alone is harmless; a subsequent lease-release or companion
+cleanup error follows the ordinary standalone-error policy and remains visible.
 Unexpected programming errors in discovery, validation or deletion propagate
 and fail the command, with completed payload counts and bytes attached as an
 exception note (eligible counts in a dry run). Ordinary secondary companion-cleanup

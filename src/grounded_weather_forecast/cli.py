@@ -1072,6 +1072,8 @@ def _backtest_products(config: Config, args: argparse.Namespace) -> int:
     _print_score_temporaries(temporary.deleted, temporary.freed_mb)
     for note in temporary.skipped:
         print(f"skipped {note}")
+    if temporary.coordination_release_error is not None:
+        raise temporary.coordination_release_error
     methods = available_methods() if args.methods == "all" else _split_csv(args.methods)
     products = _split_csv(args.products)
     promotion_semantics = _semantics_by_variable(
