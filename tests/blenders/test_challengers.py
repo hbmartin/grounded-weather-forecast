@@ -2,6 +2,7 @@
 
 import numpy as np
 import polars as pl
+import pytest
 from conftest import synthetic_hourly_matrix
 
 from grounded_weather_forecast.blenders import get_factory
@@ -12,6 +13,7 @@ from grounded_weather_forecast.contracts import (
     SourceKind,
     SupervisedSlice,
     hourly_variable,
+    obs_col,
 )
 from grounded_weather_forecast.dataset.matrix import to_supervised_slice
 from grounded_weather_forecast.metrics.deterministic import mae
@@ -63,6 +65,49 @@ class TestRaftGrounded:
 
 
 class TestSeamlessRegression:
+    @pytest.mark.parametrize("rows", [0, 21, 72])
+    @pytest.mark.parametrize("with_observation", [False, True])
+    def test_no_observed_sources_preserves_rows_and_abstains(
+        self, rows, with_observation
+    ):
+        features = pl.DataFrame({"issue_time": [utc(2026, 8, 1)] * rows})
+        if with_observation:
+            features = features.with_columns(pl.lit(20.0).alias(obs_col("temp_c")))
+        x = ForecastMatrix.build(
+            sources=("missing",),
+            values=np.full((rows, 1), np.nan),
+            lead_hours=np.ones(rows),
+            features=features,
+        )
+        train = SupervisedSlice(
+            x=x, y=np.full(rows, 20.0), variable=TEMP, source_kind=SourceKind.SYNTHETIC
+        )
+        assert _forward_filled(x, ()).shape == (rows, 0)
+        fitted = get_factory("seamless_regression")().fit(train)
+        point = fitted.predict(x).point
+        assert point.shape == (rows,)
+        assert np.isnan(point).all()
+        assert fitted.to_state()["coefficients"] is None
+
+    def test_refitting_without_observed_sources_clears_previous_fit(self):
+        train = temp_slice(days=40)
+        fitted = get_factory("seamless_regression")().fit(train)
+        assert fitted.to_state()["coefficients"] is not None
+        missing = SupervisedSlice(
+            x=ForecastMatrix.build(
+                sources=train.x.sources,
+                values=np.full_like(train.x.values, np.nan),
+                lead_hours=train.x.lead_hours,
+                features=train.x.features,
+            ),
+            y=train.y,
+            variable=train.variable,
+            source_kind=SourceKind.SYNTHETIC,
+        )
+        fitted.fit(missing)
+        assert fitted.to_state()["coefficients"] is None
+        assert np.isnan(fitted.predict(train.x).point).all()
+
     def test_learns_the_blend(self):
         train = temp_slice(days=40)
         fitted = get_factory("seamless_regression")().fit(train)

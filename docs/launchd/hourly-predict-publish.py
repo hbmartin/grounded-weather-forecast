@@ -32,16 +32,16 @@ import time
 from datetime import UTC, datetime
 from pathlib import Path
 
-REPO = "/Volumes/ExtStor/weather/grounded-weather-forecast"
+REPO = "/Volumes/Pro2T/weather/grounded-weather-forecast"
 CONFIG = f"{REPO}/config.toml"
 OUT = f"{REPO}/forecast.json"
 HERE = Path.home() / "Library/Application Support/grounded-weather-forecast"
 
 # publish_station.py imports ambientweather2sqlite's own aggregation functions,
 # so it runs under that project rather than this one. uv is also the binary
-# holding the TCC grant for /Volumes/ExtStor.
+# holding the TCC grant for /Volumes/Pro2T.
 UV = "/opt/homebrew/bin/uv"
-STATION_REPO = "/Volumes/ExtStor/weather/ambientweather2sqlite"
+STATION_REPO = "/Volumes/Pro2T/weather/ambientweather2sqlite"
 STATION_SCRIPT = HERE / "publish_station.py"
 STAGED = HERE / "staged"
 STATION_TIMEOUT_S = 180

@@ -280,6 +280,13 @@ grounding, weighting, and anchoring into one coefficient vector — it is the
 explicit test of whether the three-stage decomposition earns its keep, and it is
 on the leaderboard so that question gets an answer rather than an opinion.
 
+Columns never observed during training are excluded. If none remain, the method
+abstains with a NaN for every requested row, even when observations are present;
+it does not fit an observation-only model. Selecting zero source columns retains
+the original row count. Refitting on such a slice clears any previous fit.
+
+Implemented in: `blenders/seamless.py::SeamlessRegression`, `_forward_filled`.
+
 **Analog ensemble** (`analog_ensemble`, Delle Monache et al. 2011/2013). Normalized
 Euclidean distance over the sources finite in *both* rows:
 
