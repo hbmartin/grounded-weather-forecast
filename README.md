@@ -87,7 +87,7 @@ That works on day one. Everything else needs an archive with some history — se
 | `predict` | emit schema-6 JSON with rainfall budget conservation and release attribution only on finite values; `--method` bypasses automatic rain safeguards for experiments | `--out` `--method` `--no-history` `--semantics` `--now` |
 | `publish` | safely publish an automatic forecast, holding a matching ready document for up to six hours | `--out` `--semantics` `--recovery-methods` `--recovery-window` |
 | `recover` | recheck degradation, then rebuild live evidence and reports when recovery is still needed | `--semantics` `--methods` `--window` |
-| `prune-scores` | delete superseded scores and recover inactive leased stages one at a time; preview with `--dry-run`; recovery guard-release errors retain partial counts and diagnostics while pruning continues; unexpected recovery errors propagate | `--dry-run` |
+| `prune-scores` | delete superseded scores and recover inactive leased stages one at a time; preview with `--dry-run`; recovery guard-release errors retain partial counts, finish published-score retention, then return 1; unexpected recovery errors propagate | `--dry-run` |
 | `uv run --group profiling python scripts/profile_memory.py -- <command>` | capture a command's memory allocations and write a peak-memory HTML report | `--output-dir` `--trace-python-allocators` `--no-native` `--no-report` |
 | `uv run python scripts/benchmark_selection_memory.py` | compare full selection runs against a Git baseline in fresh processes | `--baseline` `--runs` `--evaluations` `--cases` |
 | `uv run python scripts/benchmark_backtest_memory.py` | compare streamed score generation and writing against an immutable Git baseline | `--baseline` `--runs` `--rows` `--output` |
@@ -101,7 +101,14 @@ returns 1 from backtest, maintain or recover, records `score_coordination_releas
 and its diagnostic in the run journal, and suppresses promotion. Startup recovery
 reports completed cleanup and stops before invoking writers. Recovery preserves
 secondary cleanup diagnostics after payload disappearance, preserves pending
-cancellation, and attaches partial counts/bytes to unexpected errors. It stops on
+cancellation, and attaches partial counts/bytes to unexpected errors. Standalone
+programming errors during lease release or companion removal propagate. A failed
+guard release marks that directory for the rest of the process: later acquisitions,
+including through aliases or other threads, fail immediately with exit 1 rather
+than waiting for contention. A committed publication remains successful with a
+warning; a final-product warning alone does not suppress promotion. Pruning retains
+its partial progress, finishes published-score retention, then returns 1 and journals
+`score_coordination_release`, including with `--dry-run`. Recovery stops on
 directory coordination I/O failure or observed directory disappearance; removal
 after the existence check can still race with parent creation by project helpers
 or FileLock. Disposal remains best effort with a zero-wait guard attempt, even after publication, so

@@ -37,7 +37,7 @@ unrelated child stages.
 | Code | Meaning |
 |---|---|
 | `0` | success |
-| `1` | command-level failure — missing inputs, no scores to report, a backfill error, or a directory-guard release failure during score recovery at startup or an uncommitted score write |
+| `1` | command-level failure — missing inputs, no scores to report, a backfill error, directory-guard release failure during score recovery or an uncommitted score write, or reuse of a directory whose guard release failed; `prune-scores` finishes retention before returning 1 for a recovery release failure |
 | `2` | configuration error, or an unknown command |
 | `75` | pipeline, dataset-publication, score-directory, or automatic-recovery lock contention (EX_TEMPFAIL — retry later) |
 
@@ -406,7 +406,14 @@ returns **1** from these commands, with
 then stops before invoking product writers. Writer failures close owned producers;
 both paths release the pipeline lock and suppress promotion. Ordinary housekeeping
 failure after publication remains a warning and does not turn a committed write
-into failure. Warnings
+into failure. Any guard-release failure marks the directory by process/device/inode
+identity until process exit. Later acquisitions in that process, including from
+another thread or directory alias, immediately raise the saved release diagnostic
+instead of waiting 60 seconds or returning 75. A fresh process has no such marker;
+it still contends normally with any OS lock that remains held. Fork children reset
+both the failure registry and its mutex. If the final product commits and only its
+guard release fails, the warning alone does not fail backtest or suppress promotion.
+Warnings
 retain secondary exception notes and distinguish release attempts, retry outcomes
 and the lease's final reported ownership state (`still held`, `reported released`
 or `not held on entry`), together with whether companion removal completed.
@@ -765,7 +772,11 @@ inactive ones. A busy directory guard defers the remaining candidates; a
 directory-guard release failure stops the temporary-recovery pass because ownership
 is uncertain. `prune-scores` retains the partial temporary counts and release
 diagnostic, then continues published-score pruning under its existing retention
-rules. Backtest startup instead fails before starting writers.
+rules and returns **1**, including under `--dry-run`. The run journal records
+`failure_kind="score_coordination_release"` and the diagnostic in `error_detail`.
+This failure survives the early return when the active release cannot be verified.
+Backtest startup instead fails before starting writers. Both commands print partial
+progress on stdout and the fatal release diagnostic once on stderr.
 Directory acquisition I/O errors produce one directory-level diagnostic and stop
 the pass. If disappearance of the scores directory is observed before acquisition,
 recovery stops without recreating it. Removal after the existence check can race
@@ -789,7 +800,8 @@ continues with other candidates. Successful deletions remain counted even if
 lock release fails; guard contention or release failure stops the remaining pass.
 Payload disappearance alone is harmless; a subsequent lease-release or companion
 cleanup error follows the ordinary standalone-error policy and remains visible.
-Unexpected programming errors in discovery, validation or deletion propagate
+Unexpected programming errors in discovery, validation, deletion, lease release
+or standalone companion removal propagate
 and fail the command, with completed payload counts and bytes attached as an
 exception note (eligible counts in a dry run). Ordinary secondary companion-cleanup
 errors annotate a pending failure, including cancellation or process exit; newly

@@ -594,7 +594,15 @@ def test_cleanup_preserves_deleted_accounting_on_release_failure(
             return original(path, *args, **kwargs)
 
         monkeypatch.setattr(Path, "unlink", unlink)
-    if phase == "companion" and error_type is RuntimeError:
+    if phase == "guard":
+        with pytest.raises(ScoreCoordinationReleaseError) as caught:
+            cleanup_score_temporaries(tmp_path)
+        assert caught.value.partial_result is not None
+        assert caught.value.partial_result.deleted == (staged,)
+        assert caught.value.partial_result.freed_mb == 9 / 1e6
+        assert "1 payloads deleted, 9 bytes" in caught.value.__notes__[-1]
+        return
+    if error_type is RuntimeError:
         with pytest.raises(RuntimeError, match="release fixture") as caught:
             cleanup_score_temporaries(tmp_path)
         assert not staged.exists()
@@ -716,7 +724,11 @@ def test_directory_release_error_preserves_failure_or_commit(
         write_scores(empty_scores(), tmp_path / DESTINATION)
         assert load_scores(tmp_path / DESTINATION).is_empty()
         assert "guard release fixture" in caplog.text
-    assert not payloads(tmp_path)
+    if phase == "allocation":
+        # Failed coordination prevents another cleanup acquisition in this process.
+        assert len(payloads(tmp_path)) == 1
+    else:
+        assert not payloads(tmp_path)
 
 
 @pytest.mark.parametrize("interrupt", [KeyboardInterrupt, SystemExit, GeneratorExit])

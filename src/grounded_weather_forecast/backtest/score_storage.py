@@ -37,6 +37,67 @@ class _LockState(threading.local):
 _held = _LockState()
 
 
+@dataclass(frozen=True, slots=True)
+class ScoreTempCleanup:
+    """Removed (or dry-run eligible) payloads and nonfatal diagnostics."""
+
+    deleted: tuple[Path, ...] = ()
+    freed_mb: float = 0.0
+    skipped: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True, slots=True)
+class ScoreCoordinationFailure:
+    """Serializable diagnostics without exception frames or lock references."""
+
+    lock_path: Path
+    cause_type: str
+    cause_message: str
+    notes: tuple[str, ...] = ()
+
+    @classmethod
+    def from_cause(cls, lock_path: Path, cause: BaseException) -> Self:
+        return cls(
+            lock_path,
+            f"{type(cause).__module__}.{type(cause).__qualname__}",
+            str(cause),
+            tuple(getattr(cause, "__notes__", ())),
+        )
+
+    def exception(self) -> "ScoreCoordinationReleaseError":
+        error = ScoreCoordinationReleaseError(
+            self.lock_path, RuntimeError(f"{self.cause_type}: {self.cause_message}")
+        )
+        for note in self.notes:
+            error.add_note(note)
+        return error
+
+    def diagnostic(self) -> str:
+        return _cleanup_diagnostic(self.exception())
+
+
+_failed_directories: dict[_DirectoryIdentity, ScoreCoordinationFailure] = {}
+_failed_directories_lock = threading.Lock()
+
+
+def _reset_failed_directories() -> None:
+    """A fork child must not inherit a failure marker or a locked mutex."""
+    global _failed_directories, _failed_directories_lock  # noqa: PLW0603
+    _failed_directories = {}
+    _failed_directories_lock = threading.Lock()
+
+
+if hasattr(os, "register_at_fork"):
+    os.register_at_fork(after_in_child=_reset_failed_directories)
+
+
+def _check_guard_failure(identity: _DirectoryIdentity) -> None:
+    with _failed_directories_lock:
+        failure = _failed_directories.get(identity)
+    if failure is not None:
+        raise failure.exception()
+
+
 class ScoreCoordinationTimeout(Timeout):
     """A brief score-directory bookkeeping lock could not be acquired in time."""
 
@@ -44,10 +105,17 @@ class ScoreCoordinationTimeout(Timeout):
 class ScoreCoordinationReleaseError(RuntimeError):
     """A guard release failed; the lock's ownership may be uncertain."""
 
-    def __init__(self, lock_path: Path, cause: Exception) -> None:
+    def __init__(
+        self,
+        lock_path: Path,
+        cause: Exception,
+        *,
+        partial_result: ScoreTempCleanup | None = None,
+    ) -> None:
         self.lock_path = lock_path
         self.cause = cause
         self.__cause__ = cause
+        self.partial_result = partial_result
         super().__init__(
             f"directory guard release failed for {lock_path}; "
             f"ownership uncertain: {cause}"
@@ -58,12 +126,30 @@ class ScoreCoordinationReleaseError(RuntimeError):
     ) -> tuple[type[Self], tuple[Path, Exception], dict[str, object]]:
         return type(self), (self.lock_path, self.cause), self.__dict__
 
+    def snapshot(self) -> ScoreCoordinationFailure:
+        failure = ScoreCoordinationFailure.from_cause(self.lock_path, self.cause)
+        return ScoreCoordinationFailure(
+            failure.lock_path,
+            failure.cause_type,
+            failure.cause_message,
+            (*failure.notes, *getattr(self, "__notes__", ())),
+        )
 
-def _release_guard(guard: AbstractContextManager[None], lock_path: Path) -> None:
+
+def _release_guard(
+    guard: AbstractContextManager[None],
+    lock_path: Path,
+    identity: _DirectoryIdentity,
+) -> None:
     try:
         guard.__exit__(None, None, None)
-    except (Exception,) as error:  # noqa: B013 -- resource release only
-        raise ScoreCoordinationReleaseError(lock_path, error) from error
+    except (BaseException,) as error:  # noqa: B013 -- record uncertain ownership
+        failure = ScoreCoordinationFailure.from_cause(lock_path, error)
+        with _failed_directories_lock:
+            _failed_directories.setdefault(identity, failure)
+        if isinstance(error, Exception):
+            raise ScoreCoordinationReleaseError(lock_path, error) from error
+        raise
 
 
 @contextmanager
@@ -78,6 +164,7 @@ def score_write_lock(
     directory.mkdir(parents=True, exist_ok=True)
     metadata = directory.stat()
     identity = (os.getpid(), metadata.st_dev, metadata.st_ino)
+    _check_guard_failure(identity)
     held = _held.directories
     if identity in held:
         yield
@@ -89,18 +176,19 @@ def score_write_lock(
     try:
         guard.__enter__()
     except (Timeout,) as error:  # noqa: B013 -- translate acquisition only
+        _check_guard_failure(identity)
         raise ScoreCoordinationTimeout(error.lock_file) from error
     _held.directories = held | {identity}
     try:
         yield
     except (BaseException,) as error:  # noqa: B013
         try:
-            _release_guard(guard, directory / SCORE_WRITE_LOCK)
+            _release_guard(guard, directory / SCORE_WRITE_LOCK, identity)
         except (Exception,) as secondary:  # noqa: B013
             error.add_note(f"score coordination release failed: {secondary}")
         raise
     else:
-        _release_guard(guard, directory / SCORE_WRITE_LOCK)
+        _release_guard(guard, directory / SCORE_WRITE_LOCK, identity)
     finally:
         _held.directories = held
 
@@ -219,22 +307,11 @@ def score_parquet_destination(path: Path) -> Iterator[Path]:
             _warn_committed_cleanup(path, error)
 
 
-@dataclass(frozen=True, slots=True)
-class ScoreTempCleanup:
-    """Payload progress and an optional stopped-pass guard-release failure."""
-
-    deleted: tuple[Path, ...] = ()
-    freed_mb: float = 0.0
-    skipped: tuple[str, ...] = ()
-    coordination_release_error: ScoreCoordinationReleaseError | None = None
-
-
 @dataclass
 class _RecoveryProgress:
     deleted: list[Path] = field(default_factory=list)
     freed_bytes: int = 0
     skipped: list[str] = field(default_factory=list)
-    coordination_release_error: ScoreCoordinationReleaseError | None = None
 
     def diagnostic(self, note: str, primary: BaseException | None = None) -> None:
         if primary is None:
@@ -254,7 +331,6 @@ class _RecoveryProgress:
             tuple(self.deleted),
             self.freed_bytes / 1e6,
             tuple(self.skipped),
-            self.coordination_release_error,
         )
 
 
@@ -311,6 +387,8 @@ def _reclaim_stage(path: Path, *, dry_run: bool, progress: _RecoveryProgress) ->
         try:
             lease.release()
         except (Exception,) as error:  # noqa: B013
+            if primary is None and not isinstance(error, OSError):
+                raise
             note = f"{lease_path}: temporary lease release failed: {error}"
             progress.diagnostic(note, primary)
         else:
@@ -352,12 +430,6 @@ def _recover_candidates(
                 "temporary cleanup deferred: score directory coordination is busy"
             )
             break
-        except (ScoreCoordinationReleaseError,) as error:  # noqa: B013
-            progress.coordination_release_error = error
-            progress.diagnostic(
-                f"temporary cleanup stopped: {_cleanup_diagnostic(error)}"
-            )
-            break
         except (OSError,) as error:  # noqa: B013
             progress.diagnostic(
                 f"temporary cleanup stopped: score directory coordination failed for "
@@ -374,8 +446,8 @@ def cleanup_score_temporaries(
     Directory and individual lease acquisition are nonblocking. A dry run may
     create lock metadata, but never explicitly unlinks payloads or companions.
     Deletion accounting survives ordinary errors while releasing either lock.
-    A guard-release failure returns its typed error with partial progress so a
-    caller can stop before writing. Unexpected errors propagate with the same
+    A guard-release failure raises with a structured partial result so a caller
+    must explicitly handle uncertain ownership. Unexpected errors carry the same
     partial-progress note. Observed directory disappearance stops recovery;
     removal after the existence check can race with parent-directory creation
     by score_write_lock, locked_path or FileLock.
@@ -397,7 +469,7 @@ def cleanup_score_temporaries(
         _recover_candidates(directory, candidates, dry_run=dry_run, progress=progress)
     except (BaseException,) as error:  # noqa: B013 -- annotate, never suppress
         progress.annotate(error, dry_run=dry_run)
+        if isinstance(error, ScoreCoordinationReleaseError):
+            error.partial_result = progress.result()
         raise
-    if progress.coordination_release_error is not None:
-        progress.annotate(progress.coordination_release_error, dry_run=dry_run)
     return progress.result()

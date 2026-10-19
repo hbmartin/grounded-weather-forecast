@@ -6,7 +6,6 @@ import pickle
 import signal
 import subprocess
 import sys
-from collections.abc import Iterator
 from concurrent.futures import ProcessPoolExecutor
 from contextlib import contextmanager
 from pathlib import Path
@@ -15,48 +14,20 @@ from typing import Never
 import polars as pl
 import pytest
 from conftest import write_config
+from score_recovery_helpers import GuardFailureFactory, OrphanFactory
 
 from grounded_weather_forecast import cli, runs
 from grounded_weather_forecast.backtest import engine, scores
 from grounded_weather_forecast.backtest import score_storage as storage
 from grounded_weather_forecast.reports import operations
 from grounded_weather_forecast.serve import selection
-from grounded_weather_forecast.storage import pipeline_lock, temporary_sibling
-
-
-def orphan(directory: Path, name: str = "orphan", contents: bytes = b"orphan") -> Path:
-    staged = temporary_sibling(
-        directory / f"scores_{name}.parquet", namespace=storage.SCORE_STAGE_NAMESPACE
-    )
-    staged.write_bytes(contents)
-    return staged
-
-
-@pytest.fixture
-def failed_score_guard_release(
-    monkeypatch: pytest.MonkeyPatch,
-) -> Iterator[list[storage.FileLock]]:
-    """Keep a real guard held until teardown without leaking it to other tests."""
-    held: list[storage.FileLock] = []
-    release = storage.FileLock.release
-
-    def fail_release(self: storage.FileLock, *, force: bool = False) -> None:
-        if Path(self.lock_file).name == storage.SCORE_WRITE_LOCK and self.is_locked:
-            held.append(self)
-            raise OSError("unlock fixture")
-        release(self, force=force)
-
-    monkeypatch.setattr(storage.FileLock, "release", fail_release)
-    try:
-        yield held
-    finally:
-        for guard in held:
-            release(guard, force=True)
+from grounded_weather_forecast.storage import pipeline_lock
 
 
 @pytest.mark.parametrize("phase", ["lease", "companion"])
 @pytest.mark.parametrize("secondary_error", [OSError, TypeError])
 def test_disappeared_payload_preserves_secondary_cleanup_failure(
+    orphan: OrphanFactory,
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     phase: str,
@@ -65,13 +36,13 @@ def test_disappeared_payload_preserves_secondary_cleanup_failure(
     first, second = orphan(tmp_path, "first"), orphan(tmp_path, "second")
     unlink, release = Path.unlink, storage.FileLock.release
 
-    def fail_unlink(path: Path, *args, **kwargs) -> None:
+    def fail_unlink(path: Path, *, missing_ok: bool = False) -> None:
         if path == first:
             unlink(path)
             raise FileNotFoundError("payload disappeared")
         if phase == "companion" and path == storage._lease_path(first):
             raise secondary_error("secondary fixture")
-        unlink(path, *args, **kwargs)
+        unlink(path, missing_ok=missing_ok)
 
     def fail_release(self: storage.FileLock, *, force: bool = False) -> None:
         held = self.is_locked
@@ -85,7 +56,7 @@ def test_disappeared_payload_preserves_secondary_cleanup_failure(
 
     monkeypatch.setattr(Path, "unlink", fail_unlink)
     monkeypatch.setattr(storage.FileLock, "release", fail_release)
-    if phase == "companion" and secondary_error is TypeError:
+    if secondary_error is TypeError:
         with pytest.raises(TypeError, match="secondary fixture") as caught:
             storage.cleanup_score_temporaries(tmp_path)
         assert second.exists()
@@ -101,16 +72,19 @@ def test_disappeared_payload_preserves_secondary_cleanup_failure(
 
 
 @pytest.mark.parametrize("dry_run", [False, True])
-def test_recovery_returns_typed_release_failure_and_partial_progress(
+def test_recovery_raises_typed_release_failure_and_partial_progress(
+    orphan: OrphanFactory,
     tmp_path: Path,
     failed_score_guard_release: list[storage.FileLock],
     *,
     dry_run: bool,
 ) -> None:
     first, second = orphan(tmp_path, "first"), orphan(tmp_path, "second")
-    result = storage.cleanup_score_temporaries(tmp_path, dry_run=dry_run)
-    error = result.coordination_release_error
-    assert isinstance(error, storage.ScoreCoordinationReleaseError)
+    with pytest.raises(storage.ScoreCoordinationReleaseError) as caught:
+        storage.cleanup_score_temporaries(tmp_path, dry_run=dry_run)
+    error = caught.value
+    result = error.partial_result
+    assert result is not None
     assert error.lock_path == tmp_path / storage.SCORE_WRITE_LOCK
     assert isinstance(error.cause, OSError)
     assert error.__cause__ is error.cause
@@ -122,17 +96,18 @@ def test_recovery_returns_typed_release_failure_and_partial_progress(
     assert result.freed_mb == 6 / 1e6
     assert first.exists() == dry_run
     assert second.exists()
-    assert "unlock fixture" in result.skipped[0]
+    assert not result.skipped
     assert len(failed_score_guard_release) == 1
     assert failed_score_guard_release[0].is_locked
     with (
-        pytest.raises(storage.ScoreCoordinationTimeout),
+        pytest.raises(storage.ScoreCoordinationReleaseError, match="unlock fixture"),
         storage.score_write_lock(tmp_path, timeout=0),
     ):
         pass
 
 
 def test_pruning_continues_after_recovery_guard_release_failure(
+    orphan: OrphanFactory,
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     failed_score_guard_release: list[storage.FileLock],
@@ -161,13 +136,14 @@ def test_pruning_continues_after_recovery_guard_release_failure(
     assert result.deleted == (published[0],)
     assert not published[0].exists()
     assert all(path.exists() for path in published[1:])
-    assert any("unlock fixture" in note for note in result.skipped)
+    assert result.coordination_release_failure is not None
+    assert "unlock fixture" in result.coordination_release_failure.diagnostic()
     assert failed_score_guard_release[0].is_locked
 
 
 @pytest.mark.parametrize("completed", [0, 1])
 def test_directory_acquisition_error_stops_once_with_partial_accounting(
-    tmp_path, monkeypatch, completed
+    orphan: OrphanFactory, tmp_path, monkeypatch, completed
 ):
     stages = [orphan(tmp_path, str(i)) for i in range(3)]
     monkeypatch.setattr(storage, "_stage_payloads", lambda _directory: stages)
@@ -195,7 +171,9 @@ def test_directory_acquisition_error_stops_once_with_partial_accounting(
 
 
 @pytest.mark.parametrize("dry_run", [False, True])
-def test_vanished_candidate_does_not_create_companion(tmp_path, monkeypatch, dry_run):
+def test_vanished_candidate_does_not_create_companion(
+    orphan: OrphanFactory, tmp_path, monkeypatch, dry_run
+):
     staged = orphan(tmp_path)
     discover = storage._stage_payloads
 
@@ -215,7 +193,7 @@ def test_vanished_candidate_does_not_create_companion(tmp_path, monkeypatch, dry
 @pytest.mark.parametrize("dry_run", [False, True])
 @pytest.mark.parametrize("completed", [0, 1])
 def test_observed_directory_disappearance_stops_without_recreation(
-    tmp_path, monkeypatch, dry_run, completed
+    orphan: OrphanFactory, tmp_path, monkeypatch, dry_run, completed
 ):
     directory = tmp_path / "scores"
     stages = [orphan(directory, str(i)) for i in range(2)]
@@ -248,7 +226,9 @@ def test_observed_directory_disappearance_stops_without_recreation(
 
 
 @pytest.mark.parametrize("dry_run", [False, True])
-def test_unexpected_error_carries_completed_progress(tmp_path, monkeypatch, dry_run):
+def test_unexpected_error_carries_completed_progress(
+    orphan: OrphanFactory, tmp_path, monkeypatch, dry_run
+):
     first, second = orphan(tmp_path, "first"), orphan(tmp_path, "second")
     monkeypatch.setattr(storage, "_stage_payloads", lambda _directory: [first, second])
     regular = storage._regular
@@ -271,7 +251,7 @@ def test_unexpected_error_carries_completed_progress(tmp_path, monkeypatch, dry_
 
 @pytest.mark.parametrize("interrupt", [KeyboardInterrupt, SystemExit, GeneratorExit])
 def test_new_companion_interrupt_retains_original_context(
-    tmp_path, monkeypatch, interrupt
+    orphan: OrphanFactory, tmp_path, monkeypatch, interrupt
 ):
     staged = orphan(tmp_path)
     unlink = Path.unlink
@@ -337,7 +317,7 @@ def test_timeout_warning_includes_secondary_notes(tmp_path, caplog):
 
 
 def test_busy_guard_reports_failed_first_fallback_release(
-    tmp_path, monkeypatch, caplog
+    orphan: OrphanFactory, tmp_path, monkeypatch, caplog
 ):
     staged = orphan(tmp_path)
     lease = storage.FileLock(storage._lease_path(staged))
@@ -373,7 +353,7 @@ def test_busy_guard_reports_failed_first_fallback_release(
 
 @pytest.mark.parametrize("failures", [1, 2])
 def test_release_retry_reports_attempts_and_final_state(
-    tmp_path, monkeypatch, failures
+    orphan: OrphanFactory, tmp_path, monkeypatch, failures
 ):
     staged = orphan(tmp_path)
     lease = storage.FileLock(storage._lease_path(staged))
@@ -409,7 +389,11 @@ def test_release_retry_reports_attempts_and_final_state(
 
 def test_release_error_pickle_retains_metadata_and_notes(tmp_path):
     error = storage.ScoreCoordinationReleaseError(
-        tmp_path / "guard.lock", OSError("cause fixture")
+        tmp_path / "guard.lock",
+        OSError("cause fixture"),
+        partial_result=storage.ScoreTempCleanup(
+            (tmp_path / "payload",), 0.5, ("prior",)
+        ),
     )
     error.add_note("note fixture")
     restored = pickle.loads(pickle.dumps(error))  # noqa: S301 -- local fixture only
@@ -420,10 +404,12 @@ def test_release_error_pickle_retains_metadata_and_notes(tmp_path):
     assert str(restored.cause) == "cause fixture"
     assert restored.__cause__ is restored.cause
     assert restored.__notes__ == ["note fixture"]
+    assert restored.partial_result == error.partial_result
 
 
 def raise_release_error(path: Path) -> Never:
     error = storage.ScoreCoordinationReleaseError(path, OSError("worker fixture"))
+    error.partial_result = storage.ScoreTempCleanup((path.parent / "payload",), 0.5)
     error.add_note("worker note")
     raise error
 
@@ -438,30 +424,25 @@ def test_release_error_crosses_process_pool(tmp_path):
     assert caught.value.lock_path == tmp_path / "guard.lock"
     assert isinstance(caught.value.cause, OSError)
     assert str(caught.value.cause) == "worker fixture"
-    assert caught.value.__cause__ is not None
-    assert caught.value.__cause__ is not caught.value.cause
-    assert "Traceback" in str(caught.value.__cause__)
-    assert "worker fixture" in str(caught.value.__cause__)
     assert caught.value.__notes__ == ["worker note"]
+    assert caught.value.partial_result == storage.ScoreTempCleanup(
+        (tmp_path / "payload",), 0.5
+    )
 
 
 @pytest.mark.parametrize("initially_held", [False, True])
 def test_disposal_guard_error_reports_completed_companion_removal(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, *, initially_held: bool
+    orphan: OrphanFactory,
+    tmp_path: Path,
+    fail_guard_release: GuardFailureFactory,
+    *,
+    initially_held: bool,
 ) -> None:
     staged = orphan(tmp_path)
     lease = storage.FileLock(storage._lease_path(staged))
     if initially_held:
         lease.acquire(timeout=0)
-    guard = storage.locked_path
-
-    @contextmanager
-    def fail_guard_release(*args, **kwargs):
-        with guard(*args, **kwargs):
-            yield
-        raise OSError("guard release fixture")
-
-    monkeypatch.setattr(storage, "locked_path", fail_guard_release)
+    fail_guard_release(OSError("guard release fixture"))
     try:
         with pytest.raises(storage.ScoreCoordinationReleaseError) as caught:
             storage._dispose_stage(staged, lease)
@@ -478,6 +459,7 @@ def test_disposal_guard_error_reports_completed_companion_removal(
 
 @pytest.mark.parametrize("command", ["backtest", "maintain", "recover"])
 def test_startup_release_failure_stops_writers_and_is_journaled(
+    orphan: OrphanFactory,
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
@@ -491,7 +473,7 @@ def test_startup_release_failure_stops_writers_and_is_journaled(
     writers: list[bool] = []
     promoted: list[bool] = []
 
-    def write(*_args) -> int:
+    def write(*_args: object) -> int:
         writers.append(True)
         with storage.score_write_lock(directory):
             return 1
@@ -529,6 +511,8 @@ def test_startup_release_failure_stops_writers_and_is_journaled(
     assert "deleted 1 abandoned score temporary" in output.out
     assert "1 payloads deleted, 6 bytes" in output.err
     assert "timed out" not in output.err
+    assert "unlock fixture" not in output.out
+    assert output.err.count("directory guard release failed") == 1
     failures = [record for record in records if record.exit_code == 1]
     assert len(failures) == (1 if command == "backtest" else 2)
     for record in failures:
@@ -541,7 +525,7 @@ def test_startup_release_failure_stops_writers_and_is_journaled(
 
 @pytest.mark.parametrize("command", ["backtest", "maintain", "recover"])
 def test_cli_release_failure_is_handled_and_journaled(
-    tmp_path, monkeypatch, capsys, command
+    tmp_path, monkeypatch, capsys, command, fail_guard_release: GuardFailureFactory
 ):
     config = write_config(tmp_path)
     directory = config.dataset.dir / "scores"
@@ -554,13 +538,6 @@ def test_cli_release_failure_is_handled_and_journaled(
     if os.name != "nt":
         destination.chmod(0o640)
     closed, promoted, records = [], [], []
-    guard = storage.locked_path
-
-    @contextmanager
-    def faulty_guard(*args, **kwargs):
-        with guard(*args, **kwargs):
-            yield
-        raise OSError("guard release fixture")
 
     def produce(*_args):
         try:
@@ -578,7 +555,7 @@ def test_cli_release_failure_is_handled_and_journaled(
         finally:
             closed.append(True)
 
-    monkeypatch.setattr(storage, "locked_path", faulty_guard)
+    fail_guard_release(OSError("guard release fixture"))
     monkeypatch.setattr(engine, "iter_backtest_scores", produce)
     monkeypatch.setattr(
         selection, "select_methods", lambda *_a, **_k: promoted.append(True)

@@ -247,23 +247,45 @@ Ordinary housekeeping errors after publication produce diagnostics without
 turning a committed write into failure. Deletion accounting survives release
 errors; `ScoreCoordinationReleaseError` retains the guard path and original cause,
 supports ordinary pickle round trips with notes and cause chaining, and stops
-recovery if guard release fails. A process executor substitutes its remote
-traceback as `__cause__`; the original exception remains available as `.cause`.
-`ScoreTempCleanup.coordination_release_error` defaults to `None` and carries a
-stopped pass's original guard-release exception with a partial-counts/bytes note;
-the existing `skipped` diagnostic and payload accounting remain available.
-Backtest startup raises this error before invoking product writers. Both startup
+recovery by raising if guard release fails. Its optional `partial_result` contains
+a `ScoreTempCleanup` with completed payload paths, decimal megabytes and prior
+nonfatal `skipped` diagnostics; the exception also carries the partial-counts/bytes
+note. The fatal release failure is not duplicated in `skipped`. Pickle and process
+transport preserve this partial result, metadata and notes. Current CPython process
+executors may substitute a remote traceback as `__cause__`; callers use `.cause`
+for original exception metadata rather than depending on that representation.
+Backtest startup catches the release error before invoking product writers and
+prints partial progress plus one fatal diagnostic. Both startup
 and uncommitted writer release failures are handled by CLI backtest, maintenance
 and recovery with exit 1, journal failure kind `score_coordination_release`, the
 diagnostic in `error_detail`, and no promotion. `prune-scores` retains its partial
 temporary counts and diagnostic while continuing published-score retention.
+It then returns exit 1, including for dry runs and unverifiable-release early
+returns, and journals the same failure kind. `PruneResult.coordination_release_failure`
+contains an immutable `ScoreCoordinationFailure`: lock path, cause type name,
+message and notes. Neither this snapshot nor `ScoreTempCleanup` contains an
+exception, traceback or lock reference.
+
+Every failed directory-guard release, including during an existing failure or
+control-flow exception, records a snapshot in a process-wide registry protected
+by a mutex. The key is `(pid, st_dev, st_ino)`, separate from thread-local reentrant
+ownership. Acquisition checks this registry before reentrant bypass and before
+translating a timeout; known failures raise fresh typed exceptions with synthetic
+causes describing the original failure. Aliases and other threads therefore fail
+immediately rather than waiting `SCORE_COORDINATION_TIMEOUT_S = 60.0`. Markers
+persist until process exit, even if finalization subsequently unlocks the guard.
+An `os.register_at_fork` child callback resets the registry and mutex. Committed
+publications retain warning-only behavior; a final-product release warning alone
+does not fail backtest or suppress promotion. Later coordination still fails.
+
 Diagnostics identify the affected
 resource and cleanup phase. Unexpected programming errors in recovery work
 propagate with partial payload counts and bytes in an exception note. One internal
 progress accumulator records these immediately after each successful payload
-action, before housekeeping. Broad ordinary-exception handling is restricted to
-release and secondary-cleanup boundaries: ordinary companion-removal errors
-annotate a pending failure, while new control-flow exceptions propagate with the
+action, before housekeeping. Expected standalone `OSError` lease-release and
+companion-removal errors remain best effort; standalone programming errors in
+either phase propagate. Ordinary secondary cleanup errors annotate a pending
+failure, while new control-flow exceptions propagate with the
 original context. Committed warnings retain all secondary notes and distinguish
 release attempts, retry outcomes and the lease's final reported ownership state
 (`still held`, `reported released` or `not held on entry`). Companion-removal
