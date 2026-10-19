@@ -40,7 +40,12 @@ from typing import cast
 import polars as pl
 from filelock import Timeout
 
-from grounded_weather_forecast.backtest.score_storage import cleanup_score_temporaries
+from grounded_weather_forecast.backtest.score_storage import (
+    ScoreCoordinationFailure,
+    ScoreCoordinationReleaseError,
+    ScoreTempCleanup,
+    cleanup_score_temporaries,
+)
 from grounded_weather_forecast.config import Config
 from grounded_weather_forecast.dataset.providers import source_slug
 from grounded_weather_forecast.dataset.station import sqlite_uri
@@ -887,6 +892,7 @@ class PruneResult:
     freed_mb: float
     temporary_deleted: tuple[Path, ...] = ()
     temporary_freed_mb: float = 0.0
+    coordination_release_failure: ScoreCoordinationFailure | None = None
 
 
 def _protected_evaluations(config: Config, *, now: datetime) -> set[str] | None:
@@ -976,7 +982,12 @@ def prune_scores_files(
     """
     moment = now or datetime.now(tz=UTC)
     scores_dir = config.dataset.dir / "scores"
-    temporary = cleanup_score_temporaries(scores_dir, dry_run=dry_run)
+    failure: ScoreCoordinationFailure | None = None
+    try:
+        temporary = cleanup_score_temporaries(scores_dir, dry_run=dry_run)
+    except (ScoreCoordinationReleaseError,) as error:  # noqa: B013
+        temporary = error.partial_result or ScoreTempCleanup()
+        failure = error.snapshot()
     files = sorted(scores_dir.glob("scores_*.parquet")) if scores_dir.exists() else []
     protected = _protected_evaluations(config, now=moment)
     if protected is None:
@@ -987,6 +998,7 @@ def prune_scores_files(
             freed_mb=0.0,
             temporary_deleted=temporary.deleted,
             temporary_freed_mb=temporary.freed_mb,
+            coordination_release_failure=failure,
         )
     try:
         cataloged = set(
@@ -1026,4 +1038,5 @@ def prune_scores_files(
         freed_mb=freed,
         temporary_deleted=temporary.deleted,
         temporary_freed_mb=temporary.freed_mb,
+        coordination_release_failure=failure,
     )

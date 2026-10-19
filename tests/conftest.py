@@ -1,10 +1,21 @@
 import sqlite3
+import threading
+from collections.abc import Iterator
+from contextlib import contextmanager
 from datetime import timedelta
+from pathlib import Path
 
 import numpy as np
 import polars as pl
 import pytest
+from score_recovery_helpers import (
+    GuardFailureFactory,
+    OrphanFactory,
+    create_orphan,
+    release_guards,
+)
 
+from grounded_weather_forecast.backtest import score_storage as storage
 from grounded_weather_forecast.config import load_config
 from grounded_weather_forecast.leads import hourly_bucket
 from grounded_weather_forecast.timeutil import utc
@@ -347,3 +358,54 @@ __all__ = [
     "utc",
     "write_config",
 ]
+
+
+@pytest.fixture(autouse=True)
+def isolated_score_guard_failures(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Production failures are sticky; each test owns a separate registry."""
+    monkeypatch.setattr(storage, "_failed_directories", {})
+    monkeypatch.setattr(storage, "_failed_directories_lock", threading.Lock())
+
+
+@pytest.fixture
+def orphan() -> OrphanFactory:
+    return create_orphan
+
+
+@pytest.fixture
+def fail_guard_release(monkeypatch: pytest.MonkeyPatch) -> GuardFailureFactory:
+    """Raise after actually unlocking; distinct from a held-guard failure."""
+    guard = storage.locked_path
+
+    def install(cause: Exception) -> None:
+        @contextmanager
+        def faulty(path: Path, timeout: float = -1) -> Iterator[None]:
+            with guard(path, timeout):
+                yield
+            raise cause
+
+        monkeypatch.setattr(storage, "locked_path", faulty)
+
+    return install
+
+
+@pytest.fixture
+def failed_score_guard_release(
+    monkeypatch: pytest.MonkeyPatch,
+) -> Iterator[list[storage.FileLock]]:
+    """Keep real guards held, then attempt every original release at teardown."""
+    held: list[storage.FileLock] = []
+    release = storage.FileLock.release
+
+    def fail_release(self: storage.FileLock, *, force: bool = False) -> None:
+        if Path(self.lock_file).name == storage.SCORE_WRITE_LOCK and self.is_locked:
+            if self not in held:
+                held.append(self)
+            raise OSError("unlock fixture")
+        release(self, force=force)
+
+    monkeypatch.setattr(storage.FileLock, "release", fail_release)
+    try:
+        yield held
+    finally:
+        release_guards(held, release)

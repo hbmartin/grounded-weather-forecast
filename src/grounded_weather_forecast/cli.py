@@ -1055,6 +1055,11 @@ def _cmd_backtest(config: Config, args: argparse.Namespace) -> int:
         print(f"score directory coordination timed out: {error}", file=sys.stderr)
         return EXIT_CONTENTION
     except (ScoreCoordinationReleaseError,) as error:  # noqa: B013
+        if error.partial_result is not None:
+            partial = error.partial_result
+            _print_score_temporaries(partial.deleted, partial.freed_mb)
+            for note in partial.skipped:
+                print(f"skipped {note}")
         detail = "; ".join((str(error), *getattr(error, "__notes__", ())))
         print(detail, file=sys.stderr)
         vars(args)["_failure_kind"] = "score_coordination_release"
@@ -1072,8 +1077,6 @@ def _backtest_products(config: Config, args: argparse.Namespace) -> int:
     _print_score_temporaries(temporary.deleted, temporary.freed_mb)
     for note in temporary.skipped:
         print(f"skipped {note}")
-    if temporary.coordination_release_error is not None:
-        raise temporary.coordination_release_error
     methods = available_methods() if args.methods == "all" else _split_csv(args.methods)
     products = _split_csv(args.products)
     promotion_semantics = _semantics_by_variable(
@@ -1491,6 +1494,12 @@ def _cmd_prune_scores(config: Config, args: argparse.Namespace) -> int:
     _print_score_temporaries(
         result.temporary_deleted, result.temporary_freed_mb, dry_run=args.dry_run
     )
+    if result.coordination_release_failure is not None:
+        detail = result.coordination_release_failure.diagnostic()
+        print(detail, file=sys.stderr)
+        vars(args)["_failure_kind"] = "score_coordination_release"
+        vars(args)["_error_detail"] = detail
+        return 1
     return 0
 
 
