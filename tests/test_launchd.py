@@ -2,7 +2,9 @@ import fcntl
 import importlib.util
 import json
 import os
+import shutil
 import subprocess
+import sys
 import threading
 from pathlib import Path
 from unittest.mock import patch
@@ -10,6 +12,35 @@ from unittest.mock import patch
 import pytest
 
 SCRIPT = Path(__file__).parents[1] / "docs/launchd/daily-maintenance.py"
+
+
+@pytest.fixture(autouse=True)
+def project_layout(monkeypatch, tmp_path):
+    project = tmp_path / "weather projects" / "forecast checkout"
+    project.mkdir(parents=True)
+    (project / "pyproject.toml").write_text(
+        '[project]\nname = "grounded-weather-forecast"\n'
+    )
+    (project / "config.toml").write_text(
+        '[station]\ndb_path = "station data/observations.db"\n'
+    )
+    database = project / "station data/observations.db"
+    database.parent.mkdir()
+    database.touch()
+    station = project.parent / "ambientweather2sqlite"
+    station.mkdir()
+    (station / "pyproject.toml").write_text(
+        '[project]\nname = "ambientweather2sqlite"\n'
+    )
+    binary = tmp_path / "custom bin" / "uv"
+    binary.parent.mkdir()
+    binary.write_text("#!/bin/sh\nexit 99\n")
+    binary.chmod(0o755)
+    monkeypatch.setenv(
+        "PATH", f"{binary.parent}{os.pathsep}{os.environ.get('PATH', '')}"
+    )
+    monkeypatch.chdir(project)
+    return project
 
 
 def run_maintenance(
@@ -38,7 +69,8 @@ def run_maintenance(
 def load_script(path):
     spec = importlib.util.spec_from_file_location(path.stem, path)
     module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
+    with patch.object(sys, "path", [str(path.parent), *sys.path]):
+        spec.loader.exec_module(module)
     return module
 
 
@@ -119,7 +151,7 @@ def test_healthy_hourly_check_cannot_block_daily_job(monkeypatch, tmp_path):
     hourly = load_script(SCRIPT.with_name("hourly-predict-publish.py"))
     forecast = tmp_path / "forecast.json"
     forecast.write_text(json.dumps({"status": "ready"}))
-    monkeypatch.setattr(hourly, "OUT", str(forecast))
+    paths = hourly.RuntimePaths(tmp_path, "uv")
     directory = tmp_path / "Library/Application Support/grounded-weather-forecast"
     directory.mkdir(parents=True)
     monkeypatch.setattr(hourly, "HERE", directory)
@@ -138,7 +170,7 @@ def test_healthy_hourly_check_cannot_block_daily_job(monkeypatch, tmp_path):
 
     def check():
         try:
-            hourly.maybe_spawn_restore()
+            hourly.maybe_spawn_restore(paths)
         except Exception as error:
             failures.append(error)
 
@@ -169,7 +201,7 @@ def test_actual_restore_spawns_detached_child_without_lock_probe(monkeypatch, tm
     forecast.write_text(
         json.dumps({"status": "degraded", "status_reason": "implementation changed"})
     )
-    monkeypatch.setattr(hourly, "OUT", str(forecast))
+    paths = hourly.RuntimePaths(tmp_path, "uv")
     monkeypatch.setattr(hourly, "HERE", tmp_path)
     monkeypatch.setattr(hourly, "RESTORE_LOG", tmp_path / "restore.log")
     monkeypatch.setenv("UV_TEST_PARENT", "parent-only")
@@ -186,7 +218,7 @@ def test_actual_restore_spawns_detached_child_without_lock_probe(monkeypatch, tm
     monkeypatch.setattr(subprocess, "Popen", spawn)
     with (tmp_path / "maintenance-job.lock").open("a") as lock:
         fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        hourly.maybe_spawn_restore()
+        hourly.maybe_spawn_restore(paths)
     assert len(calls) == 1
     assert calls[0][0][-1] == "--restore"
     assert calls[0][1]["start_new_session"] is True
@@ -212,7 +244,7 @@ def test_exception_releases_job_lock_and_logs_failed_exit(
     directory.mkdir(parents=True)
     module = load_script(SCRIPT)
 
-    def crash(_step):
+    def crash(_step, _paths):
         raise RuntimeError("unexpected failure")
 
     monkeypatch.setattr(Path, "home", lambda: tmp_path)
@@ -235,9 +267,9 @@ def test_hourly_failed_predict_stops_restore_and_publish(monkeypatch, capsys):
     module = load_script(SCRIPT.with_name("hourly-predict-publish.py"))
     before = dict(os.environ)
     monkeypatch.setattr(os, "chdir", lambda _: None)
-    monkeypatch.setattr(module, "run_predict", lambda: 1)
+    monkeypatch.setattr(module, "run_predict", lambda _paths: 1)
 
-    def unexpected():
+    def unexpected(_paths):
         pytest.fail("failed prediction continued to restore or publish")
 
     monkeypatch.setattr(module, "maybe_spawn_restore", unexpected)
@@ -246,7 +278,7 @@ def test_hourly_failed_predict_stops_restore_and_publish(monkeypatch, capsys):
         patch.dict(os.environ),
         patch.object(module.sys, "path", module.sys.path.copy()),
     ):
-        assert module.main() == 1
+        assert module.main([]) == 1
     assert dict(os.environ) == before
     assert "exit=1" in capsys.readouterr().out
 
@@ -331,3 +363,136 @@ def test_maintenance_stage_order_and_restore_scope(monkeypatch, sunday):
         ["report"],
         ["prune-scores"],
     ]
+
+
+def test_publishing_uses_active_project_and_configured_database(project_layout):
+    hourly = load_script(SCRIPT.with_name("hourly-predict-publish.py"))
+    paths = hourly.resolve_publishing()
+    assert paths.project == project_layout
+    assert paths.station_project == project_layout.parent / "ambientweather2sqlite"
+    assert paths.station_db == project_layout / "station data/observations.db"
+    assert Path(paths.uv).parent.name == "custom bin"
+
+
+def test_station_project_override_and_absolute_database(tmp_path, project_layout):
+    hourly = load_script(SCRIPT.with_name("hourly-predict-publish.py"))
+    collector = tmp_path / "separate collector"
+    collector.mkdir()
+    (collector / "pyproject.toml").write_text(
+        '[project]\nname = "ambientweather2sqlite"\n'
+    )
+    database = tmp_path / "separate observations.db"
+    database.touch()
+    (project_layout / "config.toml").write_text(
+        f"[station]\ndb_path = {json.dumps(str(database))}\n"
+    )
+    paths = hourly.resolve_publishing(collector)
+    assert paths.station_project == collector
+    assert paths.station_db == database
+
+
+def test_station_child_receives_explicit_database(monkeypatch):
+    hourly = load_script(SCRIPT.with_name("hourly-predict-publish.py"))
+    paths = hourly.resolve_publishing()
+    calls = []
+
+    def run(command, **kwargs):
+        calls.append((command, kwargs))
+        return subprocess.CompletedProcess(command, 0)
+
+    monkeypatch.setattr(subprocess, "run", run)
+    monkeypatch.setenv("VIRTUAL_ENV", "forecast-environment")
+    monkeypatch.setenv("UV_PROJECT", "forecast-project")
+    assert hourly.render_station(paths) == 0
+    command, kwargs = calls[0]
+    assert command[command.index("--project") + 1] == str(paths.station_project)
+    assert command[command.index("--db") + 1] == str(paths.station_db)
+    assert "VIRTUAL_ENV" not in kwargs["env"]
+    assert "UV_PROJECT" not in kwargs["env"]
+
+
+@pytest.mark.parametrize("name", ["daily-maintenance.py", "hourly-predict-publish.py"])
+@pytest.mark.parametrize(
+    "fault", ["project", "config-missing", "config-malformed", "uv"]
+)
+def test_path_failures_run_no_children_and_preserve_stamp(
+    monkeypatch, tmp_path, project_layout, capsys, name, fault
+):
+    module = load_script(SCRIPT.with_name(name))
+    directory = tmp_path / "Library/Application Support/grounded-weather-forecast"
+    directory.mkdir(parents=True)
+    stamp = directory / "last-maintenance"
+    stamp.touch()
+    os.utime(stamp, (1, 1))
+    before = stamp.stat().st_mtime_ns
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    match fault:
+        case "project":
+            (project_layout / "pyproject.toml").write_text(
+                '[project]\nname = "other"\n'
+            )
+        case "config-missing":
+            (project_layout / "config.toml").unlink()
+        case "config-malformed":
+            (project_layout / "config.toml").write_text("[broken")
+        case "uv":
+            monkeypatch.setenv("PATH", "")
+
+    def unexpected(*_args, **_kwargs):
+        pytest.fail("invalid paths started a child")
+
+    monkeypatch.setattr(subprocess, "run", unexpected)
+    with patch.dict(os.environ):
+        assert module.main([]) == 2
+    assert stamp.stat().st_mtime_ns == before
+    output = capsys.readouterr().out
+    assert "configuration error:" in output
+    assert "exit=2" in output
+
+
+@pytest.mark.parametrize("fault", ["collector", "override", "database", "database-key"])
+def test_publishing_configuration_failure_never_predicts_or_pushes(
+    monkeypatch, project_layout, capsys, fault
+):
+    hourly = load_script(SCRIPT.with_name("hourly-predict-publish.py"))
+    args = []
+    match fault:
+        case "collector":
+            (project_layout.parent / "ambientweather2sqlite/pyproject.toml").unlink()
+        case "override":
+            args = ["--station-project", str(project_layout / "absent")]
+        case "database":
+            (project_layout / "station data/observations.db").unlink()
+        case "database-key":
+            (project_layout / "config.toml").write_text("[station]\n")
+
+    def unexpected(*_args, **_kwargs):
+        pytest.fail("invalid publishing configuration started a child")
+
+    monkeypatch.setattr(subprocess, "run", unexpected)
+    with patch.dict(os.environ):
+        assert hourly.main(args) == 2
+    assert "exit=2" in capsys.readouterr().out
+
+
+def test_installed_copy_uses_launchd_working_directory(tmp_path, project_layout):
+    installed = tmp_path / "installed scripts"
+    installed.mkdir()
+    for name in ("launchd_paths.py", "hourly-predict-publish.py"):
+        shutil.copyfile(SCRIPT.with_name(name), installed / name)
+    env = dict(os.environ)
+    env.pop("PYTHONPATH", None)
+    result = subprocess.run(  # noqa: S603 -- fixture script and interpreter
+        [sys.executable, str(installed / "hourly-predict-publish.py")],
+        cwd=project_layout,
+        env=env,
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    # The fixture uv deliberately fails: configuration resolves without ever
+    # running real weather commands, touching publication state, or using Git.
+    assert result.returncode == 1
+    assert f"PROJECT_CWD cwd={project_layout}" in result.stdout
+    assert "configuration error:" not in result.stdout
+    assert "exit=1" in result.stdout

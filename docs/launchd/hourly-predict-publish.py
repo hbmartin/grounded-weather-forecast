@@ -23,25 +23,27 @@ empty as well do we decline to publish at all, so that a bad render can never
 strip files the branch is already serving.
 """
 
+import argparse
 import json
 import os
 import socket
 import subprocess
 import sys
 import time
+from collections.abc import Sequence
 from datetime import UTC, datetime
 from pathlib import Path
 
-REPO = "/Volumes/Pro2T/weather/grounded-weather-forecast"
-CONFIG = f"{REPO}/config.toml"
-OUT = f"{REPO}/forecast.json"
+from launchd_paths import (
+    PublishingPaths,
+    RuntimePathError,
+    RuntimePaths,
+    resolve_publishing,
+)
+
 HERE = Path.home() / "Library/Application Support/grounded-weather-forecast"
 
-# publish_station.py imports ambientweather2sqlite's own aggregation functions,
-# so it runs under that project rather than this one. uv is also the binary
-# holding the TCC grant for /Volumes/Pro2T.
-UV = "/opt/homebrew/bin/uv"
-STATION_REPO = "/Volumes/Pro2T/weather/ambientweather2sqlite"
+# The station publisher runs under the collector's environment for its query API.
 STATION_SCRIPT = HERE / "publish_station.py"
 STAGED = HERE / "staged"
 STATION_TIMEOUT_S = 180
@@ -54,7 +56,7 @@ def timestamp() -> str:
 # --config is a global flag: passing it after the subcommand is an argparse
 # error, which is exactly how every scheduled run between 2026-07-27 and
 # 2026-08-03 died silently.
-def run_predict() -> int:
+def run_predict(paths: RuntimePaths) -> int:
     predict_started = time.monotonic()
     print(f"{timestamp()} == predict ==", flush=True)
     try:
@@ -62,19 +64,19 @@ def run_predict() -> int:
             [
                 "/usr/bin/time",
                 "-l",
-                UV,
+                paths.uv,
                 "--directory",
-                REPO,
+                str(paths.project),
                 "run",
                 "--locked",
                 "--project",
-                REPO,
+                str(paths.project),
                 "grounded-weather-forecast",
                 "--config",
-                CONFIG,
+                str(paths.config),
                 "predict",
                 "--out",
-                OUT,
+                str(paths.forecast),
             ],
             check=False,
         ).returncode
@@ -103,7 +105,7 @@ def run_predict() -> int:
 RESTORE_LOG = HERE / "auto-restore.log"
 
 
-def maybe_spawn_restore() -> None:
+def maybe_spawn_restore(paths: RuntimePaths) -> None:
     """One detached backtest+report when serving degraded on a code change.
 
     Only the "implementation changed" reason is restorable by a cycle:
@@ -115,7 +117,7 @@ def maybe_spawn_restore() -> None:
     Publish still proceeds immediately; hold-last-good bridges the window.
     """
     try:
-        document = json.loads(Path(OUT).read_text(encoding="utf-8"))
+        document = json.loads(paths.forecast.read_text(encoding="utf-8"))
     except (OSError, ValueError):
         return
     if not isinstance(document, dict):
@@ -133,13 +135,13 @@ def maybe_spawn_restore() -> None:
         log.flush()
         process = subprocess.Popen(  # noqa: S603 - fixed uv binary and script
             [
-                UV,
+                paths.uv,
                 "--directory",
-                REPO,
+                str(paths.project),
                 "run",
                 "--locked",
                 "--project",
-                REPO,
+                str(paths.project),
                 "python",
                 str(HERE / "daily-maintenance.py"),
                 "--restore",
@@ -152,7 +154,7 @@ def maybe_spawn_restore() -> None:
     print(f"auto-restore spawned pid={process.pid} (see auto-restore.log)", flush=True)
 
 
-def render_station() -> int:
+def render_station(paths: PublishingPaths) -> int:
     """Refresh the staged station documents. Returns the child's exit code."""
     # This process is itself running inside the grounded project's virtualenv.
     # Leaving VIRTUAL_ENV set would make the nested `uv run` resolve against the
@@ -165,12 +167,14 @@ def render_station() -> int:
     try:
         result = subprocess.run(  # noqa: S603 - fixed uv binary and script
             [
-                UV,
+                paths.uv,
                 "run",
                 "--project",
-                STATION_REPO,
+                str(paths.station_project),
                 "python",
                 str(STATION_SCRIPT),
+                "--db",
+                str(paths.station_db),
                 "--out-dir",
                 str(STAGED),
             ],
@@ -184,10 +188,10 @@ def render_station() -> int:
     return result.returncode
 
 
-def publish() -> int:
+def publish(paths: PublishingPaths) -> int:
     station_started = time.monotonic()
     print(f"{timestamp()} == station ==", flush=True)
-    station_code = render_station()
+    station_code = render_station(paths)
     print(
         f"{timestamp()} == station exited {station_code} "
         f"duration_s={time.monotonic() - station_started:.1f} ==",
@@ -214,7 +218,7 @@ def publish() -> int:
     # Degraded documents (every code-identity change causes one until the restore
     # cycle finishes) hold the last ready document for up to 6h instead of swapping
     # the public forecast's character for the integration window.
-    source = publish_forecast.choose_source(Path(OUT))
+    source = publish_forecast.choose_source(paths.forecast)
     exit_code = publish_forecast.run(source=source, include_dir=STAGED)
     print(
         f"{timestamp()} == publish exited {exit_code} "
@@ -224,24 +228,36 @@ def publish() -> int:
     return exit_code
 
 
-def main() -> int:
+def main(argv: Sequence[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(description=__doc__.split("\n", 1)[0])
+    parser.add_argument(
+        "--station-project",
+        type=Path,
+        help="collector project (default: validated sibling ambientweather2sqlite)",
+    )
+    args = parser.parse_args(argv)
     os.environ.setdefault("POLARS_MAX_THREADS", "2")
     os.environ.setdefault("PYTHONUNBUFFERED", "1")
     started = time.monotonic()
     code = 1
     print(
-        f"{timestamp()} START mode=predict pid={os.getpid()} ppid={os.getppid()} cwd={Path.cwd()} host={socket.gethostname()} project={REPO} forecast={OUT}",
+        f"{timestamp()} START mode=predict pid={os.getpid()} ppid={os.getppid()} cwd={Path.cwd()} host={socket.gethostname()} project={Path.cwd()}",
         flush=True,
     )
     try:
         # History paths must resolve from the project before invoking the CLI.
-        os.chdir(REPO)
+        paths = resolve_publishing(args.station_project)
+        os.chdir(paths.project)
         print(f"{timestamp()} PROJECT_CWD cwd={Path.cwd()}", flush=True)
         sys.path.insert(0, str(HERE))
-        if run_predict() != 0:
+        if run_predict(paths) != 0:
             return 1
-        maybe_spawn_restore()
-        code = publish()
+        maybe_spawn_restore(paths)
+        code = publish(paths)
+        return code  # noqa: RET504 -- finally logs the actual exit status
+    except (RuntimePathError,) as exc:  # noqa: B013 -- project convention
+        print(f"configuration error: {exc}", flush=True)
+        code = 2
         return code  # noqa: RET504 -- finally logs the actual exit status
     finally:
         print(

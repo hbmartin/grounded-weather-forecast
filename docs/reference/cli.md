@@ -350,6 +350,17 @@ or synthetic backtest. The wrapper logs the failed stages and preserves the
 previous `last-maintenance` timestamp; an exit code alone never identifies a
 harmless no-fold result.
 
+The standalone wrappers resolve the forecast project from their working directory
+(set by launchd's `uv --directory` argument), validate its `pyproject.toml` and
+`config.toml`, and locate `uv` through `PATH`. Install `launchd_paths.py` beside
+both wrappers. The hourly wrapper discovers a validated sibling
+`ambientweather2sqlite` checkout, or accepts `--station-project PATH` for other
+layouts. It reads `station.db_path` from the forecast configuration, resolves
+relative database paths against the forecast project, and passes the resulting
+absolute path to the station publisher's `--db`. Missing or invalid paths fail
+with exit 2 before child processes start or success stamps change. These are
+standalone wrapper semantics; `--station-project` is not a core CLI option.
+
 > rolling-origin backtest over the supervised matrices
 
 | Flag | Choices / type | Default | Meaning |

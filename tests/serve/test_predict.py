@@ -147,12 +147,12 @@ def _assert_diagnosis_channels(config, document, monkeypatch):
     assert state["reason"] == document.status_reason
     target.write_text(document.to_json())
     script = Path(__file__).parents[2] / "docs/launchd/hourly-predict-publish.py"
+    monkeypatch.syspath_prepend(str(script.parent))
     spec = importlib.util.spec_from_file_location("rainfall_restore_regression", script)
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
-    monkeypatch.setattr(module, "OUT", str(target))
     monkeypatch.setattr(module, "RESTORE_LOG", target.with_suffix(".log"))
-    module.maybe_spawn_restore()
+    module.maybe_spawn_restore(module.RuntimePaths(target.parent, "uv"))
     implementation_changed = "implementation changed" in document.status_reason
     assert len(calls) == 1 + int(implementation_changed)
     if implementation_changed:
