@@ -197,9 +197,9 @@ def test_zone_c_states_fold_arithmetic(tmp_path):
     zone = readiness.build(ctx, Derived())
     fold_panel = next(panel for panel in zone.panels if panel.panel_id == "c1")
     needed = {stat.label: stat.value for stat in fold_panel.stats}
-    assert needed["needed for first fold"] == "97 d"
+    assert needed["needed for first fold"] == "90 d"
     assert fold_panel.intro is not None
-    assert "zero live folds is correct behaviour" in fold_panel.intro
+    assert "more than 90 days and usable training/test truth" in fold_panel.intro
 
 
 def test_zone_f_selection_reason_shares(tmp_path):

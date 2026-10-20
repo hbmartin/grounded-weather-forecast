@@ -87,7 +87,7 @@ That works on day one. Everything else needs an archive with some history — se
 | `predict` | emit schema-6 JSON with rainfall budget conservation and release attribution only on finite values; `--method` bypasses automatic rain safeguards for experiments | `--out` `--method` `--no-history` `--semantics` `--now` |
 | `publish` | safely publish an automatic forecast, holding a matching ready document for up to six hours | `--out` `--semantics` `--recovery-methods` `--recovery-window` |
 | `recover` | recheck degradation, then rebuild live evidence and reports when recovery is still needed | `--semantics` `--methods` `--window` |
-| `hourly-predict-publish.py` (standalone launchd wrapper) | resolve projects and station data from the active checkout and existing configuration, then publish forecast and station documents together | `--station-project` |
+| `hourly-predict-publish.py` (standalone launchd wrapper) | predict first, then render live station data through collector configuration; retain staged station files on render failure | `--station-project` |
 | `prune-scores` | delete superseded scores and recover inactive leased stages one at a time; preview with `--dry-run`; recovery guard-release errors retain partial counts, finish published-score retention, then return 1; unexpected recovery errors propagate | `--dry-run` |
 | `uv run --group profiling python scripts/profile_memory.py -- <command>` | capture a command's memory allocations and write a peak-memory HTML report | `--output-dir` `--trace-python-allocators` `--no-native` `--no-report` |
 | `uv run python scripts/benchmark_selection_memory.py` | compare full selection runs against a Git baseline in fresh processes | `--baseline` `--runs` `--evaluations` `--cases` |
@@ -97,7 +97,7 @@ That works on day one. Everything else needs an archive with some history — se
 
 Global: `--config PATH` (default `config.toml`), `--version`. Exit codes: `0` ok,
 `1` command failure, `2` config error, `3` evaluation pending because history is
-too short, `75` lock contention (retry later).
+too short or test truth is still future at the dataset snapshot time, `75` lock contention (retry later).
 Score guard-release failure during startup recovery or an uncommitted write
 returns 1 from backtest, maintain or recover, records `score_coordination_release`
 and its diagnostic in the run journal, and suppresses promotion. Startup recovery
@@ -153,7 +153,13 @@ it returns 0 if the remaining required work passes, but preserves its success
 stamp until every requested, applicable evaluation completes. All other nonzero
 stage exits fail maintenance. Sunday synthetic evaluation follows the wrapper-only
 `[maintenance].synthetic_backtest` setting (`auto`, `required`, or `off`; default
-`auto` skips when both backfill matrices are absent).
+`auto` skips when both backfill matrices are absent in an accessible dataset directory).
+Completed products may promote independently; unsupported individual products
+are skipped, while entirely inapplicable requests exit 2. Pending stage counts
+are visible during report generation and deduplicated against their parent run.
+The hourly wrapper prefers `UV` over `PATH` and resolves station prerequisites
+after prediction. Its collector working directory selects `aw2sqlite.toml`; the
+forecast evaluation database may remain a static snapshot.
 
 ## Status
 

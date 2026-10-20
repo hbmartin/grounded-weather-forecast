@@ -115,10 +115,12 @@ def iter_backtest_scores(
         else hourly_truth_known_at(matrix)
     )
     folds = fold_plans(
-        matrix["issue_time"], truth_known, config.backtest, request.window
+        matrix["issue_time"],
+        truth_known,
+        config.backtest,
+        request.window,
+        diagnostics=diagnostics,
     )
-    if diagnostics is not None:
-        diagnostics.observe_clock(matrix["issue_time"], config.backtest)
     for fold in folds:
         train_frame = matrix[fold.train_rows]
         test_frame = matrix[fold.test_rows]
@@ -129,6 +131,14 @@ def iter_backtest_scores(
                 continue
             train_scored = train_frame.filter(pl.col(truth_column).is_finite())
             test_scored = test_frame.filter(pl.col(truth_column).is_finite())
+            if diagnostics is not None and any(
+                supports_product(method, product_kind, variable)
+                for method in request.methods
+            ):
+                diagnostics.observe_tests(
+                    truth_known[fold.test_rows],
+                    usable_training=not train_scored.is_empty(),
+                )
             if train_scored.is_empty() or test_scored.is_empty():
                 continue
             train_slice = to_supervised_slice(

@@ -206,6 +206,7 @@ def _run_counts(runs_frame: pl.DataFrame, now: datetime) -> tuple[int, int, int]
     invocations = recent.filter(
         pl.col("record_kind").is_null() | (pl.col("record_kind") == "invocation")
     )
+    stages = recent.filter(pl.col("record_kind") == "stage")
     predicts = invocations.filter(
         pl.col("command").is_in(["predict", "publish"]) & (pl.col("exit_code") == 0)
     ).height
@@ -214,14 +215,35 @@ def _run_counts(runs_frame: pl.DataFrame, now: datetime) -> tuple[int, int, int]
         & pl.col("exit_code").is_in(PENDING_EXIT_CODES).fill_null(value=False)
         & pl.col("error").is_null()
     )
-    failed = invocations.filter(
-        (
-            (pl.col("exit_code").is_not_null() & (pl.col("exit_code") != 0))
-            | pl.col("error").is_not_null()
+    failure = (
+        (pl.col("exit_code").is_not_null() & (pl.col("exit_code") != 0))
+        | pl.col("error").is_not_null()
+    ) & ~pending
+    # Parent rows are written after report. Until then, each pipeline contributes
+    # one provisional failure; completed parents replace that provisional count.
+    recorded_parents = invocations.filter(failure)["run_id"]
+    failed_stages = stages.filter(
+        failure
+        & (
+            pl.col("parent_run_id").is_null()
+            | ~pl.col("parent_run_id").is_in(recorded_parents.implode())
         )
-        & ~pending
-    ).height
-    return predicts, failed, invocations.filter(pending).height
+    )
+    failed = (
+        invocations.filter(failure).height
+        + failed_stages.select(pl.coalesce("parent_run_id", "run_id")).n_unique()
+    )
+    pending_stages = stages.filter(pending & (pl.col("command") == "backtest"))
+    pending_parents = pl.concat(
+        [
+            pending_stages["parent_run_id"],
+            stages.filter(failure)["parent_run_id"],
+        ]
+    ).drop_nulls()
+    pending_invocations = invocations.filter(
+        pending & ~pl.col("run_id").is_in(pending_parents.implode())
+    )
+    return predicts, failed, pending_stages.height + pending_invocations.height
 
 
 def _stale(name: str, age: float | None, limit: float) -> list[str]:

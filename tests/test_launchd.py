@@ -6,6 +6,7 @@ import shutil
 import subprocess
 import sys
 import threading
+import types
 from datetime import UTC, datetime
 from pathlib import Path
 from unittest.mock import patch
@@ -19,6 +20,7 @@ SCRIPT = Path(__file__).parents[1] / "docs/launchd/daily-maintenance.py"
 
 @pytest.fixture(autouse=True)
 def project_layout(monkeypatch, tmp_path):
+    monkeypatch.delenv("UV", raising=False)
     project = tmp_path / "weather projects" / "forecast checkout"
     project.mkdir(parents=True)
     (project / "pyproject.toml").write_text(
@@ -519,16 +521,18 @@ def test_exit_and_crash_lines_include_source(monkeypatch, source, capsys):
     assert f"backtest --source {source} crashed" in capsys.readouterr().out
 
 
-def test_publishing_uses_active_project_and_configured_database(project_layout):
+def test_publishing_uses_active_project_independently_of_forecast_database(
+    project_layout,
+):
     hourly = load_script(SCRIPT.with_name("hourly-predict-publish.py"))
     paths = hourly.resolve_publishing()
     assert paths.project == project_layout
     assert paths.station_project == project_layout.parent / "ambientweather2sqlite"
-    assert paths.station_db == project_layout / "station data/observations.db"
+    assert not hasattr(paths, "station_db")
     assert Path(paths.uv).parent.name == "custom bin"
 
 
-def test_station_project_override_and_absolute_database(tmp_path, project_layout):
+def test_station_project_override_ignores_forecast_database(tmp_path, project_layout):
     hourly = load_script(SCRIPT.with_name("hourly-predict-publish.py"))
     collector = tmp_path / "separate collector"
     collector.mkdir()
@@ -542,10 +546,10 @@ def test_station_project_override_and_absolute_database(tmp_path, project_layout
     )
     paths = hourly.resolve_publishing(collector)
     assert paths.station_project == collector
-    assert paths.station_db == database
+    assert not hasattr(paths, "station_db")
 
 
-def test_station_child_receives_explicit_database(monkeypatch):
+def test_station_child_uses_collector_configuration(monkeypatch):
     hourly = load_script(SCRIPT.with_name("hourly-predict-publish.py"))
     paths = hourly.resolve_publishing()
     calls = []
@@ -560,7 +564,8 @@ def test_station_child_receives_explicit_database(monkeypatch):
     assert hourly.render_station(paths) == 0
     command, kwargs = calls[0]
     assert command[command.index("--project") + 1] == str(paths.station_project)
-    assert command[command.index("--db") + 1] == str(paths.station_db)
+    assert "--db" not in command
+    assert command[command.index("--directory") + 1] == str(paths.station_project)
     assert "VIRTUAL_ENV" not in kwargs["env"]
     assert "UV_PROJECT" not in kwargs["env"]
 
@@ -596,6 +601,9 @@ def test_path_failures_run_no_children_and_preserve_stamp(
         pytest.fail("invalid paths started a child")
 
     monkeypatch.setattr(subprocess, "run", unexpected)
+    monkeypatch.setattr(subprocess, "Popen", unexpected)
+    if name.startswith("hourly"):
+        monkeypatch.setattr(module, "publish", unexpected)
     with patch.dict(os.environ):
         assert module.main([]) == 2
     assert stamp.stat().st_mtime_ns == before
@@ -604,32 +612,10 @@ def test_path_failures_run_no_children_and_preserve_stamp(
     assert "exit=2" in output
 
 
-@pytest.mark.parametrize("fault", ["collector", "override", "database", "database-key"])
-def test_publishing_configuration_failure_never_predicts_or_pushes(
-    monkeypatch, project_layout, capsys, fault
+@pytest.mark.parametrize("optimized", [False, True])
+def test_installed_copy_uses_launchd_working_directory(
+    tmp_path, project_layout, optimized
 ):
-    hourly = load_script(SCRIPT.with_name("hourly-predict-publish.py"))
-    args = []
-    match fault:
-        case "collector":
-            (project_layout.parent / "ambientweather2sqlite/pyproject.toml").unlink()
-        case "override":
-            args = ["--station-project", str(project_layout / "absent")]
-        case "database":
-            (project_layout / "station data/observations.db").unlink()
-        case "database-key":
-            (project_layout / "config.toml").write_text("[station]\n")
-
-    def unexpected(*_args, **_kwargs):
-        pytest.fail("invalid publishing configuration started a child")
-
-    monkeypatch.setattr(subprocess, "run", unexpected)
-    with patch.dict(os.environ):
-        assert hourly.main(args) == 2
-    assert "exit=2" in capsys.readouterr().out
-
-
-def test_installed_copy_uses_launchd_working_directory(tmp_path, project_layout):
     installed = tmp_path / "installed scripts"
     installed.mkdir()
     for name in ("launchd_paths.py", "hourly-predict-publish.py"):
@@ -637,7 +623,11 @@ def test_installed_copy_uses_launchd_working_directory(tmp_path, project_layout)
     env = dict(os.environ)
     env.pop("PYTHONPATH", None)
     result = subprocess.run(  # noqa: S603 -- fixture script and interpreter
-        [sys.executable, str(installed / "hourly-predict-publish.py")],
+        [
+            sys.executable,
+            *(["-OO"] if optimized else []),
+            str(installed / "hourly-predict-publish.py"),
+        ],
         cwd=project_layout,
         env=env,
         check=False,
@@ -650,3 +640,189 @@ def test_installed_copy_uses_launchd_working_directory(tmp_path, project_layout)
     assert f"PROJECT_CWD cwd={project_layout}" in result.stdout
     assert "configuration error:" not in result.stdout
     assert "exit=1" in result.stdout
+
+
+@pytest.mark.parametrize("staged", [False, True])
+@pytest.mark.parametrize(
+    "fault",
+    [
+        "collector",
+        "unknown-user",
+        "symlink-loop",
+        "missing-db",
+        "permission",
+        "timeout",
+    ],
+)
+def test_station_failure_follows_prediction_and_preserves_fallback(
+    monkeypatch, tmp_path, project_layout, capsys, staged, fault
+):
+    hourly = load_script(SCRIPT.with_name("hourly-predict-publish.py"))
+    stage = tmp_path / "staged"
+    stage.mkdir()
+    if staged:
+        (stage / "latest.json").write_text('{"previous":true}')
+    monkeypatch.setattr(hourly, "STAGED", stage)
+    events = []
+    monkeypatch.setattr(
+        hourly, "run_predict", lambda paths: events.append("predict") or 0
+    )
+    monkeypatch.setattr(
+        hourly, "maybe_spawn_restore", lambda paths: events.append("restore")
+    )
+    args = []
+    if fault == "collector":
+        (project_layout.parent / "ambientweather2sqlite/pyproject.toml").unlink()
+    elif fault == "unknown-user":
+        args = ["--station-project", "~nosuchweatheruser/x"]
+    elif fault == "symlink-loop":
+        link = tmp_path / "loop"
+        link.symlink_to(link)
+        args = ["--station-project", str(link)]
+
+    def child(command, **kwargs):
+        events.append("station")
+        assert "--db" not in command
+        if fault == "permission":
+            raise PermissionError("database access denied")
+        if fault == "timeout":
+            raise subprocess.TimeoutExpired(command, 180)
+        return subprocess.CompletedProcess(command, 2)
+
+    monkeypatch.setattr(subprocess, "run", child)
+    fake = types.SimpleNamespace(
+        choose_source=lambda path: path, run=lambda **kw: events.append("publish") or 0
+    )
+    monkeypatch.setitem(sys.modules, "publish_forecast", fake)
+    with patch.object(sys, "path", sys.path.copy()):
+        assert hourly.main(args) == (0 if staged else 1)
+    assert events[:2] == ["predict", "restore"]
+    assert ("publish" in events) == staged
+    assert ("station" in events) == (fault in {"missing-db", "permission", "timeout"})
+    if staged:
+        assert (stage / "latest.json").read_text() == '{"previous":true}'
+    output = capsys.readouterr().out
+    assert "station exited" in output
+    assert f"exit={0 if staged else 1}" in output
+
+
+@pytest.mark.parametrize("name", ["daily-maintenance.py", "hourly-predict-publish.py"])
+def test_bad_arguments_and_help_have_lifecycle_logs(name, capsys):
+    module = load_script(SCRIPT.with_name(name))
+    for arguments, expected in [(["--typo"], 2), (["--help"], 0)]:
+        assert module.main(arguments) == expected
+        output = capsys.readouterr().out
+        assert "START mode=" in output
+        assert f"exit={expected}" in output
+
+
+@pytest.mark.parametrize("name", ["daily-maintenance.py", "hourly-predict-publish.py"])
+def test_startup_survives_stripped_docstrings_and_missing_cwd(
+    monkeypatch, name, capsys
+):
+    module = load_script(SCRIPT.with_name(name))
+    monkeypatch.setattr(module, "__doc__", None)
+
+    def missing():
+        raise FileNotFoundError("deleted working directory")
+
+    monkeypatch.setattr(Path, "cwd", missing)
+    assert module.main([]) == 2
+    output = capsys.readouterr().out
+    assert "START mode=" in output and "deleted working directory" in output
+    assert "exit=2" in output
+
+
+def test_uv_precedence_and_launcher_symlink(monkeypatch, project_layout, tmp_path):
+    module = load_script(SCRIPT)
+    launcher = tmp_path / "approved uv"
+    launcher.symlink_to(Path(module.resolve_runtime().uv))
+    monkeypatch.setenv("UV", str(launcher))
+    monkeypatch.setenv("PATH", "/usr/bin:/bin:/usr/sbin:/sbin")
+    assert module.resolve_runtime().uv == str(launcher)
+
+
+@pytest.mark.parametrize("value", ["", "/no/such/uv"])
+def test_invalid_explicit_uv_does_not_fall_back(monkeypatch, value):
+    module = load_script(SCRIPT)
+    monkeypatch.setenv("UV", value)
+    with pytest.raises(ValueError, match="uv|UV"):
+        module.resolve_runtime()
+
+
+def test_uv_permission_error_keeps_original_detail(monkeypatch):
+    module = load_script(SCRIPT)
+    executable = Path(module.resolve_runtime().uv)
+    monkeypatch.setenv("UV", str(executable))
+    original = Path.stat
+
+    def denied(path, *args, **kwargs):
+        if path == executable:
+            raise PermissionError("fixture permission revoked")
+        return original(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "stat", denied)
+    with pytest.raises(ValueError, match="fixture permission revoked"):
+        module.resolve_runtime()
+
+
+def test_wrapper_reads_configuration_once_and_restore_ignores_synthetic(
+    monkeypatch, project_layout, tmp_path
+):
+    with (project_layout / "config.toml").open("a") as stream:
+        stream.write('\n[maintenance]\nsynthetic_backtest="invalid"\n')
+    code, commands, _ = run_maintenance(monkeypatch, tmp_path, restore=True)
+    assert code == 0 and commands
+    module = load_script(SCRIPT)
+    original = Path.read_text
+    reads = []
+
+    def read(path, **kwargs):
+        if path.name == "config.toml":
+            reads.append(path)
+        return original(path, **kwargs)
+
+    monkeypatch.setattr(Path, "read_text", read)
+    paths = module.resolve_runtime()
+    with pytest.raises(ValueError, match="synthetic_backtest"):
+        module.synthetic_mode(paths)
+    assert reads == [project_layout / "config.toml"]
+
+
+@pytest.mark.parametrize(
+    "fault", ["missing-directory", "dangling", "directory", "permission"]
+)
+def test_optional_synthetic_inputs_require_available_storage(
+    monkeypatch, tmp_path, fault
+):
+    module = load_script(SCRIPT)
+    directory = tmp_path / "backfill"
+    if fault != "missing-directory":
+        directory.mkdir()
+    if fault == "dangling":
+        for product in ("hourly", "daily"):
+            (directory / f"{product}_matrix_synthetic.parquet").symlink_to(
+                tmp_path / "absent"
+            )
+    elif fault == "directory":
+        (directory / "hourly_matrix_synthetic.parquet").mkdir()
+    elif fault == "permission":
+
+        def denied(*_args):
+            raise PermissionError("cannot list dataset")
+
+        monkeypatch.setattr(os, "scandir", denied)
+    with pytest.raises(OSError):
+        module.synthetic_enabled("auto", directory)
+
+
+def test_daily_package_mismatch_logs_clean_configuration_failure(
+    monkeypatch, tmp_path, capsys
+):
+    load_script(SCRIPT)
+    monkeypatch.setitem(sys.modules, "grounded_weather_forecast.status", None)
+    code, _, _ = run_maintenance(monkeypatch, tmp_path)
+    assert code == 2
+    output = capsys.readouterr().out
+    assert "START mode=" in output and "exit=2" in output
+    assert "grounded_weather_forecast.status" in output

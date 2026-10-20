@@ -90,8 +90,8 @@ when derived data was omitted. An unsupplied assessment on raw alert inputs is
 informational; it does not establish that the verdict is absent.
 
 **C — Learning readiness.** Archive issue-time span versus the
-`initial_train_days + step_days` a first rolling-origin fold needs (a
-progress bar mirroring the backtest's own "no folds" arithmetic), snapshots
+`initial_train_days` first-origin threshold, which the span must exceed
+(the progress bar measures archive age; usable training and test truth are also required), snapshots
 collected per day, synthetic-backfill coverage, and the truth-semantics
 alignment study with defaulted (not-yet-data-backed) variables flagged.
 

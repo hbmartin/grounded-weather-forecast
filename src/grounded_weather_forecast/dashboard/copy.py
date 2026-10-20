@@ -199,8 +199,9 @@ PANEL_COPY: Mapping[str, PanelCopy] = {
             "missed snapshot is training data that can never be recovered."
         ),
         thresholds=(
-            "A fold needs [backtest].initial_train_days + step_days of "
-            "issue-time span. The alert is growth stopping, not the count "
+            "A fold needs an issue-time span greater than "
+            "[backtest].initial_train_days, plus usable training/test data. "
+            "The alert is growth stopping, not the count "
             "being low."
         ),
     ),

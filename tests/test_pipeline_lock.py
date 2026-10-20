@@ -1,3 +1,5 @@
+from grounded_weather_forecast.status import CommandOutcome
+
 """The pipeline mutex and short dataset snapshot lock."""
 
 from concurrent.futures import ThreadPoolExecutor
@@ -271,7 +273,7 @@ def test_pipeline_child_records_do_not_inherit_parent_failure_kind(tmp_path):
     assert (
         cli_module._run_pipeline_steps(
             config, args, (("truth-qc", lambda: 0), ("report", lambda: 0))
-        )
+        ).exit_code
         == 0
     )
     rows = load_runs(runs_path(config))
@@ -304,12 +306,11 @@ def test_stage_namespaces_are_public_and_metadata_is_explicit(tmp_path, monkeypa
         real_record(config, stage, **metadata)
 
     def fail_qc():
-        assert not hasattr(truth_args, "_error_detail")
-        truth_args._error_detail = "  handled\nneighbor failure  "
-        return 1
+        assert truth_args._error_detail == "old QC detail"
+        return CommandOutcome(1, error_detail="  handled\nneighbor failure  ")
 
     def report():
-        assert not hasattr(args, "_error_detail")
+        assert args._error_detail == "old parent detail"
         return 0
 
     monkeypatch.setattr(cli_module, "_record_run", record)
@@ -320,7 +321,7 @@ def test_stage_namespaces_are_public_and_metadata_is_explicit(tmp_path, monkeypa
             (("truth-qc", fail_qc), ("report", report)),
             continue_on_failure=frozenset({"truth-qc"}),
             stage_args={"truth-qc": truth_args},
-        )
+        ).exit_code
         == 1
     )
     assert recorded[0][0] == {"days": 17, "command": "truth-qc"}
@@ -569,8 +570,7 @@ def test_maintain_records_pending_and_does_not_hide_later_failure(
     monkeypatch.setattr(cli_module, "_cmd_build_dataset", lambda _config: 0)
 
     def no_folds(_config, args):
-        vars(args)["_failure_kind"] = "no_folds"
-        return cli_module.EXIT_NO_FOLDS
+        return CommandOutcome(cli_module.EXIT_NO_FOLDS, "no_folds")
 
     monkeypatch.setattr(cli_module, "_cmd_backtest", no_folds)
     monkeypatch.setattr(
@@ -600,8 +600,7 @@ def test_recovery_remains_incomplete_with_pending_backtest(tmp_path, monkeypatch
     monkeypatch.setattr(cli_module, "_cmd_build_dataset", lambda *_a: 0)
 
     def pending(_config, args):
-        args._failure_kind = "no_folds"
-        return cli_module.EXIT_NO_FOLDS
+        return CommandOutcome(cli_module.EXIT_NO_FOLDS, "no_folds")
 
     monkeypatch.setattr(cli_module, "_cmd_backtest", pending)
 
@@ -620,8 +619,7 @@ def test_pending_maintenance_exception_is_not_a_pending_parent(tmp_path, monkeyp
     monkeypatch.setattr(cli_module, "_cmd_build_dataset", lambda *_a: 0)
 
     def pending(_config, args):
-        args._failure_kind = "no_folds"
-        return cli_module.EXIT_NO_FOLDS
+        return CommandOutcome(cli_module.EXIT_NO_FOLDS, "no_folds")
 
     monkeypatch.setattr(cli_module, "_cmd_backtest", pending)
     monkeypatch.setattr(cli_module, "_cmd_truth_qc", lambda *_a: 0)
@@ -639,6 +637,35 @@ def test_pending_maintenance_exception_is_not_a_pending_parent(tmp_path, monkeyp
     )
     assert parent["error"] == "OSError"
     assert parent["failure_kind"] is None
+
+
+@pytest.mark.parametrize("qc_failure", [False, True])
+def test_current_pending_and_failure_are_visible_inside_report(
+    tmp_path, monkeypatch, qc_failure
+):
+    from datetime import UTC, datetime
+    from grounded_weather_forecast.reports.operations import _run_counts
+
+    config = write_config(tmp_path)
+    monkeypatch.setattr(cli_module, "_cmd_build_dataset", lambda _: 0)
+    monkeypatch.setattr(
+        cli_module, "_cmd_backtest", lambda *_: CommandOutcome(3, "no_folds")
+    )
+    monkeypatch.setattr(cli_module, "_cmd_truth_qc", lambda *_: int(qc_failure))
+    seen = []
+
+    def report(_):
+        rows = load_runs(runs_path(config))
+        assert rows.filter(pl.col("record_kind") == "invocation").is_empty()
+        seen.append(_run_counts(rows, datetime.now(UTC)))
+        return 0
+
+    monkeypatch.setattr(cli_module, "_cmd_report", report)
+    assert main(["--config", str(tmp_path / "config.toml"), "maintain"]) == int(
+        qc_failure
+    )
+    assert seen == [(0, int(qc_failure), 1)]
+    assert _run_counts(load_runs(runs_path(config)), datetime.now(UTC)) == seen[0]
 
 
 def test_invalid_truth_qc_days_rejected_before_build(tmp_path, monkeypatch):

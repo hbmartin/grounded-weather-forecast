@@ -39,7 +39,7 @@ unrelated child stages.
 | `0` | success |
 | `1` | command-level failure — missing or unusable inputs, no evaluable scores despite adequate history, no scores to report, a backfill error, directory-guard release failure during score recovery or an uncommitted score write, or reuse of a directory whose guard release failed; `prune-scores` finishes retention before returning 1 for a recovery release failure |
 | `2` | configuration error, or an unknown command |
-| `3` | evaluation pending: validated, applicable inputs cannot yet reach the first test origin; also returned for partial product completion while any applicable requested product is pending |
+| `3` | evaluation pending: validated, applicable inputs cannot yet reach the first test origin, or usable training awaits future test truth at the snapshot cutoff; also returned for partial product completion while any applicable requested product is pending |
 | `75` | pipeline, dataset-publication, score-directory, or automatic-recovery lock contention (EX_TEMPFAIL — retry later) |
 
 Note that `truth-qc` returns `0` even when it finds no evaluable checks. A cold
@@ -338,6 +338,30 @@ archive providers, keeping that provenance separate from live observations.
 
 ---
 
+## Standalone launchd wrappers
+
+The wrappers resolve the forecast project from their working directory, validate
+its project identity, and parse `config.toml` once per wrapper invocation. The CLI
+children perform full scientific configuration validation. Install `launchd_paths.py`
+beside both wrappers with a matching runtime package. Missing runtime helpers produce
+a logged configuration error instead of an import traceback.
+
+`UV` takes precedence over executable discovery on `PATH`. An explicitly invalid
+`UV` exits 2; it never silently selects another launcher. Symlink launcher paths
+are preserved for macOS permission grants. Bad arguments and unavailable forecast
+paths exit 2 with START/END logging; `--help` exits 0. Resolved project and forecast
+output paths are logged after validation.
+
+`hourly-predict-publish.py --station-project PATH` overrides the default sibling
+`ambientweather2sqlite` checkout. This is a wrapper flag, not a core CLI flag.
+Prediction runs before collector discovery. The station child runs with the
+collector as both working directory and project, without `--db`, so existing
+collector configuration owns the live station database independently of
+`station.db_path` used for forecast evaluation. Collector/path/database errors,
+permissions, and timeouts are station-stage failures: publish with existing staged
+documents when available, otherwise refuse publication. Successful staged fallback
+is logged explicitly.
+
 ## `backtest`
 
 For the local launchd deployment, `docs/launchd/daily-maintenance.py` runs each
@@ -354,34 +378,48 @@ remain failures; a later real failure overrides pending metadata. The wrapper
 logs complete stage commands and skips pruning after any report failure,
 including a report command with arguments.
 
-Only a validated, nonempty input with applicable targets/methods and an issue-time
-span too short for the first test origin receives `failure_kind="no_folds"`.
-Empty matrices, unavailable truth, invalid schema, unsupported selections, and
-zero scores despite adequate history remain errors. Valid pending evaluations
-still write empty score files for diagnostic reporting. Pending evaluations appear
-separately as `pending_evaluations_24h` in pipeline health; older ledger rows have
-an unknown (null) count. Recorded exceptions always count as failures.
+Validated, nonempty applicable inputs receive `failure_kind="no_folds"` and
+exit 3 for either insufficient issue-time history or expected future test truth.
+The first origin needs an issue span greater than `initial_train_days`, plus
+usable training data. `awaiting_truth` requires usable training and all otherwise
+eligible test targets still future at the dataset snapshot cutoff. Already-due
+missing observations, invalid schema, empty matrices, and missing usable training
+remain failures. Any positive score output completes that product.
+
+The cutoff comes from the selected inputs' hash-validated manifest: `manifest.json`
+for live matrices, `manifest_synthetic.json` for new synthetic builds. Outcomes do
+not change merely because wall time passes. Legacy matrices remain scoreable;
+without trustworthy metadata, only the short-history exemption is available.
+Rebuild the dataset/backfill to establish truth maturity. No file modification
+time is used as a scientific clock.
+
+Every independent applicable product is attempted. Real failures take precedence
+over pending outcomes. Unsupported individual products are skipped before loading
+files; unknown selections and entirely inapplicable requests exit 2 explicitly.
+Only completed live products may receive new selections from that run, under the
+existing gates. Compatible excluded incumbents and their evaluation contexts are
+carried forward. Valid pending evaluations still write empty score files.
+
+`pending_evaluations_24h` counts pending backtest invocations or embedded backtest
+stages, including the current stage before report. A completed parent does not
+count the same evaluation twice. Failed stages contribute one provisional failure
+per pipeline until its parent is recorded. Legacy parent-only rows remain readable;
+older pipeline-health rows have an unknown (null) pending count. Exceptions always
+count as failures, even when pending evaluations also exist.
 
 The daily wrapper reads `[maintenance].synthetic_backtest` from the active
 configuration: `auto` (default), `required`, or `off`. On UTC Sundays, `auto`
 runs synthetic evaluation when both hourly and daily matrices exist and skips
-when both are absent. Partial or unreadable inputs fail. `required` also fails
+when both entries are absent in an accessible dataset directory. Broken links,
+unavailable storage, partial inputs, and unreadable inputs fail. `required` also fails
 when both are absent; `off` skips. Corrupt files fail in the backtest child.
-Restore mode remains live-only and never updates the maintenance stamp. Unlike
+Scheduling-only settings are validated after acquiring the job lock and before
+checking the success stamp. Restore ignores synthetic scheduling settings,
+remains live-only, and never updates the maintenance stamp. Unlike
 routine maintenance, standalone `--restore` returns 3 after diagnostics if live
 evaluation is pending. CLI `recover` stops at that pending result and returns 3;
 neither claims restoration completed.
 
-The standalone wrappers resolve the forecast project from their working directory
-(set by launchd's `uv --directory` argument), validate its `pyproject.toml` and
-`config.toml`, and locate `uv` through `PATH`. Install `launchd_paths.py` beside
-both wrappers. The hourly wrapper discovers a validated sibling
-`ambientweather2sqlite` checkout, or accepts `--station-project PATH` for other
-layouts. It reads `station.db_path` from the forecast configuration, resolves
-relative database paths against the forecast project, and passes the resulting
-absolute path to the station publisher's `--db`. Missing or invalid paths fail
-with exit 2 before child processes start or success stamps change. These are
-standalone wrapper semantics; `--station-project` is not a core CLI option.
 
 > rolling-origin backtest over the supervised matrices
 

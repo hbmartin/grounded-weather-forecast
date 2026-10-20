@@ -16,6 +16,7 @@ Insufficient-history backtests remain pending while diagnostics continue.
 Pending evaluations and failed runs never advance the success stamp.
 """
 
+import argparse
 import fcntl
 import os
 import socket
@@ -27,9 +28,12 @@ from collections.abc import Sequence
 from datetime import UTC, datetime
 from pathlib import Path
 
-from launchd_paths import RuntimePathError, RuntimePaths, read_toml, resolve_runtime
-
-from grounded_weather_forecast.status import EXIT_NO_FOLDS
+from launchd_paths import (
+    RuntimePathError,
+    RuntimePaths,
+    resolve_runtime,
+    working_directory,
+)
 
 MIN_INTERVAL_S = 20 * 3600
 
@@ -48,32 +52,49 @@ def maintenance_steps(*, restore: bool) -> list[list[str]]:
 
 
 def synthetic_mode(paths: RuntimePaths) -> tuple[str, Path]:
-    raw = read_toml(paths.config)
+    from grounded_weather_forecast.config import (  # noqa: PLC0415 -- guarded startup
+        dataset_config,
+    )
+
+    raw = paths.raw_config
     maintenance = raw.get("maintenance", {})
     dataset = raw.get("dataset", {})
     if not isinstance(maintenance, dict) or not isinstance(dataset, dict):
         raise RuntimePathError("maintenance and dataset must be TOML tables")
     mode = maintenance.get("synthetic_backtest", "auto")
-    directory = dataset.get("dir", "data")
     if mode not in ("auto", "required", "off"):
         raise RuntimePathError(
             "maintenance.synthetic_backtest must be auto, required or off"
         )
-    if not isinstance(directory, str) or not directory.strip():
-        raise RuntimePathError("dataset.dir must be a nonempty path")
-    return mode, paths.project / directory
+    return mode, paths.project / dataset_config(raw).dir
 
 
 def synthetic_enabled(mode: str, directory: Path) -> bool:
+    from grounded_weather_forecast.dataset.matrix import (  # noqa: PLC0415 -- guarded startup
+        matrix_path,
+    )
+
     if mode == "off":
         print("synthetic backtest skipped: scheduling is off", flush=True)
         return False
     present = []
+    if not stat.S_ISDIR(directory.stat().st_mode):
+        raise OSError(f"dataset directory is not a directory: {directory}")
+    # Opening the directory also detects access denial on otherwise absent leaves.
+    with os.scandir(directory):
+        pass
     for product in ("hourly", "daily"):
-        path = directory / f"{product}_matrix_synthetic.parquet"
+        path = matrix_path(directory, product, "synthetic")
         try:
             info = path.stat()
-        except (FileNotFoundError,):
+        except (FileNotFoundError,):  # noqa: B013 -- project convention
+            # lstat distinguishes an absent entry from a dangling symlink.
+            try:
+                path.lstat()
+            except (FileNotFoundError,):  # noqa: B013 -- project convention
+                directory.stat()  # fail if storage vanished during discovery
+            else:
+                raise OSError(f"synthetic matrix is a dangling link: {path}") from None
             present.append(False)
             continue
         if not stat.S_ISREG(info.st_mode):
@@ -102,14 +123,7 @@ def run_stage(step: list[str], paths: RuntimePaths) -> int:
             [
                 "/usr/bin/time",
                 "-l",
-                paths.uv,
-                "--directory",
-                str(paths.project),
-                "run",
-                "--locked",
-                "--project",
-                str(paths.project),
-                "grounded-weather-forecast",
+                *paths.command("grounded-weather-forecast"),
                 "--config",
                 str(paths.config),
                 *step,
@@ -131,7 +145,10 @@ def run_stage(step: list[str], paths: RuntimePaths) -> int:
 
 
 def maintain(stamp: Path, *, restore: bool, paths: RuntimePaths) -> int:
-    mode, dataset_dir = synthetic_mode(paths)
+    from grounded_weather_forecast.status import (  # noqa: PLC0415 -- guarded startup
+        EXIT_NO_FOLDS,
+    )
+
     # Only actual maintenance owns this lock; readers never probe it exclusively.
     with stamp.with_name("maintenance-job.lock").open("a") as job_lock:
         try:
@@ -139,6 +156,7 @@ def maintain(stamp: Path, *, restore: bool, paths: RuntimePaths) -> int:
         except (BlockingIOError,):  # noqa: B013 -- project convention
             print("another maintenance job is running; skipping duplicate", flush=True)
             return 0
+        mode, dataset_dir = ("off", paths.project) if restore else synthetic_mode(paths)
         if (
             not restore
             and stamp.exists()
@@ -161,7 +179,7 @@ def maintain(stamp: Path, *, restore: bool, paths: RuntimePaths) -> int:
                 try:
                     if not synthetic_enabled(mode, dataset_dir):
                         continue
-                except (OSError,) as exc:
+                except (OSError,) as exc:  # noqa: B013 -- project convention
                     print(f"{label} failed: {exc}", flush=True)
                     failures.append(label)
                     failed_stages.add(name)
@@ -203,7 +221,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     started = time.monotonic()
     code = 1
     print(
-        f"{timestamp()} START mode={mode} pid={os.getpid()} ppid={os.getppid()} cwd={Path.cwd()} host={socket.gethostname()} project={Path.cwd()}",
+        f"{timestamp()} START mode={mode} pid={os.getpid()} ppid={os.getppid()} cwd={working_directory()} host={socket.gethostname()}",
         flush=True,
     )
     stamp = (
@@ -211,12 +229,24 @@ def main(argv: Sequence[str] | None = None) -> int:
         / "Library/Application Support/grounded-weather-forecast/last-maintenance"
     )
     try:
+        parser = argparse.ArgumentParser(
+            description="Daily maintenance or live-only restore"
+        )
+        parser.add_argument("--restore", action="store_true")
+        args = parser.parse_args(argv)
         paths = resolve_runtime()
-        code = maintain(stamp, restore=restore, paths=paths)
+        print(
+            f"{timestamp()} PROJECT project={paths.project} forecast={paths.forecast}",
+            flush=True,
+        )
+        code = maintain(stamp, restore=args.restore, paths=paths)
         return code  # noqa: RET504 -- finally logs the actual exit status
-    except (RuntimePathError,) as exc:  # noqa: B013 -- project convention
+    except (ValueError, OSError, ImportError) as exc:
         print(f"configuration error: {exc}", flush=True)
         code = 2
+        return code  # noqa: RET504 -- finally logs the actual exit status
+    except (SystemExit,) as exc:  # noqa: B013 -- project convention
+        code = exc.code if isinstance(exc.code, int) else 1
         return code  # noqa: RET504 -- finally logs the actual exit status
     finally:
         print(

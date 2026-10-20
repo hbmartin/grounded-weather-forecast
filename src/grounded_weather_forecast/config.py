@@ -508,10 +508,14 @@ def _forecasts(raw: Mapping[str, Any], station: StationConfig) -> ForecastsConfi
     )
 
 
-def _dataset(raw: Mapping[str, Any]) -> DatasetConfig:
+def dataset_config(raw: Mapping[str, Any]) -> DatasetConfig:
+    """Parse dataset settings shared by the CLI and standalone scheduler."""
     section = _section(raw, "dataset")
+    directory = section.get("dir", "data")
+    if not isinstance(directory, str) or not directory.strip():
+        raise ConfigError("dataset.dir must be a nonempty path")
     return DatasetConfig(
-        dir=Path(str(section.get("dir", "data"))),
+        dir=Path(directory),
         min_hour_coverage=_fraction(
             section.get("min_hour_coverage", 0.8), "min_hour_coverage", "dataset"
         ),
@@ -808,7 +812,7 @@ def load_config(path: Path) -> Config:
     except (OSError, tomllib.TOMLDecodeError) as exc:
         msg = f"cannot load config {path}: {exc}"
         raise ConfigError(msg) from exc
-    dataset = _dataset(raw)
+    dataset = dataset_config(raw)
     station = _station(raw)
     return Config(
         station=station,

@@ -32,9 +32,7 @@ def _fold_count(ctx: DashboardContext) -> int:
 
 def _fold_readiness(ctx: DashboardContext) -> Panel:
     matrix = ctx.hourly_matrix
-    needed = float(
-        ctx.config.backtest.initial_train_days + ctx.config.backtest.step_days
-    )
+    needed = float(ctx.config.backtest.initial_train_days)
     if matrix is None or matrix.is_empty() or "issue_time" not in matrix.columns:
         return empty_panel(
             "c1",
@@ -42,8 +40,8 @@ def _fold_readiness(ctx: DashboardContext) -> Panel:
             "Archive growth & fold readiness",
             "amber",
             "no live archive yet — a fold needs "
-            f"{needed:.0f} days of issue-time span "
-            "(initial_train_days + step_days); keep the cron polling",
+            f"more than {needed:.0f} days of issue-time span "
+            "(initial_train_days), plus usable data; keep the cron polling",
         )
     span = _issue_span_days(matrix)
     fraction = min(1.0, span / needed) if needed else 0.0
@@ -78,9 +76,9 @@ def _fold_readiness(ctx: DashboardContext) -> Panel:
             None
             if folds
             else (
-                f"The archive spans {span:.1f} days but a fold needs "
-                f"{needed:.0f} — zero live folds is correct behaviour, "
-                "not a fault. Keep polling."
+                f"The archive spans {span:.1f} days. The first origin requires "
+                f"more than {needed:.0f} days and usable training/test truth. "
+                "Inspect evaluation outcomes and keep polling."
             )
         ),
         raw_html=progress_html,

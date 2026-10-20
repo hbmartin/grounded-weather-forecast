@@ -197,9 +197,12 @@ field.
 |---|---|---|---|
 | `synthetic_backtest` | `auto` \| `required` \| `off` | `auto` | UTC Sunday synthetic evaluation: auto runs when both hourly/daily matrices exist, skips when both are absent, and fails on partial inputs; required fails on any absence; off skips |
 
-The daily wrapper validates this setting from the active project's `config.toml`.
-It uses `[dataset].dir`, resolving relative paths against the project. Read faults
-and corrupt matrices remain failures. Restore mode stays live-only. This setting
+The daily wrapper validates this setting after acquiring the job lock and before
+checking its success stamp. It uses the package's `[dataset].dir` parser, resolving
+relative paths against the project. In `auto` mode, both matrix entries must be
+absent in an accessible dataset directory to skip; broken links, missing storage,
+read faults and corrupt matrices remain failures. Live-only restore ignores this
+scheduling setting. This setting
 does not enter the scientific configuration fingerprint or affect core CLI
 `maintain` scheduling. The wrapper must run with the matching package version
 that supplies the exit-status protocol.
@@ -241,9 +244,11 @@ serving.
 | `step_days` | int > 0 | `7` | spacing between rolling origins |
 | `rolling_window_days` | int > 0 | `180` | training window length when `--window rolling` |
 
-`initial_train_days + step_days` is the minimum archive age before `backtest`
-produces anything at all. With defaults that is 97 days — the "no rolling-origin
-folds" message means you are not there yet.
+The issue-time span must exceed `initial_train_days` before the first test
+origin, more than 90 days by default, and usable training/test data must exist.
+`step_days` sets spacing between origins; the first test interval may be partial.
+Valid short history or expected future test truth returns 3 (pending). Truth
+maturity uses a hash-validated dataset snapshot timestamp, not wall time.
 
 ---
 

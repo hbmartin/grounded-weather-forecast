@@ -1,9 +1,11 @@
 # ruff: noqa: INP001 -- shared by the standalone installed launchd scripts
 """Resolve scheduled-job paths from the active project, without machine defaults."""
 
+import os
 import shutil
+import stat
 import tomllib
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
@@ -16,6 +18,7 @@ class RuntimePathError(ValueError):
 class RuntimePaths:
     project: Path
     uv: str
+    raw_config: dict[str, Any] = field(default_factory=dict, kw_only=True)
 
     @property
     def config(self) -> Path:
@@ -25,11 +28,22 @@ class RuntimePaths:
     def forecast(self) -> Path:
         return self.project / "forecast.json"
 
+    def command(self, *arguments: str) -> list[str]:
+        return [
+            self.uv,
+            "--directory",
+            str(self.project),
+            "run",
+            "--locked",
+            "--project",
+            str(self.project),
+            *arguments,
+        ]
+
 
 @dataclass(frozen=True)
 class PublishingPaths(RuntimePaths):
     station_project: Path
-    station_db: Path
 
 
 def read_toml(path: Path) -> dict[str, Any]:
@@ -45,55 +59,62 @@ def validate_project(path: Path, name: str) -> None:
         raise RuntimePathError(f"{path} is not a {name} project")
 
 
+def executable_uv() -> str:
+    supplied = os.environ.get("UV")
+    executable = supplied if supplied is not None else shutil.which("uv")
+    if not executable:
+        raise RuntimePathError(
+            "cannot find uv; set UV or include its installation directory in PATH"
+        )
+    try:
+        path = Path(executable).expanduser().absolute()
+        if not stat.S_ISREG(path.stat().st_mode) or not os.access(path, os.X_OK):
+            raise RuntimePathError(f"uv is not an executable file: {path}")
+    except (OSError, ValueError, RuntimeError) as exc:
+        raise RuntimePathError(f"invalid UV executable: {exc}") from exc
+    # Keep the launcher path, including symlinks: macOS grants may name it.
+    return str(path)
+
+
 def resolve_runtime() -> RuntimePaths:
-    project = Path.cwd().resolve()
+    try:
+        project = Path.cwd().resolve()
+    except (OSError, ValueError, RuntimeError) as exc:
+        raise RuntimePathError(f"cannot resolve working directory: {exc}") from exc
     try:
         validate_project(project, "grounded-weather-forecast")
-        read_toml(project / "config.toml")
     except (RuntimePathError,) as exc:  # noqa: B013 -- project convention
         raise RuntimePathError(
             f"{exc}; launch with uv --directory <forecast-project> run ..."
         ) from exc
-    executable = shutil.which("uv")
-    if executable is None:
-        raise RuntimePathError(
-            "cannot find uv; include its installation directory in PATH"
-        )
-    # Preserve the discovered executable path: macOS may grant access to that
-    # launcher path rather than to a versioned package-manager target.
-    return RuntimePaths(project=project, uv=str(Path(executable).absolute()))
+    raw = read_toml(project / "config.toml")
+    return RuntimePaths(project, executable_uv(), raw_config=raw)
 
 
-def resolve_publishing(station_project: Path | None = None) -> PublishingPaths:
-    runtime = resolve_runtime()
-    project = (
-        station_project.expanduser()
-        if station_project is not None
-        else runtime.project.parent / "ambientweather2sqlite"
-    ).resolve()
+def resolve_publishing(
+    station_project: Path | None = None, *, runtime: RuntimePaths | None = None
+) -> PublishingPaths:
+    """Resolve station-only prerequisites after prediction has completed."""
+    runtime = runtime or resolve_runtime()
     try:
+        project = (
+            station_project.expanduser()
+            if station_project is not None
+            else runtime.project.parent / "ambientweather2sqlite"
+        ).resolve()
         validate_project(project, "ambientweather2sqlite")
-    except (RuntimePathError,) as exc:  # noqa: B013 -- project convention
-        raise RuntimePathError(
-            f"{exc}; use --station-project <ambientweather2sqlite-project>"
-        ) from exc
-    station = read_toml(runtime.config).get("station")
-    value = station.get("db_path") if isinstance(station, dict) else None
-    if not isinstance(value, str) or not value.strip():
-        raise RuntimePathError(
-            f"{runtime.config}: station.db_path must be a nonempty path"
-        )
-    try:
-        database = Path(value).expanduser()
-        if not database.is_absolute():
-            database = runtime.project / database
-        database = database.resolve()
     except (OSError, ValueError, RuntimeError) as exc:
         raise RuntimePathError(
-            f"{runtime.config}: invalid station.db_path: {exc}"
+            f"cannot resolve collector project: {exc}; use --station-project PATH"
         ) from exc
-    if not database.is_file():
-        raise RuntimePathError(
-            f"station database not found: {database}; check station.db_path"
-        )
-    return PublishingPaths(runtime.project, runtime.uv, project, database)
+    return PublishingPaths(
+        runtime.project, runtime.uv, project, raw_config=runtime.raw_config
+    )
+
+
+def working_directory() -> str:
+    """Logging must survive an unavailable current directory."""
+    try:
+        return str(Path.cwd())
+    except (OSError,) as exc:  # noqa: B013 -- project convention
+        return f"unavailable ({exc})"

@@ -15,6 +15,7 @@ import numpy as np
 import numpy.typing as npt
 import polars as pl
 
+from grounded_weather_forecast.backtest.outcomes import BacktestDiagnostics
 from grounded_weather_forecast.config import BacktestConfig
 from grounded_weather_forecast.timeutil import local_day_start_utc
 
@@ -66,6 +67,8 @@ def fold_plans(
     truth_known_at: pl.Series,
     backtest: BacktestConfig,
     window: WindowMode,
+    *,
+    diagnostics: BacktestDiagnostics | None = None,
 ) -> list[Fold]:
     """Build inspectable fold plans; may be empty if data is too short."""
     if issue_time.is_empty():
@@ -85,6 +88,8 @@ def fold_plans(
     epoch = datetime(1970, 1, 1, tzinfo=UTC)
     folds: list[Fold] = []
     origin_us = start_us + backtest.initial_train_days * _US_PER_DAY
+    if diagnostics is not None:
+        diagnostics.history_too_short = origin_us >= end_us
     while origin_us < end_us:
         train_mask = known <= origin_us
         if window == "rolling":

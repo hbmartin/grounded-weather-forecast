@@ -38,8 +38,10 @@ def test_invalid_qc_arguments_record_detail_without_touching_artifact(tmp_path):
     artifact = config.artifacts_dir / "truth_qc.json"
     artifact.write_bytes(b"previous artifact")
     args = argparse.Namespace(days=0, _error_detail="stale detail")
-    assert _cmd_truth_qc(config, args) == 1
-    assert vars(args)["_error_detail"] == "--days must be a positive integer"
+    result = _cmd_truth_qc(config, args)
+    assert result.exit_code == 1
+    assert result.error_detail == "--days must be a positive integer"
+    assert vars(args)["_error_detail"] == "stale detail"
     assert artifact.read_bytes() == b"previous artifact"
 
 

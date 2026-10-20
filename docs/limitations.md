@@ -25,8 +25,8 @@ leaderboard. A typical early-run message is:
 ```
 hourly: 0 score rows -> data/scores/scores_hourly_live_expanding_<evaluation_id>.parquet
   hourly: no rolling-origin folds. The archive spans 0.0 days of issue times
-  (2026-03-22 16:19:40 .. 2026-03-22 16:28:15) but a fold needs
-  initial_train_days + step_days = 97. Keep polling, or backtest --source
+  (2026-03-22 16:19:40 .. 2026-03-22 16:28:15) but the first test origin needs
+  more than initial_train_days = 90. Keep polling, or backtest --source
   synthetic against an Open-Meteo backfill.
 ```
 

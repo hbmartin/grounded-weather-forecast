@@ -420,9 +420,8 @@ def iter_minutely_scores(
         minutely_truth_known_at(snapshots),
         config.backtest,
         request.window,
+        diagnostics=diagnostics,
     )
-    if diagnostics is not None:
-        diagnostics.observe_clock(snapshots["issue_time"], config.backtest)
     hourly_known = hourly_truth_known_at(matrix)
     for fold in folds:
         test_issues = snapshots["issue_time"][fold.test_rows]
@@ -441,6 +440,8 @@ def iter_minutely_scores(
                 else train_matrix.head(0)
             )
             if train_scored.is_empty():
+                if diagnostics is not None:
+                    diagnostics.unusable_training = True
                 continue
             proxy = GroundedEqualWeight().fit(
                 to_supervised_slice(
@@ -469,6 +470,13 @@ def iter_minutely_scores(
                 return minute_frame(rows, truth_grid, name, base, request.minute_step)
 
             test_frame = frame_for(test_issues)
+            if diagnostics is not None:
+                diagnostics.observe_tests(
+                    minutely_truth_known_at(
+                        pl.DataFrame({"valid_time": test_frame.valid_time})
+                    ),
+                    usable_training=True,
+                )
             # A minute with no station truth is unscoreable for EVERY method;
             # emitting it would put null y_true rows in the scores frame,
             # which the leaderboard's own-case mae (guarding y_pred only,

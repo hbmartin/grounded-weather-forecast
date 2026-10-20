@@ -20,7 +20,7 @@ from grounded_weather_forecast.contracts import (
     VariableSpec,
 )
 from grounded_weather_forecast.serve.schema import Forecast
-from grounded_weather_forecast.status import EXIT_NO_FOLDS
+from grounded_weather_forecast.status import EXIT_NO_FOLDS, CommandOutcome
 
 HOURLY_DEFAULT_VARIABLES = (
     "temp_c,humidity_pct,dew_point_c,wind_speed_ms,wind_gust_ms,"
@@ -594,7 +594,7 @@ def _drift_verdict_block(
     }
 
 
-def _cmd_truth_qc(config: Config, args: argparse.Namespace) -> int:
+def _cmd_truth_qc(config: Config, args: argparse.Namespace) -> int | CommandOutcome:
     import json  # noqa: PLC0415
 
     import numpy as np  # noqa: PLC0415
@@ -612,18 +612,15 @@ def _cmd_truth_qc(config: Config, args: argparse.Namespace) -> int:
     )
     from grounded_weather_forecast.solar import toa_irradiance_wm2  # noqa: PLC0415
 
-    vars(args).pop("_error_detail", None)
     if args.days <= 0:
-        vars(args)["_error_detail"] = "--days must be a positive integer"
         print("truth-qc failed: --days must be a positive integer")
-        return 1
+        return CommandOutcome(1, error_detail="--days must be a positive integer")
     _minute, hourly_truth, _daily = build_truth(config)
     try:
         checks = fetch_neighbor_checks(config, hourly_truth, hours=args.days * 24)
     except (NeighborError, OSError, ValueError) as exc:
-        vars(args)["_error_detail"] = str(exc)
         print(f"truth-qc failed: {exc}")
-        return 1
+        return CommandOutcome(1, error_detail=str(exc))
     verdict_block = _drift_verdict_block(config, checks, hourly_truth)
     artifact: dict[str, object] = {
         "schema_version": 3,
@@ -987,7 +984,7 @@ def _run_minutely_backtest(
         print("minutely: no evaluable inputs or truth")
         return ProductBacktestOutcome("minutely", "failed")
     request = MinutelyRequest(window=args.window)
-    diagnostics = BacktestDiagnostics()
+    diagnostics = _backtest_diagnostics(config, "hourly", "live", truth_minute=True)
     result = write_score_batches(
         iter_minutely_scores(matrix, grid, request, config, diagnostics=diagnostics),
         config.dataset.dir / "scores",
@@ -1010,13 +1007,58 @@ def _product_outcome(
     product: str, rows: int, diagnostics: BacktestDiagnostics
 ) -> ProductBacktestOutcome:
     outcome = ProductBacktestOutcome.from_scores(product, rows, diagnostics)
-    if outcome.status == "insufficient_history":
-        print(f"{product}: evaluation pending: insufficient issue-time history")
+    if outcome.status == "pending":
+        print(f"{product}: evaluation pending: {outcome.pending_reason}")
     elif outcome.status == "failed":
         print(
-            f"{product}: no evaluable scores; insufficient history was not established"
+            f"{product}: no evaluable scores; expected pending work was not established"
         )
+        if diagnostics.snapshot_at is None:
+            print(
+                "  snapshot metadata unavailable; rebuild the dataset/backfill to establish truth maturity"
+            )
     return outcome
+
+
+def _backtest_diagnostics(
+    config: Config, product: str, source: str, *, truth_minute: bool = False
+) -> BacktestDiagnostics:
+    from grounded_weather_forecast.dataset.evaluation_snapshot import (  # noqa: PLC0415
+        evaluation_snapshot,
+    )
+
+    return BacktestDiagnostics(
+        snapshot_at=evaluation_snapshot(
+            config.dataset.dir, product, source, truth_minute=truth_minute
+        )
+    )
+
+
+def _applicable_variables(
+    args: argparse.Namespace, product: str, methods: tuple[str, ...]
+) -> tuple[VariableSpec, ...]:
+    from grounded_weather_forecast.backtest.engine import (  # noqa: PLC0415
+        variables_from_names,
+    )
+    from grounded_weather_forecast.blenders.registry import (  # noqa: PLC0415
+        supports_product,
+    )
+    from grounded_weather_forecast.contracts import (  # noqa: PLC0415
+        DAILY_VARIABLES,
+        Product,
+    )
+
+    daily = product == "daily"
+    names = _split_csv(args.daily_variables if daily else args.hourly_variables)
+    variables = variables_from_names(
+        names, DAILY_VARIABLES if daily else HOURLY_VARIABLES
+    )
+    kind = Product.DAILY if daily else Product.HOURLY
+    return tuple(
+        variable
+        for variable in variables
+        if any(supports_product(method, kind, variable) for method in methods)
+    )
 
 
 def _valid_product_matrix(matrix: pl.DataFrame, *, daily: bool) -> bool:
@@ -1050,18 +1092,9 @@ def _run_matrix_backtest(
     from grounded_weather_forecast.backtest.engine import (  # noqa: PLC0415
         BacktestRequest,
         iter_backtest_scores,
-        variables_from_names,
     )
     from grounded_weather_forecast.backtest.scores import (  # noqa: PLC0415
         write_score_batches,
-    )
-    from grounded_weather_forecast.blenders.registry import (  # noqa: PLC0415
-        supports_product,
-    )
-    from grounded_weather_forecast.contracts import (  # noqa: PLC0415
-        DAILY_VARIABLES,
-        HOURLY_VARIABLES,
-        Product,
     )
     from grounded_weather_forecast.dataset.matrix import (  # noqa: PLC0415
         matrix_path,
@@ -1069,6 +1102,10 @@ def _run_matrix_backtest(
     )
 
     daily = product == "daily"
+    variables = _applicable_variables(args, product, methods)
+    if not variables:
+        print(f"{product}: no selected method applies, skipping")
+        return ProductBacktestOutcome(product, "not_applicable")
     matrix_file = matrix_path(config.dataset.dir, product, args.source)
     if not matrix_file.exists():
         source_hint = "backfill" if args.source == "synthetic" else "build-dataset"
@@ -1082,22 +1119,12 @@ def _run_matrix_backtest(
     if kinds != [args.source]:
         print(f"{product}: matrix carries {kinds}, expected [{args.source}]")
         return ProductBacktestOutcome(product, "failed")
-    names = _split_csv(args.daily_variables if daily else args.hourly_variables)
-    variables = variables_from_names(
-        names, DAILY_VARIABLES if daily else HOURLY_VARIABLES
-    )
     semantics = _semantics_by_variable(config, args.semantics, variables)
-    product_kind = Product.DAILY if daily else Product.HOURLY
-    applicable = tuple(
-        variable
-        for variable in variables
-        if any(supports_product(method, product_kind, variable) for method in methods)
-    )
     truth_columns = tuple(
-        truth_column_for(variable, semantics[variable.name]) for variable in applicable
+        truth_column_for(variable, semantics[variable.name]) for variable in variables
     )
-    if not applicable or any(column not in matrix.columns for column in truth_columns):
-        print(f"{product}: unsupported selection or missing truth columns")
+    if any(column not in matrix.columns for column in truth_columns):
+        print(f"{product}: missing truth columns")
         return ProductBacktestOutcome(product, "failed")
     if not _has_finite_truth(matrix, truth_columns):
         print(f"{product}: no finite truth available")
@@ -1109,7 +1136,7 @@ def _run_matrix_backtest(
         daily=daily,
         semantics=semantics,
     )
-    diagnostics = BacktestDiagnostics()
+    diagnostics = _backtest_diagnostics(config, product, args.source)
     result = write_score_batches(
         iter_backtest_scores(matrix, request, config, diagnostics=diagnostics),
         config.dataset.dir / "scores",
@@ -1123,18 +1150,17 @@ def _run_matrix_backtest(
     return _product_outcome(product, result.row_count, diagnostics)
 
 
-def _cmd_backtest(config: Config, args: argparse.Namespace) -> int:
+def _cmd_backtest(config: Config, args: argparse.Namespace) -> CommandOutcome:
     from grounded_weather_forecast.backtest.score_storage import (  # noqa: PLC0415
         ScoreCoordinationReleaseError,
         ScoreCoordinationTimeout,
     )
 
-    vars(args).pop("_failure_kind", None)
     try:
         return _backtest_products(config, args)
     except (ScoreCoordinationTimeout,) as error:  # noqa: B013
         print(f"score directory coordination timed out: {error}", file=sys.stderr)
-        return EXIT_CONTENTION
+        return CommandOutcome(EXIT_CONTENTION, error_detail=str(error))
     except (ScoreCoordinationReleaseError,) as error:  # noqa: B013
         if error.partial_result is not None:
             partial = error.partial_result
@@ -1143,12 +1169,10 @@ def _cmd_backtest(config: Config, args: argparse.Namespace) -> int:
                 print(f"skipped {note}")
         detail = "; ".join((str(error), *getattr(error, "__notes__", ())))
         print(detail, file=sys.stderr)
-        vars(args)["_failure_kind"] = "score_coordination_release"
-        vars(args)["_error_detail"] = detail
-        return 1
+        return CommandOutcome(1, "score_coordination_release", detail)
 
 
-def _backtest_products(config: Config, args: argparse.Namespace) -> int:
+def _backtest_products(config: Config, args: argparse.Namespace) -> CommandOutcome:
     from grounded_weather_forecast.backtest.score_storage import (  # noqa: PLC0415
         cleanup_score_temporaries,
     )
@@ -1167,19 +1191,21 @@ def _backtest_products(config: Config, args: argparse.Namespace) -> int:
         or set(products) - {"hourly", "daily", "minutely"}
     ):
         print("invalid backtest methods or products", file=sys.stderr)
-        return 2
+        return CommandOutcome(2)
+    try:
+        for product in products:
+            if product != "minutely":
+                _applicable_variables(args, product, methods)
+    except ValueError as exc:
+        print(f"invalid backtest selection: {exc}", file=sys.stderr)
+        return CommandOutcome(2, error_detail=str(exc))
     promotion_semantics = _semantics_by_variable(
         config, args.semantics, HOURLY_VARIABLES
     )
     outcomes: list[ProductBacktestOutcome] = []
     for product in products:
-        if product == "minutely":
-            outcome = _run_minutely_backtest(config, args)
-        else:
-            outcome = _run_matrix_backtest(config, args, product, methods)
+        outcome = _evaluate_product(config, args, product, methods)
         outcomes.append(outcome)
-        if outcome.status == "failed":
-            return 1
     total = sum(outcome.row_count for outcome in outcomes)
     if total and args.source == "live":
         from grounded_weather_forecast.serve.selection import (  # noqa: PLC0415
@@ -1190,6 +1216,9 @@ def _backtest_products(config: Config, args: argparse.Namespace) -> int:
             config,
             config.dataset.dir / "scores",
             semantics=promotion_semantics,
+            products=frozenset(
+                outcome.product for outcome in outcomes if outcome.status == "evaluated"
+            ),
         )
         release_ids = sorted(
             {
@@ -1200,10 +1229,42 @@ def _backtest_products(config: Config, args: argparse.Namespace) -> int:
         )
         if release_ids:
             print(f"promoted model release: {', '.join(release_ids)}")
-    if any(outcome.status == "insufficient_history" for outcome in outcomes):
-        vars(args)["_failure_kind"] = "no_folds"
-        return EXIT_NO_FOLDS
-    return 0 if total else 1
+    if failed := next(
+        (outcome for outcome in outcomes if outcome.status == "failed"), None
+    ):
+        return CommandOutcome(failed.exit_code, error_detail=failed.error_detail)
+    if any(outcome.status == "pending" for outcome in outcomes):
+        return CommandOutcome(EXIT_NO_FOLDS, "no_folds")
+    if not total:
+        print(
+            "no requested product is applicable to this source and method selection",
+            file=sys.stderr,
+        )
+        return CommandOutcome(2)
+    return CommandOutcome()
+
+
+def _evaluate_product(
+    config: Config, args: argparse.Namespace, product: str, methods: tuple[str, ...]
+) -> ProductBacktestOutcome:
+    from grounded_weather_forecast.backtest.score_storage import (  # noqa: PLC0415
+        ScoreCoordinationReleaseError,
+        ScoreCoordinationTimeout,
+    )
+
+    try:
+        return (
+            _run_minutely_backtest(config, args)
+            if product == "minutely"
+            else _run_matrix_backtest(config, args, product, methods)
+        )
+    except (ScoreCoordinationReleaseError, ScoreCoordinationTimeout):
+        raise  # a failed shared directory guard is not product-local
+    except Exception as exc:
+        print(f"{product}: evaluation failed: {exc!r}", file=sys.stderr)
+        return ProductBacktestOutcome(
+            product, "failed", error_detail=f"{type(exc).__name__}: {exc}"
+        )
 
 
 def _explain_no_folds(config: Config, matrix: pl.DataFrame, product: str) -> None:
@@ -1567,7 +1628,7 @@ def _print_score_temporaries(
         )
 
 
-def _cmd_prune_scores(config: Config, args: argparse.Namespace) -> int:
+def _cmd_prune_scores(config: Config, args: argparse.Namespace) -> int | CommandOutcome:
     from grounded_weather_forecast.reports.operations import (  # noqa: PLC0415
         prune_scores_files,
     )
@@ -1588,45 +1649,35 @@ def _cmd_prune_scores(config: Config, args: argparse.Namespace) -> int:
     if result.coordination_release_failure is not None:
         detail = result.coordination_release_failure.diagnostic()
         print(detail, file=sys.stderr)
-        vars(args)["_failure_kind"] = "score_coordination_release"
-        vars(args)["_error_detail"] = detail
-        return 1
+        return CommandOutcome(1, "score_coordination_release", detail)
     return 0
 
 
 def _run_pipeline_steps(
     config: Config,
     args: argparse.Namespace,
-    steps: tuple[tuple[str, Callable[[], int]], ...],
+    steps: tuple[tuple[str, Callable[[], int | CommandOutcome]], ...],
     *,
     backtest_args: argparse.Namespace | None = None,
     continue_on_failure: frozenset[str] = frozenset(),
     stage_args: Mapping[str, argparse.Namespace] | None = None,
     tolerate_pending: bool = False,
-) -> int:
-    first_failure = 0
+) -> CommandOutcome:
+    first_failure: CommandOutcome | None = None
     pending = False
     for name, step in steps:
-        record_args = stage_args.get(name, args) if stage_args is not None else args
-        vars(record_args).pop("_error_detail", None)
+        fallback = (
+            backtest_args
+            if name.startswith("backtest") and backtest_args is not None
+            else args
+        )
+        record_args = (stage_args or {}).get(name, fallback)
         print(f"pipeline step: {name}")
         started_at = datetime.now(tz=UTC)
-        result: int | None = None
+        result: CommandOutcome | None = None
         try:
-            result = step()
+            result = CommandOutcome.normalize(step())
         finally:
-            if sys.exc_info()[1] is not None:
-                vars(args).pop("_failure_kind", None)
-            kind = (
-                getattr(backtest_args or args, "_failure_kind", None)
-                if name.startswith("backtest")
-                else None
-            )
-            if kind:
-                vars(args)["_failure_kind"] = kind
-                detail = getattr(backtest_args or args, "_error_detail", None)
-                vars(args)["_error_detail"] = detail
-                vars(record_args)["_error_detail"] = detail
             stage = argparse.Namespace(
                 **{
                     key: value
@@ -1639,41 +1690,37 @@ def _run_pipeline_steps(
                 config,
                 stage,
                 started_at=started_at,
-                exit_code=result,
+                exit_code=result.exit_code if result is not None else None,
                 record_kind="stage",
                 parent_run_id=_parent_run_id(args),
-                failure_kind=kind,
-                error_detail=getattr(record_args, "_error_detail", None),
+                failure_kind=result.failure_kind if result is not None else None,
+                error_detail=result.error_detail if result is not None else None,
             )
         if (
             tolerate_pending
             and name.startswith("backtest")
-            and result == EXIT_NO_FOLDS
-            and kind == "no_folds"
+            and result.exit_code == EXIT_NO_FOLDS
+            and result.failure_kind == "no_folds"
         ):
             pending = True
-            vars(args).pop("_failure_kind", None)
             print(f"pipeline pending: {name}; continuing diagnostics")
             continue
-        if result:
-            if getattr(args, "_failure_kind", None) == "no_folds" and pending:
-                vars(args).pop("_failure_kind", None)
+        if result.exit_code:
             first_failure = first_failure or result
             if name in continue_on_failure:
                 print(
-                    f"pipeline continuing: {name} exited {result}; "
-                    "remaining outputs will run, but the pipeline will return failure",
+                    f"pipeline continuing: {name} exited {result.exit_code}; remaining outputs will run, but the pipeline will return failure",
                     file=sys.stderr,
                 )
                 continue
-            print(f"pipeline stopped: {name} exited {result}", file=sys.stderr)
+            print(
+                f"pipeline stopped: {name} exited {result.exit_code}", file=sys.stderr
+            )
             return first_failure
-    if pending and not first_failure:
-        vars(args)["_failure_kind"] = "no_folds"
-    return first_failure
+    return first_failure or CommandOutcome(0, "no_folds" if pending else None)
 
 
-def _cmd_maintain(config: Config, args: argparse.Namespace) -> int:
+def _cmd_maintain(config: Config, args: argparse.Namespace) -> CommandOutcome:
     truth_args = argparse.Namespace(days=args.truth_qc_days)
     return _run_pipeline_steps(
         config,
@@ -1732,7 +1779,7 @@ def _recovery_needed(config: Config, semantics: str = "auto") -> bool:
     return document.status == "degraded"
 
 
-def _cmd_recover(config: Config, args: argparse.Namespace) -> int:
+def _cmd_recover(config: Config, args: argparse.Namespace) -> int | CommandOutcome:
     from filelock import FileLock, Timeout  # noqa: PLC0415
 
     from grounded_weather_forecast.storage import pipeline_lock  # noqa: PLC0415
@@ -1789,7 +1836,7 @@ EXIT_CONTENTION = 75
 
 def _dispatch(
     config: Config, args: argparse.Namespace, parser: argparse.ArgumentParser
-) -> int:
+) -> int | CommandOutcome:
     if args.command not in _LOCKED_COMMANDS:
         return _run_command(config, args, parser)
     from filelock import Timeout  # noqa: PLC0415
@@ -1812,7 +1859,7 @@ def _dispatch(
 
 def _run_command(
     config: Config, args: argparse.Namespace, parser: argparse.ArgumentParser
-) -> int:
+) -> int | CommandOutcome:
     match args.command:
         case "qc":
             return _cmd_qc(config)
@@ -1928,18 +1975,18 @@ def main(argv: Sequence[str] | None = None) -> int:
     except ConfigError as exc:
         print(f"config error: {exc}")
         return 2
-    exit_code: int | None = None
+    outcome: CommandOutcome | None = None
     try:
-        exit_code = _dispatch(config, args, parser)
-        return exit_code  # noqa: RET504 - the finally block reads exit_code
+        outcome = CommandOutcome.normalize(_dispatch(config, args, parser))
+        return outcome.exit_code
     finally:
         _record_run(
             config,
             args,
             started_at=started_at,
-            exit_code=exit_code,
-            failure_kind=getattr(args, "_failure_kind", None),
-            error_detail=getattr(args, "_error_detail", None),
+            exit_code=outcome.exit_code if outcome is not None else None,
+            failure_kind=outcome.failure_kind if outcome is not None else None,
+            error_detail=outcome.error_detail if outcome is not None else None,
         )
 
 

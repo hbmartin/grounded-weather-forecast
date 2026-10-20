@@ -914,6 +914,63 @@ def near_tie_scores(created, evaluation_id, best_method, *, rival_offset=1.05):
     return pl.DataFrame(rows).cast(SCORES_SCHEMA)
 
 
+def test_partial_promotion_carries_excluded_incumbent_and_context(
+    tmp_path, monkeypatch
+):
+    config = write_config(tmp_path)
+    scores_dir = tmp_path / "scores"
+    monkeypatch.setattr(selection_module, "dataset_fingerprint", lambda _: "ds1")
+    monkeypatch.setattr(selection_module, "config_fingerprint", lambda _: "cfg1")
+    monkeypatch.setattr(selection_module, "code_identity", lambda: "code1")
+
+    def write(product, name, day, winner):
+        scores = near_tie_scores(
+            utc(2026, 8, day), name, winner, rival_offset=2.0
+        ).with_columns(pl.lit('["nws"]').alias("source_set_json"))
+        if product == "daily":
+            scores = scores.with_columns(
+                pl.lit("daily").alias("product"),
+                pl.lit("temp_max_c").alias("variable"),
+                pl.lit("D1").alias("lead_bucket"),
+            )
+        write_scores(
+            scores, scores_path(scores_dir, product, "live", "expanding", name)
+        )
+
+    write("hourly", "hour-old", 1, "inverse_mse")
+    write("daily", "day-old", 1, "inverse_mse")
+    original = select_methods(config, scores_dir)
+    daily_key = ("daily", "temp_max_c", "D1")
+    assert daily_key in original
+    write("hourly", "hour-new", 2, "cluster_equal_weight")
+    write("daily", "day-excluded", 2, "cluster_equal_weight")
+    promoted = select_methods(config, scores_dir, products=frozenset({"hourly"}))
+    assert promoted[daily_key].evaluation_id == "day-old"
+    assert promoted[daily_key].method_id == original[daily_key].method_id
+    assert promoted[daily_key].mae == original[daily_key].mae
+    assert promoted[("hourly", "temp_c", "24-48h")].evaluation_id == "hour-new"
+    release = (
+        config.artifacts_dir / "releases" / f"{promoted[daily_key].release_id}.json"
+    )
+    raw = json.loads(release.read_text())
+    assert set(raw["evaluation_ids"]) == {"hour-new", "day-old"}
+    assert {context["evaluation_id"] for context in raw["evaluation_contexts"]} == {
+        "hour-new",
+        "day-old",
+    }
+    historical = select_methods(
+        config, scores_dir, as_of=datetime.now(UTC) + timedelta(seconds=1)
+    )
+    assert historical[daily_key].evaluation_id == "day-old"
+    assert historical[("hourly", "temp_c", "24-48h")].evaluation_id == "hour-new"
+    # An empty promotion scope returns existing selections without a new release.
+    before = set(release.parent.glob("*.json"))
+    assert select_methods(config, scores_dir, products=frozenset()) == historical
+    assert set(release.parent.glob("*.json")) == before
+    monkeypatch.setattr(selection_module, "code_identity", lambda: "changed-code")
+    assert select_methods(config, scores_dir, products=frozenset()) == {}
+
+
 class TestIncumbentRetention:
     KEY = ("hourly", "temp_c", "24-48h")
 

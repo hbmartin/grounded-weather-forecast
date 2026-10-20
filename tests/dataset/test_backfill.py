@@ -187,6 +187,15 @@ class TestSyntheticMatrix:
         assert path.exists()
         assert count > 0
         assert matrix_path(config.dataset.dir, "daily", "synthetic").exists()
+        from grounded_weather_forecast.dataset.evaluation_snapshot import (
+            evaluation_snapshot,
+        )
+
+        assert (config.dataset.dir / "manifest_synthetic.json").exists()
+        assert (
+            evaluation_snapshot(config.dataset.dir, "hourly", "synthetic") is not None
+        )
+        assert evaluation_snapshot(config.dataset.dir, "daily", "synthetic") is not None
 
         matrix = pl.read_parquet(path)
         assert matrix["source_kind"].unique().to_list() == ["synthetic"]

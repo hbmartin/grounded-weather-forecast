@@ -187,6 +187,28 @@ Fold plans are computed in epoch microseconds. Both **expanding** and **rolling*
 different questions: expanding asks *what do you know?*, rolling asks *what have
 you learned lately?*
 
+### Evaluation outcomes and snapshot clock
+
+*Implemented in: `backtest/splits.py`, `backtest/outcomes.py`,
+`backtest/engine.py`, `backtest/minutely.py`,
+`dataset/evaluation_snapshot.py`, `cli.py`*
+
+The planner's first origin is the first issue plus `initial_train_days`
+(default 90); an issue must occur strictly after it. `step_days` (default 7)
+spaces later origins, rather than requiring a full first test interval.
+Producers distinguish `evaluated`, `pending`, `not_applicable`, and `failed`.
+Any emitted scores complete a product. Otherwise valid short clocks are pending;
+future test truth is pending only with usable training and every eligible test
+truth clock later than the input snapshot timestamp. Due-but-missing truth and
+empty score output after mature truth remain errors. Truth delays above are unchanged.
+
+Snapshot timestamps come from hash-validated live or synthetic build manifests;
+filesystem modification times and backtest wall time do not determine maturity.
+Legacy inputs without metadata remain scoreable and retain short-history handling,
+but cannot establish the future-truth exemption. CLI pending exit 3 keeps the
+historical `no_folds` ledger classification. Products are evaluated independently;
+only completed products can receive new promotions, under unchanged gates.
+
 ### Bounded score persistence
 
 *Implemented in: `backtest/engine.py::iter_backtest_scores`,
