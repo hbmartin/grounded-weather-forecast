@@ -96,7 +96,8 @@ That works on day one. Everything else needs an archive with some history — se
 | `uv run python scripts/benchmark_score_readers.py` | compare selection, dashboard, and report score readers; journal completed samples, use unique ignored outputs, and rescue failed runs | `--baseline` `--runs` `--evaluations` `--cases` `--output` |
 
 Global: `--config PATH` (default `config.toml`), `--version`. Exit codes: `0` ok,
-`1` command failure, `2` config error, `75` lock contention (retry later).
+`1` command failure, `2` config error, `3` evaluation pending because history is
+too short, `75` lock contention (retry later).
 Score guard-release failure during startup recovery or an uncommitted write
 returns 1 from backtest, maintain or recover, records `score_coordination_release`
 and its diagnostic in the run journal, and suppresses promotion. Startup recovery
@@ -116,7 +117,8 @@ or FileLock. Disposal remains best effort with a zero-wait guard attempt, even a
 recoverable payloads or companions may remain. Legacy temporaries stay untouched.
 Pipeline mutators serialize on `<dataset dir>/pipeline.lock`;
 scheduled `maintain` waits for it and holds it across the whole transaction.
-Build and backtest failures stop maintenance immediately. A handled truth-QC
+Build and backtest failures stop CLI maintenance immediately. Insufficient-history
+backtests (exit 3) continue to diagnostics without a failure alarm. A handled truth-QC
 failure still permits report, which may use the previous QC artifact; the failed
 refresh stays in the run ledger and maintenance returns the first nonzero stage
 result. A refreshed dashboard therefore does not imply successful maintenance.
@@ -146,8 +148,12 @@ Steady state is four crons — poll, ingest ensembles, `publish`, and nightly
 `maintain`. Cadence rationale and
 launchd templates are in
 [Scheduling](https://hbmartin.github.io/grounded-weather-forecast/scheduling/).
-The daily wrapper treats every nonzero stage exit, including live or synthetic
-backtest exit 1, as failed maintenance and preserves its previous success stamp.
+The daily wrapper treats backtest exit 3 as pending and continues diagnostics;
+it returns 0 if the remaining required work passes, but preserves its success
+stamp until every requested, applicable evaluation completes. All other nonzero
+stage exits fail maintenance. Sunday synthetic evaluation follows the wrapper-only
+`[maintenance].synthetic_backtest` setting (`auto`, `required`, or `off`; default
+`auto` skips when both backfill matrices are absent).
 
 ## Status
 

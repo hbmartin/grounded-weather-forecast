@@ -39,6 +39,33 @@ def test_all_zones_render_not_yet_states_on_cold_context(tmp_path):
                 assert panel.raw_html is not None or panel.empty_reason
 
 
+def test_pipeline_panel_displays_pending_evaluation_count(tmp_path):
+    ctx = DashboardContext(
+        config=write_config(tmp_path),
+        now=NOW,
+        evidence_history={
+            "pipeline": pl.DataFrame(
+                {
+                    "as_of_date": [NOW.date()],
+                    "alarms": [""],
+                    "truth_age_minutes": [1.0],
+                    "collector_age_minutes": [1.0],
+                    "served_history_age_minutes": [1.0],
+                    "forecast_document_age_minutes": [1.0],
+                    "pending_evaluations_24h": [2],
+                }
+            )
+        },
+    )
+    panel = operations._freshness_panel(ctx)
+    stat = next(
+        stat for stat in panel.stats if stat.label == "pending evaluations (24h)"
+    )
+    assert stat.value == "2"
+    assert stat.status == "info"
+    assert panel.status == "ok"
+
+
 def test_runtime_panel_includes_publish_and_child_stage_rows(tmp_path):
     config = write_config(tmp_path)
     ctx = DashboardContext(

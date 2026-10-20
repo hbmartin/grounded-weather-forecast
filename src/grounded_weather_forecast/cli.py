@@ -9,6 +9,10 @@ from pathlib import Path
 import polars as pl
 
 from grounded_weather_forecast import __version__
+from grounded_weather_forecast.backtest.outcomes import (
+    BacktestDiagnostics,
+    ProductBacktestOutcome,
+)
 from grounded_weather_forecast.config import Config, ConfigError, load_config
 from grounded_weather_forecast.contracts import (
     HOURLY_VARIABLES,
@@ -16,6 +20,7 @@ from grounded_weather_forecast.contracts import (
     VariableSpec,
 )
 from grounded_weather_forecast.serve.schema import Forecast
+from grounded_weather_forecast.status import EXIT_NO_FOLDS
 
 HOURLY_DEFAULT_VARIABLES = (
     "temp_c,humidity_pct,dew_point_c,wind_speed_ms,wind_gust_ms,"
@@ -937,10 +942,12 @@ def _cmd_publish(config: Config, args: argparse.Namespace) -> int:
     return 1 if problems else 0
 
 
-def _run_minutely_backtest(config: Config, args: argparse.Namespace) -> int | None:
+def _run_minutely_backtest(
+    config: Config, args: argparse.Namespace
+) -> ProductBacktestOutcome:
     """The minutely product: path constructions over the HOURLY live matrix.
 
-    None signals a hard failure (missing inputs); the caller returns 1.
+    Missing or unusable inputs are failures, rather than insufficient history.
     """
     from grounded_weather_forecast.backtest.minutely import (  # noqa: PLC0415
         MINUTELY_SCORE_VARIABLES,
@@ -959,7 +966,7 @@ def _run_minutely_backtest(config: Config, args: argparse.Namespace) -> int | No
         # No synthetic minute truth exists; scoring the nowcast against a
         # synthetic archive would be provenance theater.
         print("minutely: backtest is live-only, skipping")
-        return 0
+        return ProductBacktestOutcome("minutely", "not_applicable")
     matrix_file = matrix_path(config.dataset.dir, "hourly", "live")
     truth_file = config.dataset.dir / "truth_minute.parquet"
     for required, hint in (
@@ -968,19 +975,69 @@ def _run_minutely_backtest(config: Config, args: argparse.Namespace) -> int | No
     ):
         if not required.exists():
             print(f"missing {required}; run {hint} first")
-            return None
+            return ProductBacktestOutcome("minutely", "failed")
     matrix = pl.read_parquet(matrix_file)
     grid = truth_minute_grid(pl.read_parquet(truth_file), MINUTELY_SCORE_VARIABLES)
+    if (
+        not _valid_product_matrix(matrix, daily=False)
+        or matrix["source_kind"].unique().to_list() != ["live"]
+        or grid.is_empty()
+        or not _has_finite_truth(grid, MINUTELY_SCORE_VARIABLES)
+    ):
+        print("minutely: no evaluable inputs or truth")
+        return ProductBacktestOutcome("minutely", "failed")
     request = MinutelyRequest(window=args.window)
+    diagnostics = BacktestDiagnostics()
     result = write_score_batches(
-        iter_minutely_scores(matrix, grid, request, config),
+        iter_minutely_scores(matrix, grid, request, config, diagnostics=diagnostics),
         config.dataset.dir / "scores",
         "minutely",
         "live",
         args.window,
     )
     print(f"minutely: {result.row_count} score rows -> {result.path}")
-    return result.row_count
+    return _product_outcome("minutely", result.row_count, diagnostics)
+
+
+def _has_finite_truth(frame: pl.DataFrame, columns: Sequence[str]) -> bool:
+    return any(
+        column in frame.columns and frame[column].is_finite().any()
+        for column in columns
+    )
+
+
+def _product_outcome(
+    product: str, rows: int, diagnostics: BacktestDiagnostics
+) -> ProductBacktestOutcome:
+    outcome = ProductBacktestOutcome.from_scores(product, rows, diagnostics)
+    if outcome.status == "insufficient_history":
+        print(f"{product}: evaluation pending: insufficient issue-time history")
+    elif outcome.status == "failed":
+        print(
+            f"{product}: no evaluable scores; insufficient history was not established"
+        )
+    return outcome
+
+
+def _valid_product_matrix(matrix: pl.DataFrame, *, daily: bool) -> bool:
+    required = {"issue_time", "source_kind", "lead_bucket"}
+    required.update(
+        ("forecast_date", "lead_days") if daily else ("valid_time", "lead_hours")
+    )
+    if matrix.is_empty() or not required <= set(matrix.columns):
+        return False
+    lead = matrix["lead_days" if daily else "lead_hours"]
+    forecasts = [
+        column for column in matrix.columns if column.startswith(("fx__", "fxd__"))
+    ]
+    return (
+        all(matrix[column].null_count() == 0 for column in required)
+        and isinstance(matrix.schema["issue_time"], pl.Datetime)
+        and lead.dtype.is_numeric()
+        and lead.is_finite().all()
+        and bool(forecasts)
+        and all(matrix.schema[column].is_numeric() for column in forecasts)
+    )
 
 
 def _run_matrix_backtest(
@@ -988,7 +1045,7 @@ def _run_matrix_backtest(
     args: argparse.Namespace,
     product: str,
     methods: tuple[str, ...],
-) -> int | None:
+) -> ProductBacktestOutcome:
     """Own one product's matrices and generator until its score file is closed."""
     from grounded_weather_forecast.backtest.engine import (  # noqa: PLC0415
         BacktestRequest,
@@ -998,31 +1055,53 @@ def _run_matrix_backtest(
     from grounded_weather_forecast.backtest.scores import (  # noqa: PLC0415
         write_score_batches,
     )
+    from grounded_weather_forecast.blenders.registry import (  # noqa: PLC0415
+        supports_product,
+    )
     from grounded_weather_forecast.contracts import (  # noqa: PLC0415
         DAILY_VARIABLES,
         HOURLY_VARIABLES,
+        Product,
     )
-    from grounded_weather_forecast.dataset.matrix import matrix_path  # noqa: PLC0415
+    from grounded_weather_forecast.dataset.matrix import (  # noqa: PLC0415
+        matrix_path,
+        truth_column_for,
+    )
 
     daily = product == "daily"
     matrix_file = matrix_path(config.dataset.dir, product, args.source)
     if not matrix_file.exists():
         source_hint = "backfill" if args.source == "synthetic" else "build-dataset"
         print(f"missing {matrix_file}; run {source_hint} first")
-        return None
+        return ProductBacktestOutcome(product, "failed")
     matrix = pl.read_parquet(matrix_file)
-    if matrix.is_empty():
-        print(f"{product}: matrix is empty, skipping")
-        return 0
+    if not _valid_product_matrix(matrix, daily=daily):
+        print(f"{product}: matrix is empty or has invalid forecast schema")
+        return ProductBacktestOutcome(product, "failed")
     kinds = matrix["source_kind"].unique().to_list()
     if kinds != [args.source]:
         print(f"{product}: matrix carries {kinds}, expected [{args.source}]")
-        return None
+        return ProductBacktestOutcome(product, "failed")
     names = _split_csv(args.daily_variables if daily else args.hourly_variables)
     variables = variables_from_names(
         names, DAILY_VARIABLES if daily else HOURLY_VARIABLES
     )
     semantics = _semantics_by_variable(config, args.semantics, variables)
+    product_kind = Product.DAILY if daily else Product.HOURLY
+    applicable = tuple(
+        variable
+        for variable in variables
+        if any(supports_product(method, product_kind, variable) for method in methods)
+    )
+    truth_columns = tuple(
+        truth_column_for(variable, semantics[variable.name]) for variable in applicable
+    )
+    if not applicable or any(column not in matrix.columns for column in truth_columns):
+        print(f"{product}: unsupported selection or missing truth columns")
+        return ProductBacktestOutcome(product, "failed")
+    if not _has_finite_truth(matrix, truth_columns):
+        print(f"{product}: no finite truth available")
+        return ProductBacktestOutcome(product, "failed")
     request = BacktestRequest(
         variables=variables,
         methods=methods,
@@ -1030,17 +1109,18 @@ def _run_matrix_backtest(
         daily=daily,
         semantics=semantics,
     )
+    diagnostics = BacktestDiagnostics()
     result = write_score_batches(
-        iter_backtest_scores(matrix, request, config),
+        iter_backtest_scores(matrix, request, config, diagnostics=diagnostics),
         config.dataset.dir / "scores",
         product,
         args.source,
         args.window,
     )
     print(f"{product}: {result.row_count} score rows -> {result.path}")
-    if not result.row_count:
+    if not result.row_count and diagnostics.history_too_short:
         _explain_no_folds(config, matrix, product)
-    return result.row_count
+    return _product_outcome(product, result.row_count, diagnostics)
 
 
 def _cmd_backtest(config: Config, args: argparse.Namespace) -> int:
@@ -1049,6 +1129,7 @@ def _cmd_backtest(config: Config, args: argparse.Namespace) -> int:
         ScoreCoordinationTimeout,
     )
 
+    vars(args).pop("_failure_kind", None)
     try:
         return _backtest_products(config, args)
     except (ScoreCoordinationTimeout,) as error:  # noqa: B013
@@ -1079,18 +1160,27 @@ def _backtest_products(config: Config, args: argparse.Namespace) -> int:
         print(f"skipped {note}")
     methods = available_methods() if args.methods == "all" else _split_csv(args.methods)
     products = _split_csv(args.products)
+    if (
+        not methods
+        or set(methods) - set(available_methods())
+        or not products
+        or set(products) - {"hourly", "daily", "minutely"}
+    ):
+        print("invalid backtest methods or products", file=sys.stderr)
+        return 2
     promotion_semantics = _semantics_by_variable(
         config, args.semantics, HOURLY_VARIABLES
     )
-    total = 0
+    outcomes: list[ProductBacktestOutcome] = []
     for product in products:
         if product == "minutely":
-            rows = _run_minutely_backtest(config, args)
+            outcome = _run_minutely_backtest(config, args)
         else:
-            rows = _run_matrix_backtest(config, args, product, methods)
-        if rows is None:
+            outcome = _run_matrix_backtest(config, args, product, methods)
+        outcomes.append(outcome)
+        if outcome.status == "failed":
             return 1
-        total += rows
+    total = sum(outcome.row_count for outcome in outcomes)
     if total and args.source == "live":
         from grounded_weather_forecast.serve.selection import (  # noqa: PLC0415
             select_methods,
@@ -1110,8 +1200,9 @@ def _backtest_products(config: Config, args: argparse.Namespace) -> int:
         )
         if release_ids:
             print(f"promoted model release: {', '.join(release_ids)}")
-    if not total:
+    if any(outcome.status == "insufficient_history" for outcome in outcomes):
         vars(args)["_failure_kind"] = "no_folds"
+        return EXIT_NO_FOLDS
     return 0 if total else 1
 
 
@@ -1121,11 +1212,11 @@ def _explain_no_folds(config: Config, matrix: pl.DataFrame, product: str) -> Non
     first, last = issues.min(), issues.max()
     epoch_us = issues.cast(pl.Int64).to_numpy()
     span_days = float(epoch_us.max() - epoch_us.min()) / 86_400_000_000.0
-    needed = config.backtest.initial_train_days + config.backtest.step_days
+    needed = config.backtest.initial_train_days
     print(
         f"  {product}: no rolling-origin folds. The archive spans {span_days:.1f} "
-        f"days of issue times ({first} .. {last}) but a fold needs "
-        f"initial_train_days + step_days = {needed}. Keep polling, or backtest "
+        f"days of issue times ({first} .. {last}) but the first test origin needs "
+        f"more than initial_train_days = {needed}. Keep polling, or backtest "
         f"--source synthetic against an Open-Meteo backfill."
     )
 
@@ -1511,8 +1602,10 @@ def _run_pipeline_steps(
     backtest_args: argparse.Namespace | None = None,
     continue_on_failure: frozenset[str] = frozenset(),
     stage_args: Mapping[str, argparse.Namespace] | None = None,
+    tolerate_pending: bool = False,
 ) -> int:
     first_failure = 0
+    pending = False
     for name, step in steps:
         record_args = stage_args.get(name, args) if stage_args is not None else args
         vars(record_args).pop("_error_detail", None)
@@ -1522,6 +1615,8 @@ def _run_pipeline_steps(
         try:
             result = step()
         finally:
+            if sys.exc_info()[1] is not None:
+                vars(args).pop("_failure_kind", None)
             kind = (
                 getattr(backtest_args or args, "_failure_kind", None)
                 if name.startswith("backtest")
@@ -1550,7 +1645,19 @@ def _run_pipeline_steps(
                 failure_kind=kind,
                 error_detail=getattr(record_args, "_error_detail", None),
             )
+        if (
+            tolerate_pending
+            and name.startswith("backtest")
+            and result == EXIT_NO_FOLDS
+            and kind == "no_folds"
+        ):
+            pending = True
+            vars(args).pop("_failure_kind", None)
+            print(f"pipeline pending: {name}; continuing diagnostics")
+            continue
         if result:
+            if getattr(args, "_failure_kind", None) == "no_folds" and pending:
+                vars(args).pop("_failure_kind", None)
             first_failure = first_failure or result
             if name in continue_on_failure:
                 print(
@@ -1561,6 +1668,8 @@ def _run_pipeline_steps(
                 continue
             print(f"pipeline stopped: {name} exited {result}", file=sys.stderr)
             return first_failure
+    if pending and not first_failure:
+        vars(args)["_failure_kind"] = "no_folds"
     return first_failure
 
 
@@ -1577,6 +1686,7 @@ def _cmd_maintain(config: Config, args: argparse.Namespace) -> int:
         ),
         continue_on_failure=frozenset({"truth-qc"}),
         stage_args={"truth-qc": truth_args},
+        tolerate_pending=True,
     )
 
 

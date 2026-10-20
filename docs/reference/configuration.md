@@ -191,6 +191,19 @@ field.
 
 ---
 
+## `[maintenance]` — standalone daily wrapper only
+
+| Key | Type | Default | Meaning |
+|---|---|---|---|
+| `synthetic_backtest` | `auto` \| `required` \| `off` | `auto` | UTC Sunday synthetic evaluation: auto runs when both hourly/daily matrices exist, skips when both are absent, and fails on partial inputs; required fails on any absence; off skips |
+
+The daily wrapper validates this setting from the active project's `config.toml`.
+It uses `[dataset].dir`, resolving relative paths against the project. Read faults
+and corrupt matrices remain failures. Restore mode stays live-only. This setting
+does not enter the scientific configuration fingerprint or affect core CLI
+`maintain` scheduling. The wrapper must run with the matching package version
+that supplies the exit-status protocol.
+
 ## `[backfill.open_meteo]` / `[backfill.dynamical]`
 
 | Key | Type | Default | Meaning |

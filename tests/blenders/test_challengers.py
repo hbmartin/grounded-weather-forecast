@@ -65,12 +65,17 @@ class TestRaftGrounded:
 
 
 class TestSeamlessRegression:
-    @pytest.mark.parametrize("rows", [0, 21, 72])
+    @pytest.mark.parametrize("rows", [0, 21, 47, 48, 72])
     @pytest.mark.parametrize("with_observation", [False, True])
-    def test_no_observed_sources_preserves_rows_and_abstains(
-        self, rows, with_observation
+    @pytest.mark.parametrize("with_issue_time", [False, True])
+    def test_no_observed_sources_preserves_rows_and_uses_observation(
+        self, rows, with_observation, with_issue_time
     ):
-        features = pl.DataFrame({"issue_time": [utc(2026, 8, 1)] * rows})
+        features = pl.DataFrame({"row": list(range(rows))})
+        if with_issue_time:
+            features = features.with_columns(
+                pl.lit(utc(2026, 8, 1)).alias("issue_time")
+            )
         if with_observation:
             features = features.with_columns(pl.lit(20.0).alias(obs_col("temp_c")))
         x = ForecastMatrix.build(
@@ -86,10 +91,15 @@ class TestSeamlessRegression:
         fitted = get_factory("seamless_regression")().fit(train)
         point = fitted.predict(x).point
         assert point.shape == (rows,)
-        assert np.isnan(point).all()
-        assert fitted.to_state()["coefficients"] is None
+        if with_observation and rows >= 48:
+            assert np.isfinite(point).all()
+            assert fitted.to_state()["coefficients"] is not None
+        else:
+            assert np.isnan(point).all()
+            assert fitted.to_state()["coefficients"] is None
 
-    def test_refitting_without_observed_sources_clears_previous_fit(self):
+    @pytest.mark.parametrize("with_observation", [False, True])
+    def test_refitting_without_sources_replaces_or_clears_fit(self, with_observation):
         train = temp_slice(days=40)
         fitted = get_factory("seamless_regression")().fit(train)
         assert fitted.to_state()["coefficients"] is not None
@@ -98,15 +108,24 @@ class TestSeamlessRegression:
                 sources=train.x.sources,
                 values=np.full_like(train.x.values, np.nan),
                 lead_hours=train.x.lead_hours,
-                features=train.x.features,
+                features=(
+                    train.x.features
+                    if with_observation
+                    else train.x.features.drop(obs_col("temp_c"))
+                ),
             ),
             y=train.y,
             variable=train.variable,
             source_kind=SourceKind.SYNTHETIC,
         )
         fitted.fit(missing)
-        assert fitted.to_state()["coefficients"] is None
-        assert np.isnan(fitted.predict(train.x).point).all()
+        if with_observation:
+            assert fitted.to_state()["coefficients"] is not None
+            assert np.isfinite(fitted.predict(missing.x).point).any()
+            assert len(fitted.to_state()["coefficients"]["global"]) == 2
+        else:
+            assert fitted.to_state()["coefficients"] is None
+            assert np.isnan(fitted.predict(train.x).point).all()
 
     def test_learns_the_blend(self):
         train = temp_slice(days=40)

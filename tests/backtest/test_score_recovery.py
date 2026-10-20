@@ -13,7 +13,7 @@ from threading import Thread
 
 import polars as pl
 import pytest
-from conftest import write_config
+from conftest import synthetic_hourly_matrix, write_config
 from filelock import Timeout
 
 from grounded_weather_forecast import cli
@@ -30,6 +30,11 @@ from grounded_weather_forecast.backtest.scores import (
     empty_scores,
     load_scores,
     write_scores,
+)
+from grounded_weather_forecast.contracts import (
+    HOURLY_VARIABLES,
+    TruthSemantics,
+    truth_col,
 )
 from grounded_weather_forecast.reports.operations import prune_scores_files
 from grounded_weather_forecast.serve import selection
@@ -501,13 +506,23 @@ def test_cli_coordination_timeout_closes_producer_and_releases_pipeline(
     config = write_config(tmp_path)
     directory = config.dataset.dir / "scores"
     holder, _ = writer_processes(directory, phase="allocated")
-    pl.DataFrame({"source_kind": ["live"]}).write_parquet(
-        config.dataset.dir / "hourly_matrix_live.parquet"
-    )
+    synthetic_hourly_matrix(days=1, max_lead=1).with_columns(
+        *(
+            pl.lit(1.0).alias(
+                truth_col(
+                    variable.name,
+                    TruthSemantics.INSTANTANEOUS
+                    if variable.has_dual_semantics
+                    else None,
+                )
+            )
+            for variable in HOURLY_VARIABLES
+        )
+    ).write_parquet(config.dataset.dir / "hourly_matrix_live.parquet")
     closed = []
     promoted = []
 
-    def produce(*_args):
+    def produce(*_args, **_kwargs):
         try:
             yield (
                 scores.empty_scores()

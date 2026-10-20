@@ -101,8 +101,10 @@ maintenance or restore jobs skip as duplicates. A successful daily run writes
 `last-maintenance`; a fresh stamp skips catch-up for **20 hours**. Restore runs
 leave that stamp untouched, and a failed report skips score pruning.
 
-CLI `maintain` also runs truth-QC before report. Build/backtest failures stop the
-pipeline, while a handled truth-QC failure permits report under the same lock.
+CLI `maintain` also runs truth-QC before report. Build/backtest errors stop the
+pipeline, while an insufficient-history backtest (exit 3) and a handled truth-QC
+failure permit diagnostics under the same lock. Pending evaluation returns 0
+when the other required stages pass; a real truth-QC failure remains nonzero.
 The cross-check panel shows the retained verdict’s refresh time: amber after
 a failed refresh, beyond 48 hours (two nightly cycles), or when freshness is
 unknown. A latched drift verdict remains red; refreshing the dashboard does not
@@ -136,12 +138,24 @@ regenerate synthetic evidence where used. Run `build-dataset`, a fresh
 `backtest --source live`, and `report` under the updated code before rollout.
 Source implementation and PR delivery do not install the deployment.
 
-Every nonzero child exit makes the installed daily wrapper fail and leaves
-`last-maintenance` unchanged, including exit 1 from either live or synthetic
-backtesting. Exit 1 can indicate missing inputs, no folds, or an uncaught
-exception; the wrapper never assumes it is a harmless cold start. It logs the
-failed stages, continues to refresh diagnostics, and skips pruning when report
-fails. Inspect the stage output for the underlying reason.
+The daily wrapper treats only backtest exit 3 as expected pending evaluation.
+It continues diagnostics and returns 0 if all remaining required stages pass,
+but preserves `last-maintenance` until every requested, applicable evaluation
+completes. All other nonzero child exits remain failures. Logs identify full
+stage commands and pruning is skipped when report fails. A later error cannot
+inherit a pending exemption. CLI `recover` still exits 3 for pending evaluation
+without claiming recovery completed.
+
+The wrapper-only `[maintenance].synthetic_backtest` setting defaults to `auto`:
+on UTC Sundays run when both configured hourly/daily synthetic matrices exist,
+skip explicitly when both are absent, and fail on partial, unreadable, or corrupt
+inputs. Set `required` on hosts where backfill availability is mandatory; set
+`off` to disable this scheduled evaluation. Invalid settings exit 2. Dataset paths
+come from the active project's configuration; relative paths resolve from that
+project. This scheduling setting does not change the scientific config fingerprint.
+Restore mode performs only live evaluation and leaves the success stamp untouched.
+The hourly job's standalone `--restore` child returns 3 after diagnostics when
+evaluation is pending, retaining the incomplete recovery status.
 
 ## Profiling a scheduled run
 
@@ -190,8 +204,9 @@ exit behavior, and later analysis commands.
   but project access or environment setup failed. Application output follows
   `INVOKE`; use `launchctl print` for the final exit status.
 - A degraded `publish` candidate and a backtest finding no folds can occur
-  during a cold start. A no-fold backtest exits nonzero, so the daily wrapper
-  reports incomplete maintenance and does not advance its success stamp.
+  during a cold start. A proven insufficient-history backtest exits 3. The daily
+  wrapper reports evaluation pending and does not advance its success stamp;
+  maintenance itself exits 0 when its other required stages pass.
   The candidate names its cause in `status_reason`; `publish`
   preserves a matching ready document issued within six hours byte-for-byte, or publishes
   and archives the degraded candidate on a cold start so an output still exists.

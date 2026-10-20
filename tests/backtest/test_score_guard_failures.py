@@ -20,6 +20,7 @@ from score_recovery_helpers import (
 
 from grounded_weather_forecast import cli, runs
 from grounded_weather_forecast.backtest import score_storage as storage
+from grounded_weather_forecast.backtest.outcomes import ProductBacktestOutcome
 from grounded_weather_forecast.config import Config
 from grounded_weather_forecast.reports import operations
 from grounded_weather_forecast.serve import selection
@@ -55,13 +56,13 @@ def test_committed_guard_failure_warns_then_rejects_next_product(
 
     def write(
         config: Config, _args: argparse.Namespace, product: str, _methods: list[str]
-    ) -> int:
+    ) -> ProductBacktestOutcome:
         with storage.score_parquet_destination(
             config.dataset.dir / "scores" / f"scores_{product}.parquet"
         ) as staged:
             written.append(product)
             staged.write_bytes(b"committed fixture")
-        return 1
+        return ProductBacktestOutcome(product, "evaluated", 1)
 
     def promote(*_args: object, **_kwargs: object) -> dict[str, object]:
         promoted.append(True)

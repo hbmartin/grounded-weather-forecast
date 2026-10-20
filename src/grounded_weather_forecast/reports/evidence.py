@@ -242,6 +242,7 @@ PIPELINE_SCHEMA = pl.Schema(
         "forecast_document_age_minutes": pl.Float64(),
         "predict_runs_24h": pl.Int64(),
         "failed_runs_24h": pl.Int64(),
+        "pending_evaluations_24h": pl.Int64(),
         "alarms": pl.String(),
         "code_version": pl.String(),
         "config_fingerprint": pl.String(),

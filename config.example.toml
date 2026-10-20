@@ -140,6 +140,11 @@ min_live_n = 24
 # lists a slice under "Blocked promotions".
 report_gap_threshold = 0.15
 
+[maintenance]
+# Standalone daily wrapper only; auto skips Sunday synthetic evaluation when
+# both backfill matrices are absent. Use required to enforce their availability.
+synthetic_backtest = "auto" # auto | required | off
+
 [backtest]
 initial_train_days = 90
 step_days = 7

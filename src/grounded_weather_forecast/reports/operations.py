@@ -56,6 +56,7 @@ from grounded_weather_forecast.evaluation import (
 )
 from grounded_weather_forecast.reports import evidence
 from grounded_weather_forecast.serve.schema import Forecast
+from grounded_weather_forecast.status import PENDING_EXIT_CODES
 
 _COLLECTOR_ERRORS = (OSError, ValueError, sqlite3.Error, pl.exceptions.PolarsError)
 
@@ -197,8 +198,8 @@ def _document_age(config: Config, now: datetime) -> float | None:
     return _age_minutes(datetime.fromtimestamp(newest, tz=UTC), now)
 
 
-def _run_counts(runs_frame: pl.DataFrame, now: datetime) -> tuple[int, int] | None:
-    """(ok serving runs, failed runs) in 24h; None while the ledger is young."""
+def _run_counts(runs_frame: pl.DataFrame, now: datetime) -> tuple[int, int, int] | None:
+    """(ok serving runs, failed runs, pending evaluations) in 24h."""
     if runs_frame.is_empty():
         return None
     recent = runs_frame.filter(pl.col("started_at") >= now - timedelta(hours=24))
@@ -208,14 +209,19 @@ def _run_counts(runs_frame: pl.DataFrame, now: datetime) -> tuple[int, int] | No
     predicts = invocations.filter(
         pl.col("command").is_in(["predict", "publish"]) & (pl.col("exit_code") == 0)
     ).height
+    pending = (
+        (pl.col("failure_kind") == "no_folds").fill_null(value=False)
+        & pl.col("exit_code").is_in(PENDING_EXIT_CODES).fill_null(value=False)
+        & pl.col("error").is_null()
+    )
     failed = invocations.filter(
         (
             (pl.col("exit_code").is_not_null() & (pl.col("exit_code") != 0))
             | pl.col("error").is_not_null()
         )
-        & ~(pl.col("failure_kind") == "no_folds").fill_null(value=False)
+        & ~pending
     ).height
-    return predicts, failed
+    return predicts, failed, invocations.filter(pending).height
 
 
 def _stale(name: str, age: float | None, limit: float) -> list[str]:
@@ -294,7 +300,7 @@ def freshness_row(
         )
     alarms += _baseline_truth_alarm(truth_samples, pipeline_history, now)
     if counts is not None:
-        predicts, failed = counts
+        predicts, failed, _pending = counts
         if predicts < _MIN_PREDICT_RUNS_24H:
             alarms.append(
                 f"few predict runs ({predicts}/24h < {_MIN_PREDICT_RUNS_24H})"
@@ -313,6 +319,7 @@ def freshness_row(
         "forecast_document_age_minutes": document_age,
         "predict_runs_24h": None if counts is None else counts[0],
         "failed_runs_24h": None if counts is None else counts[1],
+        "pending_evaluations_24h": None if counts is None else counts[2],
         "alarms": ", ".join(alarms),
         "code_version": code_identity(),
         "config_fingerprint": config_fingerprint(config),
