@@ -71,6 +71,30 @@ Importing them does not change the environment or working directory, register
 exit logging, or execute jobs. Their entry points default `POLARS_MAX_THREADS`
 to **2** and log the job's start/end and exit status.
 
+Install `launchd_paths.py` alongside both standalone wrappers:
+
+```bash
+cp docs/launchd/{launchd_paths.py,daily-maintenance.py,hourly-predict-publish.py} \
+  "$HOME/Library/Application Support/grounded-weather-forecast/"
+```
+
+The project directory comes from the job's working directory, already selected
+by `uv --directory` in its LaunchAgent arguments. Both wrappers validate the
+active forecast project and `config.toml`, and find `uv` on `PATH`. Keep that
+managed launch configuration pointed at the intended runtime project when moving
+checkouts; the wrappers do not infer the runtime from a separately pinned source
+checkout or scan mounted disks.
+
+The hourly wrapper validates the sibling `ambientweather2sqlite` project. For a
+different layout, append `--station-project /path/to/collector` to its invocation.
+It reads the existing forecast configuration's `station.db_path`, resolves
+relative paths against the forecast project, and passes the absolute database
+path explicitly to `publish_station.py --db`. Publisher source paths and state
+directories are derived from this runtime project and the user's application
+support directory. Missing or invalid configuration, projects, databases, or
+`uv` produce exit 2 before prediction, publication, or a success stamp. No volume
+names or personal database locations are embedded in the wrapper sources.
+
 The daily wrapper holds `maintenance-job.lock` across its child stages using
 a context manager, releasing it on early returns and exceptions. Concurrent
 maintenance or restore jobs skip as duplicates. A successful daily run writes

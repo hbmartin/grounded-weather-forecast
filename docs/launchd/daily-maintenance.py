@@ -26,8 +26,8 @@ from collections.abc import Sequence
 from datetime import UTC, datetime
 from pathlib import Path
 
-REPO = "/Volumes/Pro2T/weather/grounded-weather-forecast"
-UV = "/opt/homebrew/bin/uv"
+from launchd_paths import RuntimePathError, RuntimePaths, resolve_runtime
+
 MIN_INTERVAL_S = 20 * 3600
 
 
@@ -44,7 +44,7 @@ def maintenance_steps(*, restore: bool) -> list[list[str]]:
     return steps
 
 
-def run_stage(step: list[str]) -> int:
+def run_stage(step: list[str], paths: RuntimePaths) -> int:
     started = time.monotonic()
     name = step[0]
     print(f"{timestamp()} == {' '.join(step)} ==", flush=True)
@@ -54,16 +54,16 @@ def run_stage(step: list[str]) -> int:
             [
                 "/usr/bin/time",
                 "-l",
-                UV,
+                paths.uv,
                 "--directory",
-                REPO,
+                str(paths.project),
                 "run",
                 "--locked",
                 "--project",
-                REPO,
+                str(paths.project),
                 "grounded-weather-forecast",
                 "--config",
-                f"{REPO}/config.toml",
+                str(paths.config),
                 *step,
             ],
             check=False,
@@ -82,7 +82,7 @@ def run_stage(step: list[str]) -> int:
     return code
 
 
-def maintain(stamp: Path, *, restore: bool) -> int:
+def maintain(stamp: Path, *, restore: bool, paths: RuntimePaths) -> int:
     # Only actual maintenance owns this lock; readers never probe it exclusively.
     with stamp.with_name("maintenance-job.lock").open("a") as job_lock:
         try:
@@ -100,7 +100,7 @@ def maintain(stamp: Path, *, restore: bool) -> int:
                 flush=True,
             )
             return 0
-        os.chdir(REPO)
+        os.chdir(paths.project)
         print(f"{timestamp()} PROJECT_CWD cwd={Path.cwd()}", flush=True)
         failures: list[str] = []
         for step in maintenance_steps(restore=restore):
@@ -109,7 +109,7 @@ def maintain(stamp: Path, *, restore: bool) -> int:
             if name == "prune-scores" and "report" in failures:
                 print("== prune-scores skipped: report failed this run ==", flush=True)
                 continue
-            code = run_stage(step)
+            code = run_stage(step, paths)
             if code != 0:
                 failures.append(" ".join(step))
         if failures:
@@ -128,7 +128,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     started = time.monotonic()
     code = 1
     print(
-        f"{timestamp()} START mode={mode} pid={os.getpid()} ppid={os.getppid()} cwd={Path.cwd()} host={socket.gethostname()} project={REPO}",
+        f"{timestamp()} START mode={mode} pid={os.getpid()} ppid={os.getppid()} cwd={Path.cwd()} host={socket.gethostname()} project={Path.cwd()}",
         flush=True,
     )
     stamp = (
@@ -136,7 +136,12 @@ def main(argv: Sequence[str] | None = None) -> int:
         / "Library/Application Support/grounded-weather-forecast/last-maintenance"
     )
     try:
-        code = maintain(stamp, restore=restore)
+        paths = resolve_runtime()
+        code = maintain(stamp, restore=restore, paths=paths)
+        return code  # noqa: RET504 -- finally logs the actual exit status
+    except (RuntimePathError,) as exc:  # noqa: B013 -- project convention
+        print(f"configuration error: {exc}", flush=True)
+        code = 2
         return code  # noqa: RET504 -- finally logs the actual exit status
     finally:
         print(

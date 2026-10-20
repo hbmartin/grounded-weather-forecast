@@ -87,6 +87,7 @@ That works on day one. Everything else needs an archive with some history — se
 | `predict` | emit schema-6 JSON with rainfall budget conservation and release attribution only on finite values; `--method` bypasses automatic rain safeguards for experiments | `--out` `--method` `--no-history` `--semantics` `--now` |
 | `publish` | safely publish an automatic forecast, holding a matching ready document for up to six hours | `--out` `--semantics` `--recovery-methods` `--recovery-window` |
 | `recover` | recheck degradation, then rebuild live evidence and reports when recovery is still needed | `--semantics` `--methods` `--window` |
+| `hourly-predict-publish.py` (standalone launchd wrapper) | resolve projects and station data from the active checkout and existing configuration, then publish forecast and station documents together | `--station-project` |
 | `prune-scores` | delete superseded scores and recover inactive leased stages one at a time; preview with `--dry-run`; recovery guard-release errors retain partial counts, finish published-score retention, then return 1; unexpected recovery errors propagate | `--dry-run` |
 | `uv run --group profiling python scripts/profile_memory.py -- <command>` | capture a command's memory allocations and write a peak-memory HTML report | `--output-dir` `--trace-python-allocators` `--no-native` `--no-report` |
 | `uv run python scripts/benchmark_selection_memory.py` | compare full selection runs against a Git baseline in fresh processes | `--baseline` `--runs` `--evaluations` `--cases` |
