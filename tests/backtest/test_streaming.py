@@ -458,7 +458,7 @@ def test_cli_releases_all_products_before_next_product_and_promotion(
             "temp_max_c",
         ]
     )
-    assert cli._cmd_backtest(config, args) == 0
+    assert cli._cmd_backtest(config, args).exit_code == 0
     assert_released()
 
 
@@ -490,8 +490,9 @@ def test_cli_does_not_promote_failed_stream(tmp_path, monkeypatch):
             "temp_c",
         ]
     )
-    with pytest.raises(OSError, match="stream failed"):
-        cli._cmd_backtest(config, args)
+    result = cli._cmd_backtest(config, args)
+    assert result.exit_code == 1
+    assert result.error_detail == "OSError: stream failed"
     assert not promoted
 
 

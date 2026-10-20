@@ -657,6 +657,7 @@ def select_methods(
     *,
     semantics: Mapping[str, TruthSemantics] | None = None,
     dataset_id: str | None = None,
+    products: frozenset[str] | None = None,
 ) -> SelectionMap:
     """Select only live evidence compatible with this dataset and issue time."""
     if as_of is not None:
@@ -665,7 +666,14 @@ def select_methods(
     pinned = _pins(config)
     selections: dict[SliceKey, Selection] = {}
     scanned = _load_evidence(config, scores_dir, as_of, semantics, current_dataset)
-    slices = scanned.slices
+    slices = {
+        key: frame
+        for key, frame in scanned.slices.items()
+        if products is None or key[0] in products
+    }
+    carried, carried_evidence = _excluded_incumbents(
+        config, products, semantics, current_dataset
+    )
     incumbents = _incumbent_methods(config)
     candidates: dict[SliceKey, tuple[Selection, ...]] = {}
     references = union_references(config.promotion)
@@ -706,7 +714,7 @@ def select_methods(
             key, board, frame, config, current_dataset
         )
     if not selections:
-        return selections
+        return carried
     evidence = EvidenceSummary.from_contexts(
         scanned.contexts,
         scanned.cutoffs,
@@ -724,12 +732,73 @@ def select_methods(
             config, selections, evidence.contexts, candidates=candidates
         ),
     )
+    if carried:
+        selections = {**carried, **selections}
+        contexts = {
+            str(context["evaluation_id"]): context
+            for context in (*carried_evidence.contexts, *evidence.contexts)
+        }
+        cutoffs = [
+            cutoff
+            for cutoff in (evidence.training_cutoff, carried_evidence.training_cutoff)
+            if cutoff is not None
+        ]
+        evidence = EvidenceSummary(
+            tuple(sorted(contexts)),
+            tuple(contexts[key] for key in sorted(contexts)),
+            max(cutoffs, default=None),
+        )
     release = _make_release(config, selections, evidence, current_dataset)
     release.write(config.artifacts_dir / "releases")
     return {
         key: replace(selected, release_id=release.release_id)
         for key, selected in selections.items()
     }
+
+
+def _excluded_incumbents(
+    config: Config,
+    products: frozenset[str] | None,
+    semantics: Mapping[str, TruthSemantics] | None,
+    dataset: str,
+) -> tuple[dict[SliceKey, Selection], EvidenceSummary]:
+    """Carry excluded selections only from an already compatible release."""
+    empty = EvidenceSummary((), (), None)
+    if products is None:
+        return {}, empty
+    prior = _release_as_of(config, datetime.now(tz=UTC), semantics) or {}
+    carried = {
+        key: value
+        for key, value in prior.items()
+        if key[0] not in products and value.dataset_fingerprint == dataset
+    }
+    if not carried:
+        return {}, empty
+    ids = {selected.evaluation_id for selected in carried.values()}
+    release_ids = {selected.release_id for selected in carried.values()}
+    contexts: dict[str, dict[str, object]] = {}
+    cutoffs: list[datetime] = []
+    for raw in _compatible_releases(config, match_dataset=True):
+        if raw.get("release_id") not in release_ids:
+            continue
+        for evaluation_id, context in _contexts_by_evaluation_id(
+            raw.get("evaluation_contexts")
+        ).items():
+            if evaluation_id in ids:
+                contexts[evaluation_id] = dict(context)
+        with suppress(TypeError, ValueError):
+            cutoffs.append(datetime.fromisoformat(str(raw.get("training_cutoff"))))
+    # Legacy releases without attributed evidence remain readable but cannot
+    # manufacture the missing context required by a new immutable release.
+    carried = {
+        key: value for key, value in carried.items() if value.evaluation_id in contexts
+    }
+    used = {str(value.evaluation_id) for value in carried.values()}
+    return carried, EvidenceSummary(
+        tuple(sorted(used)),
+        tuple(contexts[key] for key in sorted(used)),
+        max(cutoffs, default=None),
+    )
 
 
 def _live_verification(config: Config, now: datetime) -> pl.DataFrame:

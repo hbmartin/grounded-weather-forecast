@@ -39,6 +39,8 @@ from launchd_paths import (
     RuntimePathError,
     RuntimePaths,
     resolve_publishing,
+    resolve_runtime,
+    working_directory,
 )
 
 HERE = Path.home() / "Library/Application Support/grounded-weather-forecast"
@@ -64,14 +66,7 @@ def run_predict(paths: RuntimePaths) -> int:
             [
                 "/usr/bin/time",
                 "-l",
-                paths.uv,
-                "--directory",
-                str(paths.project),
-                "run",
-                "--locked",
-                "--project",
-                str(paths.project),
-                "grounded-weather-forecast",
+                *paths.command("grounded-weather-forecast"),
                 "--config",
                 str(paths.config),
                 "predict",
@@ -135,16 +130,9 @@ def maybe_spawn_restore(paths: RuntimePaths) -> None:
         log.flush()
         process = subprocess.Popen(  # noqa: S603 - fixed uv binary and script
             [
-                paths.uv,
-                "--directory",
-                str(paths.project),
-                "run",
-                "--locked",
-                "--project",
-                str(paths.project),
-                "python",
-                str(HERE / "daily-maintenance.py"),
-                "--restore",
+                *paths.command(
+                    "python", str(HERE / "daily-maintenance.py"), "--restore"
+                ),
             ],
             stdout=log,
             stderr=log,
@@ -168,13 +156,13 @@ def render_station(paths: PublishingPaths) -> int:
         result = subprocess.run(  # noqa: S603 - fixed uv binary and script
             [
                 paths.uv,
+                "--directory",
+                str(paths.station_project),
                 "run",
                 "--project",
                 str(paths.station_project),
                 "python",
                 str(STATION_SCRIPT),
-                "--db",
-                str(paths.station_db),
                 "--out-dir",
                 str(STAGED),
             ],
@@ -188,10 +176,15 @@ def render_station(paths: PublishingPaths) -> int:
     return result.returncode
 
 
-def publish(paths: PublishingPaths) -> int:
+def publish(paths: RuntimePaths, station_project: Path | None = None) -> int:
     station_started = time.monotonic()
     print(f"{timestamp()} == station ==", flush=True)
-    station_code = render_station(paths)
+    try:
+        station_paths = resolve_publishing(station_project, runtime=paths)
+        station_code = render_station(station_paths)
+    except (RuntimePathError, OSError) as exc:
+        print(f"station configuration failed: {exc}", flush=True)
+        station_code = 2
     print(
         f"{timestamp()} == station exited {station_code} "
         f"duration_s={time.monotonic() - station_started:.1f} ==",
@@ -229,34 +222,46 @@ def publish(paths: PublishingPaths) -> int:
 
 
 def main(argv: Sequence[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(description=__doc__.split("\n", 1)[0])
-    parser.add_argument(
-        "--station-project",
-        type=Path,
-        help="collector project (default: validated sibling ambientweather2sqlite)",
-    )
-    args = parser.parse_args(argv)
     os.environ.setdefault("POLARS_MAX_THREADS", "2")
     os.environ.setdefault("PYTHONUNBUFFERED", "1")
     started = time.monotonic()
     code = 1
     print(
-        f"{timestamp()} START mode=predict pid={os.getpid()} ppid={os.getppid()} cwd={Path.cwd()} host={socket.gethostname()} project={Path.cwd()}",
+        f"{timestamp()} START mode=predict pid={os.getpid()} ppid={os.getppid()} cwd={working_directory()} host={socket.gethostname()}",
         flush=True,
     )
     try:
+        parser = argparse.ArgumentParser(
+            description="Hourly forecast and station publishing"
+        )
+        parser.add_argument(
+            "--station-project",
+            type=Path,
+            help="collector project (default: sibling ambientweather2sqlite)",
+        )
+        args = parser.parse_args(argv)
         # History paths must resolve from the project before invoking the CLI.
-        paths = resolve_publishing(args.station_project)
+        paths = resolve_runtime()
         os.chdir(paths.project)
-        print(f"{timestamp()} PROJECT_CWD cwd={Path.cwd()}", flush=True)
+        print(
+            f"{timestamp()} PROJECT_CWD cwd={paths.project} project={paths.project} forecast={paths.forecast}",
+            flush=True,
+        )
         sys.path.insert(0, str(HERE))
         if run_predict(paths) != 0:
             return 1
         maybe_spawn_restore(paths)
-        code = publish(paths)
+        code = publish(paths, args.station_project)
         return code  # noqa: RET504 -- finally logs the actual exit status
     except (RuntimePathError,) as exc:  # noqa: B013 -- project convention
         print(f"configuration error: {exc}", flush=True)
+        code = 2
+        return code  # noqa: RET504 -- finally logs the actual exit status
+    except (SystemExit,) as exc:  # noqa: B013 -- project convention
+        code = exc.code if isinstance(exc.code, int) else 1
+        return code  # noqa: RET504 -- finally logs the actual exit status
+    except (OSError, ImportError) as exc:
+        print(f"runtime configuration error: {exc}", flush=True)
         code = 2
         return code  # noqa: RET504 -- finally logs the actual exit status
     finally:

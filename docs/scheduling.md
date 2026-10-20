@@ -78,22 +78,22 @@ cp docs/launchd/{launchd_paths.py,daily-maintenance.py,hourly-predict-publish.py
   "$HOME/Library/Application Support/grounded-weather-forecast/"
 ```
 
-The project directory comes from the job's working directory, already selected
-by `uv --directory` in its LaunchAgent arguments. Both wrappers validate the
-active forecast project and `config.toml`, and find `uv` on `PATH`. Keep that
-managed launch configuration pointed at the intended runtime project when moving
-checkouts; the wrappers do not infer the runtime from a separately pinned source
-checkout or scan mounted disks.
+The project directory comes from the job's working directory, selected by
+`uv --directory`. Both wrappers validate the project identity and parse its TOML
+once; CLI children perform scientific validation. Prefer the existing `UV`
+executable, falling back to `PATH` only when unset. Invalid explicit executables
+fail with exit 2, and launcher symlinks remain intact for macOS permissions.
+Configuration and argument errors have START/END records, including stripped
+Python docstrings and unavailable working directories.
 
-The hourly wrapper validates the sibling `ambientweather2sqlite` project. For a
-different layout, append `--station-project /path/to/collector` to its invocation.
-It reads the existing forecast configuration's `station.db_path`, resolves
-relative paths against the forecast project, and passes the absolute database
-path explicitly to `publish_station.py --db`. Publisher source paths and state
-directories are derived from this runtime project and the user's application
-support directory. Missing or invalid configuration, projects, databases, or
-`uv` produce exit 2 before prediction, publication, or a success stamp. No volume
-names or personal database locations are embedded in the wrapper sources.
+The hourly wrapper predicts before discovering the sibling `ambientweather2sqlite`
+project. Use `--station-project /path/to/collector` for another layout. The station
+child uses the collector's working directory and environment, allowing its existing
+`aw2sqlite.toml` or home configuration to select the live database. It does not use
+the forecast evaluation `station.db_path`, which may be a static snapshot.
+Station-only failures reuse staged documents; without staged documents the wrapper
+refuses publication. Forecast runtime configuration errors still exit 2 before
+prediction. No volume or personal database defaults are embedded in the wrappers.
 
 The daily wrapper holds `maintenance-job.lock` across its child stages using
 a context manager, releasing it on early returns and exceptions. Concurrent
@@ -138,6 +138,17 @@ regenerate synthetic evidence where used. Run `build-dataset`, a fresh
 `backtest --source live`, and `report` under the updated code before rollout.
 Source implementation and PR delivery do not install the deployment.
 
+Backtest exit 3 covers valid short history and test truth still future at a
+hash-validated dataset snapshot time. Frozen snapshots retain their classification;
+stale archives are a separate health alarm. Legacy files without metadata remain
+scoreable but cannot receive the future-truth exemption. Rebuild to establish the
+clock. Completed products may promote independently while real errors determine
+the overall exit. Entirely inapplicable requests exit 2.
+
+Pending embedded stages are visible in the current report and deduplicated against
+completed parents. Failed stages are counted provisionally before parent recording;
+pending metadata cannot hide a real failure or exception.
+
 The daily wrapper treats only backtest exit 3 as expected pending evaluation.
 It continues diagnostics and returns 0 if all remaining required stages pass,
 but preserves `last-maintenance` until every requested, applicable evaluation
@@ -148,12 +159,14 @@ without claiming recovery completed.
 
 The wrapper-only `[maintenance].synthetic_backtest` setting defaults to `auto`:
 on UTC Sundays run when both configured hourly/daily synthetic matrices exist,
-skip explicitly when both are absent, and fail on partial, unreadable, or corrupt
-inputs. Set `required` on hosts where backfill availability is mandatory; set
+skip explicitly when both entries are absent in an accessible dataset directory,
+and fail on broken links, missing storage, partial, unreadable, or corrupt inputs. Set `required` on hosts where backfill availability is mandatory; set
 `off` to disable this scheduled evaluation. Invalid settings exit 2. Dataset paths
 come from the active project's configuration; relative paths resolve from that
 project. This scheduling setting does not change the scientific config fingerprint.
-Restore mode performs only live evaluation and leaves the success stamp untouched.
+Routine scheduling settings are validated after the lock is acquired and before
+the success-stamp check. Restore ignores synthetic settings, performs only live
+evaluation, and leaves the success stamp untouched.
 The hourly job's standalone `--restore` child returns 3 after diagnostics when
 evaluation is pending, retaining the incomplete recovery status.
 

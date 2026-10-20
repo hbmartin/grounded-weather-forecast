@@ -18,7 +18,7 @@ everything.
 |---|---|
 | `qc` and `build-dataset` work | a station DB and any forecast archive |
 | `predict` works | one provider forecast within the last 12 hours |
-| `backtest` produces folds | `initial_train_days + step_days` — **97 days by default** |
+| `backtest` produces folds | issue span greater than `initial_train_days` — **more than 90 days by default**, plus usable data |
 | Promotions start clearing the gate | more, and the exact amount depends on your slice sizes |
 
 Until then `predict` will run and emit a `degraded` forecast — an ungrounded
@@ -93,7 +93,7 @@ grounded-weather-forecast predict --now 2026-03-22T17:00:00
 
 `backtest` found nothing to test. Not a failure — the system being honest.
 Backtesting means "train on the past, test on the future, repeatedly", which
-needs history. With a 97-day requirement and a one-day-old archive there is
+needs history. With a more-than-90-day first-origin requirement and a one-day-old archive there is
 nothing to do.
 
 Start the cron, and optionally backfill so you can measure something today.

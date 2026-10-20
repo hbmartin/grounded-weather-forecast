@@ -92,6 +92,69 @@ def healthy_run(command="predict", minutes_ago=30, exit_code=0):
     }
 
 
+@pytest.mark.parametrize("parent", [None, "pending", "failed"])
+def test_pipeline_stage_counts_are_visible_before_parent_and_deduplicated(parent):
+    pending = {
+        **healthy_run("backtest", exit_code=3),
+        "run_id": "evaluation",
+        "record_kind": "stage",
+        "parent_run_id": "pipeline",
+        "failure_kind": "no_folds",
+    }
+    failed = {
+        **healthy_run("truth-qc", exit_code=1),
+        "run_id": "qc",
+        "record_kind": "stage",
+        "parent_run_id": "pipeline",
+    }
+    rows = [pending]
+    if parent != "pending":
+        rows.append(failed)
+    if parent:
+        rows.append(
+            {
+                **healthy_run("maintain", exit_code=int(parent == "failed")),
+                "run_id": "pipeline",
+                "record_kind": "invocation",
+                "failure_kind": "no_folds" if parent == "pending" else None,
+            }
+        )
+    assert operations._run_counts(runs_frame(rows), NOW) == (
+        0,
+        int(parent != "pending"),
+        1,
+    )
+
+
+def test_stage_exception_overrides_pending_and_legacy_parent_is_readable():
+    stage = {
+        **healthy_run("backtest", exit_code=3),
+        "run_id": "child",
+        "record_kind": "stage",
+        "parent_run_id": "parent",
+        "failure_kind": "no_folds",
+        "error": "OSError",
+    }
+    assert operations._run_counts(runs_frame([stage]), NOW) == (0, 1, 0)
+    legacy = {
+        **healthy_run("maintain", exit_code=1),
+        "run_id": "legacy",
+        "failure_kind": "no_folds",
+    }
+    assert operations._run_counts(runs_frame([legacy]), NOW) == (0, 0, 1)
+    misleading_parent = {
+        **healthy_run("maintain", exit_code=0),
+        "run_id": "parent",
+        "record_kind": "invocation",
+        "failure_kind": "no_folds",
+    }
+    assert operations._run_counts(runs_frame([stage, misleading_parent]), NOW) == (
+        0,
+        1,
+        0,
+    )
+
+
 class TestFreshness:
     def healthy_config(self, tmp_path):
         config = write_config(tmp_path, station_db="live_station.db")

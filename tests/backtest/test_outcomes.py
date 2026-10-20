@@ -75,16 +75,12 @@ def test_only_valid_short_history_is_pending(tmp_path, case):
     elif case != "missing":
         matrix.write_parquet(path)
     args = arguments()
+    result = cli._cmd_backtest(config, args)
+    assert result.exit_code == (EXIT_NO_FOLDS if case == "short" else 1)
+    assert result.failure_kind == ("no_folds" if case == "short" else None)
+    assert not hasattr(args, "_failure_kind")
     if case == "corrupt":
-        with pytest.raises((ValueError, pl.exceptions.PolarsError, TypeError)):
-            cli._cmd_backtest(config, args)
-    else:
-        assert cli._cmd_backtest(config, args) == (
-            EXIT_NO_FOLDS if case == "short" else 1
-        )
-    assert getattr(args, "_failure_kind", None) == (
-        "no_folds" if case == "short" else None
-    )
+        assert "Error" in result.error_detail
     if case == "short":
         files = list((config.dataset.dir / "scores").glob("scores_*.parquet"))
         assert len(files) == 1
@@ -101,13 +97,13 @@ def test_adequate_history_without_usable_folds_is_failure(tmp_path):
     )
     matrix.write_parquet(config.dataset.dir / "hourly_matrix_live.parquet")
     args = arguments()
-    assert cli._cmd_backtest(config, args) == 1
+    assert cli._cmd_backtest(config, args).exit_code == 1
     assert getattr(args, "_failure_kind", None) is None
 
 
 @pytest.mark.parametrize(
     ("last_status", "expected"),
-    [("insufficient_history", EXIT_NO_FOLDS), ("failed", 1), ("evaluated", 0)],
+    [("pending", EXIT_NO_FOLDS), ("failed", 1), ("evaluated", 0)],
 )
 def test_product_aggregation_preserves_partial_pending_and_errors(
     tmp_path, monkeypatch, last_status, expected
@@ -124,10 +120,9 @@ def test_product_aggregation_preserves_partial_pending_and_errors(
 
     monkeypatch.setattr(cli, "_run_matrix_backtest", run)
     args = arguments("--products", "hourly,daily")
-    assert cli._cmd_backtest(config, args) == expected
-    assert getattr(args, "_failure_kind", None) == (
-        "no_folds" if expected == EXIT_NO_FOLDS else None
-    )
+    result = cli._cmd_backtest(config, args)
+    assert result.exit_code == expected
+    assert result.failure_kind == ("no_folds" if expected == EXIT_NO_FOLDS else None)
 
 
 @pytest.mark.parametrize(
@@ -146,7 +141,10 @@ def test_unsupported_selection_is_not_pending(tmp_path, extra):
         config.dataset.dir / "hourly_matrix_live.parquet"
     )
     args = arguments(*extra)
-    assert cli._cmd_backtest(config, args) in (1, 2)
+    # The final selection is supported but its truth column is absent.
+    assert cli._cmd_backtest(config, args).exit_code == (
+        1 if extra[-1] == "seamless_regression" else 2
+    )
     assert getattr(args, "_failure_kind", None) is None
 
 
@@ -199,8 +197,9 @@ def test_daily_short_history_is_pending(tmp_path):
     )
     matrix.write_parquet(config.dataset.dir / "daily_matrix_live.parquet")
     args = arguments("--products", "daily", "--daily-variables", "temp_max_c")
-    assert cli._cmd_backtest(config, args) == EXIT_NO_FOLDS
-    assert args._failure_kind == "no_folds"
+    result = cli._cmd_backtest(config, args)
+    assert result.exit_code == EXIT_NO_FOLDS
+    assert result.failure_kind == "no_folds"
 
 
 def test_schedule_setting_does_not_change_scientific_identity(tmp_path):

@@ -878,13 +878,22 @@ def write_synthetic_matrix(
     )
     config.dataset.dir.mkdir(parents=True, exist_ok=True)
     path = matrix_path(config.dataset.dir, "hourly", SourceKind.SYNTHETIC.value)
-    matrix.write_parquet(path)
     daily_matrix = _synthetic_daily_matrix(matrix, daily_truth, config)
-    daily_matrix.write_parquet(
-        matrix_path(config.dataset.dir, "daily", SourceKind.SYNTHETIC.value)
-    )
-    synthetic_long.write_parquet(
-        config.dataset.dir / "forecasts_long_synthetic.parquet"
+    _publish_dataset(
+        {
+            "hourly_matrix": (path, matrix),
+            "daily_matrix": (
+                matrix_path(config.dataset.dir, "daily", SourceKind.SYNTHETIC.value),
+                daily_matrix,
+            ),
+            "forecasts_long": (
+                config.dataset.dir / "forecasts_long_synthetic.parquet",
+                synthetic_long,
+            ),
+        },
+        config.dataset.dir / "manifest_synthetic.json",
+        sources=matrix_sources(matrix),
+        snapshots=snapshots.height,
     )
     return path, matrix.height
 
