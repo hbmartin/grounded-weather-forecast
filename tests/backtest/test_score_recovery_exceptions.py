@@ -13,12 +13,17 @@ from typing import Never
 
 import polars as pl
 import pytest
-from conftest import write_config
+from conftest import synthetic_hourly_matrix, write_config
 from score_recovery_helpers import GuardFailureFactory, OrphanFactory
 
 from grounded_weather_forecast import cli, runs
 from grounded_weather_forecast.backtest import engine, scores
 from grounded_weather_forecast.backtest import score_storage as storage
+from grounded_weather_forecast.contracts import (
+    HOURLY_VARIABLES,
+    TruthSemantics,
+    truth_col,
+)
 from grounded_weather_forecast.reports import operations
 from grounded_weather_forecast.serve import selection
 from grounded_weather_forecast.storage import pipeline_lock
@@ -530,16 +535,26 @@ def test_cli_release_failure_is_handled_and_journaled(
     config = write_config(tmp_path)
     directory = config.dataset.dir / "scores"
     directory.mkdir(parents=True)
-    pl.DataFrame({"source_kind": ["live"]}).write_parquet(
-        config.dataset.dir / "hourly_matrix_live.parquet"
-    )
+    synthetic_hourly_matrix(days=1, max_lead=1).with_columns(
+        *(
+            pl.lit(1.0).alias(
+                truth_col(
+                    variable.name,
+                    TruthSemantics.INSTANTANEOUS
+                    if variable.has_dual_semantics
+                    else None,
+                )
+            )
+            for variable in HOURLY_VARIABLES
+        )
+    ).write_parquet(config.dataset.dir / "hourly_matrix_live.parquet")
     destination = directory / "scores_hourly_live_expanding_fixed.parquet"
     destination.write_bytes(b"original")
     if os.name != "nt":
         destination.chmod(0o640)
     closed, promoted, records = [], [], []
 
-    def produce(*_args):
+    def produce(*_args, **_kwargs):
         try:
             yield (
                 scores.empty_scores()

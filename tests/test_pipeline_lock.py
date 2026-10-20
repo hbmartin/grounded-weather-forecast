@@ -561,23 +561,84 @@ def test_maintain_stops_after_failed_step(tmp_path, monkeypatch, failed_stage):
     assert calls == (["build"] if failed_stage == "build" else ["build", "backtest"])
 
 
-def test_maintain_records_child_stages_and_marks_only_no_folds(tmp_path, monkeypatch):
+@pytest.mark.parametrize("failure", [None, "truth-qc", "report"])
+def test_maintain_records_pending_and_does_not_hide_later_failure(
+    tmp_path, monkeypatch, failure
+):
     config = write_config(tmp_path)
     monkeypatch.setattr(cli_module, "_cmd_build_dataset", lambda _config: 0)
 
     def no_folds(_config, args):
         vars(args)["_failure_kind"] = "no_folds"
-        return 1
+        return cli_module.EXIT_NO_FOLDS
 
     monkeypatch.setattr(cli_module, "_cmd_backtest", no_folds)
-    assert main(["--config", str(tmp_path / "config.toml"), "maintain"]) == 1
+    monkeypatch.setattr(
+        cli_module, "_cmd_truth_qc", lambda *_a: int(failure == "truth-qc")
+    )
+    monkeypatch.setattr(cli_module, "_cmd_report", lambda *_a: int(failure == "report"))
+    assert main(["--config", str(tmp_path / "config.toml"), "maintain"]) == int(
+        failure is not None
+    )
     rows = load_runs(runs_path(config))
     parent = rows.filter(pl.col("record_kind") == "invocation").row(0, named=True)
     children = rows.filter(pl.col("record_kind") == "stage")
-    assert children["command"].to_list() == ["build-dataset", "backtest"]
-    assert children["parent_run_id"].to_list() == [parent["run_id"]] * 2
-    assert parent["failure_kind"] == "no_folds"
-    assert children["failure_kind"].to_list() == [None, "no_folds"]
+    assert children["command"].to_list() == [
+        "build-dataset",
+        "backtest",
+        "truth-qc",
+        "report",
+    ]
+    assert children["parent_run_id"].to_list() == [parent["run_id"]] * 4
+    assert parent["failure_kind"] == ("no_folds" if failure is None else None)
+    assert children["failure_kind"].to_list() == [None, "no_folds", None, None]
+
+
+def test_recovery_remains_incomplete_with_pending_backtest(tmp_path, monkeypatch):
+    write_config(tmp_path)
+    monkeypatch.setattr(cli_module, "_recovery_needed", lambda *_a: True)
+    monkeypatch.setattr(cli_module, "_cmd_build_dataset", lambda *_a: 0)
+
+    def pending(_config, args):
+        args._failure_kind = "no_folds"
+        return cli_module.EXIT_NO_FOLDS
+
+    monkeypatch.setattr(cli_module, "_cmd_backtest", pending)
+
+    def unexpected(*_a):
+        pytest.fail("incomplete recovery was reported as finished")
+
+    monkeypatch.setattr(cli_module, "_cmd_report", unexpected)
+    assert (
+        main(["--config", str(tmp_path / "config.toml"), "recover"])
+        == cli_module.EXIT_NO_FOLDS
+    )
+
+
+def test_pending_maintenance_exception_is_not_a_pending_parent(tmp_path, monkeypatch):
+    config = write_config(tmp_path)
+    monkeypatch.setattr(cli_module, "_cmd_build_dataset", lambda *_a: 0)
+
+    def pending(_config, args):
+        args._failure_kind = "no_folds"
+        return cli_module.EXIT_NO_FOLDS
+
+    monkeypatch.setattr(cli_module, "_cmd_backtest", pending)
+    monkeypatch.setattr(cli_module, "_cmd_truth_qc", lambda *_a: 0)
+
+    def crash(*_a):
+        raise OSError("report fixture failed")
+
+    monkeypatch.setattr(cli_module, "_cmd_report", crash)
+    with pytest.raises(OSError, match="report fixture failed"):
+        main(["--config", str(tmp_path / "config.toml"), "maintain"])
+    parent = (
+        load_runs(runs_path(config))
+        .filter(pl.col("record_kind") == "invocation")
+        .row(0, named=True)
+    )
+    assert parent["error"] == "OSError"
+    assert parent["failure_kind"] is None
 
 
 def test_invalid_truth_qc_days_rejected_before_build(tmp_path, monkeypatch):

@@ -54,6 +54,7 @@ def pipeline_row(day, alarms=""):
         "collector_age_minutes": 20.0,
         "served_history_age_minutes": 40.0,
         "forecast_document_age_minutes": 40.0,
+        "pending_evaluations_24h": 0,
         "alarms": alarms,
     }
 

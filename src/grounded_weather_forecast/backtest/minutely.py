@@ -36,6 +36,7 @@ from typing import Protocol, Self
 import numpy as np
 import polars as pl
 
+from grounded_weather_forecast.backtest.outcomes import BacktestDiagnostics
 from grounded_weather_forecast.backtest.scores import (
     SCORES_SCHEMA,
     empty_scores,
@@ -390,6 +391,8 @@ def iter_minutely_scores(
     truth_grid: pl.DataFrame,
     request: MinutelyRequest,
     config: Config,
+    *,
+    diagnostics: BacktestDiagnostics | None = None,
 ) -> Generator[pl.DataFrame, None, None]:
     """Yield bounded categorical scores for the minutely path constructions."""
     if matrix.is_empty() or truth_grid.is_empty():
@@ -418,6 +421,8 @@ def iter_minutely_scores(
         config.backtest,
         request.window,
     )
+    if diagnostics is not None:
+        diagnostics.observe_clock(snapshots["issue_time"], config.backtest)
     hourly_known = hourly_truth_known_at(matrix)
     for fold in folds:
         test_issues = snapshots["issue_time"][fold.test_rows]

@@ -12,6 +12,7 @@ from dataclasses import dataclass
 
 import polars as pl
 
+from grounded_weather_forecast.backtest.outcomes import BacktestDiagnostics
 from grounded_weather_forecast.backtest.scores import (
     SCORES_SCHEMA,
     empty_scores,
@@ -83,6 +84,7 @@ def iter_backtest_scores(
     config: Config,
     *,
     factories: dict[str, BlenderFactory] | None = None,
+    diagnostics: BacktestDiagnostics | None = None,
 ) -> Generator[pl.DataFrame, None, None]:
     """Yield bounded categorical scores in fold/variable/method order.
 
@@ -115,6 +117,8 @@ def iter_backtest_scores(
     folds = fold_plans(
         matrix["issue_time"], truth_known, config.backtest, request.window
     )
+    if diagnostics is not None:
+        diagnostics.observe_clock(matrix["issue_time"], config.backtest)
     for fold in folds:
         train_frame = matrix[fold.train_rows]
         test_frame = matrix[fold.test_rows]

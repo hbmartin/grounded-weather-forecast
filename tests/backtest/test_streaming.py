@@ -392,10 +392,12 @@ def test_cli_releases_all_products_before_next_product_and_promotion(
     config = write_config(tmp_path)
     config.dataset.dir.mkdir()
     for product in ("hourly", "daily"):
-        pl.DataFrame({"source_kind": ["live"]}).write_parquet(
-            config.dataset.dir / f"{product}_matrix_live.parquet"
-        )
-    pl.DataFrame({"minute": [1]}).write_parquet(
+        synthetic_hourly_matrix(days=1, max_lead=1).with_columns(
+            pl.col("issue_time").dt.date().alias("forecast_date"),
+            pl.lit(1.0).alias("lead_days"),
+            pl.lit(20.0).alias("t__temp_max_c"),
+        ).write_parquet(config.dataset.dir / f"{product}_matrix_live.parquet")
+    pl.DataFrame({"temp_c": [20.0]}).write_parquet(
         config.dataset.dir / "truth_minute.parquet"
     )
     references = []
@@ -412,7 +414,7 @@ def test_cli_releases_all_products_before_next_product_and_promotion(
         references.append(weakref.ref(frame))
         return frame
 
-    def produce(_matrix, request, _config):
+    def produce(_matrix, request, _config, **_kwargs):
         product = "daily" if request.daily else "hourly"
         return stream_for(product)
 
@@ -439,11 +441,23 @@ def test_cli_releases_all_products_before_next_product_and_promotion(
     monkeypatch.setattr(pl, "read_parquet", read)
     monkeypatch.setattr(engine, "iter_backtest_scores", produce)
     monkeypatch.setattr(
-        minutely, "iter_minutely_scores", lambda *_args: stream_for("minutely")
+        minutely,
+        "iter_minutely_scores",
+        lambda *_args, **_kwargs: stream_for("minutely"),
     )
     monkeypatch.setattr(truth, "truth_minute_grid", lambda frame, _variables: frame)
     monkeypatch.setattr(selection, "select_methods", promote)
-    args = cli.build_parser().parse_args(["backtest", "--methods", "equal_weight"])
+    args = cli.build_parser().parse_args(
+        [
+            "backtest",
+            "--methods",
+            "equal_weight",
+            "--hourly-variables",
+            "temp_c",
+            "--daily-variables",
+            "temp_max_c",
+        ]
+    )
     assert cli._cmd_backtest(config, args) == 0
     assert_released()
 
@@ -452,12 +466,12 @@ def test_cli_does_not_promote_failed_stream(tmp_path, monkeypatch):
 
     config = write_config(tmp_path)
     config.dataset.dir.mkdir()
-    pl.DataFrame({"source_kind": ["live"]}).write_parquet(
+    synthetic_hourly_matrix(days=1, max_lead=1).write_parquet(
         config.dataset.dir / "hourly_matrix_live.parquet"
     )
     promoted = []
 
-    def fail(*_args):
+    def fail(*_args, **_kwargs):
         raise OSError("stream failed")
         yield  # pragma: no cover - make this a generator
 
@@ -466,7 +480,15 @@ def test_cli_does_not_promote_failed_stream(tmp_path, monkeypatch):
         selection, "select_methods", lambda *_args, **_kwargs: promoted.append(True)
     )
     args = cli.build_parser().parse_args(
-        ["backtest", "--products", "hourly", "--methods", "equal_weight"]
+        [
+            "backtest",
+            "--products",
+            "hourly",
+            "--methods",
+            "equal_weight",
+            "--hourly-variables",
+            "temp_c",
+        ]
     )
     with pytest.raises(OSError, match="stream failed"):
         cli._cmd_backtest(config, args)

@@ -30,6 +30,39 @@ from grounded_weather_forecast.runs import RUNS_SCHEMA
 NOW = utc(2026, 8, 7, 12)
 
 
+def test_pending_counts_do_not_exempt_errors_or_unexpected_codes():
+    rows = []
+    for index, (code, error) in enumerate(
+        [
+            (0, None),
+            (1, None),
+            (3, None),
+            (75, None),
+            (3, "OSError"),
+            (None, "RuntimeError"),
+        ]
+    ):
+        rows.append(
+            {
+                **healthy_run(command="backtest", minutes_ago=index),
+                "exit_code": code,
+                "error": error,
+                "failure_kind": "no_folds",
+            }
+        )
+    assert operations._run_counts(runs_frame(rows), NOW) == (0, 3, 3)
+
+
+def test_legacy_pipeline_ledger_has_unknown_pending_count(tmp_path):
+    path = tmp_path / "pipeline.parquet"
+    pl.DataFrame({"as_of_date": [NOW.date()], "failed_runs_24h": [1]}).write_parquet(
+        path
+    )
+    frame = load_ledger(path, PIPELINE_LEDGER.schema)
+    assert frame["pending_evaluations_24h"].to_list() == [None]
+    assert frame["failed_runs_24h"].to_list() == [1]
+
+
 def station_db(config, timestamps):
     connection = sqlite3.connect(config.station.db_path)
     try:
@@ -138,6 +171,7 @@ class TestFreshness:
         row, alarms = operations.freshness_row(config, frame, now=NOW)
         assert row["predict_runs_24h"] == 3
         assert row["failed_runs_24h"] == 1
+        assert row["pending_evaluations_24h"] == 1
         assert any("few predict runs (3/24h" in a for a in alarms)
         assert any("failed cli runs in 24h: 1" in a for a in alarms)
 

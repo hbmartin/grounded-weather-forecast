@@ -89,7 +89,9 @@ def _design(
     """
     values = _forward_filled(x, sources)
     with np.errstate(invalid="ignore"):
-        row_mean = np.nanmean(values, axis=1)
+        row_mean = (
+            np.nanmean(values, axis=1) if values.shape[1] else np.full(x.n_rows, np.nan)
+        )
     filled = np.where(np.isfinite(values), values, row_mean[:, np.newaxis])
     if observation_column in x.features.columns:
         observation = x.features[observation_column].cast(pl.Float64).to_numpy()
@@ -121,9 +123,6 @@ class SeamlessRegression:
             for source, seen in zip(train.x.sources, observed, strict=True)
             if seen
         )
-        if not self._sources:
-            self._fitted = None
-            return self
         design = _design(train.x, self._observation_column, self._sources)
         y = train.y
         usable = np.isfinite(design).all(axis=1) & np.isfinite(y)

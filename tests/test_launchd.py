@@ -6,10 +6,13 @@ import shutil
 import subprocess
 import sys
 import threading
+from datetime import UTC, datetime
 from pathlib import Path
 from unittest.mock import patch
 
 import pytest
+
+from grounded_weather_forecast.status import EXIT_NO_FOLDS
 
 SCRIPT = Path(__file__).parents[1] / "docs/launchd/daily-maintenance.py"
 
@@ -24,6 +27,9 @@ def project_layout(monkeypatch, tmp_path):
     (project / "config.toml").write_text(
         '[station]\ndb_path = "station data/observations.db"\n'
     )
+    (project / "data").mkdir()
+    for product in ("hourly", "daily"):
+        (project / "data" / f"{product}_matrix_synthetic.parquet").touch()
     database = project / "station data/observations.db"
     database.parent.mkdir()
     database.touch()
@@ -44,24 +50,46 @@ def project_layout(monkeypatch, tmp_path):
 
 
 def run_maintenance(
-    monkeypatch, tmp_path, *, failure=None, failure_code=-9, restore=False
+    monkeypatch,
+    tmp_path,
+    *,
+    failure=None,
+    failure_code=-9,
+    restore=False,
+    steps=None,
+    old_stamp=False,
+    failures=None,
+    sunday=False,
 ):
     directory = tmp_path / "Library/Application Support/grounded-weather-forecast"
     directory.mkdir(parents=True, exist_ok=True)
     commands = []
+    if old_stamp:
+        stamp = directory / "last-maintenance"
+        stamp.touch()
+        os.utime(stamp, (1, 1))
 
     def run(command, **_kwargs):
         commands.append(command)
-        step = command[command.index("--config") + 2]
-        return subprocess.CompletedProcess(
-            command, failure_code if step == failure else 0
-        )
+        argv = tuple(command[command.index("--config") + 2 :])
+        step = argv[0]
+        code = (failures or {}).get(argv, failure_code if step == failure else 0)
+        return subprocess.CompletedProcess(command, code)
 
     monkeypatch.setattr(Path, "home", lambda: tmp_path)
     monkeypatch.setattr(os, "chdir", lambda _: None)
     monkeypatch.setattr(subprocess, "run", run)
     with patch.dict(os.environ):
         module = load_script(SCRIPT)
+
+        class Clock:
+            @staticmethod
+            def now(_timezone):
+                return datetime(2026, 10, 18 if sunday else 19, tzinfo=UTC)
+
+        monkeypatch.setattr(module, "datetime", Clock)
+        if steps is not None:
+            monkeypatch.setattr(module, "maintenance_steps", lambda **_: steps)
         code = module.main(["--restore"] if restore else [])
     return code, commands, directory
 
@@ -296,37 +324,23 @@ def test_backtest_exit_one_fails_without_success_stamp(monkeypatch, tmp_path, ca
 
 
 @pytest.mark.parametrize("source", ["live", "synthetic"])
-@pytest.mark.parametrize("failure_code", [1, 2, -9])
+@pytest.mark.parametrize("failure_code", [1, 2, 75, -9])
 def test_backtest_failures_keep_previous_success_stamp(
     monkeypatch, tmp_path, capsys, source, failure_code
 ):
-    directory = tmp_path / "Library/Application Support/grounded-weather-forecast"
-    directory.mkdir(parents=True)
-    stamp = directory / "last-maintenance"
-    stamp.touch()
-    os.utime(stamp, (1, 1))
-    before = stamp.stat().st_mtime_ns
-    module = load_script(SCRIPT)
-    monkeypatch.setattr(Path, "home", lambda: tmp_path)
-    monkeypatch.setattr(os, "chdir", lambda _: None)
-    monkeypatch.setattr(
-        module,
-        "maintenance_steps",
-        lambda **_: [
+    code, _, directory = run_maintenance(
+        monkeypatch,
+        tmp_path,
+        old_stamp=True,
+        failures={("backtest", "--source", source): failure_code},
+        steps=[
             ["backtest", "--source", "live"],
             ["backtest", "--source", "synthetic"],
             ["report"],
         ],
     )
-
-    def run(command, **_kwargs):
-        failed = "--source" in command and command[-1] == source
-        return subprocess.CompletedProcess(command, failure_code if failed else 0)
-
-    monkeypatch.setattr(subprocess, "run", run)
-    with patch.dict(os.environ):
-        assert module.main([]) == 1
-    assert stamp.stat().st_mtime_ns == before
+    assert code == 1
+    assert (directory / "last-maintenance").stat().st_mtime_ns == 1_000_000_000
     output = capsys.readouterr().out
     assert f"maintenance failed stages: backtest --source {source}" in output
     assert "END mode=maintain" in output
@@ -363,6 +377,146 @@ def test_maintenance_stage_order_and_restore_scope(monkeypatch, sunday):
         ["report"],
         ["prune-scores"],
     ]
+
+
+@pytest.mark.parametrize("source", ["live", "synthetic"])
+@pytest.mark.parametrize("later_failure", [None, "report", "truth-qc"])
+def test_pending_evaluation_preserves_stamp_and_continues(
+    monkeypatch, tmp_path, source, later_failure, capsys
+):
+    failures = {("backtest", "--source", source): EXIT_NO_FOLDS}
+    if later_failure:
+        failures[(later_failure,)] = 1
+    code, commands, directory = run_maintenance(
+        monkeypatch,
+        tmp_path,
+        old_stamp=True,
+        failures=failures,
+        steps=[
+            ["backtest", "--source", "live"],
+            ["backtest", "--source", "synthetic"],
+            ["truth-qc"],
+            ["report"],
+            ["prune-scores"],
+        ],
+    )
+    assert code == int(later_failure is not None)
+    assert (directory / "last-maintenance").stat().st_mtime_ns == 1_000_000_000
+    assert any("report" in command for command in commands)
+    assert any("prune-scores" in command for command in commands) == (
+        later_failure != "report"
+    )
+    assert f"evaluation pending: backtest --source {source}" in capsys.readouterr().out
+
+
+def test_failed_report_with_arguments_blocks_pruning(monkeypatch, tmp_path):
+    code, commands, _ = run_maintenance(
+        monkeypatch,
+        tmp_path,
+        failures={("report", "--example-option"): 1},
+        steps=[["report", "--example-option"], ["prune-scores"]],
+    )
+    assert code == 1
+    assert not any("prune-scores" in command for command in commands)
+
+
+def test_pending_automatic_restore_stays_incomplete(monkeypatch, tmp_path):
+    code, commands, directory = run_maintenance(
+        monkeypatch,
+        tmp_path,
+        restore=True,
+        old_stamp=True,
+        failures={("backtest", "--source", "live"): EXIT_NO_FOLDS},
+    )
+    assert code == EXIT_NO_FOLDS
+    assert (directory / "last-maintenance").stat().st_mtime_ns == 1_000_000_000
+    assert any("report" in command for command in commands)
+    assert not any("synthetic" in command for command in commands)
+
+
+@pytest.mark.parametrize("mode", ["auto", "required", "off"])
+@pytest.mark.parametrize("present", [(), ("hourly",), ("hourly", "daily")])
+@pytest.mark.parametrize("sunday", [False, True])
+def test_synthetic_scheduling_modes(
+    monkeypatch, tmp_path, project_layout, mode, present, sunday, capsys
+):
+    dataset = project_layout / "custom dataset"
+    dataset.mkdir()
+    for product in present:
+        (dataset / f"{product}_matrix_synthetic.parquet").touch()
+    with (project_layout / "config.toml").open("a") as file:
+        file.write(
+            f'\n[dataset]\ndir = "custom dataset"\n[maintenance]\nsynthetic_backtest = "{mode}"\n'
+        )
+    code, commands, directory = run_maintenance(monkeypatch, tmp_path, sunday=sunday)
+    expected_failure = (
+        sunday
+        and mode != "off"
+        and len(present) != 2
+        and (mode == "required" or len(present) == 1)
+    )
+    assert code == int(expected_failure)
+    assert (directory / "last-maintenance").exists() == (not expected_failure)
+    synthetic = [command for command in commands if "synthetic" in command]
+    assert bool(synthetic) == (sunday and mode != "off" and len(present) == 2)
+    if sunday and mode == "auto" and not present:
+        assert "both matrices absent" in capsys.readouterr().out
+
+
+def test_synthetic_permission_fault_is_not_an_optional_skip(monkeypatch, tmp_path):
+    original = Path.stat
+
+    def denied(path, *args, **kwargs):
+        if path.name == "hourly_matrix_synthetic.parquet":
+            raise PermissionError("fixture denied")
+        return original(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "stat", denied)
+    code, commands, directory = run_maintenance(monkeypatch, tmp_path, sunday=True)
+    assert code == 1
+    assert not (directory / "last-maintenance").exists()
+    assert not any("synthetic" in command for command in commands)
+    assert any("report" in command for command in commands)
+
+
+@pytest.mark.parametrize("fresh_stamp", [False, True])
+def test_invalid_synthetic_setting_fails_configuration(
+    monkeypatch, tmp_path, project_layout, fresh_stamp
+):
+    with (project_layout / "config.toml").open("a") as file:
+        file.write('\n[maintenance]\nsynthetic_backtest = "sometimes"\n')
+    stamp = (
+        tmp_path
+        / "Library/Application Support/grounded-weather-forecast/last-maintenance"
+    )
+    if fresh_stamp:
+        stamp.parent.mkdir(parents=True)
+        stamp.touch()
+        before = stamp.stat().st_mtime_ns
+    code, commands, directory = run_maintenance(monkeypatch, tmp_path)
+    assert code == 2
+    assert commands == []
+    assert (directory / "last-maintenance").exists() == fresh_stamp
+    if fresh_stamp:
+        assert stamp.stat().st_mtime_ns == before
+
+
+@pytest.mark.parametrize("source", ["live", "synthetic"])
+def test_exit_and_crash_lines_include_source(monkeypatch, source, capsys):
+    module = load_script(SCRIPT)
+    paths = module.resolve_runtime()
+    monkeypatch.setattr(
+        subprocess, "run", lambda *_a, **_k: subprocess.CompletedProcess([], 1)
+    )
+    assert module.run_stage(["backtest", "--source", source], paths) == 1
+    assert f"backtest --source {source} exited 1" in capsys.readouterr().out
+
+    def fail(*_a, **_k):
+        raise OSError("fixture crash")
+
+    monkeypatch.setattr(subprocess, "run", fail)
+    assert module.run_stage(["backtest", "--source", source], paths) == 70
+    assert f"backtest --source {source} crashed" in capsys.readouterr().out
 
 
 def test_publishing_uses_active_project_and_configured_database(project_layout):

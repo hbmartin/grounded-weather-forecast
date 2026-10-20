@@ -12,13 +12,14 @@ Runs daily at 06:30. Missed days require a manual launchctl kickstart. A stamp
 file prevents a manual catch-up from re-running within 20 hours of the last
 successful maintenance.
 
-Every nonzero stage exit fails maintenance, including a backtest that cannot
-produce folds. Failed runs never advance the successful-maintenance stamp.
+Insufficient-history backtests remain pending while diagnostics continue.
+Pending evaluations and failed runs never advance the success stamp.
 """
 
 import fcntl
 import os
 import socket
+import stat
 import subprocess
 import sys
 import time
@@ -26,7 +27,9 @@ from collections.abc import Sequence
 from datetime import UTC, datetime
 from pathlib import Path
 
-from launchd_paths import RuntimePathError, RuntimePaths, resolve_runtime
+from launchd_paths import RuntimePathError, RuntimePaths, read_toml, resolve_runtime
+
+from grounded_weather_forecast.status import EXIT_NO_FOLDS
 
 MIN_INTERVAL_S = 20 * 3600
 
@@ -44,9 +47,54 @@ def maintenance_steps(*, restore: bool) -> list[list[str]]:
     return steps
 
 
+def synthetic_mode(paths: RuntimePaths) -> tuple[str, Path]:
+    raw = read_toml(paths.config)
+    maintenance = raw.get("maintenance", {})
+    dataset = raw.get("dataset", {})
+    if not isinstance(maintenance, dict) or not isinstance(dataset, dict):
+        raise RuntimePathError("maintenance and dataset must be TOML tables")
+    mode = maintenance.get("synthetic_backtest", "auto")
+    directory = dataset.get("dir", "data")
+    if mode not in ("auto", "required", "off"):
+        raise RuntimePathError(
+            "maintenance.synthetic_backtest must be auto, required or off"
+        )
+    if not isinstance(directory, str) or not directory.strip():
+        raise RuntimePathError("dataset.dir must be a nonempty path")
+    return mode, paths.project / directory
+
+
+def synthetic_enabled(mode: str, directory: Path) -> bool:
+    if mode == "off":
+        print("synthetic backtest skipped: scheduling is off", flush=True)
+        return False
+    present = []
+    for product in ("hourly", "daily"):
+        path = directory / f"{product}_matrix_synthetic.parquet"
+        try:
+            info = path.stat()
+        except (FileNotFoundError,):
+            present.append(False)
+            continue
+        if not stat.S_ISREG(info.st_mode):
+            raise OSError(f"synthetic matrix is not a regular file: {path}")
+        present.append(True)
+    if mode == "auto" and not any(present):
+        print(
+            "synthetic backtest skipped: no backfill configured (both matrices absent)",
+            flush=True,
+        )
+        return False
+    if not all(present):
+        raise OSError(
+            f"synthetic backtest requires both hourly and daily matrices in {directory}"
+        )
+    return True
+
+
 def run_stage(step: list[str], paths: RuntimePaths) -> int:
     started = time.monotonic()
-    name = step[0]
+    name = " ".join(step)
     print(f"{timestamp()} == {' '.join(step)} ==", flush=True)
     try:
         # Fresh interpreters release native allocator arenas between stages.
@@ -83,6 +131,7 @@ def run_stage(step: list[str], paths: RuntimePaths) -> int:
 
 
 def maintain(stamp: Path, *, restore: bool, paths: RuntimePaths) -> int:
+    mode, dataset_dir = synthetic_mode(paths)
     # Only actual maintenance owns this lock; readers never probe it exclusively.
     with stamp.with_name("maintenance-job.lock").open("a") as job_lock:
         try:
@@ -103,19 +152,45 @@ def maintain(stamp: Path, *, restore: bool, paths: RuntimePaths) -> int:
         os.chdir(paths.project)
         print(f"{timestamp()} PROJECT_CWD cwd={Path.cwd()}", flush=True)
         failures: list[str] = []
+        failed_stages: set[str] = set()
+        pending: list[str] = []
         for step in maintenance_steps(restore=restore):
             name = step[0]
+            label = " ".join(step)
+            if step == ["backtest", "--source", "synthetic"]:
+                try:
+                    if not synthetic_enabled(mode, dataset_dir):
+                        continue
+                except (OSError,) as exc:
+                    print(f"{label} failed: {exc}", flush=True)
+                    failures.append(label)
+                    failed_stages.add(name)
+                    continue
             # Do not prune against a catalog that report failed to refresh.
-            if name == "prune-scores" and "report" in failures:
+            if name == "prune-scores" and "report" in failed_stages:
                 print("== prune-scores skipped: report failed this run ==", flush=True)
                 continue
             code = run_stage(step, paths)
+            if name == "backtest" and code == EXIT_NO_FOLDS:
+                pending.append(label)
+                print(
+                    f"evaluation pending: {label}; continuing diagnostics", flush=True
+                )
+                continue
             if code != 0:
-                failures.append(" ".join(step))
+                failures.append(label)
+                failed_stages.add(name)
         if failures:
             print(f"maintenance failed stages: {', '.join(failures)}", flush=True)
             return 1
-        if not restore:
+        if pending:
+            print(
+                f"maintenance pending evaluations: {', '.join(pending)}; success stamp unchanged",
+                flush=True,
+            )
+            if restore:
+                return EXIT_NO_FOLDS
+        elif not restore:
             stamp.touch()
         return 0
 

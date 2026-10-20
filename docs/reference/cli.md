@@ -37,8 +37,9 @@ unrelated child stages.
 | Code | Meaning |
 |---|---|
 | `0` | success |
-| `1` | command-level failure — missing inputs, no backtest folds, no scores to report, a backfill error, directory-guard release failure during score recovery or an uncommitted score write, or reuse of a directory whose guard release failed; `prune-scores` finishes retention before returning 1 for a recovery release failure |
+| `1` | command-level failure — missing or unusable inputs, no evaluable scores despite adequate history, no scores to report, a backfill error, directory-guard release failure during score recovery or an uncommitted score write, or reuse of a directory whose guard release failed; `prune-scores` finishes retention before returning 1 for a recovery release failure |
 | `2` | configuration error, or an unknown command |
+| `3` | evaluation pending: validated, applicable inputs cannot yet reach the first test origin; also returned for partial product completion while any applicable requested product is pending |
 | `75` | pipeline, dataset-publication, score-directory, or automatic-recovery lock contention (EX_TEMPFAIL — retry later) |
 
 Note that `truth-qc` returns `0` even when it finds no evaluable checks. A cold
@@ -345,10 +346,31 @@ its native allocator memory before report generation. The prediction wrapper
 uses the same process boundary. Both wrappers limit Polars to two threads and
 record `/usr/bin/time -l` peak memory and child exit status. A maintenance job
 lock prevents duplicate wrappers and concurrent automatic restore attempts.
-Every nonzero stage exit fails daily maintenance, including exit 1 from a live
-or synthetic backtest. The wrapper logs the failed stages and preserves the
-previous `last-maintenance` timestamp; an exit code alone never identifies a
-harmless no-fold result.
+Backtest exit 3 leaves evaluation pending while daily maintenance and CLI
+`maintain` continue diagnostics. They return 0 if all remaining required work
+passes. The daily wrapper preserves `last-maintenance` whenever any applicable
+live or scheduled synthetic evaluation is pending. All other nonzero child exits
+remain failures; a later real failure overrides pending metadata. The wrapper
+logs complete stage commands and skips pruning after any report failure,
+including a report command with arguments.
+
+Only a validated, nonempty input with applicable targets/methods and an issue-time
+span too short for the first test origin receives `failure_kind="no_folds"`.
+Empty matrices, unavailable truth, invalid schema, unsupported selections, and
+zero scores despite adequate history remain errors. Valid pending evaluations
+still write empty score files for diagnostic reporting. Pending evaluations appear
+separately as `pending_evaluations_24h` in pipeline health; older ledger rows have
+an unknown (null) count. Recorded exceptions always count as failures.
+
+The daily wrapper reads `[maintenance].synthetic_backtest` from the active
+configuration: `auto` (default), `required`, or `off`. On UTC Sundays, `auto`
+runs synthetic evaluation when both hourly and daily matrices exist and skips
+when both are absent. Partial or unreadable inputs fail. `required` also fails
+when both are absent; `off` skips. Corrupt files fail in the backtest child.
+Restore mode remains live-only and never updates the maintenance stamp. Unlike
+routine maintenance, standalone `--restore` returns 3 after diagnostics if live
+evaluation is pending. CLI `recover` stops at that pending result and returns 3;
+neither claims restoration completed.
 
 The standalone wrappers resolve the forecast project from their working directory
 (set by launchd's `uv --directory` argument), validate its `pyproject.toml` and

@@ -69,7 +69,14 @@ def _freshness_panel(ctx: DashboardContext) -> Panel:
         )
     newest = pipeline.sort("as_of_date").tail(1).row(0, named=True)
     alarms = str(newest["alarms"] or "")
-    stats = []
+    pending = newest.get("pending_evaluations_24h")
+    stats = [
+        Stat(
+            label="pending evaluations (24h)",
+            value="—" if pending is None else str(pending),
+            status="info" if pending is None or pending else "ok",
+        )
+    ]
     for column, label in _AGE_LABELS.items():
         age = newest[column]
         limit = FRESHNESS_THRESHOLDS[column]
