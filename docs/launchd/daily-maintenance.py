@@ -12,8 +12,8 @@ Runs daily at 06:30. Missed days require a manual launchctl kickstart. A stamp
 file prevents a manual catch-up from re-running within 20 hours of the last
 successful maintenance.
 
-A backtest exit of 1 means "no folds yet" and is tolerated so the job stays
-green while the archive matures.
+Every nonzero stage exit fails maintenance, including a backtest that cannot
+produce folds. Failed runs never advance the successful-maintenance stamp.
 """
 
 import fcntl
@@ -26,7 +26,7 @@ from collections.abc import Sequence
 from datetime import UTC, datetime
 from pathlib import Path
 
-REPO = "/Volumes/ExtStor/weather/grounded-weather-forecast"
+REPO = "/Volumes/Pro2T/weather/grounded-weather-forecast"
 UV = "/opt/homebrew/bin/uv"
 MIN_INTERVAL_S = 20 * 3600
 
@@ -110,9 +110,10 @@ def maintain(stamp: Path, *, restore: bool) -> int:
                 print("== prune-scores skipped: report failed this run ==", flush=True)
                 continue
             code = run_stage(step)
-            if code != 0 and not (name == "backtest" and code == 1):
-                failures.append(name)
+            if code != 0:
+                failures.append(" ".join(step))
         if failures:
+            print(f"maintenance failed stages: {', '.join(failures)}", flush=True)
             return 1
         if not restore:
             stamp.touch()

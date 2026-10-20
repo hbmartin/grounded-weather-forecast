@@ -50,7 +50,7 @@ def _forward_filled(
     sources = sources if sources is not None else x.sources
     indices = [x.sources.index(source) for source in sources]
     values = x.values[:, indices]
-    if "issue_time" not in x.features.columns:
+    if not sources or "issue_time" not in x.features.columns:
         return values
     frame = pl.DataFrame(
         {
@@ -121,6 +121,9 @@ class SeamlessRegression:
             for source, seen in zip(train.x.sources, observed, strict=True)
             if seen
         )
+        if not self._sources:
+            self._fitted = None
+            return self
         design = _design(train.x, self._observation_column, self._sources)
         y = train.y
         usable = np.isfinite(design).all(axis=1) & np.isfinite(y)

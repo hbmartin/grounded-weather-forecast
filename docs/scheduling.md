@@ -112,6 +112,13 @@ regenerate synthetic evidence where used. Run `build-dataset`, a fresh
 `backtest --source live`, and `report` under the updated code before rollout.
 Source implementation and PR delivery do not install the deployment.
 
+Every nonzero child exit makes the installed daily wrapper fail and leaves
+`last-maintenance` unchanged, including exit 1 from either live or synthetic
+backtesting. Exit 1 can indicate missing inputs, no folds, or an uncaught
+exception; the wrapper never assumes it is a harmless cold start. It logs the
+failed stages, continues to refresh diagnostics, and skips pruning when report
+fails. Inspect the stage output for the underlying reason.
+
 ## Profiling a scheduled run
 
 The optional Memray wrapper records allocations from the start of a command,
@@ -158,8 +165,10 @@ exit behavior, and later analysis commands.
   was absent; `MOUNT_OK` followed by a `uv` error means the volume was present
   but project access or environment setup failed. Application output follows
   `INVOKE`; use `launchctl print` for the final exit status.
-- A degraded `publish` candidate and `maintain` finding no folds are **normal**
-  early states. The candidate names its cause in `status_reason`; `publish`
+- A degraded `publish` candidate and a backtest finding no folds can occur
+  during a cold start. A no-fold backtest exits nonzero, so the daily wrapper
+  reports incomplete maintenance and does not advance its success stamp.
+  The candidate names its cause in `status_reason`; `publish`
   preserves a matching ready document issued within six hours byte-for-byte, or publishes
   and archives the degraded candidate on a cold start so an output still exists.
 - launchd `StartCalendarInterval` fires in **local time**; the 6-hourly

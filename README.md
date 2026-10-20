@@ -145,6 +145,8 @@ Steady state is four crons — poll, ingest ensembles, `publish`, and nightly
 `maintain`. Cadence rationale and
 launchd templates are in
 [Scheduling](https://hbmartin.github.io/grounded-weather-forecast/scheduling/).
+The daily wrapper treats every nonzero stage exit, including live or synthetic
+backtest exit 1, as failed maintenance and preserves its previous success stamp.
 
 ## Status
 

@@ -251,13 +251,54 @@ def test_hourly_failed_predict_stops_restore_and_publish(monkeypatch, capsys):
     assert "exit=1" in capsys.readouterr().out
 
 
-def test_backtest_without_folds_remains_successful_and_prunes(monkeypatch, tmp_path):
+def test_backtest_exit_one_fails_without_success_stamp(monkeypatch, tmp_path, capsys):
     code, commands, directory = run_maintenance(
         monkeypatch, tmp_path, failure="backtest", failure_code=1
     )
-    assert code == 0
-    assert (directory / "last-maintenance").exists()
+    assert code == 1
+    assert not (directory / "last-maintenance").exists()
     assert any("prune-scores" in command for command in commands)
+    output = capsys.readouterr().out
+    assert "maintenance failed stages: backtest --source live" in output
+    assert "exit=1" in output
+
+
+@pytest.mark.parametrize("source", ["live", "synthetic"])
+@pytest.mark.parametrize("failure_code", [1, 2, -9])
+def test_backtest_failures_keep_previous_success_stamp(
+    monkeypatch, tmp_path, capsys, source, failure_code
+):
+    directory = tmp_path / "Library/Application Support/grounded-weather-forecast"
+    directory.mkdir(parents=True)
+    stamp = directory / "last-maintenance"
+    stamp.touch()
+    os.utime(stamp, (1, 1))
+    before = stamp.stat().st_mtime_ns
+    module = load_script(SCRIPT)
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    monkeypatch.setattr(os, "chdir", lambda _: None)
+    monkeypatch.setattr(
+        module,
+        "maintenance_steps",
+        lambda **_: [
+            ["backtest", "--source", "live"],
+            ["backtest", "--source", "synthetic"],
+            ["report"],
+        ],
+    )
+
+    def run(command, **_kwargs):
+        failed = "--source" in command and command[-1] == source
+        return subprocess.CompletedProcess(command, failure_code if failed else 0)
+
+    monkeypatch.setattr(subprocess, "run", run)
+    with patch.dict(os.environ):
+        assert module.main([]) == 1
+    assert stamp.stat().st_mtime_ns == before
+    output = capsys.readouterr().out
+    assert f"maintenance failed stages: backtest --source {source}" in output
+    assert "END mode=maintain" in output
+    assert "exit=1" in output
 
 
 @pytest.mark.parametrize("sunday", [False, True])

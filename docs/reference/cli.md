@@ -37,7 +37,7 @@ unrelated child stages.
 | Code | Meaning |
 |---|---|
 | `0` | success |
-| `1` | command-level failure — missing inputs, no scores to report, a backfill error, directory-guard release failure during score recovery or an uncommitted score write, or reuse of a directory whose guard release failed; `prune-scores` finishes retention before returning 1 for a recovery release failure |
+| `1` | command-level failure — missing inputs, no backtest folds, no scores to report, a backfill error, directory-guard release failure during score recovery or an uncommitted score write, or reuse of a directory whose guard release failed; `prune-scores` finishes retention before returning 1 for a recovery release failure |
 | `2` | configuration error, or an unknown command |
 | `75` | pipeline, dataset-publication, score-directory, or automatic-recovery lock contention (EX_TEMPFAIL — retry later) |
 
@@ -345,6 +345,10 @@ its native allocator memory before report generation. The prediction wrapper
 uses the same process boundary. Both wrappers limit Polars to two threads and
 record `/usr/bin/time -l` peak memory and child exit status. A maintenance job
 lock prevents duplicate wrappers and concurrent automatic restore attempts.
+Every nonzero stage exit fails daily maintenance, including exit 1 from a live
+or synthetic backtest. The wrapper logs the failed stages and preserves the
+previous `last-maintenance` timestamp; an exit code alone never identifies a
+harmless no-fold result.
 
 > rolling-origin backtest over the supervised matrices
 
