@@ -330,10 +330,14 @@ build_snapshot(config, now)          # the same as-of code the dataset build use
   -> append to predict_history.parquet
 ```
 
-`serve/selection.py` reads only live Evaluation Runs compatible with the current
-dataset and requested issue time, then promotes the common-case, significance-aware
-per-slice winners into a Model Release. Config pins override. A slice with no
-compatible evidence uses the fit-free `equal_weight` fallback, marks the document
+Live backtests elect common-case, significance-aware per-slice winners and write
+approved Model Releases. Current prediction reads those decisions without
+re-election or release creation. Compatible rebuilds preserve choices across
+dataset fingerprints while retaining original evaluation provenance; code,
+configuration, product source set, feature schema, and truth semantics must match.
+Historical reconstruction additionally requires its exact dataset and release
+availability at issuance. Config pins override. A slice with no compatible
+approval uses the fit-free `equal_weight` fallback, marks the document
 `degraded`, and records the reason. Promoted releases are the serving boundary —
 evaluation evidence can never become a production decision by accident
 ([ADR 0005](adr/0005-promoted-model-releases-are-the-serving-boundary.md)).

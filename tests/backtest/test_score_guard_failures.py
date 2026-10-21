@@ -66,11 +66,11 @@ def test_committed_guard_failure_warns_then_rejects_next_product(
 
     def promote(*_args: object, **_kwargs: object) -> dict[str, object]:
         promoted.append(True)
-        return {}
+        return selection.PromotionResult({})
 
     monkeypatch.setattr(storage.FileLock, "release", fail_release)
     monkeypatch.setattr(cli, "_run_matrix_backtest", write)
-    monkeypatch.setattr(selection, "select_methods", promote)
+    monkeypatch.setattr(selection, "promote_methods", promote)
     monkeypatch.setattr(
         runs, "append_run", lambda record, _path: records.append(record)
     )
@@ -360,3 +360,72 @@ def test_teardown_attempts_all_guards_after_failure(tmp_path: Path) -> None:
         assert str(caught.value.exceptions[0]) == "teardown fixture"
     finally:
         release_guards(guards, storage.FileLock.release)
+
+
+def test_secondary_unlock_failure_on_last_product_suppresses_promotion(
+    tmp_path, monkeypatch
+):
+    config = write_config(tmp_path)
+    original_publish = storage.publish_parquet
+    original_release = storage.FileLock.release
+    held = []
+    failing = False
+    promoted = []
+    records = []
+
+    def publish(staged, path):
+        nonlocal failing
+        if "daily" in path.name:
+            failing = True
+            raise OSError("primary publication failure")
+        original_publish(staged, path)
+
+    def release(self, *, force=False):
+        if (
+            failing
+            and Path(self.lock_file).name == storage.SCORE_WRITE_LOCK
+            and self.is_locked
+        ):
+            held.append(self)
+            raise OSError("secondary unlock failure")
+        original_release(self, force=force)
+
+    def product(config, args, name, methods):
+        with storage.score_parquet_destination(
+            config.dataset.dir / "scores" / f"scores_{name}.parquet"
+        ) as staged:
+            staged.write_bytes(b"fixture")
+        return ProductBacktestOutcome(name, "evaluated", 1)
+
+    monkeypatch.setattr(storage, "publish_parquet", publish)
+    monkeypatch.setattr(storage.FileLock, "release", release)
+    monkeypatch.setattr(cli, "_run_matrix_backtest", product)
+    monkeypatch.setattr(
+        selection, "promote_methods", lambda *_a, **_k: promoted.append(True)
+    )
+    monkeypatch.setattr(
+        runs, "append_run", lambda record, _path: records.append(record)
+    )
+    try:
+        assert (
+            cli.main(
+                [
+                    "--config",
+                    str(tmp_path / "config.toml"),
+                    "backtest",
+                    "--products",
+                    "hourly,daily",
+                    "--methods",
+                    "equal_weight",
+                ]
+            )
+            == 1
+        )
+        assert not promoted
+        assert records[-1].failure_kind == "score_coordination_release"
+        assert "primary publication failure" in records[-1].error_detail
+        assert "secondary unlock failure" in records[-1].error_detail
+        with pipeline_lock(config.dataset.dir, timeout=0):
+            pass
+    finally:
+        release_guards(held, original_release)

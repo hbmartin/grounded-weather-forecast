@@ -1521,6 +1521,8 @@ def predict(
     ),
     force_method: str | None = None,
     dataset_snapshot: LiveDatasetSnapshot | None = None,
+    *,
+    approved_release_loaded: bool = False,
 ) -> Forecast:
     """Assemble the whole forecast document for one issue time."""
     issue_time = (now or datetime.now(tz=UTC)).replace(second=0, microsecond=0)
@@ -1614,6 +1616,7 @@ def predict(
             if dataset_snapshot is not None
             else None,
             fit_failures=fit_diagnostics.failures,
+            approved_selections=approved_release_loaded and bool(selections),
         )
         if degraded
         else None

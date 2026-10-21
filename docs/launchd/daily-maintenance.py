@@ -145,9 +145,12 @@ def run_stage(step: list[str], paths: RuntimePaths) -> int:
 
 
 def maintain(stamp: Path, *, restore: bool, paths: RuntimePaths) -> int:
-    from grounded_weather_forecast.status import (  # noqa: PLC0415 -- guarded startup
-        EXIT_NO_FOLDS,
-    )
+    try:
+        from grounded_weather_forecast.status import (  # noqa: PLC0415 -- guarded startup
+            EXIT_NO_FOLDS,
+        )
+    except (ImportError,) as exc:  # noqa: B013 -- project convention
+        raise RuntimePathError(f"maintenance runtime unavailable: {exc}") from exc
 
     # Only actual maintenance owns this lock; readers never probe it exclusively.
     with stamp.with_name("maintenance-job.lock").open("a") as job_lock:
@@ -156,7 +159,12 @@ def maintain(stamp: Path, *, restore: bool, paths: RuntimePaths) -> int:
         except (BlockingIOError,):  # noqa: B013 -- project convention
             print("another maintenance job is running; skipping duplicate", flush=True)
             return 0
-        mode, dataset_dir = ("off", paths.project) if restore else synthetic_mode(paths)
+        try:
+            mode, dataset_dir = (
+                ("off", paths.project) if restore else synthetic_mode(paths)
+            )
+        except (ImportError, ValueError) as exc:
+            raise RuntimePathError(f"invalid maintenance configuration: {exc}") from exc
         if (
             not restore
             and stamp.exists()
@@ -179,7 +187,7 @@ def maintain(stamp: Path, *, restore: bool, paths: RuntimePaths) -> int:
                 try:
                     if not synthetic_enabled(mode, dataset_dir):
                         continue
-                except (OSError,) as exc:  # noqa: B013 -- project convention
+                except (OSError, ImportError, ValueError) as exc:
                     print(f"{label} failed: {exc}", flush=True)
                     failures.append(label)
                     failed_stages.add(name)
@@ -241,9 +249,13 @@ def main(argv: Sequence[str] | None = None) -> int:
         )
         code = maintain(stamp, restore=args.restore, paths=paths)
         return code  # noqa: RET504 -- finally logs the actual exit status
-    except (ValueError, OSError, ImportError) as exc:
+    except (RuntimePathError,) as exc:  # noqa: B013 -- project convention
         print(f"configuration error: {exc}", flush=True)
         code = 2
+        return code  # noqa: RET504 -- finally logs the actual exit status
+    except (ValueError, OSError, ImportError) as exc:
+        print(f"maintenance failed: {exc}", flush=True)
+        code = 1
         return code  # noqa: RET504 -- finally logs the actual exit status
     except (SystemExit,) as exc:  # noqa: B013 -- project convention
         code = exc.code if isinstance(exc.code, int) else 1

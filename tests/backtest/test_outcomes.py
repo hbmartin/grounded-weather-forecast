@@ -109,7 +109,9 @@ def test_product_aggregation_preserves_partial_pending_and_errors(
     tmp_path, monkeypatch, last_status, expected
 ):
     config = write_config(tmp_path)
-    monkeypatch.setattr(selection, "select_methods", lambda *_a, **_k: {})
+    monkeypatch.setattr(
+        selection, "promote_methods", lambda *_a, **_k: selection.PromotionResult({})
+    )
 
     def run(_config, _args, product, _methods):
         if product == "hourly":

@@ -112,7 +112,13 @@ def test_selection_and_fitting_run_after_dataset_lock_is_released(
         assert kwargs["dataset_snapshot"].fingerprint == "pinned"
         return "document"
 
-    monkeypatch.setattr(selection_module, "select_methods", select)
+    monkeypatch.setattr(selection_module, "load_approved_selections", select)
+
+    def forbidden(*_args, **_kwargs):
+        pytest.fail("prediction attempted method election")
+
+    monkeypatch.setattr(selection_module, "promote_methods", forbidden)
+    monkeypatch.setattr(selection_module, "select_methods", forbidden)
     monkeypatch.setattr(predict_module, "predict", predict)
     assert (
         cli_module._forecast_document(

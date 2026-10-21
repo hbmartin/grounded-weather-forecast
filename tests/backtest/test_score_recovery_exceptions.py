@@ -489,7 +489,7 @@ def test_startup_release_failure_stops_writers_and_is_journaled(
     monkeypatch.setattr(cli, "_cmd_build_dataset", lambda *_args: 0)
     monkeypatch.setattr(cli, "_recovery_needed", lambda *_args: True)
     monkeypatch.setattr(
-        selection, "select_methods", lambda *_a, **_k: promoted.append(True)
+        selection, "promote_methods", lambda *_a, **_k: promoted.append(True)
     )
     monkeypatch.setattr(
         runs, "append_run", lambda record, _path: records.append(record)
@@ -573,7 +573,7 @@ def test_cli_release_failure_is_handled_and_journaled(
     fail_guard_release(OSError("guard release fixture"))
     monkeypatch.setattr(engine, "iter_backtest_scores", produce)
     monkeypatch.setattr(
-        selection, "select_methods", lambda *_a, **_k: promoted.append(True)
+        selection, "promote_methods", lambda *_a, **_k: promoted.append(True)
     )
     monkeypatch.setattr(
         runs, "append_run", lambda record, _path: records.append(record)

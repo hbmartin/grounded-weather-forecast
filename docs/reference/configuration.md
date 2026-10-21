@@ -248,7 +248,11 @@ The issue-time span must exceed `initial_train_days` before the first test
 origin, more than 90 days by default, and usable training/test data must exist.
 `step_days` sets spacing between origins; the first test interval may be partial.
 Valid short history or expected future test truth returns 3 (pending). Truth
-maturity uses a hash-validated dataset snapshot timestamp, not wall time.
+maturity uses the hash-validated manifest's `truth_snapshot_at`, captured at the
+observation read, rather than publication `created_at` or backtest wall time.
+Neither field changes scientific configuration or dataset content fingerprints.
+A missing/malformed maturity cutoff cannot block positive scoring but cannot
+justify future-truth pending status. Legacy manifests remain scoreable.
 
 ---
 

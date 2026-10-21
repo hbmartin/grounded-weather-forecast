@@ -128,6 +128,9 @@ class TestEvaluationContexts:
         selected = select_methods(config, directory)
         after = datetime.now(tz=UTC)
         context = {
+            "dataset_fingerprint": "ds1",
+            "evaluation_created_at": utc(2026, 8, 1).isoformat(),
+            "training_cutoff": utc(2026, 7, 2, 5).isoformat(),
             "evaluation_id": "evaluation-fixed",
             "source_kind": "live",
             "source_set_json": '["nws"]',
@@ -142,6 +145,7 @@ class TestEvaluationContexts:
                 "method_id": "inverse_mse",
                 "reason": "lowest backtest MAE among promotable common-case methods",
                 "evaluation_id": "evaluation-fixed",
+                "dataset_fingerprint": "ds1",
                 "code_version": "code1",
                 "n": 30,
                 "mae": 1.0,
@@ -187,6 +191,9 @@ class TestEvaluationContexts:
             "code_version": "code1",
             "config_fingerprint": "cfg1",
         }
+        expected_context.update(
+            dataset_fingerprint="ds1", evaluation_created_at=utc(2026, 8, 1).isoformat()
+        )
         assert list(contexts[0]) == list(expected_context)
         kwargs = dict(
             dataset="ds1",
@@ -1313,3 +1320,288 @@ class TestReferenceReplacementIntegration:
         assert replaced.method_id == reference
         assert replaced.mae == 5.0
         assert "demoted" in replaced.reason
+
+
+@pytest.fixture
+def approved_archive(tmp_path, monkeypatch):
+    """Real content fingerprints, with small independent product matrices."""
+    from grounded_weather_forecast.dataset.matrix import (
+        _publish_dataset,
+        matrix_feature_columns,
+        matrix_sources,
+    )
+
+    config = write_config(tmp_path)
+    config.dataset.dir.mkdir()
+    monkeypatch.setattr(selection_module, "config_fingerprint", lambda _: "cfg1")
+    monkeypatch.setattr(selection_module, "code_identity", lambda: "code1")
+    hourly = synthetic_hourly_matrix(days=2, sources=("nws",), max_lead=1)
+    daily = hourly.select(
+        "issue_time",
+        "source_kind",
+        "lead_bucket",
+        pl.col("valid_time").dt.date().alias("forecast_date"),
+        pl.lit(1.0).alias("lead_days"),
+        pl.col("fx__nws__temp_c").alias("fxd__nws__temp_max_c"),
+        pl.col("t__temp_c__inst").alias("t__temp_max_c"),
+    )
+    frames = {"hourly": hourly, "daily": daily}
+
+    def publish():
+        return _publish_dataset(
+            {
+                f"{product}_matrix": (
+                    config.dataset.dir / f"{product}_matrix_live.parquet",
+                    frame,
+                )
+                for product, frame in frames.items()
+            },
+            config.dataset.dir / "manifest.json",
+            sources=("nws",),
+            snapshots=4,
+            truth_snapshot_at=datetime.now(UTC),
+        ).fingerprint
+
+    def evaluate(product, evaluation, day=1):
+        scores = near_tie_scores(
+            utc(2026, 8, day), evaluation, "inverse_mse", rival_offset=2.0
+        )
+        if product == "daily":
+            scores = scores.with_columns(
+                pl.lit("daily").alias("product"),
+                pl.lit("temp_max_c").alias("variable"),
+                pl.lit("D1").alias("lead_bucket"),
+            )
+        scores = scores.with_columns(
+            pl.lit(selection_module.dataset_fingerprint(config)).alias(
+                "dataset_fingerprint"
+            ),
+            pl.lit(json.dumps(list(matrix_sources(frames[product])))).alias(
+                "source_set_json"
+            ),
+            pl.lit(json.dumps(list(matrix_feature_columns(frames[product])))).alias(
+                "feature_set_json"
+            ),
+        )
+        write_scores(
+            scores,
+            scores_path(
+                config.dataset.dir / "scores", product, "live", "expanding", evaluation
+            ),
+        )
+
+    publish()
+    evaluate("hourly", "hour-original")
+    evaluate("daily", "day-original")
+    initial = selection_module.promote_methods(config, config.dataset.dir / "scores")
+    assert initial.created
+    return config, frames, publish, evaluate, initial
+
+
+def test_approved_release_survives_real_fingerprint_rotation(approved_archive):
+    config, frames, publish, evaluate, initial = approved_archive
+    original_fingerprint = selection_module.dataset_fingerprint(config)
+    original_contexts = json.loads(
+        (config.artifacts_dir / "releases" / f"{initial.release_id}.json").read_text()
+    )["evaluation_contexts"]
+    frames["hourly"] = frames["hourly"].with_columns(pl.col("obs__temp_c") + 1.0)
+    current_fingerprint = publish()
+    assert original_fingerprint != current_fingerprint
+    # Before backtesting, the existing approval survives a compatible rebuild.
+    loaded = selection_module.load_approved_selections(config)
+    daily_key = ("daily", "temp_max_c", "D1")
+    assert loaded[daily_key] == initial.selections[daily_key]
+    evaluate("hourly", "hour-current", 2)
+    promoted = selection_module.promote_methods(
+        config, config.dataset.dir / "scores", products=frozenset({"hourly"})
+    )
+    assert promoted.created
+    assert promoted.selections[daily_key].evaluation_id == "day-original"
+    assert promoted.selections[daily_key].dataset_fingerprint == original_fingerprint
+    raw = json.loads(
+        (config.artifacts_dir / "releases" / f"{promoted.release_id}.json").read_text()
+    )
+    assert raw["dataset_fingerprint"] == current_fingerprint
+    assert next(
+        c for c in raw["evaluation_contexts"] if c["evaluation_id"] == "day-original"
+    ) == next(c for c in original_contexts if c["evaluation_id"] == "day-original")
+    historical = selection_module.load_approved_selections(
+        config, as_of=datetime.now(UTC) + timedelta(seconds=1)
+    )
+    assert historical[daily_key].dataset_fingerprint == original_fingerprint
+    assert historical[daily_key].release_id == promoted.release_id
+
+
+@pytest.mark.parametrize(
+    "change", ["sources", "features", "code", "config", "semantics"]
+)
+def test_approved_release_requires_product_identity(
+    approved_archive, monkeypatch, change
+):
+    config, frames, publish, _, initial = approved_archive
+    if change == "sources":
+        frames["hourly"] = frames["hourly"].rename(
+            {"fx__nws__temp_c": "fx__other__temp_c"}
+        )
+    elif change == "features":
+        frames["hourly"] = frames["hourly"].with_columns(
+            pl.lit(1.0).alias("obs__pressure_sea_hpa")
+        )
+    elif change == "code":
+        monkeypatch.setattr(selection_module, "code_identity", lambda: "other-code")
+    elif change == "config":
+        monkeypatch.setattr(
+            selection_module, "config_fingerprint", lambda _: "other-config"
+        )
+    publish()
+    semantics = (
+        {"temp_c": TruthSemantics.INTERVAL_MEAN} if change == "semantics" else None
+    )
+    loaded = selection_module.load_approved_selections(config, semantics=semantics)
+    assert not any(key[0] == "hourly" for key in loaded)
+    if change in {"sources", "features", "semantics"}:
+        assert (
+            loaded[("daily", "temp_max_c", "D1")]
+            == initial.selections[("daily", "temp_max_c", "D1")]
+        )
+    else:
+        assert loaded == {}
+
+
+def test_approved_loader_never_elects_or_writes(approved_archive, monkeypatch):
+    config, _, _, evaluate, initial = approved_archive
+    evaluate("daily", "unapproved-newer", 3)
+    before = {
+        path: path.read_bytes()
+        for path in (config.artifacts_dir / "releases").glob("*.json")
+    }
+
+    def forbidden(*_args, **_kwargs):
+        pytest.fail("serving attempted promotion")
+
+    monkeypatch.setattr(selection_module, "_load_evidence", forbidden)
+    monkeypatch.setattr(selection_module, "apply_live_gate", forbidden)
+    monkeypatch.setattr(ModelRelease, "write_once", forbidden)
+    loaded = selection_module.load_approved_selections(config)
+    assert loaded == initial.selections
+    assert {path: path.read_bytes() for path in before} == before
+
+
+def test_completed_product_without_candidate_keeps_incumbents(
+    approved_archive, monkeypatch
+):
+    config, _, _, _, initial = approved_archive
+    monkeypatch.setattr(
+        selection_module, "slice_winners", lambda *_a, **_k: pl.DataFrame()
+    )
+    result = selection_module.promote_methods(
+        config, config.dataset.dir / "scores", products=frozenset({"hourly"})
+    )
+    assert not result.created
+    assert result.selections == initial.selections
+    assert len(list((config.artifacts_dir / "releases").glob("*.json"))) == 1
+
+
+def test_release_creation_flag_is_atomic(tmp_path):
+    from concurrent.futures import ThreadPoolExecutor
+
+    release = ModelRelease.create(
+        dataset="data",
+        configuration="config",
+        evaluation_ids=(),
+        evaluation_contexts=(),
+        training_cutoff=None,
+        selections={},
+    )
+    with ThreadPoolExecutor(max_workers=4) as pool:
+        results = list(pool.map(lambda _: release.write_once(tmp_path), range(8)))
+    assert sum(created for _, created in results) == 1
+    assert len(list(tmp_path.glob("*.json"))) == 1
+
+
+def test_legacy_release_keeps_recorded_single_dataset_identity(approved_archive):
+    config, frames, publish, _, initial = approved_archive
+    path = config.artifacts_dir / "releases" / f"{initial.release_id}.json"
+    raw = json.loads(path.read_text())
+    for choice in raw["selections"].values():
+        choice.pop("dataset_fingerprint")
+    for context in raw["evaluation_contexts"]:
+        for name in ("dataset_fingerprint", "evaluation_created_at", "training_cutoff"):
+            context.pop(name)
+    path.write_text(json.dumps(raw))
+    original = raw["dataset_fingerprint"]
+    frames["hourly"] = frames["hourly"].with_columns(pl.col("obs__temp_c") + 2.0)
+    assert publish() != original
+    loaded = selection_module.load_approved_selections(config)
+    assert loaded
+    assert {choice.dataset_fingerprint for choice in loaded.values()} == {original}
+    assert (
+        selection_module.load_approved_selections(
+            config, as_of=datetime.now(UTC) + timedelta(seconds=1)
+        )
+        == {}
+    )
+
+
+def test_retained_release_is_not_reported_as_new_promotion(
+    approved_archive, monkeypatch, capsys
+):
+    from grounded_weather_forecast import cli
+    from grounded_weather_forecast.backtest.outcomes import ProductBacktestOutcome
+
+    config, _, _, _, initial = approved_archive
+    monkeypatch.setattr(
+        cli,
+        "_evaluate_product",
+        lambda *_a: ProductBacktestOutcome("hourly", "evaluated", 1),
+    )
+    monkeypatch.setattr(
+        selection_module, "slice_winners", lambda *_a, **_k: pl.DataFrame()
+    )
+    args = cli.build_parser().parse_args(
+        ["backtest", "--products", "hourly", "--methods", "equal_weight"]
+    )
+    assert cli._cmd_backtest(config, args).exit_code == 0
+    output = capsys.readouterr().out
+    assert "retained approved selections" in output
+    assert "promoted model release" not in output
+    assert list((config.artifacts_dir / "releases").glob("*.json")) == [
+        config.artifacts_dir / "releases" / f"{initial.release_id}.json"
+    ]
+
+
+@pytest.mark.parametrize("column", ["dataset_fingerprint", "evaluation_created_at"])
+def test_partial_context_identity_does_not_invent_other_field(column):
+    scores = near_tie_scores(utc(2026, 8, 1), "eval", "inverse_mse")
+    missing = (
+        "evaluation_created_at"
+        if column == "dataset_fingerprint"
+        else "dataset_fingerprint"
+    )
+    context = _evaluation_contexts([scores.drop(missing)])[0]
+    assert missing not in context
+    assert context[column] == (
+        "ds1" if column == "dataset_fingerprint" else utc(2026, 8, 1).isoformat()
+    )
+
+
+def test_approved_loader_orders_actual_instants_and_rejects_future(approved_archive):
+    config, _, _, evaluate, initial = approved_archive
+    evaluate("hourly", "new-evaluation", 2)
+    second = selection_module.promote_methods(
+        config, config.dataset.dir / "scores", products=frozenset({"hourly"})
+    )
+    first_path = config.artifacts_dir / "releases" / f"{initial.release_id}.json"
+    second_path = config.artifacts_dir / "releases" / f"{second.release_id}.json"
+    first_raw = json.loads(first_path.read_text())
+    second_raw = json.loads(second_path.read_text())
+    first_raw["promoted_at"] = "2026-08-20T13:00:00-07:00"
+    second_raw["promoted_at"] = "2026-08-20T19:30:00+00:00"
+    first_path.write_text(json.dumps(first_raw))
+    second_path.write_text(json.dumps(second_raw))
+    loaded = selection_module.load_approved_selections(config)
+    assert loaded[("hourly", "temp_c", "24-48h")].evaluation_id == "hour-original"
+    first_raw["promoted_at"] = (datetime.now(UTC) + timedelta(days=1)).isoformat()
+    first_path.write_text(json.dumps(first_raw))
+    loaded = selection_module.load_approved_selections(config)
+    assert loaded[("hourly", "temp_c", "24-48h")].evaluation_id == "new-evaluation"

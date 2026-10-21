@@ -98,6 +98,19 @@ def _check_guard_failure(identity: _DirectoryIdentity) -> None:
         raise failure.exception()
 
 
+def check_score_coordination(directory: Path) -> None:
+    """Raise a saved guard failure without acquiring or creating any resource.
+
+    Product exception handlers use this to detect secondary release failures.
+    Successful committed writes deliberately do not call this probe.
+    """
+    try:
+        metadata = directory.stat()
+    except (FileNotFoundError,):  # noqa: B013 -- no directory can have a saved owner
+        return
+    _check_guard_failure((os.getpid(), metadata.st_dev, metadata.st_ino))
+
+
 class ScoreCoordinationTimeout(Timeout):
     """A brief score-directory bookkeeping lock could not be acquired in time."""
 

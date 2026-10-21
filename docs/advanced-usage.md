@@ -211,7 +211,10 @@ Method selection resolves in this order:
 ```
 
 Only live scores matching the current dataset, configuration, source set, truth
-semantics, code identity, and requested issue time are promotable. Recent live
+semantics, and code identity are promotable by a backtest. Prediction reads the
+approved release; compatible data-only rebuilds preserve approvals and their
+original evaluation dataset. Historical reconstruction also requires its exact
+dataset and a release available by the requested issue time. Recent live
 verdicts are pooled only across releases whose configuration, selected method,
 implementation identity, provider source set, exact serving feature schema, and
 per-variable truth semantics all match — deliberately not the dataset

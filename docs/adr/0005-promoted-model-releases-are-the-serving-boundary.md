@@ -24,10 +24,24 @@ Every score row belongs to an **Evaluation Run** identified by its dataset finge
 source set and kind, product, window, per-variable truth semantics, method set, code
 version, configuration fingerprint, and creation time.
 
-Serving considers only live evaluation runs that match the current dataset and were
-available by the requested issue time. Promotion creates a **Model Release** containing
-the chosen method for each product × variable × lead bucket, its evidence IDs, and its
-training cutoff. Forecast documents and history rows carry the release identity.
+Live backtests own elections and promotion-time live-gate changes. Only completed
+products may receive new approvals. Promotion creates a **Model Release** containing
+the chosen method for each product × variable × lead bucket, its original evaluation
+dataset and evidence context, and its available training cutoff. Pending, failed,
+unrequested, and completed slices without a qualifying replacement retain compatible
+incumbents.
+
+Current-time serving reads approved decisions without scanning scores to re-elect
+methods or writing releases. It permits data-only rebuilds when code, configuration,
+product sources, exact feature set, and truth semantics match; retained evidence is
+never relabelled as evaluated against the newer dataset. Prediction-time safety
+guards remain active. Historical reconstruction still requires its exact dataset
+and a release available by the requested issue time. Forecast documents identify
+the dataset actually used and carry the release identity.
+
+Release fields are additive. Older single-dataset ledgers remain readable using
+their recorded provenance; missing evaluation context is not invented. The active
+release pointer continues to describe the locally served document.
 
 When no compatible release evidence exists, serving enters an explicit degraded mode
 and uses a fit-free equal-weight blend. Synthetic evaluations remain reportable but are

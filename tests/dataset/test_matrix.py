@@ -668,3 +668,42 @@ class TestSourceLimits:
         assert _drop_capped_leads(self.snap(), {}, pl.col("lead_hours")).equals(
             self.snap()
         )
+
+
+@pytest.mark.parametrize("synthetic", [False, True])
+def test_build_records_observation_read_clock_once(
+    fixture_config, monkeypatch, synthetic
+):
+    config = fixture_config
+    read_clock = utc(2026, 3, 22, 18, 59, 30)
+    published_clock = read_clock + timedelta(seconds=60)
+    ticks = iter([read_clock, published_clock])
+
+    class Clock:
+        @staticmethod
+        def now(tz):
+            return next(ticks)
+
+    monkeypatch.setattr(matrix_module, "datetime", Clock)
+    make_station_db(config.station.db_path, [(ISSUE.isoformat(), {"outTemp": 41.0})])
+    observations = matrix_module.read_observations(config.station)
+    reads = []
+
+    def read(_station):
+        reads.append(True)
+        return observations
+
+    monkeypatch.setattr(matrix_module, "read_observations", read)
+    if synthetic:
+        long = read_hourly_long(config.forecasts).with_columns(
+            pl.lit("synthetic").alias("source_kind")
+        )
+        matrix_module.write_synthetic_matrix(config, long)
+        path = config.dataset.dir / "manifest_synthetic.json"
+    else:
+        matrix_module.write_dataset(config)
+        path = config.dataset.dir / "manifest.json"
+    raw = json.loads(path.read_text())
+    assert raw["truth_snapshot_at"] == read_clock.isoformat()
+    assert raw["created_at"] == published_clock.isoformat()
+    assert reads == [True]

@@ -155,7 +155,7 @@ release attribution. `status_reason` explains automatic degradation. Common ones
 |---|---|
 | no backtest evidence for this slice | not enough archive yet — wait, or backfill |
 | implementation changed since the last backtest | run `recover`, or re-run `backtest --source live` then `report` |
-| dataset fingerprint changed | run `recover`, which rebuilds before backtesting |
+| no compatible approval after a dataset layout change | run `recover`, which rebuilds before backtesting; data-only fingerprint rotation preserves compatible approvals |
 | configuration changed | run `recover`, or re-run the live backtest and report |
 | some compatible promoted selections could not be fitted at issuance | inspect the named product/variable and cause: poll as live issuance advances for pending truth; later-issued rows remain unavailable at fixed historical `--now`; build missing matrices or incorporate valid truth as advised |
 | live evidence exists but no promoted release produced a finite hourly or daily forecast | inspect per-field reasons and provider availability; this does not mean a release was never promoted |

@@ -139,11 +139,26 @@ regenerate synthetic evidence where used. Run `build-dataset`, a fresh
 Source implementation and PR delivery do not install the deployment.
 
 Backtest exit 3 covers valid short history and test truth still future at a
-hash-validated dataset snapshot time. Frozen snapshots retain their classification;
+hash-validated observation snapshot cutoff (`truth_snapshot_at`). The manifest
+publication time (`created_at`) cannot substitute for that cutoff. Frozen snapshots retain their classification;
 stale archives are a separate health alarm. Legacy files without metadata remain
-scoreable but cannot receive the future-truth exemption. Rebuild to establish the
-clock. Completed products may promote independently while real errors determine
+scoreable but cannot receive the future-truth exemption. Malformed maturity
+clocks follow the same rule; integrity failures still fail. Rebuild to establish
+the clock. Completed products may promote independently while real errors determine
 the overall exit. Entirely inapplicable requests exit 2.
+
+Backtests own release changes; hourly prediction consumes approved selections.
+Compatible data-only rebuilds preserve incumbents with their original evidence
+identity. Pending/failed products and slices without a qualifying replacement do
+not lose approvals. Code, config, product source/feature, or truth-semantic changes
+still invalidate incompatible approvals. Live-gate method changes occur during
+backtests; prediction-time safeguards remain active.
+
+A failed optional restore launch never prevents the station/publication stages.
+If publication succeeds, the hourly job still returns 1 to expose the failed
+launch. Startup and policy validation return 2; later filesystem failures,
+including stamp updates, return 1. Late synthetic imports fail that stage while
+remaining diagnostics continue. Pending or failed runs do not advance the stamp.
 
 Pending embedded stages are visible in the current report and deduplicated against
 completed parents. Failed stages are counted provisionally before parent recording;

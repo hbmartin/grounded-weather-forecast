@@ -436,7 +436,7 @@ def test_cli_releases_all_products_before_next_product_and_promotion(
     def promote(*_args, **_kwargs):
         assert_released()
         assert events == ["hourly", "daily", "minutely"]
-        return {}
+        return selection.PromotionResult({})
 
     monkeypatch.setattr(pl, "read_parquet", read)
     monkeypatch.setattr(engine, "iter_backtest_scores", produce)
@@ -446,7 +446,7 @@ def test_cli_releases_all_products_before_next_product_and_promotion(
         lambda *_args, **_kwargs: stream_for("minutely"),
     )
     monkeypatch.setattr(truth, "truth_minute_grid", lambda frame, _variables: frame)
-    monkeypatch.setattr(selection, "select_methods", promote)
+    monkeypatch.setattr(selection, "promote_methods", promote)
     args = cli.build_parser().parse_args(
         [
             "backtest",
@@ -477,7 +477,7 @@ def test_cli_does_not_promote_failed_stream(tmp_path, monkeypatch):
 
     monkeypatch.setattr(engine, "iter_backtest_scores", fail)
     monkeypatch.setattr(
-        selection, "select_methods", lambda *_args, **_kwargs: promoted.append(True)
+        selection, "promote_methods", lambda *_args, **_kwargs: promoted.append(True)
     )
     args = cli.build_parser().parse_args(
         [

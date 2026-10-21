@@ -184,9 +184,14 @@ class ModelRelease:
         )
 
     def write(self, directory: Path) -> Path:
+        return self.write_once(directory)[0]
+
+    def write_once(self, directory: Path) -> tuple[Path, bool]:
+        """Return whether this process created the immutable release, under lock."""
         directory.mkdir(parents=True, exist_ok=True)
         path = directory / f"{self.release_id}.json"
         with locked_path(path):
-            if not path.exists():
+            created = not path.exists()
+            if created:
                 atomic_write_text(json.dumps(asdict(self), indent=2), path)
-        return path
+        return path, created

@@ -198,16 +198,36 @@ The planner's first origin is the first issue plus `initial_train_days`
 spaces later origins, rather than requiring a full first test interval.
 Producers distinguish `evaluated`, `pending`, `not_applicable`, and `failed`.
 Any emitted scores complete a product. Otherwise valid short clocks are pending;
-future test truth is pending only with usable training and every eligible test
-truth clock later than the input snapshot timestamp. Due-but-missing truth and
-empty score output after mature truth remain errors. Truth delays above are unchanged.
+future test truth is pending only when slices with usable training have eligible
+test truth clocks later than the observation cutoff. Unusable variables do not
+veto usable slices; all-unusable training, due-but-missing truth, and mature
+zero-score output remain failures. Truth delays above are unchanged.
 
-Snapshot timestamps come from hash-validated live or synthetic build manifests;
-filesystem modification times and backtest wall time do not determine maturity.
-Legacy inputs without metadata remain scoreable and retain short-history handling,
-but cannot establish the future-truth exemption. CLI pending exit 3 keeps the
-historical `no_folds` ledger classification. Products are evaluated independently;
-only completed products can receive new promotions, under unchanged gates.
+Live and synthetic manifests add `truth_snapshot_at`, captured before the
+consistent observation read; `created_at` remains publication time. Synthetic
+truth and causal features use the same read. Virtual synthetic issue times need
+not precede those clocks. Neither timestamp enters the content fingerprint.
+Input hashes and required schemas are always validated. Missing/malformed maturity
+clocks permit positive scoring and short-history pending, but cannot grant
+`awaiting_truth`; publication time, file modification time, and backtest wall time
+are never substitutes. CLI pending exit 3 retains the historical `no_folds` ledger
+classification. Products are evaluated independently under unchanged gates.
+
+### Approved decisions and compatible retention
+
+*Implemented in: `serve/selection.py`, `serve/evidence.py`, `evaluation.py`, `cli.py`*
+
+Only completed products in a live backtest may receive new selections. Prediction
+loads approvals without elections, promotion-time live gates, or release writes.
+Compatible incumbents survive pending, failed, unrequested, and completed slices
+without a qualifying replacement. Code, configuration, product sources, exact
+feature set, and truth semantics must match; data-only fingerprint rotation does
+not retire an approval. Each selection and context retain their original dataset
+and evaluation identity and available cutoff. New releases identify their creation
+dataset separately from retained evidence. Legacy records remain readable without
+invented context. Historical reconstruction retains exact dataset and issue-time
+checks. `PromotionResult.created` is decided under the release write lock so
+retention and duplicate writes are never logged as new promotions.
 
 ### Bounded score persistence
 
@@ -384,7 +404,9 @@ latter, and a number quietly averaging the two would be worse than no number.
 
 Identity is tracked by three fingerprints — `dataset_fingerprint` (byte-level,
 over stably-sorted parquet), `config_fingerprint`, and `code_identity` — and
-serving refuses evidence that does not match the current ones. See
+new elections require matching fingerprints. Approved decisions may survive a
+new dataset fingerprint only under the compatibility checks above; original
+evidence retains its own fingerprint. See
 [ADR 0005](../adr/0005-promoted-model-releases-are-the-serving-boundary.md).
 
 ---

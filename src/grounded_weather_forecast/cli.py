@@ -753,7 +753,7 @@ def _forecast_document(
     )
     from grounded_weather_forecast.serve.predict import predict  # noqa: PLC0415
     from grounded_weather_forecast.serve.selection import (  # noqa: PLC0415
-        select_methods,
+        load_approved_selections,
     )
 
     forced = None if method == "auto" else method
@@ -762,12 +762,12 @@ def _forecast_document(
     semantics = _semantics_by_variable(config, semantics_flag, HOURLY_VARIABLES)
     dataset = load_live_snapshot(config, lock_timeout=lock_timeout)
     selections = (
-        select_methods(
+        load_approved_selections(
             config,
-            config.dataset.dir / "scores",
             as_of=now,
             semantics=semantics,
             dataset_id=dataset.fingerprint,
+            matrices={"hourly": dataset.hourly, "daily": dataset.daily},
         )
         if not forced
         else {}
@@ -779,6 +779,7 @@ def _forecast_document(
         semantics=semantics,
         force_method=forced,
         dataset_snapshot=dataset,
+        approved_release_loaded=bool(selections),
     )
 
 
@@ -1209,10 +1210,10 @@ def _backtest_products(config: Config, args: argparse.Namespace) -> CommandOutco
     total = sum(outcome.row_count for outcome in outcomes)
     if total and args.source == "live":
         from grounded_weather_forecast.serve.selection import (  # noqa: PLC0415
-            select_methods,
+            promote_methods,
         )
 
-        promoted = select_methods(
+        promoted = promote_methods(
             config,
             config.dataset.dir / "scores",
             semantics=promotion_semantics,
@@ -1220,15 +1221,12 @@ def _backtest_products(config: Config, args: argparse.Namespace) -> CommandOutco
                 outcome.product for outcome in outcomes if outcome.status == "evaluated"
             ),
         )
-        release_ids = sorted(
-            {
-                choice.release_id
-                for choice in promoted.values()
-                if choice.release_id is not None
-            }
-        )
-        if release_ids:
-            print(f"promoted model release: {', '.join(release_ids)}")
+        if promoted.created:
+            print(f"promoted model release: {promoted.release_id}")
+        elif promoted.selections:
+            print("retained approved selections; no new model release")
+        else:
+            print("no eligible model release promoted")
     if failed := next(
         (outcome for outcome in outcomes if outcome.status == "failed"), None
     ):
@@ -1250,6 +1248,7 @@ def _evaluate_product(
     from grounded_weather_forecast.backtest.score_storage import (  # noqa: PLC0415
         ScoreCoordinationReleaseError,
         ScoreCoordinationTimeout,
+        check_score_coordination,
     )
 
     try:
@@ -1261,6 +1260,15 @@ def _evaluate_product(
     except (ScoreCoordinationReleaseError, ScoreCoordinationTimeout):
         raise  # a failed shared directory guard is not product-local
     except Exception as exc:
+        try:
+            check_score_coordination(config.dataset.dir / "scores")
+        except (ScoreCoordinationReleaseError,) as coordination:  # noqa: B013
+            coordination.add_note(
+                f"primary {product} failure: {type(exc).__name__}: {exc}"
+            )
+            for note in getattr(exc, "__notes__", ()):
+                coordination.add_note(note)
+            raise coordination from exc
         print(f"{product}: evaluation failed: {exc!r}", file=sys.stderr)
         return ProductBacktestOutcome(
             product, "failed", error_detail=f"{type(exc).__name__}: {exc}"
