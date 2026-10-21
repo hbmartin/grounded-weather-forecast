@@ -84,7 +84,7 @@ That works on day one. Everything else needs an archive with some history — se
 | `backfill` | fetch archived forecasts into the synthetic supervised matrix | `--provider` `--models` `--start` `--end` `--chunk-days` |
 | `truth-qc` | cross-check truth against lapse-adjusted neighbors and fit the radiation-shield error model | `--days` |
 | `ingest-ensembles` | poll the Open-Meteo Ensemble API for per-model spread features | `--models` |
-| `predict` | emit schema-6 JSON with rainfall budget conservation and release attribution only on finite values; `--method` bypasses automatic rain safeguards for experiments | `--out` `--method` `--no-history` `--semantics` `--now` |
+| `predict` | consume approved releases without electing methods; emit schema-6 JSON with rainfall guards and finite-value release attribution; `--method` bypasses automatic rain safeguards for experiments | `--out` `--method` `--no-history` `--semantics` `--now` |
 | `publish` | safely publish an automatic forecast, holding a matching ready document for up to six hours | `--out` `--semantics` `--recovery-methods` `--recovery-window` |
 | `recover` | recheck degradation, then rebuild live evidence and reports when recovery is still needed | `--semantics` `--methods` `--window` |
 | `hourly-predict-publish.py` (standalone launchd wrapper) | predict first, then render live station data through collector configuration; retain staged station files on render failure | `--station-project` |
@@ -97,10 +97,26 @@ That works on day one. Everything else needs an archive with some history — se
 
 Global: `--config PATH` (default `config.toml`), `--version`. Exit codes: `0` ok,
 `1` command failure, `2` config error, `3` evaluation pending because history is
-too short or test truth is still future at the dataset snapshot time, `75` lock contention (retry later).
+too short or test truth is still future at the observation snapshot cutoff, `75` lock contention (retry later).
+
+Backtests own promotions and live-gate method changes. Prediction reads approved
+choices across compatible rebuilds: code, config, product sources, features, and
+truth semantics must match. Retained choices keep their original evaluation
+dataset identity. Pending, failed, unrequested, and completed slices with no
+qualifying replacement keep compatible incumbents. An unchanged release is not
+reported as newly promoted. Input hashes remain mandatory when a manifest is
+present; missing or malformed maturity clocks do not prevent positive scoring.
+The additive manifest field `truth_snapshot_at` records the observation-read
+cutoff; `created_at` records publication. Legacy manifests remain scoreable but
+cannot establish future-truth pending status.
+
+The hourly wrapper publishes even if optional restore launch fails, then returns
+1 so monitoring sees that failure. Startup/configuration errors return 2; later
+runtime errors return 1.
 Score guard-release failure during startup recovery or an uncommitted write
 returns 1 from backtest, maintain or recover, records `score_coordination_release`
-and its diagnostic in the run journal, and suppresses promotion. Startup recovery
+and its diagnostic in the run journal, and suppresses promotion, including when
+unlocking fails alongside another uncommitted publication error. Startup recovery
 reports completed cleanup and stops before invoking writers. Recovery preserves
 secondary cleanup diagnostics after payload disappearance, preserves pending
 cancellation, and attaches partial counts/bytes to unexpected errors. Standalone

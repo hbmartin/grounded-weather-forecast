@@ -247,7 +247,7 @@ def test_next_cli_run_reclaims_hard_stopped_scores(
     assert destination.read_bytes() == b"existing destination"
     promoted = []
     monkeypatch.setattr(
-        selection, "select_methods", lambda *_a, **_k: promoted.append(True)
+        selection, "promote_methods", lambda *_a, **_k: promoted.append(True)
     )
     args = ["--config", str(tmp_path / "config.toml"), command]
     if command == "backtest":
@@ -541,7 +541,7 @@ def test_cli_coordination_timeout_closes_producer_and_releases_pipeline(
     monkeypatch.setattr(engine, "iter_backtest_scores", produce)
     monkeypatch.setattr(score_storage, "SCORE_COORDINATION_TIMEOUT_S", 0.05)
     monkeypatch.setattr(
-        selection, "select_methods", lambda *_a, **_k: promoted.append(True)
+        selection, "promote_methods", lambda *_a, **_k: promoted.append(True)
     )
     # Keep the real maintain dispatcher and journal, bypass preceding work only.
     for name in ("_cmd_build_dataset", "_cmd_truth_qc"):

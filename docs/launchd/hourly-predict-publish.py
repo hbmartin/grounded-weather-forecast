@@ -250,9 +250,18 @@ def main(argv: Sequence[str] | None = None) -> int:
         sys.path.insert(0, str(HERE))
         if run_predict(paths) != 0:
             return 1
-        maybe_spawn_restore(paths)
+        restore_failed = False
+        try:
+            maybe_spawn_restore(paths)
+        except (OSError,) as exc:  # noqa: B013 -- project convention
+            restore_failed = True
+            print(
+                f"auto-restore launch failed: {exc}; continuing publication", flush=True
+            )
         code = publish(paths, args.station_project)
-        return code  # noqa: RET504 -- finally logs the actual exit status
+        if code == 0 and restore_failed:
+            code = 1
+        return code
     except (RuntimePathError,) as exc:  # noqa: B013 -- project convention
         print(f"configuration error: {exc}", flush=True)
         code = 2
@@ -261,8 +270,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         code = exc.code if isinstance(exc.code, int) else 1
         return code  # noqa: RET504 -- finally logs the actual exit status
     except (OSError, ImportError) as exc:
-        print(f"runtime configuration error: {exc}", flush=True)
-        code = 2
+        print(f"runtime failure: {exc}", flush=True)
+        code = 1
         return code  # noqa: RET504 -- finally logs the actual exit status
     finally:
         print(

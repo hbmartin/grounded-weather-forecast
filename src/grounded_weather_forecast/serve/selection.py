@@ -96,6 +96,160 @@ type EligibleReleases = Mapping[LiveKey, frozenset[str]]
 type EvaluationCompatibility = tuple[str, frozenset[str], str, tuple[str, ...]]
 
 
+@dataclass(frozen=True, slots=True)
+class PromotionResult:
+    selections: SelectionMap
+    release_id: str | None = None
+    created: bool = False
+
+
+def load_approved_selections(
+    config: Config,
+    *,
+    as_of: datetime | None = None,
+    semantics: Mapping[str, TruthSemantics] | None = None,
+    matrices: Mapping[str, pl.DataFrame] | None = None,
+    dataset_id: str | None = None,
+) -> SelectionMap:
+    """Read approved choices; current serving never elects or writes a release."""
+    if as_of is not None:
+        return _release_as_of(config, as_of, semantics) or {}
+    return _approved_incumbents(config, semantics, dataset_id, matrices)[0]
+
+
+def _product_signatures(
+    config: Config, matrices: Mapping[str, pl.DataFrame] | None
+) -> dict[str, tuple[frozenset[str], tuple[str, ...]]]:
+    from grounded_weather_forecast.dataset.matrix import (  # noqa: PLC0415
+        matrix_feature_columns,
+        matrix_path,
+        matrix_sources,
+    )
+
+    signatures = {}
+    for product in ("hourly", "daily"):
+        frame = (matrices or {}).get(product)
+        if frame is None:
+            path = matrix_path(config.dataset.dir, product, "live")
+            if path.exists():
+                try:
+                    frame = pl.DataFrame(schema=pl.read_parquet_schema(path))
+                except (OSError, pl.exceptions.PolarsError):
+                    signatures[product] = (frozenset(), ())
+                    continue
+        if frame is not None:
+            signatures[product] = (
+                frozenset(matrix_sources(frame)),
+                matrix_feature_columns(frame),
+            )
+    if "hourly" in signatures:
+        signatures["minutely"] = signatures["hourly"]
+    return signatures
+
+
+def _approved_choice_compatible(
+    key: SliceKey,
+    selected: Selection,
+    context: Mapping[str, object] | None,
+    signatures: Mapping[str, tuple[frozenset[str], tuple[str, ...]]],
+    dataset: str,
+    code: str,
+    semantics: Mapping[str, TruthSemantics] | None,
+) -> bool:
+    expected = (
+        (semantics or {}).get(key[1], TruthSemantics.INSTANTANEOUS)
+        if key[0] == "hourly"
+        else TruthSemantics.INSTANTANEOUS
+    )
+    if selected.code_version != code or selected.truth_semantics != expected.value:
+        return False
+    signature = signatures.get(key[0])
+    compatibility = _evaluation_compatibility(context, key[1])
+    if signature is not None:
+        return (
+            compatibility is not None
+            and (compatibility[1], compatibility[3]) == signature
+        )
+    # Legacy ledgers can still justify the identical dataset. Without a current
+    # matrix signature they cannot authorize a different dataset.
+    return selected.dataset_fingerprint == dataset
+
+
+def _approved_context_matches(
+    context: Mapping[str, object] | None,
+    selected: Selection,
+    key: SliceKey,
+    configuration: object,
+    code: str,
+) -> bool:
+    if context is None:
+        return True
+    semantic_map = context.get("semantics")
+    return (
+        context.get("config_fingerprint") == configuration
+        and context.get("code_version") == code
+        and context.get("dataset_fingerprint", selected.dataset_fingerprint)
+        == selected.dataset_fingerprint
+        and isinstance(semantic_map, Mapping)
+        and semantic_map.get(key[1]) == selected.truth_semantics
+    )
+
+
+def _approved_records(config: Config) -> list[dict[str, object]]:
+    now = datetime.now(tz=UTC)
+    records: list[tuple[datetime, dict[str, object]]] = []
+    for raw in _compatible_releases(config, match_dataset=False):
+        with suppress(TypeError, ValueError):
+            promoted = datetime.fromisoformat(str(raw["promoted_at"]))
+            if promoted.tzinfo is not None and promoted <= now:
+                records.append((promoted, raw))
+    return [
+        raw
+        for _, raw in sorted(
+            records,
+            key=lambda pair: (pair[0], str(pair[1]["release_id"])),
+            reverse=True,
+        )
+    ]
+
+
+def _approved_incumbents(
+    config: Config,
+    semantics: Mapping[str, TruthSemantics] | None,
+    dataset_id: str | None = None,
+    matrices: Mapping[str, pl.DataFrame] | None = None,
+) -> tuple[dict[SliceKey, Selection], EvidenceSummary]:
+    dataset = dataset_id or dataset_fingerprint(config)
+    signatures = _product_signatures(config, matrices)
+    code = code_identity()
+    selections: dict[SliceKey, Selection] = {}
+    contexts: dict[str, dict[str, object]] = {}
+    cutoffs: list[datetime] = []
+    for raw in _approved_records(config):
+        approved = _selections_from_release(raw) or {}
+        recorded = _contexts_by_evaluation_id(raw.get("evaluation_contexts"))
+        for key, selected in approved.items():
+            context = recorded.get(selected.evaluation_id or "")
+            if not _approved_context_matches(
+                context, selected, key, raw["config_fingerprint"], code
+            ):
+                continue
+            if key in selections or not _approved_choice_compatible(
+                key, selected, context, signatures, dataset, code, semantics
+            ):
+                continue
+            selections[key] = selected
+            if context is not None and selected.evaluation_id is not None:
+                contexts[selected.evaluation_id] = dict(context)
+            with suppress(TypeError, ValueError):
+                cutoffs.append(datetime.fromisoformat(str(raw.get("training_cutoff"))))
+    return selections, EvidenceSummary(
+        tuple(sorted(contexts)),
+        tuple(contexts[key] for key in sorted(contexts)),
+        max(cutoffs, default=None),
+    )
+
+
 def _pins(config: Config) -> dict[tuple[str, str], str]:
     """``[predict.methods]`` keys are ``"<product>.<variable>"``."""
     pinned: dict[tuple[str, str], str] = {}
@@ -171,6 +325,7 @@ def _selection_payload(
             "method_id": selected.method_id,
             "reason": selected.reason,
             "evaluation_id": selected.evaluation_id,
+            "dataset_fingerprint": selected.dataset_fingerprint,
             "code_version": selected.code_version,
             "n": selected.n,
             "mae": selected.mae,
@@ -322,7 +477,9 @@ def _selections_from_release(release: Mapping[str, object]) -> SelectionMap | No
             n=n,
             mae=mae,
             evaluation_id=str(selection_mapping.get("evaluation_id") or "unknown"),
-            dataset_fingerprint=dataset,
+            dataset_fingerprint=str(
+                selection_mapping.get("dataset_fingerprint") or dataset
+            ),
             release_id=release_id,
             code_version=_release_selection_code_version(release, selection_mapping),
             truth_semantics=_release_selection_truth_semantics(
@@ -659,21 +816,62 @@ def select_methods(
     dataset_id: str | None = None,
     products: frozenset[str] | None = None,
 ) -> SelectionMap:
-    """Select only live evidence compatible with this dataset and issue time."""
+    """Compatibility API: explicit promotion, or strict historical release lookup."""
     if as_of is not None:
-        return _release_as_of(config, as_of, semantics) or {}
+        return load_approved_selections(config, as_of=as_of, semantics=semantics)
+    return promote_methods(
+        config,
+        scores_dir,
+        semantics=semantics,
+        dataset_id=dataset_id,
+        products=products,
+    ).selections
+
+
+def _remaining_incumbents(
+    carried: dict[SliceKey, Selection],
+    evidence: EvidenceSummary,
+    replacements: SelectionMap,
+) -> tuple[dict[SliceKey, Selection], EvidenceSummary]:
+    carried = {key: value for key, value in carried.items() if key not in replacements}
+    used = {selected.evaluation_id for selected in carried.values()}
+    evidence = EvidenceSummary(
+        tuple(sorted(str(value) for value in used if value is not None)),
+        tuple(
+            context for context in evidence.contexts if context["evaluation_id"] in used
+        ),
+        evidence.training_cutoff,
+    )
+    # Entries without recorded contexts remain readable, but do not invent
+    # evidence when creating a new combined release.
+    attributed = {str(context["evaluation_id"]) for context in evidence.contexts}
+    carried = {
+        key: value
+        for key, value in carried.items()
+        if value.evaluation_id in attributed
+    }
+    return carried, evidence
+
+
+def promote_methods(
+    config: Config,
+    scores_dir: Path,
+    *,
+    semantics: Mapping[str, TruthSemantics] | None = None,
+    dataset_id: str | None = None,
+    products: frozenset[str] | None = None,
+) -> PromotionResult:
+    """Elect eligible products and publish an immutable approved decision."""
     current_dataset = dataset_id or dataset_fingerprint(config)
     pinned = _pins(config)
     selections: dict[SliceKey, Selection] = {}
-    scanned = _load_evidence(config, scores_dir, as_of, semantics, current_dataset)
+    scanned = _load_evidence(config, scores_dir, None, semantics, current_dataset)
     slices = {
         key: frame
         for key, frame in scanned.slices.items()
         if products is None or key[0] in products
     }
-    carried, carried_evidence = _excluded_incumbents(
-        config, products, semantics, current_dataset
-    )
+    carried, carried_evidence = _approved_incumbents(config, semantics, current_dataset)
     incumbents = _incumbent_methods(config)
     candidates: dict[SliceKey, tuple[Selection, ...]] = {}
     references = union_references(config.promotion)
@@ -714,7 +912,10 @@ def select_methods(
             key, board, frame, config, current_dataset
         )
     if not selections:
-        return carried
+        return PromotionResult(carried)
+    carried, carried_evidence = _remaining_incumbents(
+        carried, carried_evidence, selections
+    )
     evidence = EvidenceSummary.from_contexts(
         scanned.contexts,
         scanned.cutoffs,
@@ -749,55 +950,14 @@ def select_methods(
             max(cutoffs, default=None),
         )
     release = _make_release(config, selections, evidence, current_dataset)
-    release.write(config.artifacts_dir / "releases")
-    return {
-        key: replace(selected, release_id=release.release_id)
-        for key, selected in selections.items()
-    }
-
-
-def _excluded_incumbents(
-    config: Config,
-    products: frozenset[str] | None,
-    semantics: Mapping[str, TruthSemantics] | None,
-    dataset: str,
-) -> tuple[dict[SliceKey, Selection], EvidenceSummary]:
-    """Carry excluded selections only from an already compatible release."""
-    empty = EvidenceSummary((), (), None)
-    if products is None:
-        return {}, empty
-    prior = _release_as_of(config, datetime.now(tz=UTC), semantics) or {}
-    carried = {
-        key: value
-        for key, value in prior.items()
-        if key[0] not in products and value.dataset_fingerprint == dataset
-    }
-    if not carried:
-        return {}, empty
-    ids = {selected.evaluation_id for selected in carried.values()}
-    release_ids = {selected.release_id for selected in carried.values()}
-    contexts: dict[str, dict[str, object]] = {}
-    cutoffs: list[datetime] = []
-    for raw in _compatible_releases(config, match_dataset=True):
-        if raw.get("release_id") not in release_ids:
-            continue
-        for evaluation_id, context in _contexts_by_evaluation_id(
-            raw.get("evaluation_contexts")
-        ).items():
-            if evaluation_id in ids:
-                contexts[evaluation_id] = dict(context)
-        with suppress(TypeError, ValueError):
-            cutoffs.append(datetime.fromisoformat(str(raw.get("training_cutoff"))))
-    # Legacy releases without attributed evidence remain readable but cannot
-    # manufacture the missing context required by a new immutable release.
-    carried = {
-        key: value for key, value in carried.items() if value.evaluation_id in contexts
-    }
-    used = {str(value.evaluation_id) for value in carried.values()}
-    return carried, EvidenceSummary(
-        tuple(sorted(used)),
-        tuple(contexts[key] for key in sorted(used)),
-        max(cutoffs, default=None),
+    _, created = release.write_once(config.artifacts_dir / "releases")
+    return PromotionResult(
+        {
+            key: replace(selected, release_id=release.release_id)
+            for key, selected in selections.items()
+        },
+        release.release_id,
+        created,
     )
 
 
@@ -1007,17 +1167,23 @@ def no_evidence_reason(
     dataset_id: str | None = None,
     promoted_fit_unavailable: bool = False,
     fit_failures: Sequence[FitFailure] = (),
+    approved_selections: bool = False,
 ) -> str:
     """Why serving is degraded: cold start vs invalidated evidence.
 
-    A rebuild that adds matrix columns changes the dataset fingerprint, which
-    correctly invalidates promoted evidence — but that failure reads exactly
-    like a cold start unless it is named. The distinction decides the fix:
-    keep polling, or just re-run the backtest.
+    Approved compatible releases survive data-only rebuilds. Without an approval,
+    distinguish absent evidence from changed scientific identity so recovery has
+    an actionable cause. Caller-supplied selections alone cannot establish approval.
 
     Only compatible live identities may use the prediction-local fitting
     outcome; missing or invalidated evidence keeps its more actionable reason.
     """
+    if approved_selections:
+        return (
+            describe_fit_failures(fit_failures)
+            if fit_failures
+            else "approved selections produced no finite hourly or daily forecast from training available at issuance; keep polling"
+        )
     # Retry the identity diagnosis once against a fresh directory listing
     # before tolerating missing files, so the diagnosis never reflects a
     # half-pruned directory.
@@ -1041,8 +1207,8 @@ def no_evidence_reason(
         )
     if (dataset_id or dataset_fingerprint(config)) not in live_datasets:
         return (
-            "dataset fingerprint changed since the last backtest (a rebuild "
-            "invalidates promoted evidence); re-run `backtest --source live` "
+            "dataset fingerprint changed since the last backtest and no compatible "
+            "approval exists; re-run `backtest --source live` "
             "then `report`"
         )
     if config_fingerprint(config) not in live_configs:

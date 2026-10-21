@@ -317,6 +317,11 @@ report so the operator can watch them disagree, and
 
 ## 6. The live demotion gate
 
+The gate runs during live backtest promotion. Current-time prediction consumes
+approved releases and retains its prediction-time safeguards; it does not elect
+or demote methods or write another release. Pending or failed products preserve
+compatible incumbents until an eligible replacement is approved.
+
 *Implemented in: `serve/selection.py::apply_live_gate`, `_live_verdict`*
 
 Promotion is not permanent. An unpinned method whose realized error exceeds

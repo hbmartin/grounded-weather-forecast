@@ -647,11 +647,13 @@ class DatasetManifest:
     snapshots: int
     files: dict[str, FileInfo]
     fingerprint: str
+    truth_snapshot_at: str | None = None
 
     def to_json(self) -> str:
         return json.dumps(
             {
                 "created_at": self.created_at,
+                "truth_snapshot_at": self.truth_snapshot_at,
                 "sources": list(self.sources),
                 "snapshots": self.snapshots,
                 "files": {
@@ -670,6 +672,7 @@ def _publish_dataset(
     *,
     sources: tuple[str, ...],
     snapshots: int,
+    truth_snapshot_at: datetime | None = None,
 ) -> DatasetManifest:
     """Stage a complete live dataset, then expose it under one short lock."""
     staged: dict[str, tuple[Path, Path]] = {}
@@ -695,6 +698,9 @@ def _publish_dataset(
             snapshots=snapshots,
             files=files,
             fingerprint=fingerprint,
+            truth_snapshot_at=truth_snapshot_at.isoformat()
+            if truth_snapshot_at
+            else None,
         )
         staged_manifest = stage_text(manifest.to_json(), manifest_path)
         with dataset_lock(manifest_path.parent, timeout=-1):
@@ -728,6 +734,7 @@ def write_dataset(config: Config) -> DatasetManifest:
     config.dataset.dir.mkdir(parents=True, exist_ok=True)
 
     channels = sorted(set(config.station.columns.values()))
+    truth_snapshot_at = datetime.now(tz=timezone.utc)
     observations = read_observations(config.station)
     flagged = apply_qc(observations, config.qc, channels)
     causal_flagged = apply_causal_qc(observations, config.qc, channels)
@@ -782,21 +789,29 @@ def write_dataset(config: Config) -> DatasetManifest:
             else ()
         ),
         snapshots=snapshots.height,
+        truth_snapshot_at=truth_snapshot_at,
     )
 
 
-def build_truth(config: Config) -> tuple[pl.DataFrame, pl.DataFrame, pl.DataFrame]:
+def build_truth(
+    config: Config, *, observations: pl.DataFrame | None = None
+) -> tuple[pl.DataFrame, pl.DataFrame, pl.DataFrame]:
     """QC'd minute truth plus its hourly and daily aggregations."""
     channels = sorted(set(config.station.columns.values()))
-    flagged = apply_qc(read_observations(config.station), config.qc, channels)
+    if observations is None:
+        observations = read_observations(config.station)
+    flagged = apply_qc(observations, config.qc, channels)
     minute = truth_minute(flagged, config)
     return minute, truth_hourly(minute, config), truth_daily(minute, config)
 
 
-def build_observation_features(config: Config) -> pl.DataFrame:
+def build_observation_features(
+    config: Config, *, observations: pl.DataFrame | None = None
+) -> pl.DataFrame:
     """Canonical issue-time observations using only past-dependent QC rules."""
     channels = sorted(set(config.station.columns.values()))
-    observations = read_observations(config.station)
+    if observations is None:
+        observations = read_observations(config.station)
     return truth_minute(apply_causal_qc(observations, config.qc, channels), config)
 
 
@@ -866,8 +881,10 @@ def write_synthetic_matrix(
     merge with any previously stored synthetic archive.
     """
     synthetic_long = merged_synthetic_long(config, synthetic_long)
-    _, hourly_truth, daily_truth = build_truth(config)
-    causal_minute = build_observation_features(config)
+    truth_snapshot_at = datetime.now(tz=timezone.utc)
+    observations = read_observations(config.station)
+    _, hourly_truth, daily_truth = build_truth(config, observations=observations)
+    causal_minute = build_observation_features(config, observations=observations)
     snapshots = (
         synthetic_long.select(pl.col("fetched_at").alias("issue_time"))
         .unique()
@@ -894,6 +911,7 @@ def write_synthetic_matrix(
         config.dataset.dir / "manifest_synthetic.json",
         sources=matrix_sources(matrix),
         snapshots=snapshots.height,
+        truth_snapshot_at=truth_snapshot_at,
     )
     return path, matrix.height
 

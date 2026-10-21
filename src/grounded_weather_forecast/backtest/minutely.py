@@ -440,8 +440,6 @@ def iter_minutely_scores(
                 else train_matrix.head(0)
             )
             if train_scored.is_empty():
-                if diagnostics is not None:
-                    diagnostics.unusable_training = True
                 continue
             proxy = GroundedEqualWeight().fit(
                 to_supervised_slice(

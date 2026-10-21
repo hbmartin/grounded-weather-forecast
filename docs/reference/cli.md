@@ -449,7 +449,38 @@ Notes that matter:
   questions.
 
 **Writes** `data/scores/scores_{product}_{kind}_{window}_{evaluation_id}.parquet`.
-On live sources it then runs method selection and prints the promoted release ids.
+On live sources it promotes only completed products. Compatible approved choices
+survive pending, failed, unrequested, or completed slices without a qualifying
+replacement. The CLI prints a promoted release ID only when it creates that
+immutable release; otherwise it reports retained/unchanged selections.
+
+Current-time `predict` and `publish` read approved releases and never elect
+methods, apply promotion-time live gates, or create release files. Elections and
+live-gate method changes belong to live backtests. Scientific gates and
+prediction-time safety guards retain their existing constants. The explicit
+library `select_methods` mapping API remains a promotion compatibility adapter;
+`promote_methods` returns `PromotionResult(selections, release_id, created)`, and
+`load_approved_selections` is the read-only serving interface.
+
+A data-only rebuild can retain approvals when code, configuration, product
+sources, exact feature set, and truth semantics still match. Each persisted
+selection records its original `dataset_fingerprint`; evaluation contexts also
+retain the original dataset, evaluation timestamp, and available training cutoff.
+The release's top-level dataset identifies its creation dataset; forecast JSON
+identifies the dataset actually used for this issuance. Historical replay keeps
+its strict dataset and promotion-time rules. Legacy releases remain readable
+using their recorded identity without fabricating missing context.
+
+Build manifests add `truth_snapshot_at`, captured before the observation read.
+`created_at` remains publication time. Synthetic truth and causal features share
+one observation snapshot, and virtual synthetic issue times may be later than
+either clock. Only a trustworthy truth cutoff can establish `awaiting_truth`.
+Legacy manifests with only `created_at`, absent cutoffs, and malformed maturity
+clocks permit positive scoring and valid short-history pending outcomes, but
+cannot exempt mature zero-score output. Malformed manifests, hash mismatches,
+corrupt matrices, and required schema errors remain failures. A sensor without
+usable training does not veto another eligible slice awaiting future truth;
+all-unusable training and overdue missing truth remain failures.
 
 All products write compact score batches incrementally, with at most 65,536 rows
 per batch/row group. The writer closes a temporary file before atomic publication;
@@ -743,7 +774,8 @@ gap meaningless.
 
 Degraded status is printed to **stderr**, so a `--out -` pipeline gets clean JSON
 on stdout. `status: "degraded"` means no finite hourly/daily value retains a
-promoted release matching the current fingerprints, including when automatic
+promoted release compatible with current code, configuration, sources, features,
+and truth semantics, including when automatic
 rain safeguards remove the last served attribution.
 Rainfall reasons apply only when they actually remove release attribution from
 finite served fields; otherwise cold-start and identity-change diagnoses remain

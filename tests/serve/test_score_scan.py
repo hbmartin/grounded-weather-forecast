@@ -385,7 +385,9 @@ def test_reused_contexts_and_cutoffs_only_attribute_selected_variables(tmp_path)
         result.cutoffs,
         {KEY: "eval", ("hourly", "humidity_pct", "1-3h"): None},
     )
-    assert evidence.contexts == evaluation_contexts([original])
+    expected = dict(evaluation_contexts([original])[0])
+    expected["training_cutoff"] = original["valid_time"].max().isoformat()
+    assert evidence.contexts == (expected,)
     assert evidence.evaluation_ids == ("eval",)
     assert evidence.training_cutoff == original["valid_time"].max()
 

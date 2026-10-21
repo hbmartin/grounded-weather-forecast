@@ -332,8 +332,8 @@ winners (scores_hourly_synthetic)
 └─────────┴───────────────┴─────────────┴───────────────┴──────┴──────────┘
 ```
 
-`predict` then uses only winners from a live evaluation run compatible with the
-current dataset. **You do not have to choose a method** — promotion chooses, and if
+`predict` then reads the approved release without re-electing methods. Compatible
+data-only rebuilds preserve those choices and their original evidence identity. **You do not have to choose a method** — promotion chooses, and if
 it has no evidence for a slice, the document is marked `degraded`, uses fit-free
 equal weight, and says why.
 

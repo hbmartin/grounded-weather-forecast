@@ -32,6 +32,7 @@ def publish_metadata(config, moment, product="hourly", source="live", *, minute=
         names["truth_minute"] = config.dataset.dir / "truth_minute.parquet"
     raw = {
         "created_at": moment.isoformat(),
+        "truth_snapshot_at": moment.isoformat(),
         "files": {
             name: {"sha256_16": hashlib.sha256(path.read_bytes()).hexdigest()[:16]}
             for name, path in names.items()
@@ -96,7 +97,9 @@ def test_future_truth_pending_then_overdue_is_failure(
     )
     matrix.write_parquet(config.dataset.dir / f"{product}_matrix_{source}.parquet")
     manifest = publish_metadata(config, cutoff, product, source)
-    monkeypatch.setattr(selection, "select_methods", lambda *_a, **_k: {})
+    monkeypatch.setattr(
+        selection, "promote_methods", lambda *_a, **_k: selection.PromotionResult({})
+    )
     first = cli._cmd_backtest(config, request(product, source=source))
     assert first.exit_code == 3
     assert first.failure_kind == "no_folds"
@@ -109,6 +112,7 @@ def test_future_truth_pending_then_overdue_is_failure(
     # an actual data gap; the operating-system file timestamp is irrelevant.
     raw = json.loads(manifest.read_text())
     raw["created_at"] = (cutoff + timedelta(days=5)).isoformat()
+    raw["truth_snapshot_at"] = raw["created_at"]
     manifest.write_text(json.dumps(raw))
     failed = cli._cmd_backtest(config, request(product, source=source))
     assert failed.exit_code == 1
@@ -158,11 +162,15 @@ def test_snapshot_metadata_never_invents_maturity(tmp_path, fault):
         else:
             raw["created_at"] = "2026-01-01T00:00:00"
         path.write_text(json.dumps(raw))
-    with pytest.raises(ValueError, match=r"snapshot|Expecting"):
-        evaluation_snapshot(config.dataset.dir, "hourly", "live")
+    if fault in {"missing-time", "naive-time", "early-time"}:
+        assert evaluation_snapshot(config.dataset.dir, "hourly", "live") is None
+    else:
+        with pytest.raises(ValueError, match=r"snapshot|Expecting"):
+            evaluation_snapshot(config.dataset.dir, "hourly", "live")
 
 
-def test_minutely_maturity_uses_actual_minute_targets(tmp_path):
+@pytest.mark.parametrize("variables", [("temp_c",), ("temp_c", "wind_gust_ms")])
+def test_minutely_maturity_uses_actual_minute_targets(tmp_path, variables):
     config = write_config(tmp_path)
     config = replace(config, backtest=replace(config.backtest, initial_train_days=1))
     matrix = synthetic_hourly_matrix(days=2, max_lead=3)
@@ -180,7 +188,7 @@ def test_minutely_maturity_uses_actual_minute_targets(tmp_path):
             minutely.iter_minutely_scores(
                 matrix,
                 grid,
-                minutely.MinutelyRequest(variables=("temp_c",)),
+                minutely.MinutelyRequest(variables=variables),
                 config,
                 diagnostics=diagnostics,
             )
@@ -198,7 +206,9 @@ def test_hourly_only_methods_skip_daily_without_requiring_matrix(
     synthetic_hourly_matrix(days=2).write_parquet(
         config.dataset.dir / "hourly_matrix_live.parquet"
     )
-    monkeypatch.setattr(selection, "select_methods", lambda *_a, **_k: {})
+    monkeypatch.setattr(
+        selection, "promote_methods", lambda *_a, **_k: selection.PromotionResult({})
+    )
     result = cli._cmd_backtest(config, request("hourly,daily", method))
     assert result.exit_code == 3
     assert not (config.dataset.dir / "daily_matrix_live.parquet").exists()
@@ -226,8 +236,10 @@ def test_all_products_attempted_and_only_completed_promoted(
     promoted = []
     monkeypatch.setattr(
         selection,
-        "select_methods",
-        lambda *_a, **kw: promoted.append(kw["products"]) or {},
+        "promote_methods",
+        lambda *_a, **kw: (
+            promoted.append(kw["products"]) or selection.PromotionResult({})
+        ),
     )
     assert cli._cmd_backtest(config, request(",".join(order))).exit_code == 1
     assert seen == list(order)
@@ -255,5 +267,118 @@ def test_some_scores_complete_product_with_other_future_targets(tmp_path, monkey
     )
     matrix.write_parquet(config.dataset.dir / "hourly_matrix_live.parquet")
     publish_metadata(config, cutoff)
-    monkeypatch.setattr(selection, "select_methods", lambda *_a, **_k: {})
+    monkeypatch.setattr(
+        selection, "promote_methods", lambda *_a, **_k: selection.PromotionResult({})
+    )
     assert cli._cmd_backtest(config, request()).exit_code == 0
+
+
+@pytest.mark.parametrize(
+    "clock", ["missing", "malformed", "naive", "after-publication", "legacy"]
+)
+@pytest.mark.parametrize("case, expected", [("scored", 0), ("short", 3), ("zero", 1)])
+def test_optional_maturity_clock_never_blocks_scoring(
+    tmp_path, monkeypatch, clock, case, expected
+):
+    config = write_config(tmp_path)
+    train_days = 3 if case == "zero" else 1
+    config = replace(
+        config, backtest=replace(config.backtest, initial_train_days=train_days)
+    )
+    config.dataset.dir.mkdir()
+    matrix = synthetic_hourly_matrix(
+        days=1 if case == "short" else 4, max_lead=24 if case == "zero" else 3
+    )
+    cutoff = matrix["issue_time"].max()
+    if case == "zero":
+        matrix = matrix.filter(pl.col("lead_hours") == 24).with_columns(
+            pl.when(
+                hourly_truth_known_at(matrix.filter(pl.col("lead_hours") == 24))
+                <= cutoff
+            )
+            .then(pl.col("t__temp_c__inst"))
+            .otherwise(float("nan"))
+            .alias("t__temp_c__inst")
+        )
+    matrix.write_parquet(config.dataset.dir / "hourly_matrix_live.parquet")
+    path = publish_metadata(config, cutoff)
+    raw = json.loads(path.read_text())
+    if clock in {"missing", "legacy"}:
+        del raw["truth_snapshot_at"]
+    elif clock == "malformed":
+        raw["truth_snapshot_at"] = "bad clock"
+    elif clock == "naive":
+        raw["truth_snapshot_at"] = cutoff.replace(tzinfo=None).isoformat()
+    else:
+        raw["truth_snapshot_at"] = (cutoff + timedelta(seconds=1)).isoformat()
+    path.write_text(json.dumps(raw))
+    monkeypatch.setattr(
+        selection, "promote_methods", lambda *_a, **_k: selection.PromotionResult({})
+    )
+    assert cli._cmd_backtest(config, request()).exit_code == expected
+
+
+def test_virtual_synthetic_issues_do_not_invalidate_scored_inputs(tmp_path):
+    config = write_config(tmp_path)
+    config = replace(config, backtest=replace(config.backtest, initial_train_days=1))
+    config.dataset.dir.mkdir()
+    matrix = synthetic_hourly_matrix(days=4, max_lead=3, source_kind="synthetic")
+    matrix.write_parquet(config.dataset.dir / "hourly_matrix_synthetic.parquet")
+    publish_metadata(
+        config, matrix["issue_time"].min() + timedelta(days=2), source="synthetic"
+    )
+    assert cli._cmd_backtest(config, request(source="synthetic")).exit_code == 0
+
+
+def test_unavailable_sensor_does_not_veto_eligible_pending_slice(tmp_path):
+    config = write_config(tmp_path)
+    config = replace(config, backtest=replace(config.backtest, initial_train_days=3))
+    config.dataset.dir.mkdir()
+    matrix = synthetic_hourly_matrix(days=4, max_lead=24).filter(
+        pl.col("lead_hours") == 24
+    )
+    cutoff = matrix["issue_time"].max()
+    matrix = matrix.with_columns(
+        pl.when(hourly_truth_known_at(matrix) <= cutoff)
+        .then(pl.col("t__temp_c__inst"))
+        .otherwise(float("nan"))
+        .alias("t__temp_c__inst"),
+        pl.lit(float("nan")).alias("t__wind_gust_ms"),
+        pl.lit(3.0).alias("fx__alpha__wind_gust_ms"),
+    )
+    matrix.write_parquet(config.dataset.dir / "hourly_matrix_live.parquet")
+    publish_metadata(config, cutoff)
+    args = request()
+    args.hourly_variables = "temp_c,wind_gust_ms"
+    assert cli._cmd_backtest(config, args).exit_code == 3
+    # Even with unusable gusts, overdue temperature truth is a real failure.
+    publish_metadata(config, cutoff + timedelta(days=3))
+    assert cli._cmd_backtest(config, args).exit_code == 1
+    args.hourly_variables = "wind_gust_ms"
+    assert cli._cmd_backtest(config, args).exit_code == 1
+
+
+def test_truth_cutoff_stays_at_read_time_across_publication_deadline(tmp_path):
+    config = write_config(tmp_path)
+    config = replace(config, backtest=replace(config.backtest, initial_train_days=3))
+    config.dataset.dir.mkdir()
+    matrix = synthetic_hourly_matrix(days=4, max_lead=24).filter(
+        pl.col("lead_hours") == 24
+    )
+    tests = matrix.filter(
+        pl.col("issue_time") > matrix["issue_time"].min() + timedelta(days=3)
+    )
+    read_clock = hourly_truth_known_at(tests).min() - timedelta(seconds=30)
+    matrix = matrix.with_columns(
+        pl.when(hourly_truth_known_at(matrix) <= read_clock)
+        .then(pl.col("t__temp_c__inst"))
+        .otherwise(float("nan"))
+        .alias("t__temp_c__inst")
+    )
+    matrix.write_parquet(config.dataset.dir / "hourly_matrix_live.parquet")
+    path = publish_metadata(config, read_clock)
+    raw = json.loads(path.read_text())
+    raw["created_at"] = (read_clock + timedelta(seconds=60)).isoformat()
+    path.write_text(json.dumps(raw))
+    assert cli._cmd_backtest(config, request()).exit_code == 3
+    assert cli._cmd_backtest(config, request()).exit_code == 3

@@ -15,12 +15,11 @@ class BacktestDiagnostics:
     snapshot_at: datetime | None = None
     awaiting_tests: int = 0
     overdue_tests: int = 0
-    unusable_training: bool = False
 
     def observe_tests(self, known_at: pl.Series, *, usable_training: bool) -> None:
         """Only future test truth, with usable training, can be expected pending."""
         if not usable_training:
-            self.unusable_training = True
+            return
         if self.snapshot_at is not None:
             future = known_at > self.snapshot_at
             self.awaiting_tests += int(future.sum())
@@ -32,11 +31,7 @@ class BacktestDiagnostics:
     ) -> Literal["insufficient_history", "awaiting_truth"] | None:
         if self.history_too_short:
             return "insufficient_history"
-        if (
-            self.awaiting_tests
-            and not self.overdue_tests
-            and not self.unusable_training
-        ):
+        if self.awaiting_tests and not self.overdue_tests:
             return "awaiting_truth"
         return None
 

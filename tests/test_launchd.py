@@ -826,3 +826,97 @@ def test_daily_package_mismatch_logs_clean_configuration_failure(
     output = capsys.readouterr().out
     assert "START mode=" in output and "exit=2" in output
     assert "grounded_weather_forecast.status" in output
+
+
+@pytest.mark.parametrize("fault", ["log", "spawn"])
+def test_restore_launch_failure_still_publishes_and_returns_failure(
+    monkeypatch, tmp_path, capsys, fault
+):
+    module = load_script(SCRIPT.with_name("hourly-predict-publish.py"))
+    events = []
+    monkeypatch.setattr(module, "run_predict", lambda _: events.append("predict") or 0)
+    module.resolve_runtime().forecast.write_text(
+        '{"status":"degraded","status_reason":"implementation changed"}'
+    )
+    if fault == "log":
+        monkeypatch.setattr(module, "RESTORE_LOG", tmp_path / "missing" / "restore.log")
+    else:
+        monkeypatch.setattr(module, "RESTORE_LOG", tmp_path / "restore.log")
+
+        def fail_spawn(*_a, **_k):
+            raise OSError("spawn unavailable")
+
+        monkeypatch.setattr(subprocess, "Popen", fail_spawn)
+    monkeypatch.setattr(module, "publish", lambda *_a: events.append("publish") or 0)
+    assert module.main([]) == 1
+    assert events == ["predict", "publish"]
+    output = capsys.readouterr().out
+    assert "auto-restore launch failed" in output
+    assert "exit=1" in output
+    assert "configuration error" not in output
+
+
+def test_stamp_runtime_failure_keeps_previous_stamp(monkeypatch, tmp_path, capsys):
+    directory = tmp_path / "Library/Application Support/grounded-weather-forecast"
+    directory.mkdir(parents=True)
+    stamp = directory / "last-maintenance"
+    stamp.touch()
+    os.utime(stamp, (1, 1))
+    before = stamp.stat().st_mtime_ns
+
+    def fail_touch(*_a, **_k):
+        raise PermissionError("stamp permission denied")
+
+    monkeypatch.setattr(Path, "touch", fail_touch)
+    code, commands, _ = run_maintenance(monkeypatch, tmp_path)
+    assert code == 1
+    assert stamp.stat().st_mtime_ns == before
+    assert any("prune-scores" in command for command in commands)
+    output = capsys.readouterr().out
+    assert "maintenance failed: stamp permission denied" in output
+    assert "configuration error" not in output
+    assert "exit=1" in output
+
+
+def test_late_synthetic_import_failure_continues_diagnostics(
+    monkeypatch, tmp_path, capsys
+):
+    module = load_script(SCRIPT)
+    directory = tmp_path / "Library/Application Support/grounded-weather-forecast"
+    directory.mkdir(parents=True)
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    steps = [
+        ["backtest", "--source", "synthetic"],
+        ["truth-qc"],
+        ["report"],
+        ["prune-scores"],
+    ]
+    monkeypatch.setattr(module, "maintenance_steps", lambda **_: steps)
+
+    def fail_import(*_a):
+        raise ImportError("synthetic runtime unavailable")
+
+    monkeypatch.setattr(module, "synthetic_enabled", fail_import)
+    seen = []
+    monkeypatch.setattr(
+        module, "run_stage", lambda step, _paths: seen.append(step) or 0
+    )
+    assert module.main([]) == 1
+    assert seen == steps[1:]
+    assert not (directory / "last-maintenance").exists()
+    output = capsys.readouterr().out
+    assert "backtest --source synthetic failed" in output
+    assert "exit=1" in output
+
+
+def test_publication_oserror_is_runtime_failure(monkeypatch, capsys):
+    module = load_script(SCRIPT.with_name("hourly-predict-publish.py"))
+    monkeypatch.setattr(module, "run_predict", lambda _: 0)
+    monkeypatch.setattr(module, "maybe_spawn_restore", lambda _: None)
+
+    def fail_publish(*_a):
+        raise OSError("publisher write denied")
+
+    monkeypatch.setattr(module, "publish", fail_publish)
+    assert module.main([]) == 1
+    assert "runtime failure: publisher write denied" in capsys.readouterr().out

@@ -27,7 +27,7 @@ class EvaluationContext:
 
     def payload(self, evaluation_id: str) -> dict[str, object]:
         source, sources, features, window, code, configuration = self.metadata
-        return {
+        payload: dict[str, object] = {
             "evaluation_id": evaluation_id,
             "source_kind": source,
             "source_set_json": sources,
@@ -37,6 +37,12 @@ class EvaluationContext:
             "code_version": code,
             "config_fingerprint": configuration,
         }
+        for name, value in zip(_CONTEXT_IDENTITY_COLUMNS, self.identity, strict=False):
+            if value is not None:
+                payload[name] = (
+                    value.isoformat() if isinstance(value, datetime) else value
+                )
+        return payload
 
 
 @dataclass(slots=True)
@@ -67,7 +73,7 @@ class ContextAccumulator:
             if evaluation_id in self.invalid:
                 continue
             metadata = tuple(str(row[column]) for column in CONTEXT_COLUMNS)
-            identity = tuple(row[column] for column in identity_columns)
+            identity = tuple(row.get(column) for column in _CONTEXT_IDENTITY_COLUMNS)
             context = self.contexts.get(evaluation_id)
             if context is None:
                 context = EvaluationContext(metadata, identity)
@@ -128,9 +134,22 @@ class EvidenceSummary:
                 evaluation_id, EvaluationContext(context.metadata, context.identity)
             )
             selected.semantics[key[1]] = context.semantics[key[1]]
+        payloads = []
+        for evaluation_id in sorted(projected):
+            payload = projected[evaluation_id].payload(evaluation_id)
+            cutoff = max(
+                (
+                    cutoffs[key]
+                    for key, value in attributed.items()
+                    if value == evaluation_id and cutoffs[key] is not None
+                ),
+                default=None,
+            )
+            payload["training_cutoff"] = cutoff.isoformat() if cutoff else None
+            payloads.append(payload)
         return cls(
             evaluation_ids=tuple(sorted(projected)),
-            contexts=tuple(projected[key].payload(key) for key in sorted(projected)),
+            contexts=tuple(payloads),
             training_cutoff=max(
                 (
                     value

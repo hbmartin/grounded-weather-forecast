@@ -54,7 +54,9 @@ everything it needs.
 ### `status`
 
 With automatic selection, `"ready"` means a finite hourly or daily value carries a
-promoted release matching current dataset, config, and code fingerprints. Check each variable's
+promoted release compatible with current code, config, product sources, features,
+and truth semantics. A retained selection keeps its original evaluation dataset;
+the document dataset fingerprint identifies the inputs actually used. Check each variable's
 `release_ids` for its own attribution. A minutely promotion alone does not
 change document readiness.
 Hourly and daily values are normalized once before attribution: null, NaN, or
