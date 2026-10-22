@@ -56,8 +56,7 @@ from grounded_weather_forecast.evaluation import (
 )
 from grounded_weather_forecast.reports import evidence
 from grounded_weather_forecast.serve.approvals import (
-    aware_timestamp,
-    read_approved_releases,
+    read_approval_snapshot,
 )
 from grounded_weather_forecast.serve.schema import Forecast
 from grounded_weather_forecast.status import PENDING_EXIT_CODES
@@ -928,21 +927,30 @@ class PruneResult:
     coordination_release_failure: ScoreCoordinationFailure | None = None
 
 
-def _protected_evaluations(config: Config, *, now: datetime) -> set[str] | None:
-    """Evaluation ids referenced by the active or recent releases."""
-    directory = config.artifacts_dir / "releases"
-    horizon = now - timedelta(days=_PROTECT_RELEASE_DAYS)
-    releases: list[tuple[str, datetime, set[str]]] = []
-    for release in read_approved_releases(directory, legacy_references=True):
-        promoted_at = aware_timestamp(release.get("approved_at"))
-        if promoted_at is None:
-            continue
-        release_id = str(release["release_id"])
-        raw_evaluations = release.get("evaluation_ids", [])
-        if not isinstance(raw_evaluations, (list, tuple)):
-            return None
-        evaluations = {str(e) for e in raw_evaluations}
-        releases.append((release_id, promoted_at, evaluations))
+def _release_references(raw: Mapping[str, object]) -> set[str]:
+    if "evaluation_ids" not in raw and "selections" not in raw:
+        raise ValueError("missing evaluation references")
+    evaluations = raw.get("evaluation_ids", [])
+    if not isinstance(evaluations, (list, tuple)) or not all(
+        isinstance(e, str) and e for e in evaluations
+    ):
+        raise ValueError("invalid evaluation_ids")
+    protected = {str(evaluation) for evaluation in evaluations}
+    selections = raw.get("selections", {})
+    if not isinstance(selections, Mapping):
+        raise ValueError("invalid selections")
+    for selected in selections.values():
+        if not isinstance(selected, Mapping):
+            raise ValueError("invalid selection evidence")
+        evaluation = selected.get("evaluation_id")
+        if evaluation is not None:
+            if not isinstance(evaluation, str) or not evaluation:
+                raise ValueError("invalid selection evaluation_id")
+            protected.add(evaluation)
+    return protected
+
+
+def _active_reference_ids(config: Config, *, now: datetime) -> set[str] | None:
     active_ids: set[str] | None = None
     try:
         pointer = json.loads(
@@ -950,29 +958,17 @@ def _protected_evaluations(config: Config, *, now: datetime) -> set[str] | None:
         )
         if isinstance(pointer.get("release_ids"), list):
             active_ids = {str(item) for item in pointer["release_ids"]}
-        else:
-            candidate = pointer.get("release_id")
-            if isinstance(candidate, str):
-                active_ids = {candidate}
+        elif isinstance(pointer.get("release_id"), str):
+            active_ids = {pointer["release_id"]}
         output_path = pointer.get("output_path")
         if isinstance(output_path, str):
-            try:
-                served = Forecast.from_json(
-                    Path(output_path).read_text(encoding="utf-8")
-                )
-            except (OSError, ValueError, TypeError, KeyError):
-                return None
+            served = Forecast.from_json(Path(output_path).read_text(encoding="utf-8"))
             active_ids = (active_ids or set()) | set(served.release_ids)
-    except (OSError, ValueError, AttributeError):
-        pass
-    if active_ids is None:
-        active_ids = (
-            {max(releases, key=lambda release: (release[1], release[0]))[0]}
-            if releases
-            else set()
-        )
-    # The personal publisher can hold a recent ready document after the local
-    # output has advanced to a degraded candidate. Keep its evidence too.
+    except (OSError, ValueError, AttributeError, TypeError, KeyError) as error:
+        if active_ids is not None:
+            raise ValueError(
+                f"active served document could not be verified: {error}"
+            ) from error
     archived = config.predict.history_path.parent / "served_forecasts"
     if archived.exists():
         for path in archived.glob("*.json"):
@@ -985,15 +981,48 @@ def _protected_evaluations(config: Config, *, now: datetime) -> set[str] | None:
                 issued = issued.replace(tzinfo=UTC)
             age = now - issued.astimezone(UTC)
             if document.status == "ready" and timedelta(0) <= age <= timedelta(hours=6):
-                active_ids.update(document.release_ids)
-    known_ids = {release_id for release_id, _, _ in releases}
-    if not active_ids <= known_ids:
+                active_ids = (active_ids or set()) | set(document.release_ids)
+    return active_ids
+
+
+def _protected_evaluations(
+    config: Config, *, now: datetime, failures: list[str] | None = None
+) -> set[str] | None:
+    """Authorization uses approval clocks; explicit legacy references only protect data."""
+    snapshot = read_approval_snapshot(
+        config.artifacts_dir / "releases", as_of=now, legacy_references=True
+    )
+    records = snapshot.records()
+    raw_by_id = {str(raw.get("release_id")): raw for raw in snapshot.releases}
+    known = {str(record.release["release_id"]) for record in records}
+    try:
+        active_ids = _active_reference_ids(config, now=now)
+        if active_ids is None:
+            active_ids = {str(records[0].release["release_id"])} if records else set()
+        protected: set[str] = set()
+        for release_id in active_ids:
+            raw = raw_by_id.get(release_id)
+            if raw is None:
+                raise ValueError(
+                    f"referenced release {release_id} is missing or unreadable"
+                )
+            if (
+                release_id not in known
+                and raw.get("approval_required", False) is not False
+            ):
+                raise ValueError(
+                    f"referenced release {release_id} has no eligible approval"
+                )
+            protected |= _release_references(raw)
+        horizon = now - timedelta(days=_PROTECT_RELEASE_DAYS)
+        for record in records:
+            if record.approved_at >= horizon:
+                protected |= _release_references(record.release)
+        return protected
+    except (ValueError,) as error:  # noqa: B013 -- explicit protection failure
+        if failures is not None:
+            failures.append(f"active served release could not be verified: {error}")
         return None
-    protected: set[str] = set()
-    for release_id, promoted_at, evaluations in releases:
-        if release_id in active_ids or promoted_at >= horizon:
-            protected |= evaluations
-    return protected
 
 
 def prune_scores_files(
@@ -1021,12 +1050,13 @@ def prune_scores_files(
         temporary = error.partial_result or ScoreTempCleanup()
         failure = error.snapshot()
     files = sorted(scores_dir.glob("scores_*.parquet")) if scores_dir.exists() else []
-    protected = _protected_evaluations(config, now=moment)
+    protection_failures: list[str] = []
+    protected = _protected_evaluations(config, now=moment, failures=protection_failures)
     if protected is None:
         return PruneResult(
             deleted=(),
             kept=tuple(files),
-            skipped=(*temporary.skipped, "active served release could not be verified"),
+            skipped=(*temporary.skipped, *protection_failures),
             freed_mb=0.0,
             temporary_deleted=temporary.deleted,
             temporary_freed_mb=temporary.freed_mb,

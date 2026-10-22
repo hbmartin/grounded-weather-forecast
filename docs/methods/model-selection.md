@@ -355,8 +355,9 @@ without mature live evidence use backtest MAE. Exact ties prefer `equal_weight`,
 then configured reference order. Backtest qualification is an operational
 **proxy**, not a guarantee of better realized accuracy: methods can have
 served different recent cases. If none qualifies, keep the current method and
-statistics and persist `live gate failed` / `replacement blocked` in its
-reason. No unscored fallback is synthesized. Config pins remain exempt.
+statistics. `live gate failed` / `replacement blocked` measurements are
+separate typed diagnostics in `history/live_gate.parquet`, not changes to the
+incumbent's approval reason or content identity. No unscored fallback is synthesized. Config pins remain exempt.
 
 `apply_live_gate(fallbacks=...)` remains a compatibility adapter: its candidates
 must pass the same scored quality guard as `replacement_candidates`. Supplying

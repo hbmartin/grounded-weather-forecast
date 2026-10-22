@@ -822,3 +822,102 @@ class TestBaselineTruthAlarm:
     def test_no_history_stays_quiet(self):
         assert operations._baseline_truth_alarm(810, None, NOW) == []
         assert operations._baseline_truth_alarm(810, pl.DataFrame(), NOW) == []
+
+
+@pytest.mark.parametrize("reference", ["active", "recent_served"])
+def test_naive_legacy_reference_protects_scores_without_authorizing_release(
+    tmp_path, reference
+):
+    from grounded_weather_forecast.serve.approvals import read_approved_releases
+
+    config, scores_dir = TestPruneScores().seeded(tmp_path)
+    directory = config.artifacts_dir / "releases"
+    (directory / "r1.json").write_text(
+        json.dumps(
+            {
+                "release_id": "r1",
+                "promoted_at": "2026-07-01T00:00:00",
+                "evaluation_ids": ["e1"],
+                "selections": {"hourly.temp_c.0-1h": {"evaluation_id": "e2"}},
+            }
+        )
+    )
+    if reference == "active":
+        activate_release(config.artifacts_dir, "r1")
+    else:
+        held = config.predict.history_path.parent / "served_forecasts" / "held.json"
+        held.parent.mkdir(parents=True, exist_ok=True)
+        document = Forecast(
+            schema_version=5,
+            issued_at=NOW.isoformat(),
+            latitude=34.0,
+            longitude=-117.0,
+            dataset_fingerprint="dataset",
+            sources=[],
+            observation_at=None,
+            minutely=[],
+            hourly=[],
+            daily=[],
+            status="ready",
+            release_ids=["r1"],
+        )
+        held.write_text(document.to_json())
+    assert read_approved_releases(directory, as_of=NOW) == []
+    result = operations.prune_scores_files(config, dry_run=False, now=NOW)
+    assert not result.deleted
+    assert (scores_dir / "scores_hourly_live_expanding_e1.parquet").exists()
+    assert (scores_dir / "scores_hourly_live_expanding_e2.parquet").exists()
+    assert not any("could not be verified" in note for note in result.skipped)
+
+
+@pytest.mark.parametrize(
+    "payload, detail",
+    [
+        ("broken", "missing or unreadable"),
+        (
+            json.dumps(
+                {
+                    "release_id": "r1",
+                    "promoted_at": "2026-07-01T00:00:00",
+                    "evaluation_ids": "broken",
+                }
+            ),
+            "invalid evaluation_ids",
+        ),
+        (
+            json.dumps(
+                {
+                    "release_id": "r1",
+                    "promoted_at": NOW.isoformat(),
+                    "approval_required": True,
+                    "evaluation_ids": ["e1"],
+                }
+            ),
+            "no eligible approval",
+        ),
+    ],
+)
+def test_unverifiable_reference_keeps_all_scores_with_specific_reason(
+    tmp_path, payload, detail
+):
+    config, scores_dir = TestPruneScores().seeded(tmp_path)
+    path = config.artifacts_dir / "releases" / "r1.json"
+    path.write_text(payload)
+    activate_release(config.artifacts_dir, "r1")
+    before = {p: p.read_bytes() for p in scores_dir.glob("*.parquet")}
+    result = operations.prune_scores_files(config, dry_run=False, now=NOW)
+    assert not result.deleted
+    assert any(detail in reason for reason in result.skipped)
+    assert before == {p: p.read_bytes() for p in scores_dir.glob("*.parquet")}
+
+
+def test_missing_reference_metadata_suspends_pruning(tmp_path):
+    config, scores_dir = TestPruneScores().seeded(tmp_path)
+    (config.artifacts_dir / "releases" / "r1.json").write_text(
+        json.dumps({"release_id": "r1", "promoted_at": "2026-07-01T00:00:00"})
+    )
+    activate_release(config.artifacts_dir, "r1")
+    result = operations.prune_scores_files(config, dry_run=False, now=NOW)
+    assert not result.deleted
+    assert any("missing evaluation references" in note for note in result.skipped)
+    assert (scores_dir / "scores_hourly_live_expanding_e2.parquet").exists()

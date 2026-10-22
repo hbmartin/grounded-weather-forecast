@@ -455,8 +455,10 @@ Notes that matter:
 On live sources it promotes only completed products. Compatible approved choices
 survive pending, failed, unrequested, or completed slices without a qualifying
 replacement. The CLI prints a promoted release ID only when it creates that
-immutable release; it prints `reapproved model release` when an existing release
-becomes current again, and retained/unchanged when the approval does not change.
+immutable release; `approved model release` denotes the first approval of
+content left by an interrupted run, and `reapproved model release` denotes content
+with an earlier valid approval becoming current again. Unchanged decisions print
+retained/unchanged.
 Approval events are committed after content publication under one ledger lock;
 A → B → A changes approval, while A → A records nothing new.
 
@@ -466,7 +468,9 @@ live-gate method changes belong to live backtests. Scientific gates and
 prediction-time safety guards retain their existing constants. The explicit
 library `select_methods` mapping API remains a promotion compatibility adapter;
 `promote_methods` returns `PromotionResult(selections, release_id, created,
-approval_id, approval_changed)`. `created` means immutable content was created;
+approval_id, approval_changed, disposition, gate_verdicts)`. `disposition` is
+`none`, `first`, `reapproval`, or `unchanged`; `gate_verdicts` contains typed
+measurements independent of content identity. `created` means immutable content was created;
 `approval_changed` means a new approval event committed. `approval_id` is nullable
 for legacy implicit approvals. `load_approved_selections` is the read-only serving
 interface. The library prediction marker distinguishes actually loaded approvals
@@ -486,15 +490,37 @@ outside content identity: managed content without a committed event is ignored.
 Legacy `promoted_at` provides an implicit approval; managed events provide ordered
 `approval_id`, `release_id`, timezone-aware `approved_at`, and locked `sequence`
 fields in `releases/approvals/`. Serving, incumbent lookup and historical replay
-share timestamp validation and reject malformed, naive and future approval clocks.
+share timestamp validation and reject malformed, naive, future, and overflowing
+approval clocks. Eligible managed events sort by locked sequence, ahead of implicit
+legacy approvals; legacy approvals sort by publication time. Clock correction
+cannot resurrect an older sequence. One snapshot and visibility cutoff is shared
+throughout promotion; the event records its own commit clock, not the snapshot's
+read clock. Reader `as_of`/report `now` cutoffs exclude later approvals.
 `active_release.json` still records the locally served document.
-Dashboard lineage and score-retention protection use the same committed approvals.
-The churn ledger adds nullable `from_approval_id` and `to_approval_id`, so repeated
-transitions are distinct while repeated reports remain idempotent; older rows load
-with these fields absent.
+Dashboard lineage and retention fallback use this same approval order. Active or
+recently served legacy references can separately protect scores even when their
+clock cannot authorize serving; unreadable referenced artifacts suspend pruning
+with an explicit reason. New release objects default to `approval_required=True`;
+missing fields in stored JSON retain legacy interpretation.
+
+Churn rows retain content publication time in `from/to_promoted_at`. Nullable
+`from/to_approved_at`, `from/to_approval_sequence`, approval IDs, and
+`clock_schema_version=2` identify approval transitions. Old rows are normalized in
+memory using their event IDs and available immutable content; unrecoverable clocks
+stay unknown. Historical artifacts are not rewritten. Dashboard grouping and detail
+selection use transition identity, with managed sequence ordering, so repeated
+A → B transitions remain distinct and report reruns remain idempotent.
 
 Each selection adds nullable `training_cutoff`. Contexts sharing an evaluation ID
-merge compatible variable semantics after validating identity. Summaries are
+merge compatible selected-variable semantics after validating identity; unused
+historical contexts are removed first. Known context-free legacy evaluation IDs
+remain in the reference list. Newly evaluated selections require context.
+Conflicts return 1 with `failure_kind="promotion_evidence_conflict"`, evaluation ID,
+field/variable and both values. Missing required context uses
+`promotion_evidence_invalid`. No content or approval is published on either error;
+completed scores and current approvals remain. Routine maintenance continues
+truth-QC/report diagnostics, returns failure, and preserves the success stamp;
+recovery cannot complete. Summaries are
 recomputed from the selected slices' available cutoffs; a legacy aggregate cutoff
 is not assigned to individual slices whose cutoff is unknown.
 
@@ -779,7 +805,12 @@ Live backtest promotion uses each configured safety class for guarded live
 replacement, including minutely references. Completed products' carried choices
 are checked even without a new winner; excluded products are left unchanged. A failed live gate keeps serving
 its current method when no reference passes the quality guard and records
-`replacement blocked` in its selection reason. Config pins bypass retention
+a typed `blocked` diagnostic rather than changing its approval reason.
+Measurements persist best effort in `artifacts/history/live_gate.parquet` and
+appear in CLI output and the dashboard. The ledger has a 730-day horizon and
+100,000-row limit, with recording time, slice/method, evaluation/release identity,
+verdict/detail, live and backtest MAE, sample count and provenance. Failed telemetry
+recording cannot change an approval decision. Config pins bypass retention
 and live replacement; their statistics belong to the pinned method or are
 absent when it has no compatible evidence. Minutely history attributes a
 release only when its selected method actually produced the value.
@@ -898,7 +929,11 @@ maintenance or recovery process has already restored readiness.
 Retention: the **newest three files per group** (product × kind × window) are
 always kept, as are evaluations referenced by the active release and releases
 within the last **7 days**. If an upgraded installation has no readable active
-pointer, the newest readable release is treated as active. Catalog rows survive
+pointer, the newest eligible approval under canonical sequence ordering is treated as active.
+Explicit active/recent-served legacy references protect the union of recorded
+and per-selection evaluation IDs even without an acceptable approval clock. This
+retention-only protection never authorizes serving or replay. Unverifiable references
+stop pruning conservatively with a specific reason. Catalog rows survive
 deletion, so the history ledgers stay intact — only the bulky per-case scores are
 removed. Published files the evaluations catalog has never seen are skipped,
 never deleted.

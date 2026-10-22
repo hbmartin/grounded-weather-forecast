@@ -1,8 +1,7 @@
-"""Ordered approval events for immutable release content.
+"""Approval snapshots and sequence-ordered events for immutable release content.
 
-Promotion holds the directory's approval-ledger lock across reading incumbents,
-electing, publishing content, and committing an event. Readers need no lock:
-event publication is atomic and event-managed content alone is not approved.
+Promotion holds the ledger lock from its snapshot read through event publication.
+Readers require no lock: content alone cannot authorize an event-managed release.
 """
 
 import json
@@ -11,19 +10,21 @@ from contextlib import suppress
 from dataclasses import asdict, dataclass, replace
 from datetime import UTC, datetime
 from pathlib import Path
+from typing import Literal
 
 from grounded_weather_forecast.evaluation import ModelRelease
 from grounded_weather_forecast.storage import atomic_write_text
 
+type ApprovalDisposition = Literal["none", "first", "reapproval", "unchanged"]
+
 
 def aware_timestamp(value: object) -> datetime | None:
-    """Accept only explicitly zoned clocks, comparing actual UTC instants."""
-    if not isinstance(value, str):
-        return None
-    with suppress(ValueError):
-        moment = datetime.fromisoformat(value)
-        if moment.tzinfo is not None and moment.utcoffset() is not None:
-            return moment.astimezone(UTC)
+    """Reject missing zones and clocks that overflow during UTC conversion."""
+    if isinstance(value, str):
+        with suppress(ValueError, OverflowError):
+            moment = datetime.fromisoformat(value)
+            if moment.tzinfo is not None and moment.utcoffset() is not None:
+                return moment.astimezone(UTC)
     return None
 
 
@@ -43,8 +44,20 @@ class ApprovedRelease:
     approval_id: str | None = None
 
     @property
-    def order(self) -> tuple[datetime, int, str]:
-        return self.approved_at, self.sequence, str(self.release["release_id"])
+    def order(self) -> tuple[bool, int, datetime, str]:
+        return (
+            bool(self.sequence),
+            self.sequence,
+            self.approved_at,
+            str(self.release["release_id"]),
+        )
+
+    def payload(self) -> dict[str, object]:
+        return self.release | {
+            "approved_at": self.approved_at.isoformat(),
+            "approval_id": self.approval_id,
+            "approval_sequence": self.sequence,
+        }
 
 
 @dataclass(frozen=True, slots=True)
@@ -52,6 +65,7 @@ class ApprovalCommit:
     created: bool = False
     changed: bool = False
     approval_id: str | None = None
+    disposition: ApprovalDisposition = "none"
 
 
 def _events(directory: Path) -> list[ApprovalEvent]:
@@ -75,112 +89,155 @@ def _events(directory: Path) -> list[ApprovalEvent]:
     return events
 
 
+def _reserved_sequence(directory: Path) -> int:
+    prefixes = (
+        path.stem.partition("-")[0] for path in (directory / "approvals").glob("*.json")
+    )
+    return max((int(p) for p in prefixes if p.isascii() and p.isdecimal()), default=0)
+
+
+@dataclass(frozen=True, slots=True)
+class ApprovalSnapshot:
+    """One fixed ledger view and visibility cutoff, shared throughout a promotion."""
+
+    releases: tuple[dict[str, object], ...]
+    events: tuple[ApprovalEvent, ...]
+    cutoff: datetime
+    reserved_sequence: int
+    issues: tuple[str, ...] = ()
+
+    def records(
+        self, releases: Sequence[dict[str, object]] | None = None
+    ) -> list[ApprovedRelease]:
+        latest: dict[str, ApprovalEvent] = {}
+        for event in self.events:
+            moment = aware_timestamp(event.approved_at)
+            if moment is None or moment > self.cutoff:
+                continue
+            previous = latest.get(event.release_id)
+            if previous is None or event.sequence > previous.sequence:
+                latest[event.release_id] = event
+        approved = []
+        for raw in self.releases if releases is None else releases:
+            published = aware_timestamp(raw.get("promoted_at"))
+            if (
+                not isinstance(raw.get("release_id"), str)
+                or published is None
+                or published > self.cutoff
+            ):
+                continue
+            event = latest.get(str(raw["release_id"]))
+            if event is not None:
+                moment = aware_timestamp(event.approved_at)
+                if moment is not None and moment >= published:
+                    approved.append(
+                        ApprovedRelease(raw, moment, event.sequence, event.approval_id)
+                    )
+            elif raw.get("approval_required", False) is False:
+                approved.append(ApprovedRelease(raw, published))
+        return sorted(approved, key=lambda item: item.order, reverse=True)
+
+
+def read_approval_snapshot(
+    directory: Path, *, as_of: datetime | None = None, legacy_references: bool = False
+) -> ApprovalSnapshot:
+    moment = datetime.now(UTC)
+    cutoff = min(as_of, moment) if as_of is not None else moment
+    releases = []
+    issues = []
+    for path in sorted(directory.glob("*.json")):
+        try:
+            raw = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            issues.append(str(path))
+            continue
+        if isinstance(raw, dict):
+            if legacy_references and raw.get("approval_required", False) is False:
+                raw.setdefault("release_id", path.stem)
+            releases.append(raw)
+        else:
+            issues.append(str(path))
+    return ApprovalSnapshot(
+        tuple(releases),
+        tuple(_events(directory)),
+        cutoff,
+        _reserved_sequence(directory),
+        tuple(issues),
+    )
+
+
 def ordered_approvals(
     releases: Sequence[dict[str, object]], directory: Path, as_of: datetime
 ) -> list[ApprovedRelease]:
-    """Newest approval per release, with implicit events for legacy content."""
-    cutoff = min(as_of, datetime.now(UTC))
-    latest: dict[str, ApprovalEvent] = {}
-    for event in _events(directory):
-        moment = aware_timestamp(event.approved_at)
-        if moment is None or moment > cutoff:
-            continue
-        previous = latest.get(event.release_id)
-        previous_moment = aware_timestamp(previous.approved_at) if previous else None
-        if (
-            previous_moment is None
-            or previous is None
-            or (moment, event.sequence) > (previous_moment, previous.sequence)
-        ):
-            latest[event.release_id] = event
-    approved = []
-    for raw in releases:
-        if not isinstance(raw.get("release_id"), str):
-            continue
-        published = aware_timestamp(raw.get("promoted_at"))
-        if published is None or published > cutoff:
-            continue
-        event = latest.get(str(raw.get("release_id")))
-        if event is not None:
-            moment = aware_timestamp(event.approved_at)
-            if moment is not None and moment >= published:
-                approved.append(
-                    ApprovedRelease(raw, moment, event.sequence, event.approval_id)
-                )
-        elif raw.get("approval_required", False) is False:
-            approved.append(ApprovedRelease(raw, published))
-    return sorted(approved, key=lambda item: item.order, reverse=True)
+    """Compatibility adapter; sequence determines supersession, clocks eligibility."""
+    return read_approval_snapshot(directory, as_of=as_of).records(releases)
 
 
 def publish_approval(
     release: ModelRelease,
     directory: Path,
     current: ApprovedRelease | None,
+    *,
+    snapshot: ApprovalSnapshot | None = None,
 ) -> ApprovalCommit:
-    """Commit a changed approval; caller must hold the approval-ledger lock."""
+    """Caller holds the ledger lock; commit the event after immutable content."""
     if current is not None and current.release["release_id"] == release.release_id:
-        return ApprovalCommit(approval_id=current.approval_id)
-    _, created = replace(release, approval_required=True).write_once(directory)
-    # Reserve names even for damaged events: append history, never overwrite it.
-    sequences = (
-        int(prefix)
-        for path in (directory / "approvals").glob("*.json")
-        if (prefix := path.stem.partition("-")[0]).isdigit()
+        return ApprovalCommit(approval_id=current.approval_id, disposition="unchanged")
+    snapshot = snapshot or read_approval_snapshot(directory)
+    prior = any(
+        record.release["release_id"] == release.release_id
+        for record in snapshot.records()
     )
-    sequence = max(sequences, default=0) + 1
-    moment = datetime.now(UTC)
-    # A clock stepping backwards must not make this decision older than the
-    # one it replaces. Equal instants are ordered by the locked sequence.
-    if current is not None:
-        moment = max(moment, current.approved_at)
+    _, created = replace(release, approval_required=True).write_once(directory)
+    sequence = snapshot.reserved_sequence + 1
     approval_id = f"{sequence:020d}-{release.release_id}"
-    event = ApprovalEvent(approval_id, release.release_id, moment.isoformat(), sequence)
+    event = ApprovalEvent(
+        approval_id, release.release_id, datetime.now(UTC).isoformat(), sequence
+    )
     atomic_write_text(
         json.dumps(asdict(event), indent=2),
         directory / "approvals" / f"{approval_id}.json",
     )
-    return ApprovalCommit(created=created, changed=True, approval_id=approval_id)
+    return ApprovalCommit(
+        created=created,
+        changed=True,
+        approval_id=approval_id,
+        disposition="reapproval" if prior else "first",
+    )
 
 
 def approved_payloads(
     releases: Sequence[dict[str, object]], directory: Path, as_of: datetime
 ) -> list[dict[str, object]]:
-    """Read models for reports without relabelling content publication time."""
     return [
-        record.release
-        | {
-            "approved_at": record.approved_at.isoformat(),
-            "approval_id": record.approval_id,
-            "approval_sequence": record.sequence,
-        }
-        for record in ordered_approvals(releases, directory, as_of)
+        record.payload() for record in ordered_approvals(releases, directory, as_of)
     ]
 
 
-def approval_sort_key(release: Mapping[str, object]) -> tuple[datetime, int, str]:
+def approval_sort_key(release: Mapping[str, object]) -> tuple[bool, int, datetime, str]:
     moment = aware_timestamp(release.get("approved_at", release.get("promoted_at")))
-    sequence = release.get("approval_sequence")
+    raw_sequence = release.get("approval_sequence")
+    sequence = (
+        raw_sequence
+        if isinstance(raw_sequence, int) and not isinstance(raw_sequence, bool)
+        else 0
+    )
     return (
+        bool(sequence),
+        sequence,
         moment or datetime.min.replace(tzinfo=UTC),
-        sequence if isinstance(sequence, int) else 0,
         str(release.get("release_id", "")),
     )
 
 
 def read_approved_releases(
-    directory: Path, *, legacy_references: bool = False
+    directory: Path, *, as_of: datetime | None = None, legacy_references: bool = False
 ) -> list[dict[str, object]]:
-    """Best-effort approved models for diagnostics and retention consumers."""
-    releases = []
-    for path in directory.glob("*.json"):
-        with suppress(OSError, ValueError):
-            raw = json.loads(path.read_text(encoding="utf-8"))
-            if isinstance(raw, dict):
-                # Older retention ledgers recorded references without a serving
-                # selection map or explicit id. Preserve their protection only;
-                # they cannot justify a forecast or authorize managed content.
-                if legacy_references and raw.get("approval_required", False) is False:
-                    raw.setdefault("release_id", path.stem)
-                if legacy_references or isinstance(raw.get("selections"), dict):
-                    releases.append(raw)
-    return approved_payloads(releases, directory, datetime.now(UTC))
+    snapshot = read_approval_snapshot(
+        directory, as_of=as_of, legacy_references=legacy_references
+    )
+    return [
+        record.payload()
+        for record in snapshot.records()
+        if legacy_references or isinstance(record.release.get("selections"), dict)
+    ]

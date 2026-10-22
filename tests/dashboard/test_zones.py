@@ -559,3 +559,30 @@ def test_zone_b_truth_cross_check_quiet_verdict_is_ok(tmp_path):
     }
     panel = _truth_cross_check_panel(tmp_path, payload)
     assert panel.status == "ok"
+
+
+def test_live_gate_diagnostic_ledger_is_visible_in_report(tmp_path):
+    from grounded_weather_forecast.reports import evidence
+    from grounded_weather_forecast.serve.evidence import GateVerdict
+
+    config = write_config(tmp_path)
+    verdict = GateVerdict(
+        "hourly",
+        "temp_c",
+        "0-1h",
+        "inverse_mse",
+        "evaluation",
+        "release",
+        "blocked",
+        "replacement blocked: no qualified reference",
+        5.0,
+        1.0,
+        30,
+    )
+    evidence.record_live_gate(config, (verdict,), now=NOW)
+    ctx = collect_context(config, now=NOW)
+    panel = next(
+        p for p in serving.build(ctx, derive(ctx)).panels if p.panel_id == "f4"
+    )
+    assert panel.status == "amber"
+    assert "replacement blocked" in panel.table.rows[0][-1]

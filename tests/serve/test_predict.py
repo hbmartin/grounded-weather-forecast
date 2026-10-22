@@ -1,5 +1,6 @@
 import json
 import math
+from dataclasses import replace
 from datetime import timedelta
 
 import pytest
@@ -296,7 +297,7 @@ def compatible_promotion(config, product, name, method, *, dataset_id=None):
             }
         },
     )
-    release.write(config.artifacts_dir / "releases")
+    replace(release, approval_required=False).write(config.artifacts_dir / "releases")
     directory = config.dataset.dir / "scores"
     directory.mkdir(exist_ok=True)
     scores(methods=(method,)).with_columns(

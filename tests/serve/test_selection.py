@@ -1590,7 +1590,7 @@ def test_partial_context_identity_does_not_invent_other_field(column):
     )
 
 
-def test_approved_loader_orders_actual_instants_and_rejects_future(approved_archive):
+def test_approved_loader_orders_sequences_and_rejects_future(approved_archive):
     config, _, _, evaluate, initial = approved_archive
     evaluate("hourly", "new-evaluation", 2)
     second = selection_module.promote_methods(
@@ -1610,7 +1610,7 @@ def test_approved_loader_orders_actual_instants_and_rejects_future(approved_arch
         event["approved_at"] = raw["promoted_at"]
         event_path.write_text(json.dumps(event))
     loaded = selection_module.load_approved_selections(config)
-    assert loaded[("hourly", "temp_c", "24-48h")].evaluation_id == "hour-original"
+    assert loaded[("hourly", "temp_c", "24-48h")].evaluation_id == "new-evaluation"
     first_raw["promoted_at"] = (datetime.now(UTC) + timedelta(days=1)).isoformat()
     first_path.write_text(json.dumps(first_raw))
     loaded = selection_module.load_approved_selections(config)
@@ -1680,7 +1680,21 @@ def _legacy_copy(config, initial, transform):
         else None,
         selections=raw["selections"],
     )
-    release.write(config.artifacts_dir / "releases")
+    from grounded_weather_forecast.serve.approvals import (
+        publish_approval,
+        read_approval_snapshot,
+    )
+    from grounded_weather_forecast.storage import locked_path
+
+    directory = config.artifacts_dir / "releases"
+    # An old-format document can receive a new explicit approval without rewriting it.
+    replace(release, approval_required=False).write(directory)
+    with locked_path(directory / ".approval-ledger"):
+        snapshot = read_approval_snapshot(directory)
+        records = snapshot.records()
+        publish_approval(
+            release, directory, records[0] if records else None, snapshot=snapshot
+        )
     return release
 
 
@@ -1838,13 +1852,14 @@ def test_carried_completed_choice_is_live_gated_without_new_winner(
     result = selection_module.promote_methods(
         config, config.dataset.dir / "scores", products=frozenset({"hourly"})
     )
-    assert result.approval_changed
+    assert result.approval_changed == replacement
     if replacement:
         assert result.selections[key].method_id != selected.method_id
         assert result.selections[key].reason.startswith("demoted")
     else:
         assert result.selections[key].method_id == selected.method_id
-        assert "replacement blocked" in result.selections[key].reason
+        assert result.selections[key].reason == selected.reason
+        assert "replacement blocked" in result.gate_verdicts[0].detail
     assert (
         result.selections[("daily", "temp_max_c", "D1")].evaluation_id == "day-original"
     )
@@ -1904,7 +1919,7 @@ def test_carried_pin_remains_exempt_from_live_gate(approved_archive, monkeypatch
     assert not result.approval_changed
 
 
-def test_promotion_conflict_commits_no_content_or_event(approved_archive):
+def test_unused_historical_conflict_does_not_poison_promotion(approved_archive):
     config, _, _, _, initial = approved_archive
 
     def conflict(raw):
@@ -1915,9 +1930,9 @@ def test_promotion_conflict_commits_no_content_or_event(approved_archive):
     _legacy_copy(config, initial, conflict)
     directory = config.artifacts_dir / "releases"
     before = {path: path.read_bytes() for path in directory.rglob("*.json")}
-    with pytest.raises(ValueError, match="conflicting evaluation context"):
-        selection_module.promote_methods(config, config.dataset.dir / "scores")
-    assert {path: path.read_bytes() for path in directory.rglob("*.json")} == before
+    result = selection_module.promote_methods(config, config.dataset.dir / "scores")
+    assert result.selections
+    assert all(path.read_bytes() == content for path, content in before.items())
 
 
 def test_approved_loader_does_not_construct_promotion_summary(
@@ -1947,3 +1962,218 @@ def test_simultaneous_identity_changes_diagnose_code_before_data(tmp_path):
     reason = no_evidence_reason(config, scores_dir)
     assert "implementation changed" in reason
     assert "dataset fingerprint changed" not in reason
+
+
+def _conflicting_daily_approval(config, initial):
+    def conflict(raw):
+        raw["selections"] = {
+            k: v for k, v in raw["selections"].items() if k.startswith("daily.")
+        }
+        raw["selections"]["daily.temp_max_c.D1"]["evaluation_id"] = "hour-original"
+        raw["evaluation_ids"] = ["hour-original"]
+        raw["evaluation_contexts"] = [
+            c
+            for c in raw["evaluation_contexts"]
+            if c["evaluation_id"] == "day-original"
+        ]
+        raw["evaluation_contexts"][0]["evaluation_id"] = "hour-original"
+
+    return _legacy_copy(config, initial, conflict)
+
+
+def test_selected_context_conflict_returns_structured_failure_and_keeps_scores(
+    approved_archive, monkeypatch
+):
+    from grounded_weather_forecast import cli
+    from grounded_weather_forecast.backtest.outcomes import ProductBacktestOutcome
+
+    config, _, _, _, initial = approved_archive
+    _conflicting_daily_approval(config, initial)
+    directory = config.artifacts_dir / "releases"
+    before = {p: p.read_bytes() for p in directory.rglob("*.json")}
+    scores = {
+        p: p.read_bytes() for p in (config.dataset.dir / "scores").glob("*.parquet")
+    }
+    monkeypatch.setattr(
+        cli,
+        "_evaluate_product",
+        lambda *_a: ProductBacktestOutcome("hourly", "evaluated", 1),
+    )
+    args = cli.build_parser().parse_args(
+        ["backtest", "--products", "hourly", "--methods", "equal_weight"]
+    )
+    for _ in range(2):
+        result = cli._cmd_backtest(config, args)
+        assert result.exit_code == 1
+        assert result.failure_kind == "promotion_evidence_conflict"
+        assert "hour-original" in result.error_detail
+        assert "recorded=" in result.error_detail and "proposed=" in result.error_detail
+    assert before == {p: p.read_bytes() for p in directory.rglob("*.json")}
+    assert scores == {p: p.read_bytes() for p in scores}
+    from grounded_weather_forecast import runs
+
+    monkeypatch.setattr(cli, "load_config", lambda *_a: config)
+    assert (
+        cli.main(["backtest", "--products", "hourly", "--methods", "equal_weight"]) == 1
+    )
+    journal = runs.load_runs(runs.runs_path(config))
+    assert journal["failure_kind"][-1] == "promotion_evidence_conflict"
+    assert journal["exit_code"][-1] == 1
+
+
+def test_conflict_maintenance_continues_diagnostics_and_is_not_pending(
+    approved_archive, monkeypatch
+):
+    from grounded_weather_forecast import cli
+    from grounded_weather_forecast.backtest.outcomes import ProductBacktestOutcome
+
+    config, _, _, _, initial = approved_archive
+    _conflicting_daily_approval(config, initial)
+    called = []
+    monkeypatch.setattr(cli, "_cmd_build_dataset", lambda *_a: 0)
+    monkeypatch.setattr(
+        cli,
+        "_evaluate_product",
+        lambda *_a: ProductBacktestOutcome("hourly", "evaluated", 1),
+    )
+    monkeypatch.setattr(
+        cli, "_cmd_truth_qc", lambda *_a: called.append("truth-qc") or 0
+    )
+    monkeypatch.setattr(cli, "_cmd_report", lambda *_a: called.append("report") or 0)
+    args = cli.build_parser().parse_args(["maintain"])
+    result = cli._cmd_maintain(config, args)
+    assert (
+        result.exit_code == 1 and result.failure_kind == "promotion_evidence_conflict"
+    )
+    assert called == ["truth-qc", "report"]
+
+
+def test_missing_new_context_is_an_explicit_error():
+    from grounded_weather_forecast.serve.evidence import (
+        EvidenceSummary,
+        PromotionEvidenceError,
+    )
+
+    key = ("hourly", "temp_c", "0-1h")
+    with pytest.raises(PromotionEvidenceError) as failure:
+        EvidenceSummary.from_payloads((), {key: None}, {key: "missing"})
+    assert failure.value.failure_kind == "promotion_evidence_invalid"
+    summary = EvidenceSummary.from_payloads(
+        (), {key: None}, {key: "legacy"}, legacy_missing=frozenset({"legacy"})
+    )
+    assert summary.evaluation_ids == ("legacy",) and summary.contexts == ()
+    assert (
+        EvidenceSummary.from_payloads((), {key: None}, {key: None}).evaluation_ids == ()
+    )
+
+
+def test_context_free_carried_selection_keeps_reference_in_combined_release(
+    approved_archive,
+):
+    config, frames, _, evaluate, initial = approved_archive
+
+    def remove_context(raw):
+        raw["evaluation_contexts"] = [
+            c
+            for c in raw["evaluation_contexts"]
+            if c["evaluation_id"] != "day-original"
+        ]
+
+    _legacy_copy(config, initial, remove_context)
+    for path in (config.dataset.dir / "scores").glob("scores_daily_*.parquet"):
+        path.unlink()
+    evaluate("hourly", "replacement", 2)
+    result = selection_module.promote_methods(
+        config, config.dataset.dir / "scores", products=frozenset({"hourly"})
+    )
+    directory = config.artifacts_dir / "releases"
+    raw = json.loads((directory / f"{result.release_id}.json").read_text())
+    assert "day-original" in raw["evaluation_ids"]
+    assert all(c["evaluation_id"] != "day-original" for c in raw["evaluation_contexts"])
+    for path in directory.glob("*.json"):
+        if path.stem != result.release_id:
+            path.unlink()
+    assert (
+        selection_module.load_approved_selections(config, matrices=frames)[
+            ("daily", "temp_max_c", "D1")
+        ].evaluation_id
+        == "day-original"
+    )
+
+
+def test_one_approval_snapshot_is_read_per_promotion(approved_archive, monkeypatch):
+    config, _, _, _, _ = approved_archive
+    original = selection_module.read_approval_snapshot
+    calls = []
+
+    def read(*args, **kwargs):
+        calls.append(1)
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(selection_module, "read_approval_snapshot", read)
+    selection_module.promote_methods(config, config.dataset.dir / "scores")
+    assert len(calls) == 1
+
+
+def test_blocked_gate_measurements_do_not_rotate_approval(
+    approved_archive, monkeypatch
+):
+    from grounded_weather_forecast.reports import evidence
+
+    config, _, _, _, initial = approved_archive
+    key = ("hourly", "temp_c", "24-48h")
+    selected = initial.selections[key]
+    monkeypatch.setattr(
+        selection_module, "slice_winners", lambda *_a, **_k: pl.DataFrame()
+    )
+    monkeypatch.setattr(selection_module, "_reference_candidates", lambda *_a: ())
+    directory = config.artifacts_dir / "releases"
+    before = {p: p.read_bytes() for p in directory.rglob("*.json")}
+    for live_mae, n in ((20.0, 30), (21.0, 31)):
+        monkeypatch.setattr(
+            selection_module,
+            "_live_verification",
+            lambda *_a: pl.DataFrame(
+                {
+                    "product": [key[0]],
+                    "variable": [key[1]],
+                    "lead_bucket": [key[2]],
+                    "method_id": [selected.method_id],
+                    "release_id": [initial.release_id],
+                    "n": [n],
+                    "live_mae": [live_mae],
+                }
+            ),
+        )
+        result = selection_module.promote_methods(
+            config, config.dataset.dir / "scores", products=frozenset({"hourly"})
+        )
+        assert not result.approval_changed and result.selections == initial.selections
+        assert result.gate_verdicts[0].verdict == "blocked"
+    assert before == {p: p.read_bytes() for p in directory.rglob("*.json")}
+    ledger = evidence.read_ledger(
+        evidence.ledger_path(config, evidence.LIVE_GATE_LEDGER),
+        evidence.LIVE_GATE_SCHEMA,
+    )
+    assert ledger["live_mae"].to_list() == [20.0, 21.0]
+    assert ledger["n"].to_list() == [30, 31]
+
+
+def test_first_approval_of_orphan_is_not_logged_as_reapproval(
+    approved_archive, monkeypatch, capsys
+):
+    from grounded_weather_forecast import cli
+    from grounded_weather_forecast.backtest.outcomes import ProductBacktestOutcome
+
+    config, _, _, _, _ = approved_archive
+    for path in (config.artifacts_dir / "releases" / "approvals").glob("*.json"):
+        path.unlink()
+    monkeypatch.setattr(
+        cli,
+        "_evaluate_product",
+        lambda _c, _a, p, _m: ProductBacktestOutcome(p, "evaluated", 1),
+    )
+    args = cli.build_parser().parse_args(["backtest", "--products", "hourly,daily"])
+    assert cli._cmd_backtest(config, args).exit_code == 0
+    text = capsys.readouterr().out
+    assert "approved model release:" in text and "reapproved" not in text

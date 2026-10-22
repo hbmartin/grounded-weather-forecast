@@ -319,3 +319,25 @@ class TestRecentCoveragePanel:
         ctx = context_with(tmp_path, QUALITY_LEDGER, quality_rows())
         panel = build_zone(ctx).panels[5]
         assert panel.status == "info"
+
+
+def test_repeated_destination_release_uses_latest_transition_details(tmp_path):
+    rows = []
+    for sequence, mae in ((2, 0.7), (4, 0.9)):
+        for row in churn_rows(changed_count=1, total=1):
+            row.update(
+                from_approval_id=f"event-{sequence - 1}",
+                to_approval_id=f"event-{sequence}",
+                from_approved_at=NOW,
+                to_approved_at=NOW,
+                from_approval_sequence=sequence - 1,
+                to_approval_sequence=sequence,
+                clock_schema_version=2,
+                to_mae=mae,
+            )
+            rows.append(row)
+    ctx = context_with(tmp_path, CHURN_LEDGER, rows)
+    panel = build_zone(ctx).panels[1]
+    assert panel.stats[1].value == "2"
+    assert len(panel.table.rows) == 1
+    assert panel.table.rows[0][-1] == "0.900"

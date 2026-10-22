@@ -140,26 +140,44 @@ def _churn_panel(ctx: DashboardContext) -> Panel:
             "young history — fewer than two promoted releases recorded",
         )
     transitions = (
-        churn.group_by(["from_release_id", "to_release_id", "to_promoted_at"])
+        churn.group_by(
+            [
+                "from_release_id",
+                "to_release_id",
+                "from_approval_id",
+                "to_approval_id",
+                "to_approved_at",
+                "to_approval_sequence",
+            ]
+        )
         .agg(
             pl.col("changed").mean().alias("rate"),
             pl.len().alias("slices"),
         )
-        .sort("to_promoted_at")
+        .with_columns(
+            (pl.col("to_approval_sequence").fill_null(0) > 0).alias("managed")
+        )
+        .sort(["managed", "to_approval_sequence", "to_approved_at", "to_release_id"])
         .tail(30)
     )
-    labels = [str(value)[:16] for value in transitions["to_promoted_at"].to_list()]
+    labels = [str(value)[:16] for value in transitions["to_approved_at"].to_list()]
     rates = [float(value) for value in transitions["rate"].to_list()]
     latest = rates[-1]
     status: PanelStatus = (
         "red" if latest >= _CHURN_RED else "amber" if latest >= _CHURN_AMBER else "ok"
     )
-    newest_to = transitions["to_release_id"][-1]
-    diff = (
-        churn.filter((pl.col("to_release_id") == newest_to) & pl.col("changed"))
-        .sort("slice_key")
-        .head(_DIFF_ROWS)
-    )
+    newest = transitions.row(-1, named=True)
+    identity = pl.lit(value=True)
+    for column in (
+        "from_release_id",
+        "to_release_id",
+        "from_approval_id",
+        "to_approval_id",
+        "to_approved_at",
+        "to_approval_sequence",
+    ):
+        identity &= pl.col(column).eq_missing(newest[column])
+    diff = churn.filter(identity & pl.col("changed")).sort("slice_key").head(_DIFF_ROWS)
     table = TableSpec(
         columns=("slice", "from", "to", "from mae", "to mae"),
         rows=tuple(

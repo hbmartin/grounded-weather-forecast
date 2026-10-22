@@ -107,12 +107,22 @@ qualifying replacement keep compatible incumbents. Completed products' carried
 choices still pass the live gate; pending, failed, and unrequested products retain
 their approvals. Immutable release content has separate ordered approval events:
 A → B → A reapproves A, while A → A adds no event. Event-managed releases are not
-visible before their approval commits. An unchanged release is not
-reported as newly promoted. Input hashes remain mandatory when a manifest is
+visible before their approval commits. Committed sequence determines approval
+order; timestamps constrain visibility, so clock correction cannot resurrect a
+superseded decision. New release objects require an event by default; legacy JSON
+without the marker retains implicit approval. First approval of existing content
+is distinguished from reapproval. An unchanged release is not reported as newly promoted. Input hashes remain mandatory when a manifest is
 present; missing or malformed maturity clocks do not prevent positive scoring.
 The additive manifest field `truth_snapshot_at` records the observation-read
 cutoff; `created_at` records publication. Legacy manifests remain scoreable but
 cannot establish future-truth pending status.
+
+Blocked live-gate measurements are recorded in `artifacts/history/live_gate.parquet`
+and shown in the dashboard, without changing carried approval reasons or creating
+new releases. Known legacy evaluation references remain protected even without
+full contexts; explicit active/recent-served legacy references protect scores
+without authorizing serving. Churn keeps publication and approval clocks separate,
+with additive nullable approval timestamps, sequences and a clock-schema version.
 
 The hourly wrapper publishes even if optional restore launch fails, then returns
 1 so monitoring sees that failure. Startup/configuration errors return 2; later
@@ -143,7 +153,12 @@ or FileLock. Disposal remains best effort with a zero-wait guard attempt, even a
 recoverable payloads or companions may remain. Legacy temporaries stay untouched.
 Pipeline mutators serialize on `<dataset dir>/pipeline.lock`;
 scheduled `maintain` waits for it and holds it across the whole transaction.
-Build and backtest failures stop CLI maintenance immediately. Insufficient-history
+Build and ordinary backtest failures stop CLI maintenance. Promotion-evidence
+failures preserve completed scores and allow truth-QC/report diagnostics, while
+maintenance still returns failure. Coordination failures still stop immediately.
+Conflicting selected provenance blocks every approval change and records
+`promotion_evidence_conflict`; missing new evaluation context records
+`promotion_evidence_invalid`. Neither failure advances the success stamp. Insufficient-history
 backtests (exit 3) continue to diagnostics without a failure alarm. A handled truth-QC
 failure still permits report, which may use the previous QC artifact; the failed
 refresh stays in the run ledger and maintenance returns the first nonzero stage

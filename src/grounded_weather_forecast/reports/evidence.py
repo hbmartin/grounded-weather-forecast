@@ -33,7 +33,7 @@ across fingerprint resets instead of silently mixing incomparable eras.
 
 import json
 from collections.abc import Mapping
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import TYPE_CHECKING, cast
@@ -48,11 +48,16 @@ from grounded_weather_forecast.metrics.probabilistic import (
     crps_ensemble,
     empirical_coverage,
 )
-from grounded_weather_forecast.serve.approvals import approved_payloads
+from grounded_weather_forecast.serve.approvals import (
+    aware_timestamp,
+    read_approval_snapshot,
+    read_approved_releases,
+)
 from grounded_weather_forecast.storage import atomic_write_parquet, locked_path
 
 if TYPE_CHECKING:
     from grounded_weather_forecast.reports.eprocess import EProcessStore
+    from grounded_weather_forecast.serve.evidence import GateVerdict
 
 _LOCK_TIMEOUT_SECONDS = 5.0
 RECENT_WINDOW_DAYS = 14
@@ -114,6 +119,11 @@ CHURN_SCHEMA = pl.Schema(
         "to_promoted_at": pl.Datetime("us", "UTC"),
         "from_approval_id": pl.String(),
         "to_approval_id": pl.String(),
+        "from_approved_at": pl.Datetime("us", "UTC"),
+        "to_approved_at": pl.Datetime("us", "UTC"),
+        "from_approval_sequence": pl.Int64(),
+        "to_approval_sequence": pl.Int64(),
+        "clock_schema_version": pl.Int64(),
         "slice_key": pl.String(),
         "product": pl.String(),
         "variable": pl.String(),
@@ -130,6 +140,40 @@ CHURN_SCHEMA = pl.Schema(
         "code_version": pl.String(),
     }
 )
+
+LIVE_GATE_SCHEMA = pl.Schema(
+    {
+        "recorded_at": pl.Datetime("us", "UTC"),
+        "product": pl.String(),
+        "variable": pl.String(),
+        "lead_bucket": pl.String(),
+        "method_id": pl.String(),
+        "evaluation_id": pl.String(),
+        "release_id": pl.String(),
+        "verdict": pl.String(),
+        "detail": pl.String(),
+        "live_mae": pl.Float64(),
+        "backtest_mae": pl.Float64(),
+        "n": pl.Int64(),
+        "code_version": pl.String(),
+        "config_fingerprint": pl.String(),
+        "dataset_fingerprint": pl.String(),
+    }
+)
+LIVE_GATE_LEDGER = LedgerSpec(
+    name="live_gate",
+    schema=LIVE_GATE_SCHEMA,
+    dedupe_keys=(
+        "recorded_at",
+        "product",
+        "variable",
+        "lead_bucket",
+        "method_id",
+        "evaluation_id",
+    ),
+    max_rows=100_000,
+)
+
 
 VERDICTS_SCHEMA = pl.Schema(
     {
@@ -367,6 +411,7 @@ LEDGERS: Mapping[str, LedgerSpec] = {
     for spec in (
         QUALITY_LEDGER,
         CHURN_LEDGER,
+        LIVE_GATE_LEDGER,
         VERDICTS_LEDGER,
         EPROCESS_WEALTH_LEDGER,
         SERVED_QUALITY_LEDGER,
@@ -660,8 +705,17 @@ def selection_churn(
                 "recorded_at": now,
                 "from_release_id": str(previous.get("release_id")),
                 "to_release_id": str(current.get("release_id")),
-                "from_promoted_at": _parse_promoted_at(previous),
-                "to_promoted_at": _parse_promoted_at(current),
+                "from_promoted_at": aware_timestamp(previous.get("promoted_at")),
+                "to_promoted_at": aware_timestamp(current.get("promoted_at")),
+                "from_approved_at": aware_timestamp(
+                    previous.get("approved_at", previous.get("promoted_at"))
+                ),
+                "to_approved_at": aware_timestamp(
+                    current.get("approved_at", current.get("promoted_at"))
+                ),
+                "from_approval_sequence": previous.get("approval_sequence", 0),
+                "to_approval_sequence": current.get("approval_sequence", 0),
+                "clock_schema_version": 2,
                 "from_approval_id": previous.get("approval_id"),
                 "to_approval_id": current.get("approval_id"),
                 "slice_key": key,
@@ -685,15 +739,73 @@ def selection_churn(
     )
 
 
-def _parse_promoted_at(release: Mapping[str, object]) -> datetime | None:
-    raw = release.get("approved_at", release.get("promoted_at"))
-    if not isinstance(raw, str):
-        return None
+def normalize_churn(
+    frame: pl.DataFrame, directory: Path, *, as_of: datetime
+) -> pl.DataFrame:
+    """Normalize old clocks in memory; never rewrite or invent historical evidence."""
+    if frame.is_empty():
+        return frame
+    snapshot = read_approval_snapshot(directory, as_of=as_of)
+    releases = {str(r.get("release_id")): r for r in snapshot.releases}
+    events = {e.approval_id: e for e in snapshot.events}
+    rows = frame.to_dicts()
+    for row in rows:
+        if row.get("clock_schema_version") == 2:
+            continue
+        for prefix in ("from", "to"):
+            approval_id = row.get(f"{prefix}_approval_id")
+            event = events.get(str(approval_id))
+            recorded = row.get(f"{prefix}_promoted_at")
+            if approval_id is not None:
+                row[f"{prefix}_approved_at"] = (
+                    aware_timestamp(event.approved_at)
+                    if event is not None
+                    else recorded
+                )
+                row[f"{prefix}_approval_sequence"] = (
+                    event.sequence if event is not None else None
+                )
+                raw = releases.get(str(row.get(f"{prefix}_release_id")), {})
+                row[f"{prefix}_promoted_at"] = aware_timestamp(raw.get("promoted_at"))
+            else:
+                row[f"{prefix}_approved_at"] = recorded
+                row[f"{prefix}_approval_sequence"] = 0
+    normalized = pl.DataFrame(rows, schema=dict(CHURN_SCHEMA))
+    return normalized.filter(
+        pl.col("to_approved_at").is_null()
+        | (pl.col("to_approved_at") <= snapshot.cutoff)
+    )
+
+
+def record_live_gate(
+    config: Config, verdicts: tuple["GateVerdict", ...], *, now: datetime
+) -> None:
+    """Best-effort gate telemetry; independent of approval content and identity."""
+    if not verdicts:
+        return
     try:
-        moment = datetime.fromisoformat(raw)
-    except ValueError:
-        return None
-    return moment if moment.tzinfo else moment.replace(tzinfo=UTC)
+        from grounded_weather_forecast.evaluation import (  # noqa: PLC0415
+            dataset_fingerprint,
+        )
+
+        rows = [
+            asdict(verdict)
+            | {
+                "recorded_at": now,
+                "code_version": code_identity(),
+                "config_fingerprint": config_fingerprint(config),
+                "dataset_fingerprint": dataset_fingerprint(config),
+            }
+            for verdict in verdicts
+        ]
+        append_ledger(
+            pl.DataFrame(rows, schema=dict(LIVE_GATE_SCHEMA)),
+            ledger_path(config, LIVE_GATE_LEDGER),
+            LIVE_GATE_LEDGER,
+            now=now,
+        )
+    except _RECORDER_ERRORS:
+        return
 
 
 _TRANSFORM_ORDER = {"raw": 0, "pit": 1, "cqr": 2}
@@ -854,7 +966,7 @@ def record_selection_churn(
     """Diff the two newest releases; returns the churn frame for rendering."""
     try:
         moment = now or datetime.now(tz=UTC)
-        releases = _readable_releases(config.artifacts_dir / "releases")
+        releases = _readable_releases(config.artifacts_dir / "releases", as_of=moment)
         if len(releases) < 2:
             return pl.DataFrame(schema=CHURN_SCHEMA)
         fresh = selection_churn(
@@ -868,21 +980,10 @@ def record_selection_churn(
     return fresh
 
 
-def _readable_releases(directory: Path) -> list[Mapping[str, object]]:
-    releases: list[dict[str, object]] = []
-    for path in sorted(directory.glob("*.json")):
-        try:
-            raw = json.loads(path.read_text(encoding="utf-8"))
-        except (OSError, ValueError):
-            continue
-        if (
-            isinstance(raw, dict)
-            and isinstance(raw.get("release_id"), str)
-            and isinstance(raw.get("promoted_at"), str)
-            and isinstance(raw.get("selections"), dict)
-        ):
-            releases.append(raw)
-    return list(reversed(approved_payloads(releases, directory, datetime.now(UTC))))
+def _readable_releases(
+    directory: Path, *, as_of: datetime | None = None
+) -> list[Mapping[str, object]]:
+    return list(reversed(read_approved_releases(directory, as_of=as_of)))
 
 
 def _append_verdicts(
