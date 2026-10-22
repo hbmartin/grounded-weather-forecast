@@ -103,6 +103,13 @@ rows was unavailable at the requested issuance. Repeating a fixed historical
 required. Unknown history receives inspection advice. Other cases say no promoted release produced a finite hourly or daily
 forecast. Per-field reasons retain their selection history. Diagnostics retain
 only small counts and failure records and are not serialized.
+Implementation-change diagnosis takes precedence when code, configuration and
+dataset identities have changed together, preserving the automatic restore trigger.
+Approved minutely selections alone do not establish hourly/daily readiness: the
+reason requests `backtest --source live` rather than only polling. The approved-load
+marker remains distinct from arbitrary library-supplied selections. Serving derives
+truth and causal observation features from one observation read per snapshot.
+
 Within a product snapshot, later successful or unpromoted attempts do not erase
 earlier promoted-fit failures. A surviving finite attributed forecast still
 keeps the document ready; these records do not independently demote readiness.

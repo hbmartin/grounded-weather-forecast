@@ -115,6 +115,26 @@ class ScoreCoordinationTimeout(Timeout):
     """A brief score-directory bookkeeping lock could not be acquired in time."""
 
 
+class ScoreCoordinationProbeError(RuntimeError):
+    """A secondary diagnostic cannot establish whether shared ownership is safe."""
+
+    def __init__(self, directory: Path, primary: Exception, probe: OSError) -> None:
+        self.directory = directory
+        self.primary_type = type(primary).__name__
+        self.primary_message = str(primary)
+        self.probe_type = type(probe).__name__
+        self.probe_message = str(probe)
+        super().__init__(
+            f"score coordination check failed for {directory}: {self.probe_type}: "
+            f"{self.probe_message}; primary failure: {self.primary_type}: {self.primary_message}"
+        )
+        for note in (
+            *getattr(primary, "__notes__", ()),
+            *getattr(probe, "__notes__", ()),
+        ):
+            self.add_note(note)
+
+
 class ScoreCoordinationReleaseError(RuntimeError):
     """A guard release failed; the lock's ownership may be uncertain."""
 

@@ -48,6 +48,7 @@ from grounded_weather_forecast.metrics.probabilistic import (
     crps_ensemble,
     empirical_coverage,
 )
+from grounded_weather_forecast.serve.approvals import approved_payloads
 from grounded_weather_forecast.storage import atomic_write_parquet, locked_path
 
 if TYPE_CHECKING:
@@ -111,6 +112,8 @@ CHURN_SCHEMA = pl.Schema(
         "to_release_id": pl.String(),
         "from_promoted_at": pl.Datetime("us", "UTC"),
         "to_promoted_at": pl.Datetime("us", "UTC"),
+        "from_approval_id": pl.String(),
+        "to_approval_id": pl.String(),
         "slice_key": pl.String(),
         "product": pl.String(),
         "variable": pl.String(),
@@ -196,7 +199,7 @@ QUALITY_LEDGER = LedgerSpec(
 CHURN_LEDGER = LedgerSpec(
     name="churn",
     schema=CHURN_SCHEMA,
-    dedupe_keys=("from_release_id", "to_release_id", "slice_key"),
+    dedupe_keys=("from_release_id", "to_release_id", "to_approval_id", "slice_key"),
     max_rows=100_000,
 )
 VERDICTS_LEDGER = LedgerSpec(
@@ -659,6 +662,8 @@ def selection_churn(
                 "to_release_id": str(current.get("release_id")),
                 "from_promoted_at": _parse_promoted_at(previous),
                 "to_promoted_at": _parse_promoted_at(current),
+                "from_approval_id": previous.get("approval_id"),
+                "to_approval_id": current.get("approval_id"),
                 "slice_key": key,
                 "product": product,
                 "variable": variable,
@@ -681,7 +686,7 @@ def selection_churn(
 
 
 def _parse_promoted_at(release: Mapping[str, object]) -> datetime | None:
-    raw = release.get("promoted_at")
+    raw = release.get("approved_at", release.get("promoted_at"))
     if not isinstance(raw, str):
         return None
     try:
@@ -864,7 +869,7 @@ def record_selection_churn(
 
 
 def _readable_releases(directory: Path) -> list[Mapping[str, object]]:
-    releases: list[Mapping[str, object]] = []
+    releases: list[dict[str, object]] = []
     for path in sorted(directory.glob("*.json")):
         try:
             raw = json.loads(path.read_text(encoding="utf-8"))
@@ -877,8 +882,7 @@ def _readable_releases(directory: Path) -> list[Mapping[str, object]]:
             and isinstance(raw.get("selections"), dict)
         ):
             releases.append(raw)
-    releases.sort(key=lambda release: str(release["promoted_at"]))
-    return releases
+    return list(reversed(approved_payloads(releases, directory, datetime.now(UTC))))
 
 
 def _append_verdicts(

@@ -1153,12 +1153,17 @@ def _run_matrix_backtest(
 
 def _cmd_backtest(config: Config, args: argparse.Namespace) -> CommandOutcome:
     from grounded_weather_forecast.backtest.score_storage import (  # noqa: PLC0415
+        ScoreCoordinationProbeError,
         ScoreCoordinationReleaseError,
         ScoreCoordinationTimeout,
     )
 
     try:
         return _backtest_products(config, args)
+    except (ScoreCoordinationProbeError,) as error:  # noqa: B013
+        detail = "; ".join((str(error), *getattr(error, "__notes__", ())))
+        print(detail, file=sys.stderr)
+        return CommandOutcome(1, "score_coordination_probe", detail)
     except (ScoreCoordinationTimeout,) as error:  # noqa: B013
         print(f"score directory coordination timed out: {error}", file=sys.stderr)
         return CommandOutcome(EXIT_CONTENTION, error_detail=str(error))
@@ -1223,6 +1228,8 @@ def _backtest_products(config: Config, args: argparse.Namespace) -> CommandOutco
         )
         if promoted.created:
             print(f"promoted model release: {promoted.release_id}")
+        elif promoted.approval_changed:
+            print(f"reapproved model release: {promoted.release_id}")
         elif promoted.selections:
             print("retained approved selections; no new model release")
         else:
@@ -1246,6 +1253,7 @@ def _evaluate_product(
     config: Config, args: argparse.Namespace, product: str, methods: tuple[str, ...]
 ) -> ProductBacktestOutcome:
     from grounded_weather_forecast.backtest.score_storage import (  # noqa: PLC0415
+        ScoreCoordinationProbeError,
         ScoreCoordinationReleaseError,
         ScoreCoordinationTimeout,
         check_score_coordination,
@@ -1269,6 +1277,10 @@ def _evaluate_product(
             for note in getattr(exc, "__notes__", ()):
                 coordination.add_note(note)
             raise coordination from exc
+        except (OSError,) as probe:  # noqa: B013 -- unknown ownership fails closed
+            raise ScoreCoordinationProbeError(
+                config.dataset.dir / "scores", exc, probe
+            ) from probe
         print(f"{product}: evaluation failed: {exc!r}", file=sys.stderr)
         return ProductBacktestOutcome(
             product, "failed", error_detail=f"{type(exc).__name__}: {exc}"

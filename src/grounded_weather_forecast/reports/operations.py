@@ -55,6 +55,10 @@ from grounded_weather_forecast.evaluation import (
     config_fingerprint,
 )
 from grounded_weather_forecast.reports import evidence
+from grounded_weather_forecast.serve.approvals import (
+    aware_timestamp,
+    read_approved_releases,
+)
 from grounded_weather_forecast.serve.schema import Forecast
 from grounded_weather_forecast.status import PENDING_EXIT_CODES
 
@@ -929,16 +933,15 @@ def _protected_evaluations(config: Config, *, now: datetime) -> set[str] | None:
     directory = config.artifacts_dir / "releases"
     horizon = now - timedelta(days=_PROTECT_RELEASE_DAYS)
     releases: list[tuple[str, datetime, set[str]]] = []
-    for path in sorted(directory.glob("*.json")) if directory.exists() else []:
-        try:
-            release = json.loads(path.read_text(encoding="utf-8"))
-            promoted_at = datetime.fromisoformat(str(release["promoted_at"]))
-        except (OSError, ValueError, KeyError):
+    for release in read_approved_releases(directory, legacy_references=True):
+        promoted_at = aware_timestamp(release.get("approved_at"))
+        if promoted_at is None:
             continue
-        if promoted_at.tzinfo is None:
-            promoted_at = promoted_at.replace(tzinfo=UTC)
-        release_id = str(release.get("release_id", path.stem))
-        evaluations = {str(e) for e in release.get("evaluation_ids", [])}
+        release_id = str(release["release_id"])
+        raw_evaluations = release.get("evaluation_ids", [])
+        if not isinstance(raw_evaluations, (list, tuple)):
+            return None
+        evaluations = {str(e) for e in raw_evaluations}
         releases.append((release_id, promoted_at, evaluations))
     active_ids: set[str] | None = None
     try:

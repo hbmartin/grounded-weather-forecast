@@ -103,7 +103,11 @@ Backtests own promotions and live-gate method changes. Prediction reads approved
 choices across compatible rebuilds: code, config, product sources, features, and
 truth semantics must match. Retained choices keep their original evaluation
 dataset identity. Pending, failed, unrequested, and completed slices with no
-qualifying replacement keep compatible incumbents. An unchanged release is not
+qualifying replacement keep compatible incumbents. Completed products' carried
+choices still pass the live gate; pending, failed, and unrequested products retain
+their approvals. Immutable release content has separate ordered approval events:
+A → B → A reapproves A, while A → A adds no event. Event-managed releases are not
+visible before their approval commits. An unchanged release is not
 reported as newly promoted. Input hashes remain mandatory when a manifest is
 present; missing or malformed maturity clocks do not prevent positive scoring.
 The additive manifest field `truth_snapshot_at` records the observation-read
@@ -113,6 +117,12 @@ cannot establish future-truth pending status.
 The hourly wrapper publishes even if optional restore launch fails, then returns
 1 so monitoring sees that failure. Startup/configuration errors return 2; later
 runtime errors return 1.
+If the coordination check after a product failure also fails, the command records
+`score_coordination_probe` with both errors, stops remaining score writers, and
+suppresses promotion. Prediction reads observations once for truth and causal
+features; code-change diagnosis takes precedence over data rotation so restoration
+remains actionable. Minutely-only approvals do not satisfy hourly/daily readiness.
+
 Score guard-release failure during startup recovery or an uncommitted write
 returns 1 from backtest, maintain or recover, records `score_coordination_release`
 and its diagnostic in the run journal, and suppresses promotion, including when

@@ -4,6 +4,7 @@ import logging
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import datetime
+from typing import cast
 
 import polars as pl
 
@@ -109,11 +110,80 @@ def evaluation_contexts(
     return accumulator.payloads()
 
 
+def merge_contexts(
+    payloads: Sequence[Mapping[str, object]],
+) -> dict[str, dict[str, object]]:
+    """Union attributed semantics without overwriting an evaluation's identity."""
+    merged: dict[str, dict[str, object]] = {}
+    for payload in payloads:
+        evaluation = str(payload["evaluation_id"])
+        identity = {
+            k: v
+            for k, v in payload.items()
+            if k not in ("semantics", "training_cutoff")
+        }
+        semantics = payload.get("semantics")
+        if not isinstance(semantics, Mapping):
+            raise ValueError(f"missing evaluation semantics: {evaluation}")
+        current = merged.setdefault(evaluation, {})
+        old_semantics = current.get("semantics", {})
+        if not isinstance(old_semantics, Mapping):
+            raise ValueError(f"invalid evaluation semantics: {evaluation}")
+        semantics = cast(Mapping[str, object], semantics)
+        old_semantics = cast(Mapping[str, object], old_semantics)
+        for key, value in identity.items():
+            if key in current and current[key] != value:
+                raise ValueError(f"conflicting evaluation context {evaluation}: {key}")
+        for variable, semantic in semantics.items():
+            if variable in old_semantics and old_semantics[variable] != semantic:
+                raise ValueError(
+                    f"conflicting evaluation semantics {evaluation}: {variable}"
+                )
+        current.update(identity)
+        current["semantics"] = dict(old_semantics) | dict(semantics)
+    return merged
+
+
 @dataclass(frozen=True, slots=True)
 class EvidenceSummary:
     evaluation_ids: tuple[str, ...]
     contexts: tuple[dict[str, object], ...]
     training_cutoff: datetime | None
+
+    @classmethod
+    def from_payloads(
+        cls,
+        payloads: Sequence[Mapping[str, object]],
+        cutoffs: Mapping[tuple[str, str, str], datetime | None],
+        evaluations: Mapping[tuple[str, str, str], str | None],
+    ) -> "EvidenceSummary":
+        contexts = merge_contexts(payloads)
+        projected: dict[str, dict[str, object]] = {}
+        by_evaluation: dict[str, list[datetime]] = {}
+        for key, evaluation in sorted(evaluations.items()):
+            if evaluation is None or evaluation not in contexts:
+                continue  # Preserve unknown legacy provenance as unknown.
+            context = contexts[evaluation]
+            semantics = context["semantics"]
+            if not isinstance(semantics, Mapping) or key[1] not in semantics:
+                raise ValueError(f"missing evaluation semantics {evaluation}: {key[1]}")
+            semantics = cast(Mapping[str, object], semantics)
+            selected = projected.setdefault(evaluation, context | {"semantics": {}})
+            selected_semantics = cast(dict[str, object], selected["semantics"])
+            selected_semantics[key[1]] = semantics[key[1]]
+            if cutoff := cutoffs.get(key):
+                by_evaluation.setdefault(evaluation, []).append(cutoff)
+        for evaluation, context in projected.items():
+            cutoff = max(by_evaluation.get(evaluation, []), default=None)
+            context["training_cutoff"] = cutoff.isoformat() if cutoff else None
+        return cls(
+            tuple(sorted(projected)),
+            tuple(projected[key] for key in sorted(projected)),
+            max(
+                (value for values in by_evaluation.values() for value in values),
+                default=None,
+            ),
+        )
 
     @classmethod
     def from_contexts(

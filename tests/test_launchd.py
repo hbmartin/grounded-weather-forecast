@@ -828,7 +828,7 @@ def test_daily_package_mismatch_logs_clean_configuration_failure(
     assert "grounded_weather_forecast.status" in output
 
 
-@pytest.mark.parametrize("fault", ["log", "spawn"])
+@pytest.mark.parametrize("fault", ["log", "spawn", "value", "subprocess"])
 def test_restore_launch_failure_still_publishes_and_returns_failure(
     monkeypatch, tmp_path, capsys, fault
 ):
@@ -844,7 +844,12 @@ def test_restore_launch_failure_still_publishes_and_returns_failure(
         monkeypatch.setattr(module, "RESTORE_LOG", tmp_path / "restore.log")
 
         def fail_spawn(*_a, **_k):
-            raise OSError("spawn unavailable")
+            error = {
+                "spawn": OSError,
+                "value": ValueError,
+                "subprocess": subprocess.SubprocessError,
+            }[fault]
+            raise error("spawn unavailable")
 
         monkeypatch.setattr(subprocess, "Popen", fail_spawn)
     monkeypatch.setattr(module, "publish", lambda *_a: events.append("publish") or 0)
@@ -854,6 +859,48 @@ def test_restore_launch_failure_still_publishes_and_returns_failure(
     assert "auto-restore launch failed" in output
     assert "exit=1" in output
     assert "configuration error" not in output
+
+
+def test_fresh_support_directory_is_initialized(monkeypatch, tmp_path):
+    module = load_script(SCRIPT)
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    monkeypatch.setattr(module, "run_stage", lambda *_a: 0)
+    monkeypatch.setattr(module, "maintenance_steps", lambda **_k: [["report"]])
+    directory = tmp_path / "Library/Application Support/grounded-weather-forecast"
+    assert not directory.exists()
+    assert module.main([]) == 0
+    assert (directory / "last-maintenance").exists()
+
+
+@pytest.mark.parametrize("fault", ["mkdir", "open", "flock"])
+def test_support_lock_setup_faults_are_configuration_errors(
+    monkeypatch, tmp_path, capsys, fault
+):
+    module = load_script(SCRIPT)
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    directory = tmp_path / "Library/Application Support/grounded-weather-forecast"
+    directory.mkdir(parents=True)
+
+    def denied(*_a, **_k):
+        raise PermissionError("support lock fixture")
+
+    if fault == "mkdir":
+        monkeypatch.setattr(Path, "mkdir", denied)
+    elif fault == "open":
+        opened = Path.open
+
+        def deny_lock(path, *args, **kwargs):
+            if path.name == "maintenance-job.lock":
+                denied()
+            return opened(path, *args, **kwargs)
+
+        monkeypatch.setattr(Path, "open", deny_lock)
+    else:
+        monkeypatch.setattr(module.fcntl, "flock", denied)
+    assert module.main([]) == 2
+    output = capsys.readouterr().out
+    assert "START mode=maintain" in output and "exit=2" in output
+    assert "support lock fixture" in output
 
 
 def test_stamp_runtime_failure_keeps_previous_stamp(monkeypatch, tmp_path, capsys):

@@ -152,13 +152,24 @@ Compatible data-only rebuilds preserve incumbents with their original evidence
 identity. Pending/failed products and slices without a qualifying replacement do
 not lose approvals. Code, config, product source/feature, or truth-semantic changes
 still invalidate incompatible approvals. Live-gate method changes occur during
-backtests; prediction-time safeguards remain active.
+backtests, including checks of carried choices in completed products when no new
+winner qualifies; prediction-time safeguards remain active. Separate approval
+events order decisions without rewriting release content. Reapproving an older
+release becomes current immediately; unchanged reruns add no event. New release
+content is ignored until its approval event commits.
 
 A failed optional restore launch never prevents the station/publication stages.
 If publication succeeds, the hourly job still returns 1 to expose the failed
-launch. Startup and policy validation return 2; later filesystem failures,
+launch, including ordinary launch argument and subprocess exceptions. Cancellation
+still propagates. The support directory is initialized before job-lock acquisition;
+setup and policy validation return 2; later filesystem failures,
 including stamp updates, return 1. Late synthetic imports fail that stage while
 remaining diagnostics continue. Pending or failed runs do not advance the stamp.
+A secondary failure checking score coordination records both errors as
+`score_coordination_probe`, stops remaining score writers, and suppresses promotion.
+Code-change diagnostics take precedence over dataset rotation so hourly restoration
+is still triggered. Approvals for minutely alone call for a live backtest to establish
+hourly/daily approvals rather than merely more polling.
 
 Pending embedded stages are visible in the current report and deduplicated against
 completed parents. Failed stages are counted provisionally before parent recording;

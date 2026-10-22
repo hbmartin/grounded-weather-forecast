@@ -23,6 +23,7 @@ from grounded_weather_forecast.dataset.matrix import DatasetPaths, matrix_path
 from grounded_weather_forecast.dataset.providers import read_latest_archive_location
 from grounded_weather_forecast.reports.eprocess import EProcessStore
 from grounded_weather_forecast.runs import RUNS_SCHEMA, read_runs, runs_path
+from grounded_weather_forecast.serve.approvals import approved_payloads
 from grounded_weather_forecast.serve.history import load_history
 from grounded_weather_forecast.serve.observability import (
     OBSERVABILITY_HISTORY_SCHEMA,
@@ -154,7 +155,17 @@ def _releases(config: Config, failures: list[str]) -> tuple[Mapping[str, object]
         )
         for path in sorted(directory.glob("*.json"))
     )
-    return tuple(release for release in loaded if release is not None)
+    return tuple(
+        approved_payloads(
+            [
+                dict(release)
+                for release in loaded
+                if release is not None and isinstance(release.get("selections"), dict)
+            ],
+            directory,
+            datetime.now(UTC),
+        )
+    )
 
 
 def _qc_summary(config: Config) -> pl.DataFrame | None:

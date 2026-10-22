@@ -492,11 +492,12 @@ class TestTrainServeSymmetry:
         empty = pl.DataFrame()
 
         # Stub only what build_snapshot needs to reach the ensembles seam.
+        monkeypatch.setattr(predict, "read_observations", lambda _station: empty)
         monkeypatch.setattr(
-            predict, "build_truth", lambda _config: (empty, empty, empty)
+            predict, "build_truth", lambda _config, **_kwargs: (empty, empty, empty)
         )
         monkeypatch.setattr(
-            predict, "build_observation_features", lambda _config: empty
+            predict, "build_observation_features", lambda _config, **_kwargs: empty
         )
         monkeypatch.setattr(
             predict,

@@ -39,6 +39,21 @@ guards remain active. Historical reconstruction still requires its exact dataset
 and a release available by the requested issue time. Forecast documents identify
 the dataset actually used and carry the release identity.
 
+Immutable release content and approval time are separate. A directory-wide ledger
+lock serializes incumbent reads, elections, content publication and an atomic approval
+event. Events are written only for changed decisions: A → B → A reapproves A; A → A
+is unchanged. New content carries `approval_required` outside its content hash and
+is invisible until its event commits. Legacy releases retain implicit approval through
+`promoted_at`. All readers use the same aware timestamp validation and ordering;
+historical replay considers only events available by its cutoff.
+
+Carried choices in completed products still pass the live gate, including slices
+without a new winner. Pending, failed and unrequested products remain untouched.
+Combined releases union compatible per-variable contexts and reject conflicting
+identity. Each selected slice preserves its available training cutoff; summaries are
+recomputed after replacements, without borrowing a legacy aggregate for an unknown
+slice. Context-free legacy choices can justify only their identical recorded dataset.
+
 Release fields are additive. Older single-dataset ledgers remain readable using
 their recorded provenance; missing evaluation context is not invented. The active
 release pointer continues to describe the locally served document.

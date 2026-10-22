@@ -34,6 +34,7 @@ from grounded_weather_forecast.reports.truth_qc import (
     TruthQCFreshness,
     truth_qc_age_limit,
 )
+from grounded_weather_forecast.serve.approvals import approval_sort_key
 
 type Severity = Literal["red", "amber", "info"]
 
@@ -691,7 +692,7 @@ def _lineage_alerts(inputs: AlertInputs) -> tuple[Alert, ...]:
         if inputs.manifest
         else "unknown"
     )
-    newest = max(inputs.releases, key=lambda r: str(r.get("promoted_at", "")))
+    newest = max(inputs.releases, key=approval_sort_key)
     alerts: list[Alert] = []
     if str(newest.get("dataset_fingerprint")) != manifest_print:
         alerts.append(
