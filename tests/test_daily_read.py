@@ -512,6 +512,17 @@ def test_concurrent_file_replacement_retries_and_discards_mixed_result(
     assert "prediction_quality" in result
     assert result["forecast"]["limitations"] == ["concurrent_replacement_after_retry"]
     assert "hourly" not in result["forecast"]
+    result["forecast"]["limitations"].append("caller annotation")
+    assert result["operational_health"]["station"]["limitations"] == [
+        "concurrent_replacement_after_retry"
+    ]
+    result["operational_health"]["station"]["limitations"].append("station annotation")
+    assert result["operational_health"]["providers"]["limitations"] == [
+        "concurrent_replacement_after_retry"
+    ]
+    assert result["prediction_quality"]["backtest"]["limitations"] == [
+        "concurrent_replacement_after_retry"
+    ]
 
 
 def test_source_schema_changes_are_partial(tmp_path):

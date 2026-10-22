@@ -54,8 +54,13 @@ def freshness(value: object, now: datetime, limit: float) -> dict[str, Any]:
             "max_age_minutes": limit,
         }
     age = (now - moment).total_seconds() / 60
+    status = "fresh"
+    if age < 0:
+        status = "unknown"
+    elif age > limit:
+        status = "stale"
     return {
-        "status": "unknown" if age < 0 else "stale" if age > limit else "fresh",
+        "status": status,
         "at": moment.isoformat(),
         "age_minutes": age,
         "max_age_minutes": limit,
@@ -374,24 +379,42 @@ def _recent_rows(
     return [r for r in frame.to_dicts() if timestamp(r["recorded_at"]) <= now]
 
 
+def _recent_run(row: Mapping[str, Any], now: datetime) -> bool:
+    if row["exit_code"] is not None and type(row["exit_code"]) is not int:
+        raise SourceError("invalid_run_exit_code")
+    if row.get("failure_kind") is not None and not isinstance(row["failure_kind"], str):
+        raise SourceError("invalid_run_failure_kind")
+    if (
+        row.get("record_kind") not in (None, "invocation", "stage")
+        or row["ended_at"] is None
+    ):
+        return False
+    ended = timestamp(row["ended_at"])
+    return (
+        now - timedelta(hours=24) <= ended <= now
+        and timestamp(row["started_at"]) <= ended
+    )
+
+
+def _run_status(row: Mapping[str, Any]) -> str:
+    if (
+        row.get("failure_kind") == "no_folds"
+        and row["exit_code"] in PENDING_EXIT_CODES
+        and not row.get("error")
+    ):
+        return "pending"
+    if row["exit_code"] is None and not row.get("error"):
+        return "unknown"
+    if row["exit_code"] == 0 and not row.get("error"):
+        return "ok"
+    return "failed"
+
+
 def read_runs(snapshot: Snapshot, path: Path, now: datetime) -> dict[str, Any]:
     frame = snapshot.frame(path, {"command", "started_at", "ended_at", "exit_code"})
     latest: dict[str, dict[str, Any]] = {}
     for row in frame.to_dicts():
-        if row["exit_code"] is not None and type(row["exit_code"]) is not int:
-            raise SourceError("invalid_run_exit_code")
-        if row.get("failure_kind") is not None and not isinstance(
-            row["failure_kind"], str
-        ):
-            raise SourceError("invalid_run_failure_kind")
-        if row.get("record_kind") not in (None, "invocation", "stage"):
-            continue
-        if (
-            row["ended_at"] is None
-            or not now - timedelta(hours=24) <= timestamp(row["ended_at"]) <= now
-        ):
-            continue
-        if timestamp(row["started_at"]) > timestamp(row["ended_at"]):
+        if not _recent_run(row, now):
             continue
         key = row["command"]
         if key not in {
@@ -408,24 +431,10 @@ def read_runs(snapshot: Snapshot, path: Path, now: datetime) -> dict[str, Any]:
             row["ended_at"]
         ):
             continue
-        pending = (
-            row.get("failure_kind") == "no_folds"
-            and row["exit_code"] in PENDING_EXIT_CODES
-            and not row.get("error")
-        )
-        status = (
-            "pending"
-            if pending
-            else "unknown"
-            if row["exit_code"] is None and not row.get("error")
-            else "ok"
-            if row["exit_code"] == 0 and not row.get("error")
-            else "failed"
-        )
         latest[key] = {
             "command": key,
             "ended_at": timestamp(row["ended_at"]).isoformat(),
-            "status": status,
+            "status": _run_status(row),
             "exit_code": row["exit_code"],
             "failure_kind": row.get("failure_kind"),
         }
@@ -518,6 +527,42 @@ def _quality_rows(
     )
 
 
+def _matches_score(
+    row: Mapping[str, Any],
+    cohort: tuple[str, ...],
+    release: Mapping[str, Any],
+    selection: Mapping[str, Any],
+    now: datetime,
+    *,
+    realized: bool,
+) -> bool:
+    variable, bucket, method, semantics, release_id = cohort
+    if (
+        row["product"],
+        row["variable"],
+        row["lead_bucket"],
+        row["method_id"],
+        row["truth_semantics"],
+    ) != ("hourly", variable, bucket, method, semantics):
+        return False
+    if (
+        row["dataset_fingerprint"] != release["dataset_fingerprint"]
+        or row["config_fingerprint"] != release["config_fingerprint"]
+    ):
+        return False
+    if realized:
+        return (
+            row["release_id"] == release_id
+            and row["as_of_date"] is not None
+            and date.fromisoformat(str(row["as_of_date"])) <= now.date()
+        )
+    return (
+        row["source_kind"] == "live"
+        and row["evaluation_id"] == selection.get("evaluation_id")
+        and timestamp(row["evaluation_created_at"]) <= now
+    )
+
+
 def _slice_score(
     rows: list[dict[str, Any]],
     cohort: tuple[str, ...],
@@ -527,36 +572,11 @@ def _slice_score(
     *,
     realized: bool,
 ) -> dict[str, Any]:
-    variable, bucket, method, semantics, release_id = cohort
-    matching = []
-    for row in rows:
-        if (
-            row["product"],
-            row["variable"],
-            row["lead_bucket"],
-            row["method_id"],
-            row["truth_semantics"],
-        ) != ("hourly", variable, bucket, method, semantics):
-            continue
-        if (
-            row["dataset_fingerprint"] != release["dataset_fingerprint"]
-            or row["config_fingerprint"] != release["config_fingerprint"]
-        ):
-            continue
-        if realized:
-            if (
-                row["release_id"] != release_id
-                or row["as_of_date"] is None
-                or date.fromisoformat(str(row["as_of_date"])) > now.date()
-            ):
-                continue
-        elif (
-            row["source_kind"] != "live"
-            or row["evaluation_id"] != selection.get("evaluation_id")
-            or timestamp(row["evaluation_created_at"]) > now
-        ):
-            continue
-        matching.append(row)
+    matching = [
+        row
+        for row in rows
+        if _matches_score(row, cohort, release, selection, now, realized=realized)
+    ]
     if not matching:
         return {"status": "unknown", "limitations": ["no_matching_current_evidence"]}
     row = max(
@@ -573,12 +593,13 @@ def _slice_score(
     )
     score = row["live_mae" if realized else "mae"]
     enough = type(row["n"]) is int and row["n"] > 0 and _finite(score)
+    status = "available"
+    if not enough:
+        status = "insufficient"
+    elif age["status"] != "fresh":
+        status = "stale"
     return {
-        "status": "insufficient"
-        if not enough
-        else "stale"
-        if age["status"] != "fresh"
-        else "available",
+        "status": status,
         "n": row["n"] if type(row["n"]) is int else None,
         "mae": score if _finite(score) else None,
         "evaluation_id": row.get("evaluation_id"),
@@ -718,6 +739,10 @@ def _report_envelope(
     }
 
 
+def _unstable_component() -> dict[str, Any]:
+    return {"status": "unknown", "limitations": ["concurrent_replacement_after_retry"]}
+
+
 def read_daily_report(
     config: Config,
     *,
@@ -777,17 +802,13 @@ def read_daily_report(
                 ["sources_are_independent_snapshots_not_a_global_transaction"],
             )
     # Keep the success envelope stable, but discard any potentially mixed data.
-    unavailable = {
-        "status": "unknown",
-        "limitations": ["concurrent_replacement_after_retry"],
-    }
     return _report_envelope(
         start,
         now,
         zone,
-        unavailable,
-        dict.fromkeys(operational, unavailable),
-        dict.fromkeys(prediction, unavailable),
+        _unstable_component(),
+        {key: _unstable_component() for key in operational},
+        {key: _unstable_component() for key in prediction},
         ["concurrent_replacement_after_retry"],
     )
 
