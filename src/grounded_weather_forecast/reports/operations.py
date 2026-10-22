@@ -927,25 +927,27 @@ class PruneResult:
     coordination_release_failure: ScoreCoordinationFailure | None = None
 
 
-def _release_references(raw: Mapping[str, object]) -> set[str]:
+def _release_references(raw: Mapping[str, object], *, release_id: str) -> set[str]:
     if "evaluation_ids" not in raw and "selections" not in raw:
-        raise ValueError("missing evaluation references")
+        raise ValueError(f"release {release_id}: missing evaluation references")
     evaluations = raw.get("evaluation_ids", [])
     if not isinstance(evaluations, (list, tuple)) or not all(
         isinstance(e, str) and e for e in evaluations
     ):
-        raise ValueError("invalid evaluation_ids")
+        raise ValueError(f"release {release_id}: invalid evaluation_ids")
     protected = {str(evaluation) for evaluation in evaluations}
     selections = raw.get("selections", {})
     if not isinstance(selections, Mapping):
-        raise ValueError("invalid selections")
+        raise ValueError(f"release {release_id}: invalid selections")
     for selected in selections.values():
         if not isinstance(selected, Mapping):
-            raise ValueError("invalid selection evidence")
+            raise ValueError(f"release {release_id}: invalid selection evidence")
         evaluation = selected.get("evaluation_id")
         if evaluation is not None:
             if not isinstance(evaluation, str) or not evaluation:
-                raise ValueError("invalid selection evaluation_id")
+                raise ValueError(
+                    f"release {release_id}: invalid selection evaluation_id"
+                )
             protected.add(evaluation)
     return protected
 
@@ -992,10 +994,12 @@ def _protected_evaluations(
     snapshot = read_approval_snapshot(
         config.artifacts_dir / "releases", as_of=now, legacy_references=True
     )
-    records = snapshot.records()
-    raw_by_id = {str(raw.get("release_id")): raw for raw in snapshot.releases}
-    known = {str(record.release["release_id"]) for record in records}
     try:
+        if snapshot.issues:
+            raise ValueError("unreadable release files: " + ", ".join(snapshot.issues))
+        records = snapshot.records()
+        raw_by_id = {str(raw.get("release_id")): raw for raw in snapshot.releases}
+        known = {str(record.release["release_id"]) for record in records}
         active_ids = _active_reference_ids(config, now=now)
         if active_ids is None:
             active_ids = {str(records[0].release["release_id"])} if records else set()
@@ -1013,15 +1017,17 @@ def _protected_evaluations(
                 raise ValueError(
                     f"referenced release {release_id} has no eligible approval"
                 )
-            protected |= _release_references(raw)
+            protected |= _release_references(raw, release_id=release_id)
         horizon = now - timedelta(days=_PROTECT_RELEASE_DAYS)
         for record in records:
             if record.approved_at >= horizon:
-                protected |= _release_references(record.release)
+                protected |= _release_references(
+                    record.release, release_id=str(record.release["release_id"])
+                )
         return protected
     except (ValueError,) as error:  # noqa: B013 -- explicit protection failure
         if failures is not None:
-            failures.append(f"active served release could not be verified: {error}")
+            failures.append(f"release references could not be verified: {error}")
         return None
 
 

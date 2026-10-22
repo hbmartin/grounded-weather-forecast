@@ -933,7 +933,13 @@ pointer, the newest eligible approval under canonical sequence ordering is treat
 Explicit active/recent-served legacy references protect the union of recorded
 and per-selection evaluation IDs even without an acceptable approval clock. This
 retention-only protection never authorizes serving or replay. Unverifiable references
-stop pruning conservatively with a specific reason. Catalog rows survive
+stop published-score pruning conservatively with a specific reason. Any unreadable
+or non-object release JSON file suspends published-score deletion, even if it is
+not active: its age and evidence references cannot be verified. The diagnostic
+names the affected paths; invalid references name the release ID. This applies
+under `--dry-run` too. These protection skips retain the existing exit code **0**;
+abandoned-temporary recovery still runs and its failures retain their existing
+exit behavior. Repair the affected release files before retrying. Catalog rows survive
 deletion, so the history ledgers stay intact — only the bulky per-case scores are
 removed. Published files the evaluations catalog has never seen are skipped,
 never deleted.

@@ -125,7 +125,7 @@ when a read fault persists.
 | `releases/*.json` | `backtest`, `predict`, `publish` | immutable promoted `ModelRelease` records — the serving boundary |
 | `active_release.json` | `predict`, `publish` | atomic record of the local output: `release_ids` (possibly empty) and `output_path`; older `release_id` pointers remain readable |
 | `eprocess/{product}_{kind}.json` | `report` | accumulated betting wealth per candidate/reference pair |
-| `history/*.parquet` | `report` | ten append-only ledgers (below) |
+| `history/*.parquet` | `report` | eleven append-only ledgers (below) |
 | `alignment.json` | `alignment` | measured truth semantics per provider |
 | `truth_qc.json` | `truth-qc` | neighbour verdicts, shield fit, and optional UTC ISO `generated_at` refresh timestamp (schema v3) |
 | `drift.json` | `report` | provider drift alarms |
@@ -206,7 +206,7 @@ F and H: `quality`, `churn`, `verdicts`, `served_quality`, `eprocess_wealth`,
 Append-only is the point — they record what was true *at the time*, so a
 regression is visible as a trend rather than only as a current value.
 
-!!! danger "`artifacts/` holds two things that cannot be rebuilt"
+!!! danger "Preserve irreplaceable evidence in `artifacts/`"
     **`eprocess/`** — a betting e-process is a sequential accumulation. A bet,
     once made, is never revised, and deleting the store discards all accumulated
     evidence; the gate restarts from zero wealth and re-earns significance from
@@ -271,6 +271,12 @@ If `active_release.json` is missing or malformed after an upgrade, the newest
 readable release is conservatively treated as active. Thus an evaluation still
 backing current serving is never deleted, even when that release is older than
 the rollback horizon.
+
+If any release JSON file is unreadable or is not an object, all published scores
+are kept and the diagnostic names the affected paths. A non-active file can
+still protect evidence, so pruning resumes only after those files can be
+verified. This safeguard also applies to `--dry-run` and leaves the existing
+temporary-recovery and exit-code behavior unchanged.
 
 ---
 
