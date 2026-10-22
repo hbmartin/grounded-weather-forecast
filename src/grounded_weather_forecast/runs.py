@@ -38,6 +38,7 @@ RUNS_SCHEMA = pl.Schema(
         "parent_run_id": pl.String(),
         "failure_kind": pl.String(),
         "error_detail": pl.String(),
+        "failure_details_json": pl.String(),
     }
 )
 
@@ -60,6 +61,7 @@ class RunRecord:
     parent_run_id: str | None = None
     failure_kind: str | None = None
     error_detail: str | None = None
+    failure_details_json: str | None = None
 
 
 def normalize_error_detail(detail: object) -> str | None:
@@ -180,5 +182,6 @@ def _to_frame(record: RunRecord) -> pl.DataFrame:
         "parent_run_id": record.parent_run_id,
         "failure_kind": record.failure_kind,
         "error_detail": normalize_error_detail(record.error_detail),
+        "failure_details_json": record.failure_details_json,
     }
     return pl.DataFrame([row], schema=RUNS_SCHEMA)

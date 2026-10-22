@@ -4,6 +4,7 @@ import logging
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import datetime
+from types import MappingProxyType
 from typing import Literal, cast
 
 import polars as pl
@@ -190,6 +191,27 @@ def merge_contexts(
     return merged
 
 
+@dataclass(frozen=True, slots=True, init=False)
+class ValidatedContexts:
+    """A merged, read-only context set; construction always validates raw input."""
+
+    contexts: Mapping[str, Mapping[str, object]]
+
+    def __init__(self, payloads: Sequence[Mapping[str, object]]) -> None:
+        contexts = {
+            evaluation: MappingProxyType(
+                context
+                | {
+                    "semantics": MappingProxyType(
+                        cast(Mapping[str, object], context["semantics"])
+                    )
+                }
+            )
+            for evaluation, context in merge_contexts(payloads).items()
+        }
+        object.__setattr__(self, "contexts", MappingProxyType(contexts))
+
+
 @dataclass(frozen=True, slots=True)
 class EvidenceSummary:
     evaluation_ids: tuple[str, ...]
@@ -203,24 +225,33 @@ class EvidenceSummary:
         cutoffs: Mapping[tuple[str, str, str], datetime | None],
         evaluations: Mapping[tuple[str, str, str], str | None],
         *,
-        legacy_missing: frozenset[str] = frozenset(),
-        merged: bool = False,
+        legacy_missing: frozenset[tuple[str, str, str]] = frozenset(),
     ) -> "EvidenceSummary":
-        contexts = (
-            {str(p["evaluation_id"]): dict(p) for p in payloads}
-            if merged
-            else merge_contexts(payloads)
+        return cls.from_validated_contexts(
+            ValidatedContexts(payloads),
+            cutoffs,
+            evaluations,
+            legacy_missing=legacy_missing,
         )
+
+    @classmethod
+    def from_validated_contexts(
+        cls,
+        validated: ValidatedContexts,
+        cutoffs: Mapping[tuple[str, str, str], datetime | None],
+        evaluations: Mapping[tuple[str, str, str], str | None],
+        *,
+        legacy_missing: frozenset[tuple[str, str, str]] = frozenset(),
+    ) -> "EvidenceSummary":
+        contexts = validated.contexts
         projected: dict[str, dict[str, object]] = {}
         by_evaluation: dict[str, list[datetime]] = {}
         for key, evaluation in sorted(evaluations.items()):
-            if evaluation is None:
+            if evaluation is None or key in legacy_missing:
                 continue
             if evaluation not in contexts:
-                if evaluation in legacy_missing:
-                    continue
                 raise PromotionEvidenceError(evaluation, "context")
-            context = contexts[evaluation]
+            context = dict(contexts[evaluation])
             semantics = context["semantics"]
             if not isinstance(semantics, Mapping) or key[1] not in semantics:
                 raise PromotionEvidenceError(evaluation, f"semantics.{key[1]}")

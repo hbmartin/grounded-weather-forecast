@@ -1,3 +1,5 @@
+import json
+from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 
 import polars as pl
@@ -13,6 +15,29 @@ from grounded_weather_forecast.runs import (
 )
 
 TEST_NOW = datetime(2026, 7, 19, tzinfo=UTC)
+
+
+def test_component_diagnostics_are_bounded_and_legacy_rows_remain_readable(tmp_path):
+    from grounded_weather_forecast.status import (
+        ComponentDiagnostic,
+        failure_details_json,
+    )
+
+    path = tmp_path / "runs.parquet"
+    detail = failure_details_json(
+        (
+            ComponentDiagnostic("daily", 1, "backtest_product_failed", "long\n" * 200),
+            ComponentDiagnostic(
+                "promotion", 1, "promotion_evidence_conflict", "conflict"
+            ),
+        )
+    )
+    append_run(replace(_record(), failure_details_json=detail), path, now=TEST_NOW)
+    decoded = json.loads(load_runs(path)["failure_details_json"][0])
+    assert len(decoded[0]["detail"]) <= 400 and "\n" not in decoded[0]["detail"]
+    assert decoded[1]["detail"] == "conflict"
+    load_runs(path).drop("failure_details_json").write_parquet(path)
+    assert load_runs(path)["failure_details_json"].to_list() == [None]
 
 
 def _record(command="qc", exit_code=0, error=None, offset_s=0):
@@ -150,6 +175,7 @@ class TestRetention:
                 "parent_run_id": [None, None],
                 "failure_kind": [None, None],
                 "error_detail": [None, None],
+                "failure_details_json": [None, None],
             },
             schema=RUNS_SCHEMA,
         )

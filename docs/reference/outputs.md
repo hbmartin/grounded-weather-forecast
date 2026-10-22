@@ -34,7 +34,7 @@ Written by `build-dataset` unless noted.
 | `ensembles.parquet` | written by `ingest-ensembles`; ensemble spread features |
 | `manifest.json` | per-file SHA-256 plus the **dataset fingerprint** |
 | `predict_history.parquet` | written by `predict` and `publish`; every accepted served forecast |
-| `runs.parquet` | parsed command invocations and maintenance/recovery child stages (`record_kind`, `parent_run_id`, `failure_kind`); older ledgers remain readable; pruned to 90 days / 50k rows |
+| `runs.parquet` | parsed command invocations and maintenance/recovery child stages (`record_kind`, `parent_run_id`, `failure_kind`, nullable `failure_details_json` component diagnostics); older ledgers remain readable; pruned to 90 days / 50k rows |
 | `scores/` | written by `backtest` |
 | `served_forecasts/` | archived served documents |
 
@@ -122,7 +122,8 @@ when a read fault persists.
 
 | Path | Written by | Contents |
 |---|---|---|
-| `releases/*.json` | `backtest`, `predict`, `publish` | immutable promoted `ModelRelease` records — the serving boundary |
+| `releases/*.json` | `backtest` | immutable `ModelRelease` content; managed content requires an approval event |
+| `releases/approvals/*.json` | `backtest` | committed sequence, actual `approved_at`, and nullable historical `visible_at` floor |
 | `active_release.json` | `predict`, `publish` | atomic record of the local output: `release_ids` (possibly empty) and `output_path`; older `release_id` pointers remain readable |
 | `eprocess/{product}_{kind}.json` | `report` | accumulated betting wealth per candidate/reference pair |
 | `history/*.parquet` | `report` | eleven append-only ledgers (below) |
@@ -218,6 +219,9 @@ regression is visible as a trend rather than only as a current value.
     `releases/` contains immutable content and append-only approval history;
     keep it for historical replay. `active_release.json` describes the locally
     served document. Its references also protect legacy score evidence.
+    Approval events add nullable `visible_at` for conservative historical visibility;
+    current decisions follow committed sequence. Selection markers
+    `legacy_context_missing` preserve exact-dataset legacy compatibility per slice.
     `history/live_gate.parquet` records gate diagnostics separately from approval
     identity. Churn history adds explicit approval clocks and sequences; older
     rows are normalized in memory without rewriting their recorded values.

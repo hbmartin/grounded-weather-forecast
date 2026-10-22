@@ -116,7 +116,8 @@ def test_future_truth_pending_then_overdue_is_failure(
     manifest.write_text(json.dumps(raw))
     failed = cli._cmd_backtest(config, request(product, source=source))
     assert failed.exit_code == 1
-    assert failed.failure_kind is None
+    assert failed.failure_kind == "backtest_product_failed"
+    assert failed.diagnostics[0].stage == product
 
 
 @pytest.mark.parametrize(

@@ -62,6 +62,7 @@ def run_maintenance(
     old_stamp=False,
     failures=None,
     sunday=False,
+    failure_kind=None,
 ):
     directory = tmp_path / "Library/Application Support/grounded-weather-forecast"
     directory.mkdir(parents=True, exist_ok=True)
@@ -76,6 +77,10 @@ def run_maintenance(
         argv = tuple(command[command.index("--config") + 2 :])
         step = argv[0]
         code = (failures or {}).get(argv, failure_code if step == failure else 0)
+        if step == "backtest" and (path := os.environ.get("_GWF_COMMAND_OUTCOME_PATH")):
+            Path(path).write_text(
+                json.dumps({"exit_code": code, "failure_kind": failure_kind})
+            )
         return subprocess.CompletedProcess(command, code)
 
     monkeypatch.setattr(Path, "home", lambda: tmp_path)
@@ -319,10 +324,29 @@ def test_backtest_exit_one_fails_without_success_stamp(monkeypatch, tmp_path, ca
     )
     assert code == 1
     assert not (directory / "last-maintenance").exists()
-    assert any("prune-scores" in command for command in commands)
+    assert not any("prune-scores" in command for command in commands)
     output = capsys.readouterr().out
     assert "maintenance failed stages: backtest --source live" in output
     assert "exit=1" in output
+
+
+@pytest.mark.parametrize(
+    "failure_kind", ["promotion_evidence_conflict", "promotion_evidence_invalid"]
+)
+def test_promotion_only_wrapper_failure_continues_diagnostics_without_stamp(
+    monkeypatch, tmp_path, failure_kind
+):
+    code, commands, directory = run_maintenance(
+        monkeypatch,
+        tmp_path,
+        failure="backtest",
+        failure_code=1,
+        failure_kind=failure_kind,
+    )
+    assert code == 1 and not (directory / "last-maintenance").exists()
+    assert any("truth-qc" in command for command in commands)
+    assert any("report" in command for command in commands)
+    assert any("prune-scores" in command for command in commands)
 
 
 @pytest.mark.parametrize("source", ["live", "synthetic"])

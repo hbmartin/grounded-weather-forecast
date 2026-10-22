@@ -77,7 +77,9 @@ def test_only_valid_short_history_is_pending(tmp_path, case):
     args = arguments()
     result = cli._cmd_backtest(config, args)
     assert result.exit_code == (EXIT_NO_FOLDS if case == "short" else 1)
-    assert result.failure_kind == ("no_folds" if case == "short" else None)
+    assert result.failure_kind == (
+        "no_folds" if case == "short" else "backtest_product_failed"
+    )
     assert not hasattr(args, "_failure_kind")
     if case == "corrupt":
         assert "Error" in result.error_detail
@@ -124,7 +126,9 @@ def test_product_aggregation_preserves_partial_pending_and_errors(
     args = arguments("--products", "hourly,daily")
     result = cli._cmd_backtest(config, args)
     assert result.exit_code == expected
-    assert result.failure_kind == ("no_folds" if expected == EXIT_NO_FOLDS else None)
+    assert result.failure_kind == (
+        {EXIT_NO_FOLDS: "no_folds", 1: "backtest_product_failed"}.get(expected)
+    )
 
 
 @pytest.mark.parametrize(

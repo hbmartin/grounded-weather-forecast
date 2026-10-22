@@ -753,8 +753,9 @@ class TestPruneScores:
         assert (scores_dir / "scores_hourly_live_expanding_e2.parquet").exists()
 
     @pytest.mark.parametrize("pointer_payload", [None, "{broken"])
+    @pytest.mark.parametrize("archived_reference", [False, True])
     def test_missing_or_malformed_pointer_falls_back_to_newest_release(
-        self, tmp_path, pointer_payload
+        self, tmp_path, pointer_payload, archived_reference
     ):
         config, scores_dir = self.seeded(tmp_path)
         releases = config.artifacts_dir / "releases"
@@ -778,11 +779,62 @@ class TestPruneScores:
             (config.artifacts_dir / "active_release.json").write_text(
                 pointer_payload, encoding="utf-8"
             )
+        if archived_reference:
+            held = config.predict.history_path.parent / "served_forecasts" / "held.json"
+            held.parent.mkdir(parents=True, exist_ok=True)
+            held.write_text(
+                Forecast(
+                    schema_version=5,
+                    issued_at=NOW.isoformat(),
+                    latitude=34.0,
+                    longitude=-117.0,
+                    dataset_fingerprint="dataset",
+                    sources=[],
+                    observation_at=None,
+                    minutely=[],
+                    hourly=[],
+                    daily=[],
+                    status="ready",
+                    release_ids=["older"],
+                ).to_json()
+            )
 
         operations.prune_scores_files(config, dry_run=False, now=NOW)
 
-        assert not (scores_dir / "scores_hourly_live_expanding_e1.parquet").exists()
+        assert (
+            scores_dir / "scores_hourly_live_expanding_e1.parquet"
+        ).exists() == archived_reference
         assert (scores_dir / "scores_hourly_live_expanding_e2.parquet").exists()
+
+    @pytest.mark.parametrize("content", [None, "{broken"])
+    @pytest.mark.parametrize("dry_run", [False, True])
+    def test_output_only_pointer_failure_keeps_every_published_score(
+        self, tmp_path, content, dry_run
+    ):
+        config, scores_dir = self.seeded(tmp_path)
+        output = tmp_path / "referenced.json"
+        if content is not None:
+            output.write_text(content)
+        (config.artifacts_dir / "active_release.json").write_text(
+            json.dumps({"output_path": str(output)})
+        )
+        before = {p: p.read_bytes() for p in scores_dir.glob("*.parquet")}
+        result = operations.prune_scores_files(config, dry_run=dry_run, now=NOW)
+        assert not result.deleted and set(result.kept) == set(before)
+        assert before == {p: p.read_bytes() for p in before}
+        assert any(
+            "active served document could not be verified" in diagnostic
+            for diagnostic in result.skipped
+        )
+
+    def test_unknown_evaluation_placeholder_is_not_protected(self, tmp_path):
+        config, _ = self.seeded(tmp_path)
+        path = config.artifacts_dir / "releases" / "r1.json"
+        raw = json.loads(path.read_text())
+        raw["evaluation_ids"].append("unknown")
+        raw["selections"] = {"hourly.temp_c.0-1h": {"evaluation_id": "unknown"}}
+        path.write_text(json.dumps(raw))
+        assert operations._protected_evaluations(config, now=NOW) == {"e1"}
 
 
 def pipeline_history(samples, days):

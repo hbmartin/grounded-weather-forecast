@@ -38,6 +38,85 @@ from grounded_weather_forecast.timeutil import utc
 NOW = utc(2026, 8, 6)
 
 
+def test_modern_churn_100k_rows_remains_vectorized_and_reuses_snapshot(
+    tmp_path, monkeypatch
+):
+    from grounded_weather_forecast.serve.approvals import read_approval_snapshot
+
+    frame = (
+        pl.DataFrame({"slice_key": [f"hourly.temp_c.{i % 50}" for i in range(100_000)]})
+        .with_columns(
+            *[
+                pl.lit(None, dtype=dtype).alias(name)
+                for name, dtype in CHURN_SCHEMA.items()
+                if name != "slice_key"
+            ]
+        )
+        .with_columns(
+            pl.lit(2).alias("clock_schema_version"),
+            pl.lit(NOW - timedelta(days=1)).alias("to_approved_at"),
+        )
+        .select(CHURN_SCHEMA.names())
+        .cast(CHURN_SCHEMA)
+    )
+    snapshot = read_approval_snapshot(tmp_path, as_of=NOW)
+
+    def unexpected(*_a, **_k):
+        raise AssertionError(
+            "modern churn must not normalize rows or read the snapshot again"
+        )
+
+    monkeypatch.setattr(pl.DataFrame, "to_dicts", unexpected)
+    monkeypatch.setattr(evidence, "read_approval_snapshot", unexpected)
+    result = evidence.normalize_churn(frame, tmp_path, as_of=NOW, snapshot=snapshot)
+    assert result.equals(frame) and result.schema == frame.schema
+
+
+def test_standalone_live_gate_recorder_computes_shared_identity_once(
+    tmp_path, monkeypatch
+):
+    from grounded_weather_forecast import evaluation
+    from grounded_weather_forecast.serve.evidence import GateVerdict
+
+    config = write_config(tmp_path)
+    calls = []
+
+    def identity(label):
+        def value(*_a):
+            calls.append(label)
+            return label
+
+        return value
+
+    monkeypatch.setattr(evaluation, "dataset_fingerprint", identity("dataset"))
+    monkeypatch.setattr(evidence, "config_fingerprint", identity("config"))
+    monkeypatch.setattr(evidence, "code_identity", identity("code"))
+    verdicts = tuple(
+        GateVerdict(
+            "hourly",
+            variable,
+            "0-1h",
+            "equal_weight",
+            "eval",
+            "release",
+            "blocked",
+            "fixture",
+            2.0,
+            1.0,
+            30,
+        )
+        for variable in ("temp_c", "humidity_pct", "wind_speed_mps")
+    )
+    evidence.record_live_gate(config, verdicts, now=NOW)
+    assert sorted(calls) == ["code", "config", "dataset"]
+    ledger = read_ledger(
+        ledger_path(config, evidence.LIVE_GATE_LEDGER), evidence.LIVE_GATE_SCHEMA
+    )
+    assert ledger.height == 3 and ledger["dataset_fingerprint"].unique().to_list() == [
+        "dataset"
+    ]
+
+
 def quality_row(evaluation_id="eval1", method_id="equal_weight", recorded_at=NOW):
     return {
         "recorded_at": recorded_at,

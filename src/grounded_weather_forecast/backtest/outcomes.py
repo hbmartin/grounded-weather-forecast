@@ -1,10 +1,16 @@
 """Product-level outcomes, independent of the number of emitted score rows."""
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Literal
 
 import polars as pl
+
+from grounded_weather_forecast.status import (
+    EXIT_NO_FOLDS,
+    CommandOutcome,
+    ComponentDiagnostic,
+)
 
 
 @dataclass(slots=True)
@@ -54,3 +60,48 @@ class ProductBacktestOutcome:
         if reason := diagnostics.pending_reason:
             return cls(product, "pending", pending_reason=reason)
         return cls(product, "failed")
+
+
+@dataclass(slots=True)
+class BacktestResult:
+    """Keep evaluation failures even if a later promotion fails independently."""
+
+    products: list[ProductBacktestOutcome] = field(default_factory=list)
+    promotion: CommandOutcome = field(default_factory=CommandOutcome)
+
+    @property
+    def row_count(self) -> int:
+        return sum(product.row_count for product in self.products)
+
+    def product_diagnostics(self) -> tuple[ComponentDiagnostic, ...]:
+        return tuple(
+            ComponentDiagnostic(
+                product.product,
+                product.exit_code,
+                "backtest_product_failed",
+                product.error_detail or "evaluation produced no usable scores",
+            )
+            for product in self.products
+            if product.status == "failed"
+        )
+
+    def command(self) -> CommandOutcome:
+        diagnostics = self.product_diagnostics() + self.promotion.diagnostics
+        failed = next((p for p in self.products if p.status == "failed"), None)
+        if failed is not None:
+            return CommandOutcome(
+                failed.exit_code,
+                "backtest_product_failed",
+                failed.error_detail,
+                diagnostics,
+            )
+        if self.promotion.exit_code:
+            return CommandOutcome(
+                self.promotion.exit_code,
+                self.promotion.failure_kind,
+                self.promotion.error_detail,
+                diagnostics,
+            )
+        if any(p.status == "pending" for p in self.products):
+            return CommandOutcome(EXIT_NO_FOLDS, "no_folds")
+        return CommandOutcome(0 if self.row_count else 2)
