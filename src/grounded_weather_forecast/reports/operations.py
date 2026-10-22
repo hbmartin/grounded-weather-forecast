@@ -54,6 +54,9 @@ from grounded_weather_forecast.evaluation import (
     code_identity,
     config_fingerprint,
 )
+from grounded_weather_forecast.health_policy import (
+    FRESHNESS_THRESHOLDS as FRESHNESS_THRESHOLDS,  # noqa: PLC0414 - compatibility export
+)
 from grounded_weather_forecast.reports import evidence
 from grounded_weather_forecast.serve.approvals import (
     read_approval_snapshot,
@@ -67,10 +70,10 @@ _FUNNEL_WINDOW_DAYS = 14
 _BASELINE_WINDOW_DAYS = 14
 _BASELINE_MIN_DAYS = 3
 
-_TRUTH_AGE_ALARM_MINUTES = 120.0
-_COLLECTOR_AGE_ALARM_MINUTES = 180.0
-_SERVED_AGE_ALARM_MINUTES = 180.0
-_DOCUMENT_AGE_ALARM_MINUTES = 180.0
+_TRUTH_AGE_ALARM_MINUTES = FRESHNESS_THRESHOLDS["truth_age_minutes"]
+_COLLECTOR_AGE_ALARM_MINUTES = FRESHNESS_THRESHOLDS["collector_age_minutes"]
+_SERVED_AGE_ALARM_MINUTES = FRESHNESS_THRESHOLDS["served_history_age_minutes"]
+_DOCUMENT_AGE_ALARM_MINUTES = FRESHNESS_THRESHOLDS["forecast_document_age_minutes"]
 # The hourly predict cadence yields ~24 runs/day; half that means the
 # scheduler has been broken for at least half a day.
 _MIN_PREDICT_RUNS_24H = 12
@@ -88,13 +91,6 @@ _DETAIL_MAX_CHARS = 400
 
 # Shared freshness policy for pipeline collectors, dashboard panels and central
 # alerts. Truth-QC freshness is assessed separately, without pipeline columns.
-FRESHNESS_THRESHOLDS: Mapping[str, float] = {
-    "truth_age_minutes": _TRUTH_AGE_ALARM_MINUTES,
-    "collector_age_minutes": _COLLECTOR_AGE_ALARM_MINUTES,
-    "served_history_age_minutes": _SERVED_AGE_ALARM_MINUTES,
-    "forecast_document_age_minutes": _DOCUMENT_AGE_ALARM_MINUTES,
-    "truth_qc_age_minutes": 2880.0,
-}
 
 _SNAPSHOT_NAME = "identity_snapshot.json"
 

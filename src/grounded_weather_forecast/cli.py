@@ -104,6 +104,26 @@ def build_parser() -> argparse.ArgumentParser:
         version=f"%(prog)s {__version__}",
     )
     subparsers = parser.add_subparsers(dest="command", required=True)
+    daily = subparsers.add_parser(
+        "read-daily-report",
+        help="read versioned daily JSON without telemetry or mutations",
+    )
+    daily.add_argument(
+        "--start", required=True, help="scheduled report start, offset-bearing ISO 8601"
+    )
+    daily.add_argument(
+        "--as-of", required=True, help="execution cutoff, offset-bearing ISO 8601"
+    )
+    daily.add_argument(
+        "--hours", type=int, default=12, help="window length; must be 12"
+    )
+    daily.add_argument("--forecast", type=Path, default=Path("forecast.json"))
+    daily.add_argument(
+        "--published-station",
+        type=Path,
+        default=None,
+        help="optional station snapshot fallback path",
+    )
     subparsers.add_parser("qc", help="summarize station truth quality control")
     subparsers.add_parser(
         "build-dataset",
@@ -2010,6 +2030,9 @@ def main(argv: Sequence[str] | None = None) -> int:
     started_at = datetime.now(tz=UTC)
     parser = build_parser()
     args = parser.parse_args(argv)
+    if args.command == "read-daily-report":
+        # This boundary must precede the invocation recorder's try/finally.
+        return _read_daily(args)
     vars(args)["_run_started_at"] = started_at
     try:
         config = load_config(args.config)
@@ -2029,6 +2052,54 @@ def main(argv: Sequence[str] | None = None) -> int:
             failure_kind=outcome.failure_kind if outcome is not None else None,
             error_detail=outcome.error_detail if outcome is not None else None,
         )
+
+
+def _read_daily(args: argparse.Namespace) -> int:
+    import json  # noqa: PLC0415
+
+    from grounded_weather_forecast.daily_read import (  # noqa: PLC0415
+        PUBLISHED_STATION,
+        SCHEMA_VERSION,
+        json_default,
+        read_daily_report,
+        timestamp,
+    )
+
+    try:
+        config = load_config(args.config)
+    except (ConfigError, OSError):
+        print(
+            json.dumps(
+                {
+                    "schema_version": SCHEMA_VERSION,
+                    "status": "error",
+                    "limitations": ["invalid_configuration"],
+                }
+            )
+        )
+        return 2
+    try:
+        result = read_daily_report(
+            config,
+            forecast_path=args.forecast,
+            start=timestamp(args.start),
+            as_of=timestamp(args.as_of),
+            hours=args.hours,
+            published_station=args.published_station or PUBLISHED_STATION,
+        )
+    except (ValueError, TypeError):
+        print(
+            json.dumps(
+                {
+                    "schema_version": SCHEMA_VERSION,
+                    "status": "error",
+                    "limitations": ["invalid_time_range"],
+                }
+            )
+        )
+        return 2
+    print(json.dumps(result, default=json_default, allow_nan=False, sort_keys=True))
+    return 0
 
 
 if __name__ == "__main__":  # pragma: no cover

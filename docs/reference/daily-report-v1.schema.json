@@ -1,0 +1,470 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://hbmartin.github.io/grounded-weather-forecast/reference/daily-report-v1.schema.json",
+  "title": "Daily report v1",
+  "oneOf": [
+    {
+      "type": "object",
+      "required": [
+        "schema_version",
+        "as_of",
+        "window",
+        "forecast",
+        "operational_health",
+        "prediction_quality",
+        "limitations"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "schema_version": {
+          "const": 1
+        },
+        "as_of": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "window": {
+          "type": "object",
+          "required": [
+            "start",
+            "end",
+            "hours",
+            "timezone",
+            "local_start",
+            "local_end",
+            "end_exclusive"
+          ],
+          "additionalProperties": false,
+          "properties": {
+            "start": {
+              "type": "string",
+              "format": "date-time"
+            },
+            "end": {
+              "type": "string",
+              "format": "date-time"
+            },
+            "hours": {
+              "const": 12
+            },
+            "timezone": {
+              "type": "string"
+            },
+            "local_start": {
+              "type": "string",
+              "format": "date-time"
+            },
+            "local_end": {
+              "type": "string",
+              "format": "date-time"
+            },
+            "end_exclusive": {
+              "const": true
+            }
+          }
+        },
+        "forecast": {
+          "$ref": "#/$defs/component"
+        },
+        "operational_health": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "station",
+            "providers",
+            "runs",
+            "pipeline"
+          ],
+          "properties": {
+            "station": {
+              "$ref": "#/$defs/component"
+            },
+            "providers": {
+              "$ref": "#/$defs/component"
+            },
+            "runs": {
+              "$ref": "#/$defs/component"
+            },
+            "pipeline": {
+              "$ref": "#/$defs/component"
+            }
+          }
+        },
+        "prediction_quality": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "backtest",
+            "realized_live",
+            "truth_qc",
+            "drift"
+          ],
+          "properties": {
+            "backtest": {
+              "$ref": "#/$defs/component"
+            },
+            "realized_live": {
+              "$ref": "#/$defs/component"
+            },
+            "truth_qc": {
+              "$ref": "#/$defs/component"
+            },
+            "drift": {
+              "$ref": "#/$defs/component"
+            }
+          }
+        },
+        "limitations": {
+          "$ref": "#/$defs/limitations"
+        }
+      }
+    },
+    {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "schema_version",
+        "status",
+        "limitations"
+      ],
+      "properties": {
+        "schema_version": {
+          "const": 1
+        },
+        "status": {
+          "const": "error"
+        },
+        "limitations": {
+          "$ref": "#/$defs/limitations"
+        }
+      }
+    }
+  ],
+  "$defs": {
+    "limitations": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "component": {
+      "type": "object",
+      "required": [
+        "status",
+        "limitations"
+      ],
+      "properties": {
+        "status": {
+          "enum": [
+            "ok",
+            "partial",
+            "unknown",
+            "available",
+            "insufficient",
+            "stale",
+            "historical"
+          ]
+        },
+        "limitations": {
+          "$ref": "#/$defs/limitations"
+        },
+        "freshness": {
+          "$ref": "#/$defs/freshness"
+        },
+        "observation_freshness": {
+          "$ref": "#/$defs/freshness"
+        },
+        "hourly": {
+          "type": "array",
+          "minItems": 12,
+          "maxItems": 12,
+          "items": {
+            "$ref": "#/$defs/hour"
+          }
+        },
+        "issued_at": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "observation_at": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "forecast_status": {
+          "type": "string"
+        },
+        "status_reason": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "source_schema_version": {
+          "const": 6
+        }
+      },
+      "additionalProperties": true
+    },
+    "freshness": {
+      "type": "object",
+      "required": [
+        "status",
+        "at",
+        "age_minutes",
+        "max_age_minutes"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "status": {
+          "enum": [
+            "fresh",
+            "stale",
+            "unknown"
+          ]
+        },
+        "at": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "format": "date-time"
+        },
+        "age_minutes": {
+          "type": [
+            "number",
+            "null"
+          ]
+        },
+        "max_age_minutes": {
+          "type": "number"
+        }
+      }
+    },
+    "values": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "temp_c",
+        "humidity_pct",
+        "dew_point_c",
+        "wind_speed_ms",
+        "wind_gust_ms",
+        "pressure_sea_hpa",
+        "precip_mm",
+        "pop"
+      ],
+      "properties": {
+        "temp_c": {
+          "type": [
+            "number",
+            "null"
+          ]
+        },
+        "humidity_pct": {
+          "type": [
+            "number",
+            "null"
+          ]
+        },
+        "dew_point_c": {
+          "type": [
+            "number",
+            "null"
+          ]
+        },
+        "wind_speed_ms": {
+          "type": [
+            "number",
+            "null"
+          ]
+        },
+        "wind_gust_ms": {
+          "type": [
+            "number",
+            "null"
+          ]
+        },
+        "pressure_sea_hpa": {
+          "type": [
+            "number",
+            "null"
+          ]
+        },
+        "precip_mm": {
+          "type": [
+            "number",
+            "null"
+          ]
+        },
+        "pop": {
+          "type": [
+            "number",
+            "null"
+          ]
+        }
+      }
+    },
+    "attribution": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "temp_c",
+        "humidity_pct",
+        "dew_point_c",
+        "wind_speed_ms",
+        "wind_gust_ms",
+        "pressure_sea_hpa",
+        "precip_mm",
+        "pop"
+      ],
+      "properties": {
+        "temp_c": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "humidity_pct": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "dew_point_c": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "wind_speed_ms": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "wind_gust_ms": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "pressure_sea_hpa": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "precip_mm": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "pop": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      }
+    },
+    "hour": {
+      "type": "object",
+      "required": [
+        "valid_time",
+        "local_time",
+        "lead_bucket",
+        "values",
+        "methods",
+        "release_ids",
+        "truth_semantics",
+        "selection_reasons",
+        "missing_variables",
+        "null_variables",
+        "invalid_variables"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "valid_time": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "local_time": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "lead_bucket": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "values": {
+          "$ref": "#/$defs/values"
+        },
+        "methods": {
+          "$ref": "#/$defs/attribution"
+        },
+        "release_ids": {
+          "$ref": "#/$defs/attribution"
+        },
+        "truth_semantics": {
+          "$ref": "#/$defs/attribution"
+        },
+        "selection_reasons": {
+          "$ref": "#/$defs/attribution"
+        },
+        "missing_variables": {
+          "type": "array",
+          "items": {
+            "enum": [
+              "temp_c",
+              "humidity_pct",
+              "dew_point_c",
+              "wind_speed_ms",
+              "wind_gust_ms",
+              "pressure_sea_hpa",
+              "precip_mm",
+              "pop"
+            ]
+          },
+          "uniqueItems": true
+        },
+        "null_variables": {
+          "type": "array",
+          "items": {
+            "enum": [
+              "temp_c",
+              "humidity_pct",
+              "dew_point_c",
+              "wind_speed_ms",
+              "wind_gust_ms",
+              "pressure_sea_hpa",
+              "precip_mm",
+              "pop"
+            ]
+          },
+          "uniqueItems": true
+        },
+        "invalid_variables": {
+          "type": "array",
+          "items": {
+            "enum": [
+              "temp_c",
+              "humidity_pct",
+              "dew_point_c",
+              "wind_speed_ms",
+              "wind_gust_ms",
+              "pressure_sea_hpa",
+              "precip_mm",
+              "pop"
+            ]
+          },
+          "uniqueItems": true
+        }
+      }
+    }
+  }
+}

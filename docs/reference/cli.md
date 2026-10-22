@@ -12,7 +12,8 @@ The entry point is `grounded_weather_forecast.cli:main`. Once a command has
 parsed and its configuration has loaded successfully, its outcome is appended
 to the **run ledger** (`data/runs.parquet`, pruned to 90 days / 50k rows), so
 `report` can tell you what actually ran. Help, `--version`, parse failures, and
-configuration failures occur before ledgering. The optional `error_detail` stores
+configuration failures occur before ledgering. `read-daily-report` explicitly
+returns before the recorder and never appends an invocation. The optional `error_detail` stores
 a single-line failure message capped at 400 characters, separately from the
 exception class in `error`. Older ledgers read with null detail. Handled truth-QC
 failures record the message for both standalone invocations and maintenance stages.
@@ -62,6 +63,79 @@ exiting `75`. Selection and fitting use the pinned in-memory snapshot after
 releasing the lock, so serving sees one complete dataset publication. They do not wait
 behind an hour-long backtest or report. `ingest-ensembles` keeps its own
 store-level lock and runs freely alongside the chain.
+
+---
+
+## `read-daily-report`
+
+Read the existing project forecast and health evidence as one JSON document on
+stdout. This is a separate reader, not `predict`, `report`, `qc`, or maintenance.
+It does not collect, fit, publish, regenerate, repair, install, acquire file locks,
+write telemetry/evidence, or change data, schedules, or services. It never
+substitutes an external forecast. Use the already installed environment and
+disable Python bytecode writes; do not run `uv run` in a read-only automation.
+
+From `/Volumes/Pro2T/weather/grounded-weather-forecast`, the exact caller is:
+
+```bash
+.venv/bin/python -B -m grounded_weather_forecast.cli --config config.toml read-daily-report \
+  --start 2026-10-22T07:00:00-07:00 \
+  --as-of 2026-10-22T07:20:00-07:00 --hours 12 --forecast forecast.json
+```
+
+| Flag | Contract |
+|---|---|
+| `--start` | Required scheduled report start, ISO 8601 with explicit UTC offset; must be on an absolute hour. The caller resolves 07:00 in `America/Los_Angeles` for the scheduled date, using its IANA timezone rules. Never derive start from delayed execution time. |
+| `--as-of` | Required execution cutoff with explicit offset, at or after `start`. Even execution after 19:00 preserves the scheduled window; stale/missing data remains explicit. Future-issued forecasts and future-recorded evidence are excluded. This reads current files and cannot reconstruct past overwritten artifacts. |
+| `--hours` | Default 12; any other value is rejected. Twelve elapsed UTC hours with an exclusive end. At 07:00 Pacific this is `[07:00, 19:00)` on both DST transition dates. Offsets change from `-07:00` to `-08:00` in winter. |
+| `--forecast` | Existing schema-6 forecast path, default `forecast.json`, relative to caller working directory. Unknown source versions are rejected. |
+| `--published-station` | Optional fallback JSON path; default `/Users/haroldmartin/Library/Application Support/grounded-weather-forecast/staged/current.json`. Only `metadata.observed_at` is read into the result, labeled `published_station_snapshot`. It is not a live station observation query or a forecast source. |
+
+Exit `0` means a structured read completed, including partial/unknown data. Exit
+`2` means invalid configuration or time range and returns a schema-1 JSON error;
+argparse syntax errors use its normal stderr/exit 2. Missing or corrupt artifacts
+do not prevent other components from reporting. Reject unknown output versions.
+
+The machine-readable [schema-1 envelope](daily-report-v1.schema.json) and
+[selection/freshness rules](../methods/daily-report.md) define the contract.
+An accepted invocation always returns:
+
+| Field | Meaning |
+|---|---|
+| `schema_version`, `as_of` | Integer `1` and the normalized UTC cutoff. |
+| `window` | UTC `start`, exclusive `end`, `hours=12`, configured IANA `timezone`, offset-bearing `local_start`/`local_end`, `end_exclusive=true`. |
+| `forecast` | Component status/limitations; when readable, original forecast status/reason, source schema, issue/observation dates, dataset fingerprint, release IDs, units, freshness, coverage, and twelve hourly rows. |
+| `forecast.hourly[]` | UTC/local valid time, lead bucket, canonical values, methods, per-variable release IDs, truth semantics, selection reasons, and separate missing/null/invalid-variable arrays. Missing/duplicate hours have null values; duplicates are never arbitrarily selected. Numeric nulls remain null; no rain/temperature aggregate is invented. |
+| `operational_health` | Independent `station`, `providers`, `runs`, `pipeline` components. Provider rows expose attempts, successes/failures, rate, latest outcome/completion and freshness over `(as_of - 24h)` through `as_of`. No raw provider payloads or error messages. Runs expose latest completed relevant outcome per command within 24h, including expected pending evaluation. |
+| `prediction_quality` | Independent `backtest`, `realized_live`, `truth_qc`, `drift` components. Scores are hourly cohorts matching the actual forecast's variable, method, lead bucket, semantics, release, current dataset and configuration. Includes MAE in that variable's declared unit, `n`, evaluation/record dates and freshness. Backtest on live-origin inputs is still a backtest, never a realized live score. |
+| `limitations` | Machine-readable limitation codes. No claim of a global transaction across independently maintained sources. |
+
+Component `status` describes availability (`ok`, `partial`, `unknown`,
+`available`, `insufficient`, `stale`, `historical`), not a single prediction-health
+grade. Examine original `forecast_status`, provider `latest_status`, run
+`status`, freshness, and quality sample counts separately. Unknown components
+have `status` and `limitations`; their unavailable payload fields are absent.
+`freshness` has `status` (`fresh`, `stale`, `unknown`), `at`, `age_minutes`,
+`max_age_minutes`; future timestamps are unknown. Historical alarms are labeled
+and never converted into current operational failures. Current legacy drift
+artifacts lack dataset/time attribution, so current drift is explicitly unknown.
+Legacy date-only truth-QC retains its evaluation date without claiming an exact
+refresh instant. A rebuild with no forecast release IDs yields
+`forecast_has_no_release_ids` for both score components, even when old ledgers
+contain good-looking scores.
+
+The reader detects file replacement/in-place changes across its file reads and
+retries the read once without locks. Continued changes yield the same envelope
+with unknown components and `concurrent_replacement_after_retry`. SQLite reads
+use `mode=ro`, never `immutable`, and refuse a WAL lacking existing shared memory.
+Each query sees its own SQLite snapshot; no transaction spans both databases.
+Station database failure permits the labeled published snapshot fallback.
+If that also fails, station health stays unknown.
+
+Keep the existing 07:00 America/Los_Angeles automation on its verified reader
+until this interface is merged/available and validated in its actual checkout.
+Do not add a scheduler. Maintenance may still run at 07:00: independent file
+snapshots, precise cutoffs and unknown evidence support overlapping work.
 
 ---
 

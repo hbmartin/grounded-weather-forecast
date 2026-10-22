@@ -76,6 +76,7 @@ That works on day one. Everything else needs an archive with some history — se
 | Command | What it does | Flags |
 |---|---|---|
 | `qc` | summarize station truth quality control | — |
+| `read-daily-report` | read schema-1 daily JSON from existing artifacts without collection, telemetry, locks, or repairs; see [caller contract](https://hbmartin.github.io/grounded-weather-forecast/reference/cli/#read-daily-report) | `--start` `--as-of` `--hours` `--forecast` `--published-station` |
 | `build-dataset` | materialize truth tables and supervised matrices as parquet | — |
 | `backtest` | recover abandoned leased score stages, then run a rolling-origin backtest; allocation and publication each wait at most 60 seconds; a startup-recovery or uncommitted writer guard-release failure returns 1 and suppresses promotion | `--methods` `--hourly-variables` `--daily-variables` `--products` `--window` `--source` `--semantics` |
 | `maintain` | run one locked live build → backtest → truth-QC → report transaction; finish report after a handled truth-QC failure, then return failure | `--methods` `--hourly-variables` `--daily-variables` `--products` `--window` `--semantics` `--truth-qc-days` |

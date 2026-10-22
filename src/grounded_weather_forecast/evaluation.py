@@ -8,6 +8,9 @@ from pathlib import Path
 
 from grounded_weather_forecast import __version__
 from grounded_weather_forecast.config import Config
+from grounded_weather_forecast.config import (
+    config_fingerprint as config_fingerprint,  # noqa: PLC0414 - compatibility export
+)
 from grounded_weather_forecast.contracts import TruthSemantics
 from grounded_weather_forecast.storage import atomic_write_text, locked_path
 
@@ -21,11 +24,6 @@ def dataset_fingerprint(config: Config) -> str:
         return "unknown"
     raw = json.loads(manifest.read_text(encoding="utf-8"))
     return str(raw.get("fingerprint", "unknown"))
-
-
-def config_fingerprint(config: Config) -> str:
-    """Stable identity for every setting that influences an evaluation."""
-    return hashlib.sha256(repr(config).encode()).hexdigest()[:16]
 
 
 def code_identity() -> str:
