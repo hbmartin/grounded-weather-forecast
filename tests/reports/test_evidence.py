@@ -189,6 +189,7 @@ class TestLedgerEngine:
         assert set(LEDGERS) == {
             "quality",
             "churn",
+            "live_gate",
             "verdicts",
             "eprocess_wealth",
             "served_quality",
@@ -826,3 +827,82 @@ class TestNbmBenchmark:
         assert line is not None
         assert "nbm benchmark (hourly live)" in line
         assert "2 slices" in line
+
+
+def test_new_churn_preserves_publication_and_approval_clocks():
+    old = {
+        "release_id": "a",
+        "promoted_at": (NOW - timedelta(days=10)).isoformat(),
+        "approved_at": (NOW - timedelta(days=1)).isoformat(),
+        "approval_id": "approval-a",
+        "approval_sequence": 3,
+        "selections": {"hourly.temp_c.0-1h": {"method_id": "A"}},
+    }
+    new = {
+        "release_id": "b",
+        "promoted_at": (NOW - timedelta(days=5)).isoformat(),
+        "approved_at": NOW.isoformat(),
+        "approval_id": "approval-b",
+        "approval_sequence": 4,
+        "selections": {"hourly.temp_c.0-1h": {"method_id": "B"}},
+    }
+    row = selection_churn(old, new, now=NOW, code_version="code").row(0, named=True)
+    assert row["clock_schema_version"] == 2
+    assert row["to_promoted_at"] == NOW - timedelta(days=5)
+    assert row["to_approved_at"] == NOW and row["to_approval_sequence"] == 4
+    assert row["from_promoted_at"] == NOW - timedelta(days=10)
+
+
+@pytest.mark.parametrize("content_available", [True, False])
+def test_old_churn_normalizes_in_memory_without_rewriting(tmp_path, content_available):
+    import json
+
+    directory = tmp_path / "releases"
+    directory.mkdir()
+    approved = NOW - timedelta(days=1)
+    published = NOW - timedelta(days=10)
+    approval_id = "00000000000000000003-new"
+    if content_available:
+        (directory / "new.json").write_text(
+            json.dumps(
+                {
+                    "release_id": "new",
+                    "promoted_at": published.isoformat(),
+                    "approval_required": True,
+                    "selections": {},
+                }
+            )
+        )
+        events = directory / "approvals"
+        events.mkdir()
+        (events / f"{approval_id}.json").write_text(
+            json.dumps(
+                {
+                    "approval_id": approval_id,
+                    "release_id": "new",
+                    "approved_at": approved.isoformat(),
+                    "sequence": 3,
+                }
+            )
+        )
+    row = {
+        "recorded_at": NOW,
+        "from_release_id": "old",
+        "to_release_id": "new",
+        "from_promoted_at": published,
+        "to_promoted_at": approved,
+        "to_approval_id": approval_id,
+        "slice_key": "hourly.temp_c.0-1h",
+        "changed": True,
+    }
+    frame = pl.DataFrame([row], schema=dict(CHURN_SCHEMA))
+    before = {p: p.read_bytes() for p in directory.rglob("*.json")}
+    normalized = evidence.normalize_churn(frame, directory, as_of=NOW).row(
+        0, named=True
+    )
+    assert normalized["to_approved_at"] == approved
+    assert normalized["to_promoted_at"] == (published if content_available else None)
+    assert normalized["to_approval_sequence"] == (3 if content_available else None)
+    assert normalized["from_approved_at"] == published
+    assert frame["to_promoted_at"][0] == approved
+    assert before == {p: p.read_bytes() for p in directory.rglob("*.json")}

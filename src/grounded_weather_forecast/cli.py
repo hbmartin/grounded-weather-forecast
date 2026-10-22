@@ -1157,9 +1157,15 @@ def _cmd_backtest(config: Config, args: argparse.Namespace) -> CommandOutcome:
         ScoreCoordinationReleaseError,
         ScoreCoordinationTimeout,
     )
+    from grounded_weather_forecast.serve.evidence import (  # noqa: PLC0415
+        PromotionEvidenceError,
+    )
 
     try:
         return _backtest_products(config, args)
+    except (PromotionEvidenceError,) as error:  # noqa: B013
+        print(f"promotion failed: {error}", file=sys.stderr)
+        return CommandOutcome(1, error.failure_kind, str(error))
     except (ScoreCoordinationProbeError,) as error:  # noqa: B013
         detail = "; ".join((str(error), *getattr(error, "__notes__", ())))
         print(detail, file=sys.stderr)
@@ -1226,9 +1232,17 @@ def _backtest_products(config: Config, args: argparse.Namespace) -> CommandOutco
                 outcome.product for outcome in outcomes if outcome.status == "evaluated"
             ),
         )
-        if promoted.created:
-            print(f"promoted model release: {promoted.release_id}")
-        elif promoted.approval_changed:
+        for verdict in promoted.gate_verdicts:
+            print(
+                f"live gate {verdict.product}.{verdict.variable}.{verdict.lead_bucket}: {verdict.detail}"
+            )
+        if promoted.disposition == "first":
+            print(
+                f"approved model release: {promoted.release_id}"
+                if not promoted.created
+                else f"promoted model release: {promoted.release_id}"
+            )
+        elif promoted.disposition == "reapproval":
             print(f"reapproved model release: {promoted.release_id}")
         elif promoted.selections:
             print("retained approved selections; no new model release")
@@ -1680,6 +1694,7 @@ def _run_pipeline_steps(
     *,
     backtest_args: argparse.Namespace | None = None,
     continue_on_failure: frozenset[str] = frozenset(),
+    continue_on_failure_kinds: frozenset[str] = frozenset(),
     stage_args: Mapping[str, argparse.Namespace] | None = None,
     tolerate_pending: bool = False,
 ) -> CommandOutcome:
@@ -1727,7 +1742,10 @@ def _run_pipeline_steps(
             continue
         if result.exit_code:
             first_failure = first_failure or result
-            if name in continue_on_failure:
+            if (
+                name in continue_on_failure
+                or result.failure_kind in continue_on_failure_kinds
+            ):
                 print(
                     f"pipeline continuing: {name} exited {result.exit_code}; remaining outputs will run, but the pipeline will return failure",
                     file=sys.stderr,
@@ -1752,6 +1770,9 @@ def _cmd_maintain(config: Config, args: argparse.Namespace) -> CommandOutcome:
             ("report", lambda: _cmd_report(config)),
         ),
         continue_on_failure=frozenset({"truth-qc"}),
+        continue_on_failure_kinds=frozenset(
+            {"promotion_evidence_conflict", "promotion_evidence_invalid"}
+        ),
         stage_args={"truth-qc": truth_args},
         tolerate_pending=True,
     )

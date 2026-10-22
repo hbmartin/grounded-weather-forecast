@@ -264,7 +264,40 @@ def _releases_panel(ctx: DashboardContext) -> Panel:
     )
 
 
+def _gate_panel(ctx: DashboardContext) -> Panel | None:
+    ledger = ctx.evidence_history.get("live_gate", pl.DataFrame())
+    if ledger.is_empty():
+        return None
+    recent = ledger.filter(
+        pl.col("recorded_at").is_between(ctx.now - timedelta(days=1), ctx.now)
+    )
+    if recent.is_empty():
+        return None
+    return Panel(
+        panel_id="f4",
+        title="Live gate decisions",
+        status="amber"
+        if recent.filter(pl.col("verdict") == "blocked").height
+        else "info",
+        copy=PANEL_COPY["f4"],
+        table=TableSpec(
+            columns=("recorded_at", "slice", "method", "verdict", "detail"),
+            rows=tuple(
+                (
+                    str(r["recorded_at"]),
+                    f"{r['product']}.{r['variable']}.{r['lead_bucket']}",
+                    str(r["method_id"]),
+                    str(r["verdict"]),
+                    str(r["detail"]),
+                )
+                for r in recent.sort("recorded_at").tail(20).iter_rows(named=True)
+            ),
+        ),
+    )
+
+
 def build(ctx: DashboardContext, derived: Derived) -> Zone:
+    gate = _gate_panel(ctx)
     return Zone(
         zone_id="F",
         title="Serving & self-verification",
@@ -273,5 +306,6 @@ def build(ctx: DashboardContext, derived: Derived) -> Zone:
             _verification_panel(ctx, derived),
             _reasons_panel(ctx),
             _releases_panel(ctx),
+            *((gate,) if gate is not None else ()),
         ),
     )

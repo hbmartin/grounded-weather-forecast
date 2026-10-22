@@ -101,8 +101,13 @@ maintenance or restore jobs skip as duplicates. A successful daily run writes
 `last-maintenance`; a fresh stamp skips catch-up for **20 hours**. Restore runs
 leave that stamp untouched, and a failed report skips score pruning.
 
-CLI `maintain` also runs truth-QC before report. Build/backtest errors stop the
-pipeline, while an insufficient-history backtest (exit 3) and a handled truth-QC
+CLI `maintain` also runs truth-QC before report. Build and ordinary backtest errors stop the
+pipeline; coordination failures still stop immediately. Promotion evidence errors
+preserve completed scores and continue truth-QC/report while retaining failure
+status. Promotion evidence conflicts and missing required
+contexts record `promotion_evidence_conflict` or `promotion_evidence_invalid`,
+publish no approval changes, and preserve `last-maintenance`. An insufficient-history
+backtest (exit 3) and a handled truth-QC
 failure permit diagnostics under the same lock. Pending evaluation returns 0
 when the other required stages pass; a real truth-QC failure remains nonzero.
 The cross-check panel shows the retained verdict’s refresh time: amber after

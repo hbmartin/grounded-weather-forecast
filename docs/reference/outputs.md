@@ -199,9 +199,9 @@ these scratch defaults without replacing the committed evidence. See
 
 ### The history ledgers
 
-`artifacts/history/` holds ten append-only parquet ledgers driving dashboard zone
-H: `quality`, `churn`, `verdicts`, `served_quality`, `eprocess_wealth`,
-`pipeline`, `provider_health`, `build_funnel`, `changes`, `evaluations`.
+`artifacts/history/` holds eleven append-only parquet ledgers driving dashboard zones
+F and H: `quality`, `churn`, `verdicts`, `served_quality`, `eprocess_wealth`,
+`pipeline`, `provider_health`, `build_funnel`, `changes`, `evaluations`, `live_gate`.
 
 Append-only is the point — they record what was true *at the time*, so a
 regression is visible as a trend rather than only as a current value.
@@ -215,8 +215,12 @@ regression is visible as a trend rather than only as a current value.
 
     **`history/`** — append-only ledgers. Deleting them erases the past.
 
-    `releases/`, `active_release.json`, and `alignment.json` can be regenerated
-    by re-running their pipeline commands; the two above cannot.
+    `releases/` contains immutable content and append-only approval history;
+    keep it for historical replay. `active_release.json` describes the locally
+    served document. Its references also protect legacy score evidence.
+    `history/live_gate.parquet` records gate diagnostics separately from approval
+    identity. Churn history adds explicit approval clocks and sequences; older
+    rows are normalized in memory without rewriting their recorded values.
 
 ---
 

@@ -292,3 +292,14 @@ Serialization uses `allow_nan=False`: a missing value is JSON `null`, never
 `NaN`. The document is therefore valid JSON for every strict parser.
 
 **Check `schema_version` before parsing.** A version bump means fields changed.
+
+## Approval metadata compatibility
+
+Release content is immutable and new release objects require committed approval
+events. Event sequence determines which eligible approval is current; timestamps
+bound historical visibility. Legacy JSON without `approval_required` retains
+implicit approval only with an acceptable aware publication timestamp. This does
+not change forecast schema 6 or `active_release.json` attribution. Context-free
+legacy selections remain limited to their recorded dataset; known evaluation IDs
+are retained for evidence protection. Gate measurements live in diagnostic history
+and do not rotate release identity when the incumbent remains approved.

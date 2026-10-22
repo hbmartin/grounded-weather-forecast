@@ -215,7 +215,8 @@ classification. Products are evaluated independently under unchanged gates.
 
 ### Approved decisions and compatible retention
 
-*Implemented in: `serve/selection.py`, `serve/evidence.py`, `evaluation.py`, `cli.py`*
+*Implemented in: `serve/selection.py`, `serve/evidence.py`, `serve/approvals.py`,
+`reports/evidence.py`, `reports/operations.py`, `evaluation.py`, `cli.py`*
 
 Only completed products in a live backtest may receive new selections. Prediction
 loads approvals without elections, promotion-time live gates, or release writes.
@@ -228,6 +229,23 @@ dataset separately from retained evidence. Legacy records remain readable withou
 invented context. Historical reconstruction retains exact dataset and issue-time
 checks. `PromotionResult.created` is decided under the release write lock so
 retention and duplicate writes are never logged as new promotions.
+
+A single locked approval snapshot supplies promotion decisions. Eligible managed
+approvals sort by committed sequence, not wall-clock time; legacy implicit approvals
+sort by validated publication time behind managed events. UTC conversion overflow,
+missing zones, malformed clocks and future approvals are excluded. Events record
+commit time; historical cutoffs remain strict. First approval of existing content
+is not reapproval.
+
+Only final selected-variable contexts are merged. Required context omissions and
+conflicts are typed failures before any content/event publication. Known legacy
+references survive missing context without invented cutoffs. Blocked live gates
+retain selection identity and record measurements separately in the bounded
+`live_gate` telemetry ledger (730 days, 100,000 rows); statistical constants and
+reference qualifications remain unchanged. Active/recent-served legacy references
+can protect scores without authorizing predictions. Churn uses separate publication
+and approval clocks, sequence order and approval identity; old rows normalize in
+memory without rewriting evidence.
 
 ### Bounded score persistence
 

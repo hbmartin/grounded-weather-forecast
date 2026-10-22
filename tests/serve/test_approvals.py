@@ -5,6 +5,7 @@ import threading
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import asdict, replace
 from datetime import UTC, datetime, timedelta
+from pathlib import Path
 
 import pytest
 from conftest import write_config
@@ -240,3 +241,130 @@ def test_repeated_transitions_are_distinct_and_reports_remain_idempotent(
     )
     assert ledger.height == 4
     assert ledger["to_approval_id"].n_unique() == 4
+
+
+def test_clock_correction_never_resurrects_superseded_release(tmp_path, monkeypatch):
+    a, b = release("a"), release("b")
+    corrected = PAST + timedelta(days=1)
+    clock(monkeypatch, corrected + timedelta(hours=1))
+    commit(tmp_path, a)
+    clock(monkeypatch, corrected)
+    commit(tmp_path, b)
+    assert records(tmp_path)[0].release["release_id"] == b.release_id
+    clock(monkeypatch, corrected + timedelta(hours=2))
+    assert records(tmp_path)[0].release["release_id"] == b.release_id
+    assert records(tmp_path, corrected)[0].release["release_id"] == b.release_id
+
+
+def test_managed_approval_precedes_newer_implicit_legacy(tmp_path, monkeypatch):
+    a, b = release("a"), release("b")
+    clock(monkeypatch, PAST + timedelta(days=1))
+    commit(tmp_path, a)
+    replace(
+        b, approval_required=False, promoted_at=(PAST + timedelta(days=2)).isoformat()
+    ).write(tmp_path)
+    clock(monkeypatch, PAST + timedelta(days=3))
+    assert records(tmp_path)[0].release["release_id"] == a.release_id
+
+
+def test_new_content_requires_event_and_orphan_retry_is_first_approval(
+    tmp_path, monkeypatch
+):
+    model = release("a")
+    assert model.approval_required
+    model.write(tmp_path)
+    assert records(tmp_path) == []
+    first = commit(tmp_path, model)
+    assert first.disposition == "first" and not first.created and first.changed
+    assert commit(tmp_path, model).disposition == "unchanged"
+    commit(tmp_path, release("b"))
+    assert commit(tmp_path, model).disposition == "reapproval"
+
+
+@pytest.mark.parametrize(
+    "timestamp", ["0001-01-01T00:00:00+05:00", "9999-12-31T23:59:59-05:00"]
+)
+def test_overflowing_clocks_are_excluded(tmp_path, timestamp):
+    assert approvals.aware_timestamp(timestamp) is None
+    model = release("a")
+    result = commit(tmp_path, model)
+    path = tmp_path / "approvals" / f"{result.approval_id}.json"
+    raw = json.loads(path.read_text()) | {"approved_at": timestamp}
+    path.write_text(json.dumps(raw))
+    assert records(tmp_path) == []
+
+
+def test_sequence_reservation_ignores_unicode_but_keeps_damaged_ascii_names(tmp_path):
+    directory = tmp_path / "approvals"
+    directory.mkdir()
+    (directory / "²-stray.json").write_text("{}")
+    (directory / "１２-stray.json").write_text("{}")
+    (directory / "00000000000000000042-damaged.json").write_text("broken")
+    result = commit(tmp_path, release("a"))
+    assert result.approval_id.startswith("00000000000000000043-")
+    assert (directory / "00000000000000000042-damaged.json").read_text() == "broken"
+
+
+def test_readers_and_retention_use_sequence_after_recent_window(tmp_path, monkeypatch):
+    from grounded_weather_forecast.reports import evidence, operations
+    from grounded_weather_forecast.dashboard.context import _releases
+
+    config = write_config(tmp_path)
+    directory = config.artifacts_dir / "releases"
+    high, low = sorted(
+        [release("a"), release("b")], key=lambda r: r.release_id, reverse=True
+    )
+    when = PAST + timedelta(days=1)
+    clock(monkeypatch, when)
+    commit(directory, high)
+    commit(directory, low)
+    clock(monkeypatch, when + timedelta(days=10))
+    assert _releases(config, [])[0]["release_id"] == low.release_id
+    assert evidence._readable_releases(directory)[-1]["release_id"] == low.release_id
+    assert operations._protected_evaluations(
+        config, now=when + timedelta(days=10)
+    ) == set(low.evaluation_ids)
+
+
+def test_past_report_and_retention_exclude_later_approvals(tmp_path, monkeypatch):
+    from grounded_weather_forecast.reports import evidence, operations
+
+    config = write_config(tmp_path)
+    directory = config.artifacts_dir / "releases"
+    before = PAST + timedelta(days=1)
+    clock(monkeypatch, before)
+    commit(directory, release("a"))
+    clock(monkeypatch, before + timedelta(days=1))
+    commit(directory, release("b"))
+    assert evidence.record_selection_churn(config, now=before).is_empty()
+    assert operations._protected_evaluations(config, now=before) == {"a"}
+    assert approvals.read_approved_releases(directory, as_of=before)[0][
+        "evaluation_ids"
+    ] == ["a"]
+
+
+def test_commit_clock_is_not_backdated_to_promotion_snapshot(tmp_path, monkeypatch):
+    model = release("a")
+    clock(monkeypatch, PAST + timedelta(days=1))
+    snapshot = approvals.read_approval_snapshot(tmp_path)
+    clock(monkeypatch, PAST + timedelta(days=2))
+    with locked_path(tmp_path / ".approval-ledger"):
+        approvals.publish_approval(model, tmp_path, None, snapshot=snapshot)
+    assert records(tmp_path, PAST + timedelta(days=1, hours=1)) == []
+    assert records(tmp_path)[0].approved_at == PAST + timedelta(days=2)
+
+
+def test_snapshot_remains_fixed_when_later_approval_commits(tmp_path):
+    a, b = release("a"), release("b")
+    commit(tmp_path, a)
+    snapshot = approvals.read_approval_snapshot(tmp_path)
+    commit(tmp_path, b)
+    assert snapshot.records()[0].release["release_id"] == a.release_id
+    assert records(tmp_path)[0].release["release_id"] == b.release_id
+
+
+def test_snapshot_preserves_unreadable_and_wrong_shape_diagnostics(tmp_path):
+    (tmp_path / "broken.json").write_text("broken")
+    (tmp_path / "array.json").write_text("[]")
+    snapshot = approvals.read_approval_snapshot(tmp_path)
+    assert {Path(p).name for p in snapshot.issues} == {"broken.json", "array.json"}

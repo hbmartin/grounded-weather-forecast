@@ -9,7 +9,6 @@ never to silence.
 import json
 import math
 from collections.abc import Mapping, Sequence
-from contextlib import suppress
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -39,16 +38,24 @@ from grounded_weather_forecast.reports.leaderboard import (
 )
 from grounded_weather_forecast.reports.winner_curse import should_retain_incumbent
 from grounded_weather_forecast.serve.approvals import (
+    ApprovalDisposition,
+    ApprovalSnapshot,
     ApprovedRelease,
     aware_timestamp,
-    ordered_approvals,
     publish_approval,
+    read_approval_snapshot,
 )
 from grounded_weather_forecast.serve.diagnostics import (
     FitFailure,
     describe_fit_failures,
 )
-from grounded_weather_forecast.serve.evidence import EvidenceSummary, merge_contexts
+from grounded_weather_forecast.serve.evidence import (
+    EvaluationContext,
+    EvidenceSummary,
+    GateVerdict,
+    PromotionEvidenceError,
+    merge_contexts,
+)
 from grounded_weather_forecast.storage import locked_path
 
 from grounded_weather_forecast.serve.score_scan import (  # isort: skip
@@ -111,6 +118,8 @@ class PromotionResult:
     created: bool = False
     approval_id: str | None = None
     approval_changed: bool = False
+    disposition: ApprovalDisposition = "none"
+    gate_verdicts: tuple[GateVerdict, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -219,12 +228,17 @@ def _approved_context_matches(
 
 
 def _approved_records(
-    config: Config, as_of: datetime | None = None, *, match_dataset: bool = False
+    config: Config,
+    as_of: datetime | None = None,
+    *,
+    match_dataset: bool = False,
+    snapshot: ApprovalSnapshot | None = None,
 ) -> list[ApprovedRelease]:
-    return ordered_approvals(
-        _compatible_releases(config, match_dataset=match_dataset),
-        config.artifacts_dir / "releases",
-        as_of or datetime.now(UTC),
+    snapshot = snapshot or read_approval_snapshot(
+        config.artifacts_dir / "releases", as_of=as_of
+    )
+    return snapshot.records(
+        _compatible_releases(config, match_dataset=match_dataset, snapshot=snapshot)
     )
 
 
@@ -233,13 +247,15 @@ def _approved_choices(
     semantics: Mapping[str, TruthSemantics] | None,
     dataset_id: str | None = None,
     matrices: Mapping[str, pl.DataFrame] | None = None,
+    *,
+    snapshot: ApprovalSnapshot | None = None,
 ) -> dict[SliceKey, _ApprovedChoice]:
     dataset = dataset_id or dataset_fingerprint(config)
     signatures = _product_signatures(config, matrices)
     code = code_identity()
     pins = _pins(config)
     selections: dict[SliceKey, _ApprovedChoice] = {}
-    for record in _approved_records(config):
+    for record in _approved_records(config, snapshot=snapshot):
         raw = record.release
         approved = _selections_from_release(raw) or {}
         recorded = _contexts_by_evaluation_id(raw.get("evaluation_contexts"))
@@ -410,6 +426,8 @@ def _make_release(
     selections: Mapping[SliceKey, Selection],
     evidence: EvidenceSummary,
     dataset_id: str | None = None,
+    *,
+    promoted_at: datetime | None = None,
 ) -> ModelRelease:
     return ModelRelease.create(
         dataset=dataset_id or dataset_fingerprint(config),
@@ -418,11 +436,12 @@ def _make_release(
         evaluation_contexts=evidence.contexts,
         training_cutoff=evidence.training_cutoff,
         selections=_selection_payload(selections),
+        promoted_at=promoted_at,
     )
 
 
 def _compatible_releases(
-    config: Config, *, match_dataset: bool
+    config: Config, *, match_dataset: bool, snapshot: ApprovalSnapshot | None = None
 ) -> list[dict[str, object]]:
     """Ledger entries written under a config this system can still act on.
 
@@ -432,30 +451,22 @@ def _compatible_releases(
     """
     configuration = config_fingerprint(config)
     dataset = dataset_fingerprint(config) if match_dataset else None
-    releases: list[dict[str, object]] = []
-    for path in sorted((config.artifacts_dir / "releases").glob("*.json")):
-        # One unreadable ledger entry must not take down nightly selection.
-        with suppress(OSError, ValueError):
-            raw = json.loads(path.read_text(encoding="utf-8"))
-            if not isinstance(raw, dict):
-                continue
-            required = (
-                "release_id",
-                "promoted_at",
-                "dataset_fingerprint",
-                "config_fingerprint",
-                "selections",
-            )
-            if any(field not in raw for field in required):
-                continue
-            if not isinstance(raw["selections"], dict):
-                continue
-            if raw.get("config_fingerprint") != configuration:
-                continue
-            if dataset is not None and raw.get("dataset_fingerprint") != dataset:
-                continue
-            releases.append(raw)
-    return releases
+    snapshot = snapshot or read_approval_snapshot(config.artifacts_dir / "releases")
+    required = (
+        "release_id",
+        "promoted_at",
+        "dataset_fingerprint",
+        "config_fingerprint",
+        "selections",
+    )
+    return [
+        raw
+        for raw in snapshot.releases
+        if all(field in raw for field in required)
+        and isinstance(raw["selections"], dict)
+        and raw.get("config_fingerprint") == configuration
+        and (dataset is None or raw.get("dataset_fingerprint") == dataset)
+    ]
 
 
 def _selections_from_release(release: Mapping[str, object]) -> SelectionMap | None:
@@ -489,7 +500,9 @@ def _selections_from_release(release: Mapping[str, object]) -> SelectionMap | No
             reason=reason,
             n=n,
             mae=mae,
-            evaluation_id=str(selection_mapping.get("evaluation_id") or "unknown"),
+            evaluation_id=str(selection_mapping["evaluation_id"])
+            if selection_mapping.get("evaluation_id")
+            else None,
             dataset_fingerprint=str(
                 selection_mapping.get("dataset_fingerprint") or dataset
             ),
@@ -563,6 +576,8 @@ def _eligible_release_ids(
     evaluation_contexts: tuple[dict[str, object], ...] = (),
     *,
     candidates: Mapping[SliceKey, tuple[Selection, ...]] | None = None,
+    snapshot: ApprovalSnapshot | None = None,
+    choice_contexts: Mapping[LiveKey, Mapping[str, object] | None] | None = None,
 ) -> EligibleReleases:
     """Release cohorts matching each selected method and evaluation context.
 
@@ -586,7 +601,7 @@ def _eligible_release_ids(
         )
     eligible: dict[LiveKey, set[str]] = {key: set() for key in choices}
     current_contexts = _contexts_by_evaluation_id(evaluation_contexts)
-    for approved in _approved_records(config):
+    for approved in _approved_records(config, snapshot=snapshot):
         raw = approved.release
         release_id = raw.get("release_id")
         raw_selections = raw.get("selections")
@@ -599,7 +614,11 @@ def _eligible_release_ids(
             if not isinstance(raw_selected, dict):
                 continue
             selection_mapping = cast(Mapping[str, object], raw_selected)
-            current_context = current_contexts.get(selected.evaluation_id or "")
+            current_context = (
+                choice_contexts.get(live_key)
+                if choice_contexts is not None
+                else current_contexts.get(selected.evaluation_id or "")
+            )
             release_context = release_contexts.get(
                 str(selection_mapping.get("evaluation_id") or "")
             )
@@ -660,7 +679,9 @@ _RETAINED_REASON = "retained incumbent within one SE of best (winner-curse guard
 _RETENTION_GATES = (None, "eligibility")
 
 
-def _incumbent_methods(config: Config) -> dict[SliceKey, tuple[str, str | None]]:
+def _incumbent_methods(
+    config: Config, *, snapshot: ApprovalSnapshot | None = None
+) -> dict[SliceKey, tuple[str, str | None]]:
     """The previous release's (method_id, truth_semantics) per slice.
 
     Newest ``promoted_at`` among config-compatible releases, with the dataset
@@ -671,7 +692,7 @@ def _incumbent_methods(config: Config) -> dict[SliceKey, tuple[str, str | None]]
     from the current board.
     """
 
-    releases = _approved_records(config)
+    releases = _approved_records(config, snapshot=snapshot)
     if not releases:
         return {}
     newest = releases[0].release
@@ -849,9 +870,10 @@ def _elect_slices(
     slices: Mapping[SliceKey, pl.DataFrame],
     dataset: str,
     cutoffs: Mapping[SliceKey, datetime | None],
+    snapshot: ApprovalSnapshot,
 ) -> tuple[dict[SliceKey, Selection], dict[SliceKey, tuple[Selection, ...]]]:
     pinned = _pins(config)
-    incumbents = _incumbent_methods(config)
+    incumbents = _incumbent_methods(config, snapshot=snapshot)
     selected: dict[SliceKey, Selection] = {}
     candidates: dict[SliceKey, tuple[Selection, ...]] = {}
     references = union_references(config.promotion)
@@ -900,6 +922,70 @@ def _elect_slices(
     return selected, candidates
 
 
+def _evaluated_context(
+    contexts: Mapping[str, EvaluationContext], choice: Selection, key: SliceKey
+) -> Mapping[str, object] | None:
+    if choice.evaluation_id is None:
+        return None  # Unscored explicit pins make no evaluation claim.
+    context = contexts.get(choice.evaluation_id)
+    if context is None:
+        raise PromotionEvidenceError(choice.evaluation_id, "context")
+    return _project_context(context.payload(choice.evaluation_id), key)
+
+
+def _gate_completed(
+    config: Config,
+    selections: dict[SliceKey, Selection],
+    contexts: dict[SliceKey, Mapping[str, object] | None],
+    candidates: Mapping[SliceKey, tuple[Selection, ...]],
+    products: frozenset[str] | None,
+    scanned: ScoreScanResult,
+    snapshot: ApprovalSnapshot,
+) -> tuple[GateVerdict, ...]:
+    pinned = _pins(config)
+    in_scope = {
+        key: replace(choice, pinned=pinned.get(key[:2]) == choice.method_id)
+        for key, choice in selections.items()
+        if products is None or key[0] in products
+    }
+    diagnostics: list[GateVerdict] = []
+    if in_scope:
+        gate_contexts = {
+            (*key, choice.method_id): contexts.get(key)
+            for key, choice in in_scope.items()
+        }
+        gate_contexts.update(
+            {
+                (*key, c.method_id): _evaluated_context(scanned.contexts, c, key)
+                for key, refs in candidates.items()
+                for c in refs
+            }
+        )
+        gated = apply_live_gate(
+            in_scope,
+            _live_verification(config, snapshot.cutoff),
+            factor=config.promotion.live_gap_factor,
+            min_n=config.promotion.min_live_n,
+            candidates=candidates,
+            eligible_releases=_eligible_release_ids(
+                config,
+                in_scope,
+                candidates=candidates,
+                snapshot=snapshot,
+                choice_contexts=gate_contexts,
+            ),
+            diagnostics=diagnostics,
+        )
+        for key, choice in gated.items():
+            if (
+                choice.evaluation_id != in_scope[key].evaluation_id
+                or choice.method_id != in_scope[key].method_id
+            ):
+                contexts[key] = _evaluated_context(scanned.contexts, choice, key)
+        selections.update(gated)
+    return tuple(diagnostics)
+
+
 def _promote_methods(
     config: Config,
     scores_dir: Path,
@@ -907,6 +993,7 @@ def _promote_methods(
     dataset_id: str | None,
     products: frozenset[str] | None,
 ) -> PromotionResult:
+    snapshot = read_approval_snapshot(config.artifacts_dir / "releases")
     dataset = dataset_id or dataset_fingerprint(config)
     scanned = _load_evidence(config, scores_dir, None, semantics, dataset)
     slices = {
@@ -914,63 +1001,63 @@ def _promote_methods(
         for key, frame in scanned.slices.items()
         if products is None or key[0] in products
     }
-    approved = _approved_choices(config, semantics, dataset)
+    approved = _approved_choices(config, semantics, dataset, snapshot=snapshot)
     carried = {key: value.selection for key, value in approved.items()}
-    elected, candidates = _elect_slices(config, slices, dataset, scanned.cutoffs)
-    selections = carried | elected
-    payloads = [
-        choice.context for choice in approved.values() if choice.context is not None
-    ]
-    used_evaluations = {
-        choice.evaluation_id
-        for choice in (
-            *selections.values(),
-            *(c for refs in candidates.values() for c in refs),
-        )
-    }
-    payloads.extend(
-        context.payload(evaluation)
-        for evaluation, context in scanned.contexts.items()
-        if evaluation in used_evaluations
+    elected, candidates = _elect_slices(
+        config, slices, dataset, scanned.cutoffs, snapshot
     )
-    contexts = merge_contexts(payloads)
-    pinned = _pins(config)
-    in_scope = {
-        key: replace(choice, pinned=pinned.get(key[:2]) == choice.method_id)
-        for key, choice in selections.items()
-        if products is None or key[0] in products
+    selections = carried | elected
+    contexts: dict[SliceKey, Mapping[str, object] | None] = {
+        key: choice.context for key, choice in approved.items()
     }
-    if in_scope:
-        selections.update(
-            apply_live_gate(
-                in_scope,
-                _live_verification(config, datetime.now(UTC)),
-                factor=config.promotion.live_gap_factor,
-                min_n=config.promotion.min_live_n,
-                candidates=candidates,
-                eligible_releases=_eligible_release_ids(
-                    config,
-                    in_scope,
-                    tuple(contexts.values()),
-                    candidates=candidates,
-                ),
-            )
+
+    contexts.update(
+        {
+            key: _evaluated_context(scanned.contexts, choice, key)
+            for key, choice in elected.items()
+        }
+    )
+    legacy_missing = frozenset(
+        choice.selection.evaluation_id
+        for choice in approved.values()
+        if choice.context is None and choice.selection.evaluation_id is not None
+    )
+    diagnostics = _gate_completed(
+        config, selections, contexts, candidates, products, scanned, snapshot
+    )
+    final_contexts = merge_contexts(
+        tuple(
+            _project_context(contexts[key], key)
+            for key in selections
+            if contexts.get(key) is not None
         )
-    records = _approved_records(config)
+    )
+    evidence = EvidenceSummary.from_payloads(
+        tuple(final_contexts.values()),
+        {key: choice.training_cutoff for key, choice in selections.items()},
+        {key: choice.evaluation_id for key, choice in selections.items()},
+        legacy_missing=legacy_missing,
+        merged=True,
+    )
+    records = _approved_records(config, snapshot=snapshot)
     current = records[0] if records else None
+    from grounded_weather_forecast.reports.evidence import (  # noqa: PLC0415
+        record_live_gate,
+    )
+
+    record_live_gate(config, tuple(diagnostics), now=snapshot.cutoff)
     if not selections or _selection_payload(selections) == _selection_payload(carried):
         return PromotionResult(
             carried,
-            str(current.release["release_id"]) if current is not None else None,
-            approval_id=current.approval_id if current is not None else None,
+            str(current.release["release_id"]) if current else None,
+            approval_id=current.approval_id if current else None,
+            disposition="unchanged" if current else "none",
+            gate_verdicts=tuple(diagnostics),
         )
-    evidence = EvidenceSummary.from_payloads(
-        tuple(contexts.values()),
-        {key: choice.training_cutoff for key, choice in selections.items()},
-        {key: choice.evaluation_id for key, choice in selections.items()},
-    )
     release = _make_release(config, selections, evidence, dataset)
-    commit = publish_approval(release, config.artifacts_dir / "releases", current)
+    commit = publish_approval(
+        release, config.artifacts_dir / "releases", current, snapshot=snapshot
+    )
     return PromotionResult(
         {
             key: replace(choice, release_id=release.release_id)
@@ -980,7 +1067,24 @@ def _promote_methods(
         commit.created,
         commit.approval_id,
         commit.changed,
+        commit.disposition,
+        tuple(diagnostics),
     )
+
+
+def _project_context(
+    context: Mapping[str, object] | None, key: SliceKey
+) -> dict[str, object]:
+    if context is None:
+        raise PromotionEvidenceError("unknown", "context")
+    semantics = context.get("semantics")
+    if not isinstance(semantics, Mapping) or key[1] not in semantics:
+        raise PromotionEvidenceError(
+            str(context.get("evaluation_id")), f"semantics.{key[1]}"
+        )
+    return dict(context) | {
+        "semantics": {key[1]: cast(Mapping[str, object], semantics)[key[1]]}
+    }
 
 
 def _live_verification(config: Config, now: datetime) -> pl.DataFrame:
@@ -1136,6 +1240,7 @@ def apply_live_gate(
     fallbacks: Mapping[SliceKey, Selection] | None = None,
     candidates: Mapping[SliceKey, tuple[Selection, ...]] | None = None,
     eligible_releases: frozenset[str] | EligibleReleases | None = None,
+    diagnostics: list[GateVerdict] | None = None,
 ) -> dict[tuple[str, str, str], Selection]:
     """Close the self-verification loop: demote methods that underdeliver live.
 
@@ -1167,12 +1272,25 @@ def apply_live_gate(
         fallback = _gate_fallback(
             key, selected, choices, pooled, factor=factor, min_n=min_n
         )
-        if fallback is None:
-            gated[key] = replace(
-                selected,
-                reason=verdict.replace("demoted", "live gate failed for", 1)
-                + "; replacement blocked: no reference passes quality guard",
+        if diagnostics is not None:
+            n, live_mae = pooled[(*key, selected.method_id)]
+            diagnostics.append(
+                GateVerdict(
+                    *key,
+                    selected.method_id,
+                    selected.evaluation_id,
+                    selected.release_id,
+                    "blocked" if fallback is None else "replaced",
+                    verdict
+                    if fallback is not None
+                    else verdict.replace("demoted", "live gate failed for", 1)
+                    + "; replacement blocked: no reference passes quality guard",
+                    live_mae,
+                    float(selected.mae or 0.0),
+                    n,
+                )
             )
+        if fallback is None:
             continue
         gated[key] = replace(
             fallback,

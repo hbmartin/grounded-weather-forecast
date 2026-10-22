@@ -45,14 +45,26 @@ event. Events are written only for changed decisions: A → B → A reapproves A
 is unchanged. New content carries `approval_required` outside its content hash and
 is invisible until its event commits. Legacy releases retain implicit approval through
 `promoted_at`. All readers use the same aware timestamp validation and ordering;
-historical replay considers only events available by its cutoff.
+historical replay considers only events available by its cutoff. Managed event
+sequence determines supersession; aware clocks determine visibility. Eligible
+managed events precede implicit legacy approvals, which retain publication-time
+ordering. A corrected wall clock cannot revive a lower sequence. Approval events
+use their commit clock, not the earlier promotion snapshot clock. New objects
+require approvals by default; only legacy read compatibility supplies an implicit
+approval for missing markers. First approval and reapproval are distinct outcomes.
 
 Carried choices in completed products still pass the live gate, including slices
 without a new winner. Pending, failed and unrequested products remain untouched.
 Combined releases union compatible per-variable contexts and reject conflicting
 identity. Each selected slice preserves its available training cutoff; summaries are
 recomputed after replacements, without borrowing a legacy aggregate for an unknown
-slice. Context-free legacy choices can justify only their identical recorded dataset.
+slice. Context-free legacy choices can justify only their identical recorded dataset,
+and retain known evaluation references without invented context or cutoffs.
+Final selected contexts are merged once; unused historical contexts cannot poison
+promotion. Conflicts fail the transaction with typed diagnostics and exit 1,
+preserving scores and approvals while maintenance continues diagnostics.
+Blocked gate measurements are separate best-effort telemetry, so changing MAE or
+sample count cannot create diagnostic-only approval churn.
 
 Release fields are additive. Older single-dataset ledgers remain readable using
 their recorded provenance; missing evaluation context is not invented. The active
@@ -82,3 +94,10 @@ reconstructed with future data.
   prior incumbents can settle on different path-dependent fixed points under the
   same near-tie evidence. Two different serving decisions still cannot share a
   release id.
+
+Approval snapshots also supply report and retention readers with one cutoff and
+ordering. Retention-only references from active/recent-served legacy documents
+protect evidence without granting serving authorization. Unverifiable references
+suspend pruning. Churn separates immutable publication and approval clocks with
+additive nullable fields and in-memory legacy normalization; approval identity,
+not only release identity, distinguishes repeated transitions.

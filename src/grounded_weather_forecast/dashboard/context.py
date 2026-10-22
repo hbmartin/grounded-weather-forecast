@@ -23,7 +23,7 @@ from grounded_weather_forecast.dataset.matrix import DatasetPaths, matrix_path
 from grounded_weather_forecast.dataset.providers import read_latest_archive_location
 from grounded_weather_forecast.reports.eprocess import EProcessStore
 from grounded_weather_forecast.runs import RUNS_SCHEMA, read_runs, runs_path
-from grounded_weather_forecast.serve.approvals import approved_payloads
+from grounded_weather_forecast.serve.approvals import read_approval_snapshot
 from grounded_weather_forecast.serve.history import load_history
 from grounded_weather_forecast.serve.observability import (
     OBSERVABILITY_HISTORY_SCHEMA,
@@ -143,28 +143,20 @@ def _latest_forecast(config: Config, failures: list[str]) -> Forecast | None:
         return None
 
 
-def _releases(config: Config, failures: list[str]) -> tuple[Mapping[str, object], ...]:
+def _releases(
+    config: Config, failures: list[str], *, now: datetime | None = None
+) -> tuple[Mapping[str, object], ...]:
     directory = config.artifacts_dir / "releases"
     if not directory.exists():
         return ()
-    loaded = (
-        _try_json(
-            path,
-            failures,
-            label=f"artifacts/releases/{path.name}",
-        )
-        for path in sorted(directory.glob("*.json"))
+    snapshot = read_approval_snapshot(directory, as_of=now)
+    failures.extend(
+        f"artifacts/releases/{Path(issue).name}" for issue in snapshot.issues
     )
     return tuple(
-        approved_payloads(
-            [
-                dict(release)
-                for release in loaded
-                if release is not None and isinstance(release.get("selections"), dict)
-            ],
-            directory,
-            datetime.now(UTC),
-        )
+        record.payload()
+        for record in snapshot.records()
+        if isinstance(record.release.get("selections"), dict)
     )
 
 
@@ -262,11 +254,14 @@ def _archive_location(config: Config) -> tuple[float, float] | None:
         return None
 
 
-def _evidence_history(config: Config, failures: list[str]) -> dict[str, pl.DataFrame]:
+def _evidence_history(
+    config: Config, failures: list[str], *, now: datetime | None = None
+) -> dict[str, pl.DataFrame]:
     """All five history ledgers, absent files as empty typed frames."""
     from grounded_weather_forecast.reports.evidence import (  # noqa: PLC0415
         LEDGERS,
         ledger_path,
+        normalize_churn,
         read_ledger,
     )
 
@@ -274,7 +269,16 @@ def _evidence_history(config: Config, failures: list[str]) -> dict[str, pl.DataF
     for name, spec in LEDGERS.items():
         path = ledger_path(config, spec)
         try:
-            frames[name] = read_ledger(path, spec.schema)
+            frame = read_ledger(path, spec.schema)
+            frames[name] = (
+                normalize_churn(
+                    frame,
+                    config.artifacts_dir / "releases",
+                    as_of=now or datetime.now(UTC),
+                )
+                if name == "churn"
+                else frame
+            )
         except (OSError, ValueError, pl.exceptions.PolarsError):
             if path.exists():
                 failures.append(f"artifacts/history/{spec.name}.parquet")
@@ -346,7 +350,7 @@ def collect_context(
             unreadable,
             label="artifacts/latest_publish_attempt.json",
         ),
-        releases=_releases(config, unreadable),
+        releases=_releases(config, unreadable, now=now),
         alignment=_try_json(
             config.artifacts_dir / "alignment.json",
             unreadable,
@@ -366,6 +370,6 @@ def collect_context(
         observability_history=_observability_history(config, unreadable),
         runs=_runs(config, unreadable),
         archive_location=_archive_location(config),
-        evidence_history=_evidence_history(config, unreadable),
+        evidence_history=_evidence_history(config, unreadable, now=now),
         unreadable_artifacts=tuple(sorted(set(unreadable))),
     )

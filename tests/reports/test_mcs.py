@@ -431,12 +431,14 @@ class TestGuardedReplacement:
         ]
         for name, (n, error) in (reference_live or {}).items():
             live.append(live[0] | {"method_id": name, "n": n, "live_mae": error})
+        self.diagnostics = []
         return apply_live_gate(
             {self.KEY: Selection(method, "winner", n=30, mae=1.0)},
             pl.DataFrame(live),
             factor=1.5,
             min_n=24,
             candidates={self.KEY: candidates},
+            diagnostics=self.diagnostics,
         )[self.KEY]
 
     @pytest.mark.parametrize(
@@ -446,11 +448,13 @@ class TestGuardedReplacement:
         result = self.gate((Selection("reference", "reference", mae=error),))
         assert result.method_id == "winner"
         assert result.mae == 1.0
-        assert "live gate failed" in result.reason
-        assert "replacement blocked" in result.reason
+        assert result.reason == "winner"
+        assert "live gate failed" in self.diagnostics[0].detail
+        assert "replacement blocked" in self.diagnostics[0].detail
 
     def test_missing_reference_is_recorded(self):
-        assert "replacement blocked" in self.gate().reason
+        assert self.gate().reason == "winner"
+        assert "replacement blocked" in self.diagnostics[0].detail
 
     @pytest.mark.parametrize("live", [3.0, 1.6])
     def test_mature_bad_live_reference_is_vetoed(self, live):

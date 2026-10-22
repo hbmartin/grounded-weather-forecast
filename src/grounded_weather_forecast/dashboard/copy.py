@@ -65,6 +65,11 @@ ZONE_INTROS: Mapping[str, str] = {
 }
 
 PANEL_COPY: Mapping[str, PanelCopy] = {
+    "f4": PanelCopy(
+        what="Recent live-gate replacement decisions and measurements.",
+        why="A blocked reference preserves the incumbent approval without creating release churn.",
+        thresholds="Uses the configured live-gap factor and minimum sample count; shows the last day.",
+    ),
     "a1": PanelCopy(
         what=(
             "The status of the most recently served forecast document: ready "

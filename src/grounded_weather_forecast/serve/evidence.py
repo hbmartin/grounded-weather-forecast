@@ -4,7 +4,7 @@ import logging
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import datetime
-from typing import cast
+from typing import Literal, cast
 
 import polars as pl
 
@@ -18,6 +18,46 @@ CONTEXT_COLUMNS = (
 )
 _CONTEXT_IDENTITY_COLUMNS = ("dataset_fingerprint", "evaluation_created_at")
 _LOGGER = logging.getLogger(__name__)
+
+
+class PromotionEvidenceError(ValueError):
+    """Invalid final release provenance, with diagnostics safe for command outcomes."""
+
+    def __init__(
+        self,
+        evaluation: str,
+        field: str,
+        left: object = None,
+        right: object = None,
+        *,
+        conflict: bool = False,
+    ) -> None:
+        self.evaluation_id = evaluation
+        self.field = field
+        self.left = left
+        self.right = right
+        self.failure_kind = (
+            "promotion_evidence_conflict" if conflict else "promotion_evidence_invalid"
+        )
+        kind = "conflicting" if conflict else "missing or invalid"
+        super().__init__(
+            f"{kind} evaluation evidence {evaluation}: {field}; recorded={left!r}, proposed={right!r}"
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class GateVerdict:
+    product: str
+    variable: str
+    lead_bucket: str
+    method_id: str
+    evaluation_id: str | None
+    release_id: str | None
+    verdict: Literal["blocked", "replaced"]
+    detail: str
+    live_mae: float
+    backtest_mae: float
+    n: int
 
 
 @dataclass(slots=True)
@@ -124,20 +164,26 @@ def merge_contexts(
         }
         semantics = payload.get("semantics")
         if not isinstance(semantics, Mapping):
-            raise ValueError(f"missing evaluation semantics: {evaluation}")
+            raise PromotionEvidenceError(evaluation, "semantics")
         current = merged.setdefault(evaluation, {})
         old_semantics = current.get("semantics", {})
         if not isinstance(old_semantics, Mapping):
-            raise ValueError(f"invalid evaluation semantics: {evaluation}")
+            raise PromotionEvidenceError(evaluation, "semantics", old_semantics)
         semantics = cast(Mapping[str, object], semantics)
         old_semantics = cast(Mapping[str, object], old_semantics)
         for key, value in identity.items():
             if key in current and current[key] != value:
-                raise ValueError(f"conflicting evaluation context {evaluation}: {key}")
+                raise PromotionEvidenceError(
+                    evaluation, key, current[key], value, conflict=True
+                )
         for variable, semantic in semantics.items():
             if variable in old_semantics and old_semantics[variable] != semantic:
-                raise ValueError(
-                    f"conflicting evaluation semantics {evaluation}: {variable}"
+                raise PromotionEvidenceError(
+                    evaluation,
+                    variable,
+                    old_semantics[variable],
+                    semantic,
+                    conflict=True,
                 )
         current.update(identity)
         current["semantics"] = dict(old_semantics) | dict(semantics)
@@ -156,17 +202,28 @@ class EvidenceSummary:
         payloads: Sequence[Mapping[str, object]],
         cutoffs: Mapping[tuple[str, str, str], datetime | None],
         evaluations: Mapping[tuple[str, str, str], str | None],
+        *,
+        legacy_missing: frozenset[str] = frozenset(),
+        merged: bool = False,
     ) -> "EvidenceSummary":
-        contexts = merge_contexts(payloads)
+        contexts = (
+            {str(p["evaluation_id"]): dict(p) for p in payloads}
+            if merged
+            else merge_contexts(payloads)
+        )
         projected: dict[str, dict[str, object]] = {}
         by_evaluation: dict[str, list[datetime]] = {}
         for key, evaluation in sorted(evaluations.items()):
-            if evaluation is None or evaluation not in contexts:
-                continue  # Preserve unknown legacy provenance as unknown.
+            if evaluation is None:
+                continue
+            if evaluation not in contexts:
+                if evaluation in legacy_missing:
+                    continue
+                raise PromotionEvidenceError(evaluation, "context")
             context = contexts[evaluation]
             semantics = context["semantics"]
             if not isinstance(semantics, Mapping) or key[1] not in semantics:
-                raise ValueError(f"missing evaluation semantics {evaluation}: {key[1]}")
+                raise PromotionEvidenceError(evaluation, f"semantics.{key[1]}")
             semantics = cast(Mapping[str, object], semantics)
             selected = projected.setdefault(evaluation, context | {"semantics": {}})
             selected_semantics = cast(dict[str, object], selected["semantics"])
@@ -177,7 +234,9 @@ class EvidenceSummary:
             cutoff = max(by_evaluation.get(evaluation, []), default=None)
             context["training_cutoff"] = cutoff.isoformat() if cutoff else None
         return cls(
-            tuple(sorted(projected)),
+            tuple(
+                sorted({value for value in evaluations.values() if value is not None})
+            ),
             tuple(projected[key] for key in sorted(projected)),
             max(
                 (value for values in by_evaluation.values() for value in values),
@@ -192,40 +251,10 @@ class EvidenceSummary:
         cutoffs: Mapping[tuple[str, str, str], datetime | None],
         evaluations: Mapping[tuple[str, str, str], str | None],
     ) -> "EvidenceSummary":
-        attributed = {
-            key: evaluation_id
-            for key, evaluation_id in sorted(evaluations.items())
-            if evaluation_id is not None
-        }
-        projected: dict[str, EvaluationContext] = {}
-        for key, evaluation_id in attributed.items():
-            context = contexts[evaluation_id]
-            selected = projected.setdefault(
-                evaluation_id, EvaluationContext(context.metadata, context.identity)
-            )
-            selected.semantics[key[1]] = context.semantics[key[1]]
-        payloads = []
-        for evaluation_id in sorted(projected):
-            payload = projected[evaluation_id].payload(evaluation_id)
-            cutoff = max(
-                (
-                    cutoffs[key]
-                    for key, value in attributed.items()
-                    if value == evaluation_id and cutoffs[key] is not None
-                ),
-                default=None,
-            )
-            payload["training_cutoff"] = cutoff.isoformat() if cutoff else None
-            payloads.append(payload)
-        return cls(
-            evaluation_ids=tuple(sorted(projected)),
-            contexts=tuple(payloads),
-            training_cutoff=max(
-                (
-                    value
-                    for key in attributed
-                    if isinstance(value := cutoffs[key], datetime)
-                ),
-                default=None,
+        return cls.from_payloads(
+            tuple(
+                context.payload(evaluation) for evaluation, context in contexts.items()
             ),
+            cutoffs,
+            evaluations,
         )
