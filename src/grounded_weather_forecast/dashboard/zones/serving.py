@@ -281,14 +281,26 @@ def _gate_panel(ctx: DashboardContext) -> Panel | None:
         else "info",
         copy=PANEL_COPY["f4"],
         table=TableSpec(
-            columns=("recorded_at", "slice", "method", "verdict", "detail"),
+            columns=(
+                "recorded_at",
+                "slice",
+                "method",
+                "verdict",
+                "live_mae",
+                "backtest_mae",
+                "n",
+                "detail",
+            ),
             rows=tuple(
                 (
                     str(r["recorded_at"]),
                     f"{r['product']}.{r['variable']}.{r['lead_bucket']}",
                     str(r["method_id"]),
                     str(r["verdict"]),
-                    str(r["detail"]),
+                    fmt(r["live_mae"], 3),
+                    fmt(r["backtest_mae"], 3),
+                    fmt(r["n"]),
+                    fmt(r["detail"]),
                 )
                 for r in recent.sort("recorded_at").tail(20).iter_rows(named=True)
             ),

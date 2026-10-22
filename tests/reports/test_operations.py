@@ -5,6 +5,7 @@ import os
 import sqlite3
 from dataclasses import replace
 from datetime import timedelta
+from pathlib import Path
 
 import polars as pl
 import pytest
@@ -873,7 +874,7 @@ def test_naive_legacy_reference_protects_scores_without_authorizing_release(
 @pytest.mark.parametrize(
     "payload, detail",
     [
-        ("broken", "missing or unreadable"),
+        ("broken", "unreadable release files"),
         (
             json.dumps(
                 {
@@ -921,3 +922,111 @@ def test_missing_reference_metadata_suspends_pruning(tmp_path):
     assert not result.deleted
     assert any("missing evaluation references" in note for note in result.skipped)
     assert (scores_dir / "scores_hourly_live_expanding_e2.parquet").exists()
+
+
+@pytest.mark.parametrize("dry_run", [False, True])
+@pytest.mark.parametrize("damage", ["corrupt", "non_object", "permission"])
+def test_unreadable_non_active_release_keeps_all_published_scores(
+    tmp_path, monkeypatch, dry_run, damage
+):
+    config, scores_dir = TestPruneScores().seeded(tmp_path)
+    activate_release(config.artifacts_dir, "r1")
+    path = config.artifacts_dir / "releases" / "r2.json"
+    path.write_text(
+        json.dumps(
+            {
+                "release_id": "r2",
+                "promoted_at": (NOW - timedelta(days=1)).isoformat(),
+                "evaluation_ids": ["e2"],
+            }
+        )
+    )
+    if damage == "permission":
+        read_text = Path.read_text
+
+        def denied(candidate, *args, **kwargs):
+            if candidate == path:
+                raise PermissionError("release fixture permission denied")
+            return read_text(candidate, *args, **kwargs)
+
+        monkeypatch.setattr(Path, "read_text", denied)
+    else:
+        path.write_text("{broken" if damage == "corrupt" else "[]")
+    before = {p: p.read_bytes() for p in scores_dir.glob("*.parquet")}
+
+    result = operations.prune_scores_files(config, dry_run=dry_run, now=NOW)
+
+    assert result.deleted == ()
+    assert set(result.kept) == set(before)
+    assert result.freed_mb == 0
+    assert any(
+        "unreadable release files" in reason and str(path) in reason
+        for reason in result.skipped
+    )
+    assert before == {p: p.read_bytes() for p in scores_dir.glob("*.parquet")}
+
+
+def test_repairing_unreadable_release_resumes_pruning(tmp_path):
+    config, scores_dir = TestPruneScores().seeded(tmp_path)
+    activate_release(config.artifacts_dir, "r1")
+    path = config.artifacts_dir / "releases" / "r2.json"
+    path.write_text("{broken")
+    blocked = operations.prune_scores_files(config, dry_run=False, now=NOW)
+    assert not blocked.deleted
+    assert (scores_dir / "scores_hourly_live_expanding_e2.parquet").exists()
+
+    path.write_text(
+        json.dumps(
+            {
+                "release_id": "r2",
+                "promoted_at": (NOW - timedelta(days=1)).isoformat(),
+                "evaluation_ids": ["e1"],
+            }
+        )
+    )
+    resumed = operations.prune_scores_files(config, dry_run=False, now=NOW)
+    assert [p.name for p in resumed.deleted] == [
+        "scores_hourly_live_expanding_e2.parquet"
+    ]
+    assert not any("could not be verified" in reason for reason in resumed.skipped)
+    assert (scores_dir / "scores_hourly_live_expanding_e1.parquet").exists()
+
+
+@pytest.mark.parametrize("reference", ["active", "recent"])
+@pytest.mark.parametrize(
+    "fields, detail",
+    [
+        ({}, "missing evaluation references"),
+        ({"evaluation_ids": "broken"}, "invalid evaluation_ids"),
+        ({"selections": []}, "invalid selections"),
+        ({"selections": {"hourly.temp_c.0-1h": []}}, "invalid selection evidence"),
+        (
+            {"selections": {"hourly.temp_c.0-1h": {"evaluation_id": ""}}},
+            "invalid selection evaluation_id",
+        ),
+    ],
+)
+def test_invalid_release_references_identify_the_release(
+    tmp_path, reference, fields, detail
+):
+    config, scores_dir = TestPruneScores().seeded(tmp_path)
+    activate_release(config.artifacts_dir, "r1")
+    release_id = "r1" if reference == "active" else "r2"
+    (config.artifacts_dir / "releases" / f"{release_id}.json").write_text(
+        json.dumps(
+            {
+                "release_id": release_id,
+                "promoted_at": (NOW - timedelta(days=1)).isoformat(),
+                **fields,
+            }
+        )
+    )
+    before = {p: p.read_bytes() for p in scores_dir.glob("*.parquet")}
+
+    result = operations.prune_scores_files(config, dry_run=False, now=NOW)
+
+    assert not result.deleted
+    assert result.skipped == (
+        f"release references could not be verified: release {release_id}: {detail}",
+    )
+    assert before == {p: p.read_bytes() for p in scores_dir.glob("*.parquet")}

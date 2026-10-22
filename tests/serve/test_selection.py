@@ -1590,7 +1590,12 @@ def test_partial_context_identity_does_not_invent_other_field(column):
     )
 
 
-def test_approved_loader_orders_sequences_and_rejects_future(approved_archive):
+@pytest.mark.parametrize("future_clock", ["publication", "approval"])
+def test_approved_loader_orders_sequences_and_rejects_future(
+    approved_archive, monkeypatch, future_clock
+):
+    from grounded_weather_forecast.serve import approvals
+
     config, _, _, evaluate, initial = approved_archive
     evaluate("hourly", "new-evaluation", 2)
     second = selection_module.promote_methods(
@@ -1604,6 +1609,15 @@ def test_approved_loader_orders_sequences_and_rejects_future(approved_archive):
     second_raw["promoted_at"] = "2026-08-20T19:30:00+00:00"
     first_path.write_text(json.dumps(first_raw))
     second_path.write_text(json.dumps(second_raw))
+
+    cutoff = utc(2026, 8, 21, 12)
+
+    class Clock(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return cutoff
+
+    monkeypatch.setattr(approvals, "datetime", Clock)
     for event_path in (config.artifacts_dir / "releases/approvals").glob("*.json"):
         event = json.loads(event_path.read_text())
         raw = first_raw if event["release_id"] == initial.release_id else second_raw
@@ -1611,10 +1625,18 @@ def test_approved_loader_orders_sequences_and_rejects_future(approved_archive):
         event_path.write_text(json.dumps(event))
     loaded = selection_module.load_approved_selections(config)
     assert loaded[("hourly", "temp_c", "24-48h")].evaluation_id == "new-evaluation"
-    first_raw["promoted_at"] = (datetime.now(UTC) + timedelta(days=1)).isoformat()
-    first_path.write_text(json.dumps(first_raw))
+    future = (cutoff + timedelta(days=1)).isoformat()
+    if future_clock == "publication":
+        second_raw["promoted_at"] = future
+        second_path.write_text(json.dumps(second_raw))
+    else:
+        for event_path in (config.artifacts_dir / "releases/approvals").glob("*.json"):
+            event = json.loads(event_path.read_text())
+            if event["release_id"] == second.release_id:
+                event["approved_at"] = future
+                event_path.write_text(json.dumps(event))
     loaded = selection_module.load_approved_selections(config)
-    assert loaded[("hourly", "temp_c", "24-48h")].evaluation_id == "new-evaluation"
+    assert loaded[("hourly", "temp_c", "24-48h")].evaluation_id == "hour-original"
 
 
 def test_a_b_a_promotion_is_served_and_cli_reports_reapproval(

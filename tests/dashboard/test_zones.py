@@ -585,4 +585,42 @@ def test_live_gate_diagnostic_ledger_is_visible_in_report(tmp_path):
         p for p in serving.build(ctx, derive(ctx)).panels if p.panel_id == "f4"
     )
     assert panel.status == "amber"
+    assert panel.table.columns == (
+        "recorded_at",
+        "slice",
+        "method",
+        "verdict",
+        "live_mae",
+        "backtest_mae",
+        "n",
+        "detail",
+    )
+    assert panel.table.rows[0][4:7] == ("5.000", "1.000", "30")
     assert "replacement blocked" in panel.table.rows[0][-1]
+
+
+def test_live_gate_panel_formats_nullable_measurements(tmp_path):
+    from grounded_weather_forecast.reports import evidence
+
+    config = write_config(tmp_path)
+    row = {name: None for name in evidence.LIVE_GATE_SCHEMA.names()}
+    row.update(
+        recorded_at=NOW,
+        product="hourly",
+        variable="temp_c",
+        lead_bucket="0-1h",
+        method_id="inverse_mse",
+        verdict="blocked",
+    )
+    evidence.append_ledger(
+        pl.DataFrame([row], schema=dict(evidence.LIVE_GATE_SCHEMA)),
+        evidence.ledger_path(config, evidence.LIVE_GATE_LEDGER),
+        evidence.LIVE_GATE_LEDGER,
+        now=NOW,
+    )
+    ctx = collect_context(config, now=NOW)
+    panel = next(
+        p for p in serving.build(ctx, derive(ctx)).panels if p.panel_id == "f4"
+    )
+    assert panel.status == "amber"
+    assert panel.table.rows[0][4:] == ("—", "—", "—", "—")

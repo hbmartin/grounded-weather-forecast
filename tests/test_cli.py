@@ -600,6 +600,32 @@ def test_prune_scores_cli_respects_dry_run(tmp_path, capsys):
     assert len(list(scores_dir.glob("*.parquet"))) == 3
 
 
+@pytest.mark.parametrize("dry_run", [False, True])
+def test_prune_scores_unreadable_release_is_a_protection_skip(
+    tmp_path, capsys, dry_run
+):
+    config = write_config(tmp_path)
+    scores_dir = config.dataset.dir / "scores"
+    scores_dir.mkdir(parents=True)
+    for index in range(4):
+        (scores_dir / f"scores_hourly_live_expanding_e{index}.parquet").write_bytes(
+            b"published scores"
+        )
+    release = config.artifacts_dir / "releases" / "unreadable.json"
+    release.parent.mkdir(parents=True)
+    release.write_text("{broken")
+    before = {path: path.read_bytes() for path in scores_dir.glob("*.parquet")}
+
+    arguments = ["--config", str(tmp_path / "config.toml"), "prune-scores"]
+    assert main([*arguments, *(["--dry-run"] if dry_run else [])]) == 0
+
+    output = capsys.readouterr()
+    assert f"unreadable release files: {release}" in output.out
+    assert "0 scores files (0.0 MB), kept 4" in output.out
+    assert output.err == ""
+    assert before == {path: path.read_bytes() for path in scores_dir.glob("*.parquet")}
+
+
 def test_report_served_ledger_records_only_the_products_own_rows(tmp_path, monkeypatch):
     from conftest import synthetic_hourly_matrix
 
