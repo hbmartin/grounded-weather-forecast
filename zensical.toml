@@ -57,6 +57,7 @@ nav = [
     { "Model selection" = "methods/model-selection.md" },
     { "Precipitation" = "methods/precipitation.md" },
     { "Truth and QC" = "methods/truth-qc.md" },
+    { "Daily read contract" = "methods/daily-report.md" },
     { "Bibliography" = "methods/bibliography.md" },
   ] },
   { "Project" = [

@@ -4,6 +4,7 @@ The config carries everything location-specific (DB paths, coordinates,
 station column/unit mappings) so the codebase itself stays station-agnostic.
 """
 
+import hashlib
 import math
 import tomllib
 from collections.abc import Mapping
@@ -17,6 +18,11 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 class ConfigError(ValueError):
     """The TOML file is missing required keys or has ill-typed values."""
+
+
+def config_fingerprint(config: "Config") -> str:
+    """Stable evaluation identity, available without importing persistence."""
+    return hashlib.sha256(repr(config).encode()).hexdigest()[:16]
 
 
 DEFAULT_STATION_COLUMNS: Mapping[str, str] = MappingProxyType(
