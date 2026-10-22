@@ -85,6 +85,33 @@ def test_timestamp_freshness_unknown_stale_and_dated_qc(tmp_path):
     ]
 
 
+def test_station_default_tracks_active_home_and_qc_uses_shared_policy(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setattr(reader.Path, "home", classmethod(lambda _cls: tmp_path))
+    assert (
+        reader.published_station_path()
+        == tmp_path
+        / "Library/Application Support/grounded-weather-forecast/staged/current.json"
+    )
+    config, forecast, _ = setup(tmp_path)
+    write_json(
+        config.artifacts_dir / "truth_qc.json",
+        {
+            "schema_version": 3,
+            "generated_at": START,
+            "drift_alert": False,
+            "correlation_alert": False,
+            "shield_alert": False,
+        },
+    )
+    monkeypatch.setitem(reader.FRESHNESS_THRESHOLDS, "truth_qc_age_minutes", 5.0)
+    result = read(config, forecast)["prediction_quality"]["truth_qc"]
+    assert result["freshness"]["max_age_minutes"] == 5.0
+    assert result["freshness"]["status"] == "stale"
+    assert result["current_alerts"] is None
+
+
 def test_empty_provider_and_old_runs_do_not_invent_health(tmp_path):
     config, forecast, _ = setup(tmp_path)
     provider_db(config.forecasts.db_path)

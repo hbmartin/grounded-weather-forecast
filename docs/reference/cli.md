@@ -89,7 +89,7 @@ From `/Volumes/Pro2T/weather/grounded-weather-forecast`, the exact caller is:
 | `--as-of` | Required execution cutoff with explicit offset, at or after `start`. Even execution after 19:00 preserves the scheduled window; stale/missing data remains explicit. Future-issued forecasts and future-recorded evidence are excluded. This reads current files and cannot reconstruct past overwritten artifacts. |
 | `--hours` | Default 12; any other value is rejected. Twelve elapsed UTC hours with an exclusive end. At 07:00 Pacific this is `[07:00, 19:00)` on both DST transition dates. Offsets change from `-07:00` to `-08:00` in winter. |
 | `--forecast` | Existing schema-6 forecast path, default `forecast.json`, relative to caller working directory. Unknown source versions are rejected. |
-| `--published-station` | Optional fallback JSON path; default `/Users/haroldmartin/Library/Application Support/grounded-weather-forecast/staged/current.json`. Only `metadata.observed_at` is read into the result, labeled `published_station_snapshot`. It is not a live station observation query or a forecast source. |
+| `--published-station` | Optional fallback JSON path; default `~/Library/Application Support/grounded-weather-forecast/staged/current.json`, resolved from the active user's home directory. Only `metadata.observed_at` is read into the result, labeled `published_station_snapshot`. It is not a live station observation query or a forecast source. |
 
 Exit `0` means a structured read completed, including partial/unknown data. Exit
 `2` means invalid configuration or time range and returns a schema-1 JSON error;
