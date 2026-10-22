@@ -11,6 +11,7 @@ from grounded_weather_forecast.dashboard.copy import PANEL_COPY, ZONE_INTROS
 from grounded_weather_forecast.dashboard.derive import Derived
 from grounded_weather_forecast.dashboard.model import Panel, Stat, TableSpec, Zone
 from grounded_weather_forecast.dashboard.zones.common import empty_panel, fmt
+from grounded_weather_forecast.serve.approvals import approval_sort_key
 
 _DEGRADED_WINDOW_DAYS = 1.0
 _DEGRADED_AMBER = 0.10
@@ -219,9 +220,7 @@ def _releases_panel(ctx: DashboardContext) -> Panel:
     rows: list[tuple[str, ...]] = []
     classes: list[tuple[str, ...]] = []
     stale = 0
-    for release in sorted(
-        ctx.releases, key=lambda r: str(r.get("promoted_at", "")), reverse=True
-    ):
+    for release in sorted(ctx.releases, key=approval_sort_key, reverse=True):
         dataset_print = str(release.get("dataset_fingerprint", ""))
         selections = release.get("selections")
         evaluation_ids = release.get("evaluation_ids")
@@ -230,7 +229,7 @@ def _releases_panel(ctx: DashboardContext) -> Panel:
         rows.append(
             (
                 str(release.get("release_id", "")),
-                str(release.get("promoted_at", "")),
+                str(release.get("approved_at", release.get("promoted_at", ""))),
                 dataset_print,
                 str(len(selections)) if isinstance(selections, dict) else "0",
                 str(release.get("training_cutoff", "")),
@@ -253,7 +252,7 @@ def _releases_panel(ctx: DashboardContext) -> Panel:
         table=TableSpec(
             columns=(
                 "release_id",
-                "promoted_at",
+                "approved_at",
                 "dataset_fingerprint",
                 "slices",
                 "training_cutoff",

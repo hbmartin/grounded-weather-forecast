@@ -38,11 +38,18 @@ from grounded_weather_forecast.reports.leaderboard import (
     union_references,
 )
 from grounded_weather_forecast.reports.winner_curse import should_retain_incumbent
+from grounded_weather_forecast.serve.approvals import (
+    ApprovedRelease,
+    aware_timestamp,
+    ordered_approvals,
+    publish_approval,
+)
 from grounded_weather_forecast.serve.diagnostics import (
     FitFailure,
     describe_fit_failures,
 )
-from grounded_weather_forecast.serve.evidence import EvidenceSummary
+from grounded_weather_forecast.serve.evidence import EvidenceSummary, merge_contexts
+from grounded_weather_forecast.storage import locked_path
 
 from grounded_weather_forecast.serve.score_scan import (  # isort: skip
     ScoreIdentity,
@@ -87,6 +94,7 @@ class Selection:
     # over a statistically indistinguishable new argmin. Appended last —
     # field order is a compatibility contract.
     retained: bool = False
+    training_cutoff: datetime | None = None
 
 
 type SelectionMap = Mapping[tuple[str, str, str], Selection]
@@ -101,6 +109,14 @@ class PromotionResult:
     selections: SelectionMap
     release_id: str | None = None
     created: bool = False
+    approval_id: str | None = None
+    approval_changed: bool = False
+
+
+@dataclass(frozen=True, slots=True)
+class _ApprovedChoice:
+    selection: Selection
+    context: Mapping[str, object] | None
 
 
 def load_approved_selections(
@@ -114,7 +130,12 @@ def load_approved_selections(
     """Read approved choices; current serving never elects or writes a release."""
     if as_of is not None:
         return _release_as_of(config, as_of, semantics) or {}
-    return _approved_incumbents(config, semantics, dataset_id, matrices)[0]
+    return {
+        key: choice.selection
+        for key, choice in _approved_choices(
+            config, semantics, dataset_id, matrices
+        ).items()
+    }
 
 
 def _product_signatures(
@@ -165,6 +186,8 @@ def _approved_choice_compatible(
         return False
     signature = signatures.get(key[0])
     compatibility = _evaluation_compatibility(context, key[1])
+    if context is None:
+        return selected.dataset_fingerprint == dataset
     if signature is not None:
         return (
             compatibility is not None
@@ -195,37 +218,29 @@ def _approved_context_matches(
     )
 
 
-def _approved_records(config: Config) -> list[dict[str, object]]:
-    now = datetime.now(tz=UTC)
-    records: list[tuple[datetime, dict[str, object]]] = []
-    for raw in _compatible_releases(config, match_dataset=False):
-        with suppress(TypeError, ValueError):
-            promoted = datetime.fromisoformat(str(raw["promoted_at"]))
-            if promoted.tzinfo is not None and promoted <= now:
-                records.append((promoted, raw))
-    return [
-        raw
-        for _, raw in sorted(
-            records,
-            key=lambda pair: (pair[0], str(pair[1]["release_id"])),
-            reverse=True,
-        )
-    ]
+def _approved_records(
+    config: Config, as_of: datetime | None = None, *, match_dataset: bool = False
+) -> list[ApprovedRelease]:
+    return ordered_approvals(
+        _compatible_releases(config, match_dataset=match_dataset),
+        config.artifacts_dir / "releases",
+        as_of or datetime.now(UTC),
+    )
 
 
-def _approved_incumbents(
+def _approved_choices(
     config: Config,
     semantics: Mapping[str, TruthSemantics] | None,
     dataset_id: str | None = None,
     matrices: Mapping[str, pl.DataFrame] | None = None,
-) -> tuple[dict[SliceKey, Selection], EvidenceSummary]:
+) -> dict[SliceKey, _ApprovedChoice]:
     dataset = dataset_id or dataset_fingerprint(config)
     signatures = _product_signatures(config, matrices)
     code = code_identity()
-    selections: dict[SliceKey, Selection] = {}
-    contexts: dict[str, dict[str, object]] = {}
-    cutoffs: list[datetime] = []
-    for raw in _approved_records(config):
+    pins = _pins(config)
+    selections: dict[SliceKey, _ApprovedChoice] = {}
+    for record in _approved_records(config):
+        raw = record.release
         approved = _selections_from_release(raw) or {}
         recorded = _contexts_by_evaluation_id(raw.get("evaluation_contexts"))
         for key, selected in approved.items():
@@ -238,16 +253,11 @@ def _approved_incumbents(
                 key, selected, context, signatures, dataset, code, semantics
             ):
                 continue
-            selections[key] = selected
-            if context is not None and selected.evaluation_id is not None:
-                contexts[selected.evaluation_id] = dict(context)
-            with suppress(TypeError, ValueError):
-                cutoffs.append(datetime.fromisoformat(str(raw.get("training_cutoff"))))
-    return selections, EvidenceSummary(
-        tuple(sorted(contexts)),
-        tuple(contexts[key] for key in sorted(contexts)),
-        max(cutoffs, default=None),
-    )
+            selections[key] = _ApprovedChoice(
+                replace(selected, pinned=pins.get(key[:2]) == selected.method_id),
+                context,
+            )
+    return selections
 
 
 def _pins(config: Config) -> dict[tuple[str, str], str]:
@@ -331,6 +341,9 @@ def _selection_payload(
             "mae": selected.mae,
             "truth_semantics": selected.truth_semantics,
             "retained": selected.retained,
+            "training_cutoff": selected.training_cutoff.isoformat()
+            if selected.training_cutoff is not None
+            else None,
         }
         for key, selected in sorted(selections.items())
     }
@@ -486,6 +499,7 @@ def _selections_from_release(release: Mapping[str, object]) -> SelectionMap | No
                 release, selection_mapping, variable
             ),
             retained=bool(selection_mapping.get("retained", False)),
+            training_cutoff=aware_timestamp(selection_mapping.get("training_cutoff")),
         )
     return selections
 
@@ -572,7 +586,8 @@ def _eligible_release_ids(
         )
     eligible: dict[LiveKey, set[str]] = {key: set() for key in choices}
     current_contexts = _contexts_by_evaluation_id(evaluation_contexts)
-    for raw in _compatible_releases(config, match_dataset=False):
+    for approved in _approved_records(config):
+        raw = approved.release
         release_id = raw.get("release_id")
         raw_selections = raw.get("selections")
         if not isinstance(release_id, str) or not isinstance(raw_selections, dict):
@@ -615,8 +630,8 @@ def _release_as_of(
     if as_of.tzinfo is None:
         as_of = as_of.replace(tzinfo=UTC)
     current_code = code_identity()
-    candidates: list[tuple[datetime, SelectionMap]] = []
-    for raw in _compatible_releases(config, match_dataset=True):
+    for approved in _approved_records(config, as_of, match_dataset=True):
+        raw = approved.release
         selections = _selections_from_release(raw)
         raw_selections = raw.get("selections")
         if (
@@ -635,14 +650,8 @@ def _release_as_of(
             )
         ):
             continue
-        with suppress(TypeError, ValueError):
-            promoted_at = datetime.fromisoformat(str(raw["promoted_at"]))
-            if promoted_at <= as_of:
-                candidates.append((promoted_at, selections))
-    if not candidates:
-        return None
-    _, selections = max(candidates, key=lambda item: item[0])
-    return selections
+        return selections
+    return None
 
 
 _RETAINED_REASON = "retained incumbent within one SE of best (winner-curse guard)"
@@ -662,16 +671,10 @@ def _incumbent_methods(config: Config) -> dict[SliceKey, tuple[str, str | None]]
     from the current board.
     """
 
-    def promoted_at(release: Mapping[str, object]) -> datetime:
-        with suppress(ValueError, TypeError):
-            moment = datetime.fromisoformat(str(release.get("promoted_at")))
-            return moment if moment.tzinfo else moment.replace(tzinfo=UTC)
-        return datetime.min.replace(tzinfo=UTC)
-
-    releases = _compatible_releases(config, match_dataset=False)
+    releases = _approved_records(config)
     if not releases:
         return {}
-    newest = max(releases, key=lambda r: (promoted_at(r), str(r.get("release_id"))))
+    newest = releases[0].release
     selections = _selections_from_release(newest) or {}
     return {
         key: (selected.method_id, selected.truth_semantics)
@@ -828,31 +831,6 @@ def select_methods(
     ).selections
 
 
-def _remaining_incumbents(
-    carried: dict[SliceKey, Selection],
-    evidence: EvidenceSummary,
-    replacements: SelectionMap,
-) -> tuple[dict[SliceKey, Selection], EvidenceSummary]:
-    carried = {key: value for key, value in carried.items() if key not in replacements}
-    used = {selected.evaluation_id for selected in carried.values()}
-    evidence = EvidenceSummary(
-        tuple(sorted(str(value) for value in used if value is not None)),
-        tuple(
-            context for context in evidence.contexts if context["evaluation_id"] in used
-        ),
-        evidence.training_cutoff,
-    )
-    # Entries without recorded contexts remain readable, but do not invent
-    # evidence when creating a new combined release.
-    attributed = {str(context["evaluation_id"]) for context in evidence.contexts}
-    carried = {
-        key: value
-        for key, value in carried.items()
-        if value.evaluation_id in attributed
-    }
-    return carried, evidence
-
-
 def promote_methods(
     config: Config,
     scores_dir: Path,
@@ -861,25 +839,39 @@ def promote_methods(
     dataset_id: str | None = None,
     products: frozenset[str] | None = None,
 ) -> PromotionResult:
-    """Elect eligible products and publish an immutable approved decision."""
-    current_dataset = dataset_id or dataset_fingerprint(config)
+    """Serialize elections and approval commits against the same incumbent state."""
+    with locked_path(config.artifacts_dir / "releases" / ".approval-ledger"):
+        return _promote_methods(config, scores_dir, semantics, dataset_id, products)
+
+
+def _elect_slices(
+    config: Config,
+    slices: Mapping[SliceKey, pl.DataFrame],
+    dataset: str,
+    cutoffs: Mapping[SliceKey, datetime | None],
+) -> tuple[dict[SliceKey, Selection], dict[SliceKey, tuple[Selection, ...]]]:
     pinned = _pins(config)
-    selections: dict[SliceKey, Selection] = {}
-    scanned = _load_evidence(config, scores_dir, None, semantics, current_dataset)
-    slices = {
-        key: frame
-        for key, frame in scanned.slices.items()
-        if products is None or key[0] in products
-    }
-    carried, carried_evidence = _approved_incumbents(config, semantics, current_dataset)
     incumbents = _incumbent_methods(config)
+    selected: dict[SliceKey, Selection] = {}
     candidates: dict[SliceKey, tuple[Selection, ...]] = {}
     references = union_references(config.promotion)
-    eprocess_stores: dict[str, EProcessStore] = {}
+    stores: dict[str, EProcessStore] = {}
     for key, frame in slices.items():
         board = leaderboard(frame, references=references)
+        # A carried choice must still have scored replacements available when
+        # no new winner qualifies. Missing candidates never synthesize a fallback.
+        candidates[key] = tuple(
+            replace(candidate, training_cutoff=cutoffs.get(key))
+            for candidate in _reference_candidates(key, board, frame, config, dataset)
+        )
         if (method := pinned.get(key[:2])) is not None:
-            selections[key] = _pinned_selection(method, board, frame, current_dataset)
+            pinned_choice = _pinned_selection(method, board, frame, dataset)
+            selected[key] = replace(
+                pinned_choice,
+                training_cutoff=cutoffs.get(key)
+                if pinned_choice.evaluation_id is not None
+                else None,
+            )
             continue
         winners = slice_winners(
             board,
@@ -887,7 +879,7 @@ def promote_methods(
             rule=config.promotion.rule,
             alpha=config.promotion.alpha,
             promotion=config.promotion,
-            eprocess_store=_eprocess_store_for(config, key[0], eprocess_stores),
+            eprocess_store=_eprocess_store_for(config, key[0], stores),
         )
         if winners.is_empty():
             continue
@@ -895,69 +887,99 @@ def promote_methods(
         reason = "lowest backtest MAE among promotable common-case methods"
         if row.get("gate") == "pooled_D3-10":
             reason += " (gated on pooled D3-10 evidence)"
-        selected = _selection_from_row(row, frame, current_dataset, reason)
-        selections[key] = (
-            _retained_incumbent(
-                config,
-                row,
-                board,
-                frame,
-                incumbents.get(key),
-                str(frame["evaluation_id"][0]),
-                current_dataset,
+        choice = _retained_incumbent(
+            config,
+            row,
+            board,
+            frame,
+            incumbents.get(key),
+            str(frame["evaluation_id"][0]),
+            dataset,
+        ) or _selection_from_row(row, frame, dataset, reason)
+        selected[key] = replace(choice, training_cutoff=cutoffs.get(key))
+    return selected, candidates
+
+
+def _promote_methods(
+    config: Config,
+    scores_dir: Path,
+    semantics: Mapping[str, TruthSemantics] | None,
+    dataset_id: str | None,
+    products: frozenset[str] | None,
+) -> PromotionResult:
+    dataset = dataset_id or dataset_fingerprint(config)
+    scanned = _load_evidence(config, scores_dir, None, semantics, dataset)
+    slices = {
+        key: frame
+        for key, frame in scanned.slices.items()
+        if products is None or key[0] in products
+    }
+    approved = _approved_choices(config, semantics, dataset)
+    carried = {key: value.selection for key, value in approved.items()}
+    elected, candidates = _elect_slices(config, slices, dataset, scanned.cutoffs)
+    selections = carried | elected
+    payloads = [
+        choice.context for choice in approved.values() if choice.context is not None
+    ]
+    used_evaluations = {
+        choice.evaluation_id
+        for choice in (
+            *selections.values(),
+            *(c for refs in candidates.values() for c in refs),
+        )
+    }
+    payloads.extend(
+        context.payload(evaluation)
+        for evaluation, context in scanned.contexts.items()
+        if evaluation in used_evaluations
+    )
+    contexts = merge_contexts(payloads)
+    pinned = _pins(config)
+    in_scope = {
+        key: replace(choice, pinned=pinned.get(key[:2]) == choice.method_id)
+        for key, choice in selections.items()
+        if products is None or key[0] in products
+    }
+    if in_scope:
+        selections.update(
+            apply_live_gate(
+                in_scope,
+                _live_verification(config, datetime.now(UTC)),
+                factor=config.promotion.live_gap_factor,
+                min_n=config.promotion.min_live_n,
+                candidates=candidates,
+                eligible_releases=_eligible_release_ids(
+                    config,
+                    in_scope,
+                    tuple(contexts.values()),
+                    candidates=candidates,
+                ),
             )
-            or selected
         )
-        candidates[key] = _reference_candidates(
-            key, board, frame, config, current_dataset
+    records = _approved_records(config)
+    current = records[0] if records else None
+    if not selections or _selection_payload(selections) == _selection_payload(carried):
+        return PromotionResult(
+            carried,
+            str(current.release["release_id"]) if current is not None else None,
+            approval_id=current.approval_id if current is not None else None,
         )
-    if not selections:
-        return PromotionResult(carried)
-    carried, carried_evidence = _remaining_incumbents(
-        carried, carried_evidence, selections
+    evidence = EvidenceSummary.from_payloads(
+        tuple(contexts.values()),
+        {key: choice.training_cutoff for key, choice in selections.items()},
+        {key: choice.evaluation_id for key, choice in selections.items()},
     )
-    evidence = EvidenceSummary.from_contexts(
-        scanned.contexts,
-        scanned.cutoffs,
-        {key: selected.evaluation_id for key, selected in selections.items()},
-    )
-    # Every replacement candidate comes from the same slice/evaluation, so
-    # changing the served method cannot change this release's evidence.
-    selections = apply_live_gate(
-        selections,
-        _live_verification(config, datetime.now(tz=UTC)),
-        factor=config.promotion.live_gap_factor,
-        min_n=config.promotion.min_live_n,
-        candidates=candidates,
-        eligible_releases=_eligible_release_ids(
-            config, selections, evidence.contexts, candidates=candidates
-        ),
-    )
-    if carried:
-        selections = {**carried, **selections}
-        contexts = {
-            str(context["evaluation_id"]): context
-            for context in (*carried_evidence.contexts, *evidence.contexts)
-        }
-        cutoffs = [
-            cutoff
-            for cutoff in (evidence.training_cutoff, carried_evidence.training_cutoff)
-            if cutoff is not None
-        ]
-        evidence = EvidenceSummary(
-            tuple(sorted(contexts)),
-            tuple(contexts[key] for key in sorted(contexts)),
-            max(cutoffs, default=None),
-        )
-    release = _make_release(config, selections, evidence, current_dataset)
-    _, created = release.write_once(config.artifacts_dir / "releases")
+    release = _make_release(config, selections, evidence, dataset)
+    commit = publish_approval(release, config.artifacts_dir / "releases", current)
     return PromotionResult(
         {
-            key: replace(selected, release_id=release.release_id)
-            for key, selected in selections.items()
+            key: replace(choice, release_id=release.release_id)
+            for key, choice in selections.items()
         },
         release.release_id,
-        created,
+        commit.created,
+        commit.approval_id,
+        commit.changed,
     )
 
 
@@ -1155,7 +1177,6 @@ def apply_live_gate(
         gated[key] = replace(
             fallback,
             reason=verdict,
-            dataset_fingerprint=selected.dataset_fingerprint,
         )
     return gated
 
@@ -1168,6 +1189,7 @@ def no_evidence_reason(
     promoted_fit_unavailable: bool = False,
     fit_failures: Sequence[FitFailure] = (),
     approved_selections: bool = False,
+    missing_product_approvals: bool = False,
 ) -> str:
     """Why serving is degraded: cold start vs invalidated evidence.
 
@@ -1178,6 +1200,8 @@ def no_evidence_reason(
     Only compatible live identities may use the prediction-local fitting
     outcome; missing or invalidated evidence keeps its more actionable reason.
     """
+    if missing_product_approvals:
+        return "no approved hourly or daily selections; run `backtest --source live` then `report`"
     if approved_selections:
         return (
             describe_fit_failures(fit_failures)
@@ -1205,21 +1229,21 @@ def no_evidence_reason(
             "no live backtest evidence yet (synthetic evidence is never "
             "promoted); keep polling and run `backtest --source live`"
         )
-    if (dataset_id or dataset_fingerprint(config)) not in live_datasets:
+    if code_identity() not in live_code_versions:
         return (
-            "dataset fingerprint changed since the last backtest and no compatible "
-            "approval exists; re-run `backtest --source live` "
-            "then `report`"
+            "implementation changed since the last backtest; re-run "
+            "`backtest --source live` then `report`"
         )
     if config_fingerprint(config) not in live_configs:
         return (
             "config changed since the last backtest; re-run "
             "`backtest --source live` then `report`"
         )
-    if code_identity() not in live_code_versions:
+    if (dataset_id or dataset_fingerprint(config)) not in live_datasets:
         return (
-            "implementation changed since the last backtest; re-run "
-            "`backtest --source live` then `report`"
+            "dataset fingerprint changed since the last backtest and no compatible "
+            "approval exists; re-run `backtest --source live` "
+            "then `report`"
         )
     if fit_failures:
         return describe_fit_failures(fit_failures)

@@ -24,7 +24,8 @@ import stat
 import subprocess
 import sys
 import time
-from collections.abc import Sequence
+from collections.abc import Iterator, Sequence
+from contextlib import contextmanager
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -144,6 +145,25 @@ def run_stage(step: list[str], paths: RuntimePaths) -> int:
     return code
 
 
+@contextmanager
+def maintenance_lock(stamp: Path) -> Iterator[bool]:
+    """Prepare startup state without reclassifying later stage exceptions."""
+    try:
+        stamp.parent.mkdir(parents=True, exist_ok=True)
+        lock = stamp.with_name("maintenance-job.lock").open("a")
+    except (OSError,) as exc:  # noqa: B013 -- startup boundary
+        raise RuntimePathError(f"cannot initialize maintenance lock: {exc}") from exc
+    with lock:
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except (BlockingIOError,):  # noqa: B013 -- duplicate job remains nonfatal
+            yield False
+            return
+        except (OSError,) as exc:  # noqa: B013 -- startup boundary
+            raise RuntimePathError(f"cannot acquire maintenance lock: {exc}") from exc
+        yield True
+
+
 def maintain(stamp: Path, *, restore: bool, paths: RuntimePaths) -> int:
     try:
         from grounded_weather_forecast.status import (  # noqa: PLC0415 -- guarded startup
@@ -153,10 +173,8 @@ def maintain(stamp: Path, *, restore: bool, paths: RuntimePaths) -> int:
         raise RuntimePathError(f"maintenance runtime unavailable: {exc}") from exc
 
     # Only actual maintenance owns this lock; readers never probe it exclusively.
-    with stamp.with_name("maintenance-job.lock").open("a") as job_lock:
-        try:
-            fcntl.flock(job_lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except (BlockingIOError,):  # noqa: B013 -- project convention
+    with maintenance_lock(stamp) as acquired:
+        if not acquired:
             print("another maintenance job is running; skipping duplicate", flush=True)
             return 0
         try:

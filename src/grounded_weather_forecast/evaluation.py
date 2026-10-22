@@ -150,6 +150,9 @@ class ModelRelease:
     evaluation_contexts: tuple[dict[str, object], ...]
     training_cutoff: str | None
     selections: dict[str, dict[str, object]]
+    # Publication becomes an approval only after its separate event commits.
+    # This transport marker deliberately does not participate in content identity.
+    approval_required: bool = False
 
     @classmethod
     def create(

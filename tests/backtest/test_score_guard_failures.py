@@ -27,6 +27,61 @@ from grounded_weather_forecast.serve import selection
 from grounded_weather_forecast.storage import pipeline_lock
 
 
+@pytest.mark.parametrize("products", ["hourly,daily,minutely", "daily,hourly,minutely"])
+def test_secondary_stat_failure_is_structured_and_suppresses_all_promotion(
+    tmp_path, monkeypatch, capsys, products
+):
+    config = write_config(tmp_path)
+    called = []
+    recorded = []
+
+    def product(_config, _args, name, _methods):
+        called.append(name)
+        if name == "daily":
+            error = ValueError("daily primary fixture")
+            error.add_note("primary detail")
+            raise error
+        return ProductBacktestOutcome(name, "evaluated", 1)
+
+    def denied(_directory):
+        error = PermissionError("coordination stat fixture")
+        error.add_note("probe detail")
+        raise error
+
+    def forbidden(*_a, **_k):
+        pytest.fail("unknown coordination must not reach another writer or promotion")
+
+    monkeypatch.setattr(cli, "_run_matrix_backtest", product)
+    monkeypatch.setattr(cli, "_run_minutely_backtest", forbidden)
+    monkeypatch.setattr(storage, "check_score_coordination", denied)
+    monkeypatch.setattr(selection, "promote_methods", forbidden)
+    monkeypatch.setattr(
+        runs, "append_run", lambda record, _directory: recorded.append(record)
+    )
+    assert (
+        cli.main(
+            [
+                "--config",
+                str(tmp_path / "config.toml"),
+                "backtest",
+                "--methods",
+                "equal_weight",
+                "--products",
+                products,
+            ]
+        )
+        == 1
+    )
+    assert called == products.split(",")[: products.split(",").index("daily") + 1]
+    assert recorded[-1].failure_kind == "score_coordination_probe"
+    detail = recorded[-1].error_detail
+    assert "daily primary fixture" in detail and "coordination stat fixture" in detail
+    assert "primary detail" in detail and "probe detail" in detail
+    assert "coordination stat fixture" in capsys.readouterr().err
+    with pipeline_lock(config.dataset.dir, timeout=0):
+        pass
+
+
 @pytest.mark.parametrize("products", ["hourly", "hourly,daily"])
 @pytest.mark.parametrize("phase", ["publication", "disposal"])
 def test_committed_guard_failure_warns_then_rejects_next_product(

@@ -151,6 +151,7 @@ class TestEvaluationContexts:
                 "mae": 1.0,
                 "truth_semantics": "inst",
                 "retained": False,
+                "training_cutoff": utc(2026, 7, 2, 5).isoformat(),
             }
         }
         expected = ModelRelease.create(
@@ -724,7 +725,9 @@ class TestNoEvidenceReason:
         config = write_config(tmp_path)
         scores_dir = tmp_path / "scores"
         scores_dir.mkdir()
-        stale = self._live_scores_row("oldfingerprint00", "oldconfig0000000")
+        stale = self._live_scores_row(
+            "oldfingerprint00", selection_module.config_fingerprint(config)
+        ).with_columns(pl.lit(selection_module.code_identity()).alias("code_version"))
         stale.write_parquet(scores_dir / "scores_hourly_live_expanding.parquet")
         reason = no_evidence_reason(config, scores_dir)
         assert "fingerprint changed" in reason
@@ -737,7 +740,9 @@ class TestNoEvidenceReason:
         config = write_config(tmp_path)
         scores_dir = tmp_path / "scores"
         scores_dir.mkdir()
-        stale = self._live_scores_row(dataset_fingerprint(config), "oldconfig0000000")
+        stale = self._live_scores_row(
+            dataset_fingerprint(config), "oldconfig0000000"
+        ).with_columns(pl.lit(selection_module.code_identity()).alias("code_version"))
         stale.write_parquet(scores_dir / "scores_hourly_live_expanding.parquet")
         assert "config changed" in no_evidence_reason(config, scores_dir)
 
@@ -1599,9 +1604,346 @@ def test_approved_loader_orders_actual_instants_and_rejects_future(approved_arch
     second_raw["promoted_at"] = "2026-08-20T19:30:00+00:00"
     first_path.write_text(json.dumps(first_raw))
     second_path.write_text(json.dumps(second_raw))
+    for event_path in (config.artifacts_dir / "releases/approvals").glob("*.json"):
+        event = json.loads(event_path.read_text())
+        raw = first_raw if event["release_id"] == initial.release_id else second_raw
+        event["approved_at"] = raw["promoted_at"]
+        event_path.write_text(json.dumps(event))
     loaded = selection_module.load_approved_selections(config)
     assert loaded[("hourly", "temp_c", "24-48h")].evaluation_id == "hour-original"
     first_raw["promoted_at"] = (datetime.now(UTC) + timedelta(days=1)).isoformat()
     first_path.write_text(json.dumps(first_raw))
     loaded = selection_module.load_approved_selections(config)
     assert loaded[("hourly", "temp_c", "24-48h")].evaluation_id == "new-evaluation"
+
+
+def test_a_b_a_promotion_is_served_and_cli_reports_reapproval(
+    approved_archive, monkeypatch, capsys
+):
+    from grounded_weather_forecast import cli
+    from grounded_weather_forecast.backtest.outcomes import ProductBacktestOutcome
+
+    config, frames, _, _, initial = approved_archive
+    directory = config.artifacts_dir / "releases"
+    first_bytes = (directory / f"{initial.release_id}.json").read_bytes()
+    gate = selection_module.apply_live_gate
+    with monkeypatch.context() as patcher:
+        patcher.setattr(
+            selection_module,
+            "apply_live_gate",
+            lambda choices, *_a, **_k: {
+                key: replace(value, method_id="best_provider", reason="gate fixture")
+                for key, value in choices.items()
+            },
+        )
+        second = selection_module.promote_methods(config, config.dataset.dir / "scores")
+    assert second.created
+    assert (
+        selection_module.load_approved_selections(config, matrices=frames)
+        == second.selections
+    )
+    monkeypatch.setattr(
+        cli,
+        "_evaluate_product",
+        lambda _c, _a, product, _m: ProductBacktestOutcome(product, "evaluated", 1),
+    )
+    args = cli.build_parser().parse_args(["backtest", "--products", "hourly,daily"])
+    assert cli._cmd_backtest(config, args).exit_code == 0
+    assert "reapproved model release" in capsys.readouterr().out
+    assert (
+        selection_module.load_approved_selections(config, matrices=frames)
+        == initial.selections
+    )
+    assert (
+        selection_module._incumbent_methods(config)[("hourly", "temp_c", "24-48h")][0]
+        == "inverse_mse"
+    )
+    assert (directory / f"{initial.release_id}.json").read_bytes() == first_bytes
+    assert len(list((directory / "approvals").glob("*.json"))) == 3
+    unchanged = selection_module.promote_methods(config, config.dataset.dir / "scores")
+    assert not unchanged.created and not unchanged.approval_changed
+    assert selection_module.apply_live_gate is gate
+
+
+def _legacy_copy(config, initial, transform):
+    raw = json.loads(
+        (config.artifacts_dir / "releases" / f"{initial.release_id}.json").read_text()
+    )
+    transform(raw)
+    release = ModelRelease.create(
+        dataset=raw["dataset_fingerprint"],
+        configuration=raw["config_fingerprint"],
+        evaluation_ids=tuple(raw["evaluation_ids"]),
+        evaluation_contexts=tuple(raw["evaluation_contexts"]),
+        training_cutoff=datetime.fromisoformat(raw["training_cutoff"])
+        if raw["training_cutoff"]
+        else None,
+        selections=raw["selections"],
+    )
+    release.write(config.artifacts_dir / "releases")
+    return release
+
+
+def test_shared_context_merge_round_trips_without_older_releases(approved_archive):
+    config, frames, _, _, initial = approved_archive
+
+    def add_humidity(raw):
+        raw["selections"]["hourly.humidity_pct.24-48h"] = dict(
+            raw["selections"]["hourly.temp_c.24-48h"]
+        )
+        raw["selections"]["hourly.temp_c.24-48h"].update(
+            method_id="best_provider", reason="older approval"
+        )
+        for context in raw["evaluation_contexts"]:
+            if context["evaluation_id"] == "hour-original":
+                context["semantics"]["humidity_pct"] = "inst"
+
+    legacy = _legacy_copy(config, initial, add_humidity)
+    result = selection_module.promote_methods(
+        config, config.dataset.dir / "scores", products=frozenset({"hourly"})
+    )
+    assert result.created
+    directory = config.artifacts_dir / "releases"
+    raw = json.loads((directory / f"{result.release_id}.json").read_text())
+    context = next(
+        c for c in raw["evaluation_contexts"] if c["evaluation_id"] == "hour-original"
+    )
+    assert context["semantics"] == {"humidity_pct": "inst", "temp_c": "inst"}
+    for old in directory.glob("*.json"):
+        if old.stem != result.release_id:
+            old.unlink()
+    assert (
+        selection_module.load_approved_selections(config, matrices=frames)
+        == result.selections
+    )
+    assert legacy.release_id != result.release_id
+
+
+def test_replaced_slice_does_not_leave_its_cutoff_in_combined_release(approved_archive):
+    config, _, _, evaluate, initial = approved_archive
+
+    def cutoffs(raw):
+        raw["training_cutoff"] = utc(2026, 9, 30).isoformat()
+        raw["selections"]["hourly.temp_c.24-48h"]["training_cutoff"] = raw[
+            "training_cutoff"
+        ]
+        raw["selections"]["daily.temp_max_c.D1"]["training_cutoff"] = utc(
+            2026, 7, 1
+        ).isoformat()
+        for context in raw["evaluation_contexts"]:
+            context["training_cutoff"] = raw["training_cutoff"]
+
+    _legacy_copy(config, initial, cutoffs)
+    evaluate("hourly", "replacement", 2)
+    result = selection_module.promote_methods(
+        config, config.dataset.dir / "scores", products=frozenset({"hourly"})
+    )
+    raw = json.loads(
+        (config.artifacts_dir / "releases" / f"{result.release_id}.json").read_text()
+    )
+    assert raw["training_cutoff"] == utc(2026, 7, 2, 5).isoformat()
+    daily = next(
+        c for c in raw["evaluation_contexts"] if c["evaluation_id"] == "day-original"
+    )
+    assert daily["training_cutoff"] == utc(2026, 7, 1).isoformat()
+
+
+def test_context_free_legacy_matches_only_recorded_dataset(approved_archive):
+    config, frames, publish, _, initial = approved_archive
+
+    def remove_context(raw):
+        raw["evaluation_contexts"] = []
+        for choice in raw["selections"].values():
+            choice.pop("training_cutoff")
+
+    legacy = _legacy_copy(config, initial, remove_context)
+    # Remove the modern release so the assertion cannot recover from its context.
+    (config.artifacts_dir / "releases" / f"{initial.release_id}.json").unlink()
+    loaded = selection_module.load_approved_selections(config, matrices=frames)
+    assert loaded and {choice.release_id for choice in loaded.values()} == {
+        legacy.release_id
+    }
+    assert all(choice.training_cutoff is None for choice in loaded.values())
+    frames["hourly"] = frames["hourly"].with_columns(pl.col("obs__temp_c") + 1)
+    publish()
+    assert selection_module.load_approved_selections(config, matrices=frames) == {}
+
+
+@pytest.mark.parametrize(
+    "field", ["code_version", "dataset_fingerprint", "source_set_json", "semantics"]
+)
+def test_context_merge_rejects_conflicting_identity(field):
+    from grounded_weather_forecast.serve.evidence import merge_contexts
+
+    context = {
+        "evaluation_id": "eval",
+        "semantics": {"temp_c": "inst"},
+        "code_version": "code",
+        "dataset_fingerprint": "data",
+        "source_set_json": '["nws"]',
+    }
+    other = context | {
+        field: {"temp_c": "mean"} if field == "semantics" else "conflict"
+    }
+    with pytest.raises(ValueError, match="conflicting evaluation"):
+        merge_contexts((context, other))
+
+
+def test_legacy_aggregate_cutoff_is_not_assigned_to_unknown_slices():
+    from grounded_weather_forecast.serve.evidence import EvidenceSummary
+
+    key = ("hourly", "temp_c", "0-1h")
+    summary = EvidenceSummary.from_payloads(
+        (
+            {
+                "evaluation_id": "eval",
+                "semantics": {"temp_c": "inst"},
+                "training_cutoff": utc(2026, 9, 30).isoformat(),
+            },
+        ),
+        {key: None},
+        {key: "eval"},
+    )
+    assert summary.training_cutoff is None
+    assert summary.contexts[0]["training_cutoff"] is None
+
+
+@pytest.mark.parametrize("replacement", [True, False])
+def test_carried_completed_choice_is_live_gated_without_new_winner(
+    approved_archive, monkeypatch, replacement
+):
+    config, _, _, _, initial = approved_archive
+    key = ("hourly", "temp_c", "24-48h")
+    selected = initial.selections[key]
+    monkeypatch.setattr(
+        selection_module, "slice_winners", lambda *_a, **_k: pl.DataFrame()
+    )
+    monkeypatch.setattr(
+        selection_module,
+        "_live_verification",
+        lambda *_a: pl.DataFrame(
+            {
+                "product": [key[0]],
+                "variable": [key[1]],
+                "lead_bucket": [key[2]],
+                "method_id": [selected.method_id],
+                "release_id": [selected.release_id],
+                "n": [30],
+                "live_mae": [20.0],
+            }
+        ),
+    )
+    if not replacement:
+        monkeypatch.setattr(selection_module, "_reference_candidates", lambda *_a: ())
+    result = selection_module.promote_methods(
+        config, config.dataset.dir / "scores", products=frozenset({"hourly"})
+    )
+    assert result.approval_changed
+    if replacement:
+        assert result.selections[key].method_id != selected.method_id
+        assert result.selections[key].reason.startswith("demoted")
+    else:
+        assert result.selections[key].method_id == selected.method_id
+        assert "replacement blocked" in result.selections[key].reason
+    assert (
+        result.selections[("daily", "temp_max_c", "D1")].evaluation_id == "day-original"
+    )
+
+
+def test_excluded_carried_choices_are_not_gated(approved_archive, monkeypatch):
+    config, _, _, _, initial = approved_archive
+
+    def forbidden(*_a, **_k):
+        pytest.fail("no completed product may be gated")
+
+    monkeypatch.setattr(selection_module, "apply_live_gate", forbidden)
+    result = selection_module.promote_methods(
+        config, config.dataset.dir / "scores", products=frozenset()
+    )
+    assert result.selections == initial.selections
+    assert not result.approval_changed
+
+
+def test_carried_pin_remains_exempt_from_live_gate(approved_archive, monkeypatch):
+    config, _, _, _, initial = approved_archive
+    key = ("hourly", "temp_c", "24-48h")
+    config = replace(
+        config,
+        predict=replace(
+            config.predict, methods={"hourly.temp_c": initial.selections[key].method_id}
+        ),
+    )
+    monkeypatch.setattr(
+        selection_module, "slice_winners", lambda *_a, **_k: pl.DataFrame()
+    )
+    monkeypatch.setattr(
+        selection_module,
+        "_load_evidence",
+        lambda *_a: selection_module.ScoreScanResult(),
+    )
+    monkeypatch.setattr(
+        selection_module,
+        "_live_verification",
+        lambda *_a: pl.DataFrame(
+            {
+                "product": [key[0]],
+                "variable": [key[1]],
+                "lead_bucket": [key[2]],
+                "method_id": [initial.selections[key].method_id],
+                "release_id": [initial.release_id],
+                "n": [30],
+                "live_mae": [100.0],
+            }
+        ),
+    )
+    result = selection_module.promote_methods(
+        config, config.dataset.dir / "scores", products=frozenset({"hourly"})
+    )
+    assert result.selections[key].pinned
+    assert result.selections[key].method_id == initial.selections[key].method_id
+    assert not result.approval_changed
+
+
+def test_promotion_conflict_commits_no_content_or_event(approved_archive):
+    config, _, _, _, initial = approved_archive
+
+    def conflict(raw):
+        for context in raw["evaluation_contexts"]:
+            if context["evaluation_id"] == "hour-original":
+                context["window"] = "rolling"
+
+    _legacy_copy(config, initial, conflict)
+    directory = config.artifacts_dir / "releases"
+    before = {path: path.read_bytes() for path in directory.rglob("*.json")}
+    with pytest.raises(ValueError, match="conflicting evaluation context"):
+        selection_module.promote_methods(config, config.dataset.dir / "scores")
+    assert {path: path.read_bytes() for path in directory.rglob("*.json")} == before
+
+
+def test_approved_loader_does_not_construct_promotion_summary(
+    approved_archive, monkeypatch
+):
+    config, frames, _, _, initial = approved_archive
+
+    def forbidden(*_a, **_k):
+        pytest.fail("prediction constructed promotion-only evidence")
+
+    monkeypatch.setattr(selection_module, "EvidenceSummary", forbidden)
+    assert (
+        selection_module.load_approved_selections(config, matrices=frames)
+        == initial.selections
+    )
+
+
+def test_simultaneous_identity_changes_diagnose_code_before_data(tmp_path):
+    from grounded_weather_forecast.serve.selection import no_evidence_reason
+
+    config = write_config(tmp_path)
+    scores_dir = tmp_path / "scores"
+    scores_dir.mkdir()
+    TestNoEvidenceReason()._live_scores_row("old-data", "old-config").write_parquet(
+        scores_dir / "scores_hourly_live_expanding.parquet"
+    )
+    reason = no_evidence_reason(config, scores_dir)
+    assert "implementation changed" in reason
+    assert "dataset fingerprint changed" not in reason

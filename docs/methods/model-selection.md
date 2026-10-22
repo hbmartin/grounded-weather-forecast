@@ -320,7 +320,10 @@ report so the operator can watch them disagree, and
 The gate runs during live backtest promotion. Current-time prediction consumes
 approved releases and retains its prediction-time safeguards; it does not elect
 or demote methods or write another release. Pending or failed products preserve
-compatible incumbents until an eligible replacement is approved.
+compatible incumbents until an eligible replacement is approved. Within completed
+products, carried choices still pass the live gate even when no new winner exists.
+Replacement candidates must have validated current evidence; without a qualifying
+reference the incumbent stays and records the blocked verdict.
 
 *Implemented in: `serve/selection.py::apply_live_gate`, `_live_verdict`*
 

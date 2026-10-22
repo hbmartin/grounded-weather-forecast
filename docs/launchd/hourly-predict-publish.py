@@ -253,7 +253,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         restore_failed = False
         try:
             maybe_spawn_restore(paths)
-        except (OSError,) as exc:  # noqa: B013 -- project convention
+        except Exception as exc:  # optional launch faults cannot block publication
             restore_failed = True
             print(
                 f"auto-restore launch failed: {exc}; continuing publication", flush=True

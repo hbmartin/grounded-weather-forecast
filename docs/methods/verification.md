@@ -411,6 +411,27 @@ evidence retains its own fingerprint. See
 
 ---
 
+### Approval events and retained evidence
+
+*Implemented in: `serve/approvals.py`, `serve/selection.py`, `serve/evidence.py`,
+`evaluation.py`*
+
+Release content is immutable; changed approval decisions commit separate ordered
+events under one ledger lock. A → B → A records reapproval, while A → A is unchanged.
+Managed content without an event is not approved. Legacy releases use their aware
+`promoted_at` clock; future, naive and malformed approvals are excluded. Historical
+replay retains its exact dataset and issue-time constraints.
+Reporting and pruning share this visibility and order. Nullable approval IDs in
+the churn ledger distinguish repeated transitions without duplicating unchanged
+reports; legacy ledger rows remain readable.
+
+Combined releases validate shared evaluation identity and union variable semantics.
+Nullable per-slice `training_cutoff` values determine the remaining context/release
+summaries after replacement; a legacy aggregate never supplies an unknown slice's
+cutoff. This is operational provenance policy, not a new statistical gate. Existing
+live-gate constants apply to carried choices in completed products, while pending,
+failed and unrequested products preserve their approvals.
+
 ## 8. Self-verification
 
 *Implemented in: `reports/verification.py`*

@@ -350,7 +350,10 @@ a logged configuration error instead of an import traceback.
 `UV` exits 2; it never silently selects another launcher. Symlink launcher paths
 are preserved for macOS permission grants. Bad arguments and unavailable forecast
 paths exit 2 with START/END logging; `--help` exits 0. Resolved project and forecast
-output paths are logged after validation.
+output paths are logged after validation. Maintenance initializes the support
+directory before taking its job lock; directory creation, lock opening and lock
+acquisition setup errors exit 2. Duplicate-job contention still skips successfully;
+later stage and stamp-update errors exit 1.
 
 `hourly-predict-publish.py --station-project PATH` overrides the default sibling
 `ambientweather2sqlite` checkout. This is a wrapper flag, not a core CLI flag.
@@ -452,15 +455,22 @@ Notes that matter:
 On live sources it promotes only completed products. Compatible approved choices
 survive pending, failed, unrequested, or completed slices without a qualifying
 replacement. The CLI prints a promoted release ID only when it creates that
-immutable release; otherwise it reports retained/unchanged selections.
+immutable release; it prints `reapproved model release` when an existing release
+becomes current again, and retained/unchanged when the approval does not change.
+Approval events are committed after content publication under one ledger lock;
+A → B → A changes approval, while A → A records nothing new.
 
 Current-time `predict` and `publish` read approved releases and never elect
 methods, apply promotion-time live gates, or create release files. Elections and
 live-gate method changes belong to live backtests. Scientific gates and
 prediction-time safety guards retain their existing constants. The explicit
 library `select_methods` mapping API remains a promotion compatibility adapter;
-`promote_methods` returns `PromotionResult(selections, release_id, created)`, and
-`load_approved_selections` is the read-only serving interface.
+`promote_methods` returns `PromotionResult(selections, release_id, created,
+approval_id, approval_changed)`. `created` means immutable content was created;
+`approval_changed` means a new approval event committed. `approval_id` is nullable
+for legacy implicit approvals. `load_approved_selections` is the read-only serving
+interface. The library prediction marker distinguishes actually loaded approvals
+from arbitrary caller-supplied selection maps.
 
 A data-only rebuild can retain approvals when code, configuration, product
 sources, exact feature set, and truth semantics still match. Each persisted
@@ -469,7 +479,24 @@ retain the original dataset, evaluation timestamp, and available training cutoff
 The release's top-level dataset identifies its creation dataset; forecast JSON
 identifies the dataset actually used for this issuance. Historical replay keeps
 its strict dataset and promotion-time rules. Legacy releases remain readable
-using their recorded identity without fabricating missing context.
+using their recorded identity without fabricating missing context. Context-free
+legacy approvals are accepted only on their recorded dataset, with matching code,
+configuration and truth semantics. New `approval_required` release markers are
+outside content identity: managed content without a committed event is ignored.
+Legacy `promoted_at` provides an implicit approval; managed events provide ordered
+`approval_id`, `release_id`, timezone-aware `approved_at`, and locked `sequence`
+fields in `releases/approvals/`. Serving, incumbent lookup and historical replay
+share timestamp validation and reject malformed, naive and future approval clocks.
+`active_release.json` still records the locally served document.
+Dashboard lineage and score-retention protection use the same committed approvals.
+The churn ledger adds nullable `from_approval_id` and `to_approval_id`, so repeated
+transitions are distinct while repeated reports remain idempotent; older rows load
+with these fields absent.
+
+Each selection adds nullable `training_cutoff`. Contexts sharing an evaluation ID
+merge compatible variable semantics after validating identity. Summaries are
+recomputed from the selected slices' available cutoffs; a legacy aggregate cutoff
+is not assigned to individual slices whose cutoff is unknown.
 
 Build manifests add `truth_snapshot_at`, captured before the observation read.
 `created_at` remains publication time. Synthetic truth and causal features share
@@ -505,6 +532,11 @@ can approach **120 seconds**, excluding computation and other locks. Contention
 that times out allocation or publication produces a score-specific diagnostic and exit code
 **75** (`EXIT_CONTENTION`) from `backtest`, `maintain` or `recover`, releases
 the pipeline lock and suppresses promotion. This is not a total command timeout.
+A failed follow-up coordination probe after a product error returns 1 with
+`failure_kind="score_coordination_probe"` and both primary and probe diagnostics.
+Unknown ownership stops remaining score writers and suppresses all promotion;
+this diagnostic is never treated as a product-local failure or pending evaluation.
+
 Directory-guard release failure during startup recovery or an uncommitted write
 returns **1** from these commands, with
 `failure_kind="score_coordination_release"` and the diagnostic in the run journal's
@@ -743,8 +775,9 @@ apparent diversity without adding information.
 Emits a schema v6 `Forecast` document — see
 [Forecast JSON](forecast-json.md) for the field-by-field reference.
 
-Automatic selection uses each configured safety class for guarded live
-replacement, including minutely references. A failed live gate keeps serving
+Live backtest promotion uses each configured safety class for guarded live
+replacement, including minutely references. Completed products' carried choices
+are checked even without a new winner; excluded products are left unchanged. A failed live gate keeps serving
 its current method when no reference passes the quality guard and records
 `replacement blocked` in its selection reason. Config pins bypass retention
 and live replacement; their statistics belong to the pinned method or are

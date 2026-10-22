@@ -2601,7 +2601,8 @@ def replace_snapshot_observation(snapshot, observation):
     return replace(snapshot, observation=observation)
 
 
-def test_minutely_release_list_preserves_hourly_daily_readiness(tmp_path):
+@pytest.mark.parametrize("approved", [False, True])
+def test_minutely_release_list_preserves_hourly_daily_readiness(tmp_path, approved):
     config = build_fixture(tmp_path)
     selections = {
         ("minutely", "temp_c", bucket): Selection(
@@ -2615,9 +2616,13 @@ def test_minutely_release_list_preserves_hourly_daily_readiness(tmp_path):
     selections[("minutely", "pop", "0-5m")] = Selection(
         "minutely_anchor_full", "selected", release_id="unused-native-release"
     )
-    forecast = predict(config, selections, now=NOW)
+    forecast = predict(config, selections, now=NOW, approved_release_loaded=approved)
     assert forecast.release_ids == ["minute-release"]
     assert forecast.status == "degraded"
+    if approved:
+        assert "no approved hourly or daily selections" in forecast.status_reason
+        assert "backtest --source live" in forecast.status_reason
+        assert "keep polling" not in forecast.status_reason
     assert all("pop" not in point.release_ids for point in forecast.minutely)
     raw = json.loads(forecast.to_json())
     raw["schema_version"] = 5
@@ -2633,3 +2638,37 @@ def test_minutely_release_list_preserves_hourly_daily_readiness(tmp_path):
         and not point.truth_semantics
         for point in old.minutely
     )
+
+
+def test_prediction_truth_and_features_share_one_observation_read(
+    tmp_path, monkeypatch
+):
+    import importlib
+
+    module = importlib.import_module("grounded_weather_forecast.serve.predict")
+    config = build_fixture(tmp_path)
+    read = module.read_observations
+    truth = module.build_truth
+    features = module.build_observation_features
+    reads = []
+    seen = []
+
+    def observations(station):
+        frame = read(station)
+        reads.append(frame)
+        return frame
+
+    def build_truth(config, **kwargs):
+        seen.append(kwargs["observations"])
+        return truth(config, **kwargs)
+
+    def build_features(config, **kwargs):
+        seen.append(kwargs["observations"])
+        return features(config, **kwargs)
+
+    monkeypatch.setattr(module, "read_observations", observations)
+    monkeypatch.setattr(module, "build_truth", build_truth)
+    monkeypatch.setattr(module, "build_observation_features", build_features)
+    build_snapshot(config, NOW)
+    assert len(reads) == 1 and len(seen) == 2
+    assert seen[0] is reads[0] and seen[1] is reads[0]

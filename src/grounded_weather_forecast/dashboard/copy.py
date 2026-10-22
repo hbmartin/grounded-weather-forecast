@@ -402,8 +402,8 @@ PANEL_COPY: Mapping[str, PanelCopy] = {
         why=(
             "Answers 'which evaluation justified this served value?'. "
             "release_id is a content hash (promoted_at excluded), so "
-            "identical content promoted twice dedupes to one release and "
-            "only genuine churn shows."
+            "identical content dedupes to one release. Separate approval "
+            "events order reapprovals without rewriting content."
         ),
         thresholds=(
             "A release whose dataset fingerprint no longer matches the "

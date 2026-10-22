@@ -61,6 +61,7 @@ from grounded_weather_forecast.dataset.matrix import (
     truth_column_for,
 )
 from grounded_weather_forecast.dataset.providers import read_forecast_archive
+from grounded_weather_forecast.dataset.station import read_observations
 from grounded_weather_forecast.dataset.truth import observed_rainfall
 from grounded_weather_forecast.evaluation import dataset_fingerprint
 from grounded_weather_forecast.leads import (
@@ -172,8 +173,9 @@ def _latest_observation(
 
 def build_snapshot(config: Config, issue_time: datetime) -> Snapshot:
     """The as-of view of every source at ``issue_time``, plus current truth."""
-    _, hourly_truth, daily_truth = build_truth(config)
-    causal_minute = build_observation_features(config)
+    observations = read_observations(config.station)
+    _, hourly_truth, daily_truth = build_truth(config, observations=observations)
+    causal_minute = build_observation_features(config, observations=observations)
     archive = read_forecast_archive(config.forecasts)
     snapshots = pl.DataFrame(
         {"issue_time": [issue_time]},
@@ -1607,6 +1609,7 @@ def predict(
             timeline=rainfall_timeline,
         )
     degraded = not _served_release_ids(hourly, daily) and force_method is None
+    has_product_approvals = any(key[0] in ("hourly", "daily") for key in selections)
     status_reason = (
         rainfall_status_reason(rainfall_effects)
         or no_evidence_reason(
@@ -1616,7 +1619,9 @@ def predict(
             if dataset_snapshot is not None
             else None,
             fit_failures=fit_diagnostics.failures,
-            approved_selections=approved_release_loaded and bool(selections),
+            approved_selections=approved_release_loaded and has_product_approvals,
+            missing_product_approvals=approved_release_loaded
+            and not has_product_approvals,
         )
         if degraded
         else None
