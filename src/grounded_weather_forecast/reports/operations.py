@@ -59,6 +59,7 @@ from grounded_weather_forecast.health_policy import (
 )
 from grounded_weather_forecast.reports import evidence
 from grounded_weather_forecast.serve.approvals import (
+    json_entries,
     read_approval_snapshot,
 )
 from grounded_weather_forecast.serve.schema import Forecast
@@ -88,9 +89,6 @@ _HOURLY_LEAD_CONTRACTION_HOURS = 12.0
 
 _REDACTED_MARKERS = ("token", "secret", "password")
 _DETAIL_MAX_CHARS = 400
-
-# Shared freshness policy for pipeline collectors, dashboard panels and central
-# alerts. Truth-QC freshness is assessed separately, without pipeline columns.
 
 _SNAPSHOT_NAME = "identity_snapshot.json"
 
@@ -957,41 +955,100 @@ class _ServedReferences:
     archived: frozenset[str]
 
 
-def _active_reference_ids(config: Config, *, now: datetime) -> _ServedReferences:
-    active_ids: set[str] | None = None
-    referenced_output = False
+def _active_pointer(config: Config) -> dict[str, object] | None:
+    path = active_release_path(config.artifacts_dir)
     try:
-        pointer = json.loads(
-            active_release_path(config.artifacts_dir).read_text(encoding="utf-8")
-        )
-        if isinstance(pointer.get("release_ids"), list):
-            active_ids = {str(item) for item in pointer["release_ids"]}
-        elif isinstance(pointer.get("release_id"), str):
-            active_ids = {pointer["release_id"]}
-        output_path = pointer.get("output_path")
-        if isinstance(output_path, str):
-            referenced_output = True
-            served = Forecast.from_json(Path(output_path).read_text(encoding="utf-8"))
-            active_ids = (active_ids or set()) | set(served.release_ids)
-    except (OSError, ValueError, AttributeError, TypeError, KeyError) as error:
-        if active_ids is not None or referenced_output:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+    except (FileNotFoundError,):  # noqa: B013 -- only actual absence permits fallback
+        try:
+            path.lstat()
+        except (FileNotFoundError,):  # noqa: B013
+            return None
+        except (OSError,) as error:  # noqa: B013
             raise ValueError(
-                f"active served document could not be verified: {error}"
+                f"active pointer could not be verified: {path}: {error}"
             ) from error
-    archived = config.predict.history_path.parent / "served_forecasts"
-    archived_ids: set[str] = set()
-    if archived.exists():
-        for path in archived.glob("*.json"):
-            try:
-                document = Forecast.from_json(path.read_text(encoding="utf-8"))
-                issued = datetime.fromisoformat(document.issued_at)
-            except (OSError, ValueError, TypeError, KeyError):
-                continue
+        raise ValueError(
+            f"active pointer could not be verified: {path}: dangling link"
+        ) from None
+    except (OSError, ValueError) as error:
+        raise ValueError(
+            f"active pointer could not be verified: {path}: {error}"
+        ) from error
+    if not isinstance(raw, dict):
+        raise ValueError(
+            f"active pointer could not be verified: {path}: expected an object"
+        )
+    return raw
+
+
+def _served_document_ids(path: Path, *, recent_at: datetime | None = None) -> set[str]:
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+        if not isinstance(raw, dict):
+            raise ValueError("served document must be an object")
+        if recent_at is not None:
+            issued = datetime.fromisoformat(raw["issued_at"])
             if issued.tzinfo is None:
                 issued = issued.replace(tzinfo=UTC)
-            age = now - issued.astimezone(UTC)
-            if document.status == "ready" and timedelta(0) <= age <= timedelta(hours=6):
-                archived_ids.update(document.release_ids)
+            age = recent_at - issued.astimezone(UTC)
+            if (
+                not timedelta(0) <= age <= timedelta(hours=6)
+                or raw.get("status", "ready") != "ready"
+            ):
+                return set()
+        ids = raw.get("release_ids")
+        if not isinstance(ids, list) or not all(isinstance(v, str) and v for v in ids):
+            raise ValueError("invalid or missing served release_ids")
+        Forecast.from_json(json.dumps(raw))  # validate a referenced/recent document
+        return {str(v) for v in ids}
+    except (OSError, ValueError, OverflowError, TypeError, KeyError) as error:
+        kind = "archived" if recent_at is not None else "active"
+        raise ValueError(
+            f"{kind} served document could not be verified: {path}: {error}"
+        ) from error
+
+
+def _active_reference_ids(config: Config, *, now: datetime) -> _ServedReferences:
+    active_ids: set[str] | None = None
+    pointer = _active_pointer(config)
+    if pointer is not None:
+        try:
+            if "release_ids" in pointer:
+                ids = pointer["release_ids"]
+                if not isinstance(ids, list) or not all(
+                    isinstance(v, str) and v for v in ids
+                ):
+                    raise ValueError("invalid release_ids")
+                active_ids = {str(v) for v in ids}
+            elif "release_id" in pointer:
+                identifier = pointer["release_id"]
+                if not isinstance(identifier, str) or not identifier:
+                    raise ValueError("invalid release_id")
+                active_ids = {identifier}
+            if "output_path" in pointer:
+                output_path = pointer["output_path"]
+                if not isinstance(output_path, str) or not output_path:
+                    raise ValueError("invalid output_path")
+                active_ids = (active_ids or set()) | _served_document_ids(
+                    Path(output_path)
+                )
+            if active_ids is None:
+                raise ValueError(
+                    "pointer has no valid release references or served output"
+                )
+        except (OSError, ValueError, AttributeError, TypeError, KeyError) as error:
+            raise ValueError(
+                f"active served document could not be verified: {active_release_path(config.artifacts_dir)}: {error}"
+            ) from error
+    archived = config.predict.history_path.parent / "served_forecasts"
+    issues = []
+    entries = json_entries(archived, issues)
+    if issues:
+        raise ValueError("; ".join(issue.diagnostic() for issue in issues))
+    archived_ids: set[str] = set()
+    for path in entries:
+        archived_ids.update(_served_document_ids(path, recent_at=now))
     return _ServedReferences(active_ids, frozenset(archived_ids))
 
 
@@ -1007,7 +1064,13 @@ def _protected_evaluations(
     )
     try:
         if snapshot.issues:
-            raise ValueError("unreadable release files: " + ", ".join(snapshot.issues))
+            raise ValueError(
+                "unreadable release files or unverifiable metadata: "
+                + (
+                    "; ".join(issue.diagnostic() for issue in snapshot.diagnostics)
+                    or ", ".join(snapshot.issues)
+                )
+            )
         records = snapshot.records()
         raw_by_id = {str(raw.get("release_id")): raw for raw in snapshot.releases}
         known = {str(record.release["release_id"]) for record in records}
@@ -1021,7 +1084,7 @@ def _protected_evaluations(
             raw = raw_by_id.get(release_id)
             if raw is None:
                 raise ValueError(
-                    f"referenced release {release_id} is missing or unreadable"
+                    f"referenced release {release_id} is missing or has a filename/identity mismatch"
                 )
             if (
                 release_id not in known

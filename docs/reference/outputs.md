@@ -271,16 +271,33 @@ Kept:
 - any evaluation **referenced by a release within the last 7 days**;
 - **all catalog rows** — the ledgers survive; only the bulky per-case scores go.
 
-If `active_release.json` is missing or malformed after an upgrade, the newest
-readable release is conservatively treated as active. Thus an evaluation still
-backing current serving is never deleted, even when that release is older than
-the rollback horizon.
+If `active_release.json` is genuinely absent, the newest current approval under
+sequence ordering and recent served-document references are protected together.
+A corrupt pointer suspends deletion. Explicit empty/degraded pointers do not
+trigger the newest-approval fallback.
 
 If any release JSON file is unreadable or is not an object, all published scores
 are kept and the diagnostic names the affected paths. A non-active file can
 still protect evidence, so pruning resumes only after those files can be
 verified. This safeguard also applies to `--dry-run` and leaves the existing
 temporary-recovery and exit-code behavior unchanged.
+
+
+Approval verification uses typed internal path/category/detail diagnostics with the
+existing `issues` path interface. Unreadable releases/events, invalid metadata,
+denied listings, corrupt active pointers and unreadable served archives suspend
+published-score deletion through `PruneResult.skipped`, including dry runs. These
+conditions do not authorize excluded releases. Genuine pointer absence alone uses
+the newest current approval fallback. Pre-#79 readers require a compatibility
+backport before reading events with `visible_at`; no artifacts are migrated.
+
+## Daily report reader
+
+Daily-report schema 1 retains its envelope and adds nullable realized-evidence
+attribution: `evidence_match`, `evidence_release_id`, and
+`evidence_dataset_fingerprint`. Forecast release identities remain separate from
+the evidence cohort. Station diagnostics expose the resolved fallback path; latest
+run entries carry individual freshness. Existing ledgers are unchanged.
 
 ---
 

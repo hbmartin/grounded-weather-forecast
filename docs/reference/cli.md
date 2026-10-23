@@ -87,7 +87,7 @@ write telemetry/evidence, or change data, schedules, or services. It never
 substitutes an external forecast. Use the already installed environment and
 disable Python bytecode writes; do not run `uv run` in a read-only automation.
 
-From `/Volumes/Pro2T/weather/grounded-weather-forecast`, the exact caller is:
+From the repository root, the exact caller is:
 
 ```bash
 .venv/bin/python -B -m grounded_weather_forecast.cli --config config.toml read-daily-report \
@@ -101,10 +101,10 @@ From `/Volumes/Pro2T/weather/grounded-weather-forecast`, the exact caller is:
 | `--as-of` | Required execution cutoff with explicit offset, at or after `start`. Even execution after 19:00 preserves the scheduled window; stale/missing data remains explicit. Future-issued forecasts and future-recorded evidence are excluded. This reads current files and cannot reconstruct past overwritten artifacts. |
 | `--hours` | Default 12; any other value is rejected. Twelve elapsed UTC hours with an exclusive end. At 07:00 Pacific this is `[07:00, 19:00)` on both DST transition dates. Offsets change from `-07:00` to `-08:00` in winter. |
 | `--forecast` | Existing schema-6 forecast path, default `forecast.json`, relative to caller working directory. Unknown source versions are rejected. |
-| `--published-station` | Optional fallback JSON path; default `~/Library/Application Support/grounded-weather-forecast/staged/current.json`, resolved from the active user's home directory. Only `metadata.observed_at` is read into the result, labeled `published_station_snapshot`. It is not a live station observation query or a forecast source. |
+| `--published-station` | Optional fallback JSON path; default `~/Library/Application Support/grounded-weather-forecast/staged/current.json`, resolved at invocation from `$HOME`, or the system home lookup when unset; an empty or invalid home requires an explicit override. Only `metadata.observed_at` is read into the result, labeled `published_station_snapshot`. It is not a live station observation query or a forecast source. |
 
 Exit `0` means a structured read completed, including partial/unknown data. Exit
-`2` means invalid configuration or time range and returns a schema-1 JSON error;
+`2` means invalid configuration, time range or final JSON serialization and returns a schema-1 JSON error;
 argparse syntax errors use its normal stderr/exit 2. Missing or corrupt artifacts
 do not prevent other components from reporting. Reject unknown output versions.
 
@@ -118,8 +118,8 @@ An accepted invocation always returns:
 | `window` | UTC `start`, exclusive `end`, `hours=12`, configured IANA `timezone`, offset-bearing `local_start`/`local_end`, `end_exclusive=true`. |
 | `forecast` | Component status/limitations; when readable, original forecast status/reason, source schema, issue/observation dates, dataset fingerprint, release IDs, units, freshness, coverage, and twelve hourly rows. |
 | `forecast.hourly[]` | UTC/local valid time, lead bucket, canonical values, methods, per-variable release IDs, truth semantics, selection reasons, and separate missing/null/invalid-variable arrays. Missing/duplicate hours have null values; duplicates are never arbitrarily selected. Numeric nulls remain null; no rain/temperature aggregate is invented. |
-| `operational_health` | Independent `station`, `providers`, `runs`, `pipeline` components. Provider rows expose attempts, successes/failures, rate, latest outcome/completion and freshness over `(as_of - 24h)` through `as_of`. No raw provider payloads or error messages. Runs expose latest completed relevant outcome per command within 24h, including expected pending evaluation. |
-| `prediction_quality` | Independent `backtest`, `realized_live`, `truth_qc`, `drift` components. Scores are hourly cohorts matching the actual forecast's variable, method, lead bucket, semantics, release, current dataset and configuration. Includes MAE in that variable's declared unit, `n`, evaluation/record dates and freshness. Backtest on live-origin inputs is still a backtest, never a realized live score. |
+| `operational_health` | Independent `station`, `providers`, `runs`, `pipeline` components. Provider rows expose attempts, successes/failures, rate, latest outcome/completion and freshness over `(as_of - 24h)` through `as_of`. No raw provider payloads or error messages. Provider rates use the configured coordinate tolerance. Runs expose the latest completed relevant outcome at/before the cutoff with per-command freshness, including expected pending evaluation; old outcomes remain visible as stale. |
+| `prediction_quality` | Independent `backtest`, `realized_live`, `truth_qc`, `drift` components. Scores match the forecast slice and its recorded selection provenance. Backtest rows use the selection's evaluation dataset, code and configuration. Realized rows prefer the exact release, then explicitly attributed compatible older evidence. Includes MAE in that variable's declared unit, `n`, evaluation/record dates and freshness. Backtest on live-origin inputs is still a backtest, never a realized live score. |
 | `limitations` | Machine-readable limitation codes. No claim of a global transaction across independently maintained sources. |
 
 Component `status` describes availability (`ok`, `partial`, `unknown`,
@@ -131,18 +131,35 @@ have `status` and `limitations`; their unavailable payload fields are absent.
 `max_age_minutes`; future timestamps are unknown. Historical alarms are labeled
 and never converted into current operational failures. Current legacy drift
 artifacts lack dataset/time attribution, so current drift is explicitly unknown.
-Legacy date-only truth-QC retains its evaluation date without claiming an exact
-refresh instant. A rebuild with no forecast release IDs yields
-`forecast_has_no_release_ids` for both score components, even when old ledgers
-contain good-looking scores.
+Date-only truth-QC uses the same conservative interval and failed-refresh assessment
+as the dashboard, retaining a null exact refresh instant. Optional null flags do
+not erase usable evidence. Malformed optional verdicts retain valid freshness and
+alerts with a limitation.
 
-The reader detects file replacement/in-place changes across its file reads and
-retries the read once without locks. Continued changes yield the same envelope
-with unknown components and `concurrent_replacement_after_retry`. SQLite reads
-use `mode=ro`, never `immutable`, and refuse a WAL lacking existing shared memory.
-Each query sees its own SQLite snapshot; no transaction spans both databases.
-Station database failure permits the labeled published snapshot fallback.
-If that also fails, station health stays unknown.
+The reader never opens a source database with SQLite. It validates rollback-mode
+bytes and associated-file signatures, deserializes only into memory and enables
+query-only/memory-temporary mode. WAL, journal-dependent or unverifiable sources
+are refused. Station reads use the explicitly labelled JSON fallback and expose
+`published_station_path`; provider data becomes unknown. No source sidecars or
+temporary disk snapshots are created. The default fallback resolves lazily, and an
+explicit `--published-station` avoids home lookup.
+
+Realized slices add nullable `evidence_match` (`exact_release` or
+`compatible_release`), `evidence_release_id` and `evidence_dataset_fingerprint`.
+The existing `release_id` describes the forecast. A fallback adds
+`older_compatible_release_evidence`; it selects one existing cohort without pooling.
+Exact rows take precedence even when stale or insufficient. Missing modern
+source/feature/code/configuration/semantic compatibility prevents fallback.
+
+Each distinct release is parsed once per stable attempt. Changed sources retry
+only dependent components once; repeated changes leave those components unknown
+while unrelated evidence remains available.
+
+Source reads use independent stable snapshots. Repeated changes yield the same
+envelope with only affected components unknown and
+`concurrent_replacement_after_retry`. Station database failure permits the labelled
+published snapshot fallback; if that fails, station health remains unknown and
+reports the attempted fallback path.
 
 Keep the existing 07:00 America/Los_Angeles automation on its verified reader
 until this interface is merged/available and validated in its actual checkout.
@@ -693,6 +710,21 @@ DataFrame; model fitting and fold plans retain their existing working sets.
 
 ---
 
+
+### Approval publication compatibility
+
+`promotion_publication_failed` covers expected release/event I/O, JSON and clock
+validation errors; `promotion_snapshot_stale` rejects an election made before a
+newer reservation appeared. Both preserve product diagnostics. Successful
+evaluations permit maintenance truth-QC/report to continue with failure status;
+real evaluation errors still stop maintenance, and no failure advances the stamp.
+Readers ignore unknown additive event keys. Pre-#79 binaries need a reader
+compatibility backport before rollback because their event constructor rejects
+`visible_at`. Existing artifacts are never rewritten. Historical visibility floors
+are deliberately conservative and uncapped; inspect the earliest elevated event
+when a historical query excludes later approvals. Correcting the host clock fixes
+current sequence-based serving, but does not rewrite historical visibility.
+
 ## `maintain`
 
 > run the scheduled live maintenance transaction under one pipeline lock
@@ -1029,12 +1061,12 @@ maintenance or recovery process has already restored readiness.
 
 Retention: the **newest three files per group** (product × kind × window) are
 always kept, as are evaluations referenced by the active release and releases
-within the last **7 days**. If an upgraded installation has no readable active
+within the last **7 days**. If an upgraded installation has a genuinely absent active
 pointer, the newest current approval under canonical sequence ordering is protected
 in addition to recent served-document references. An explicit empty/degraded pointer
 keeps its existing meaning and does not trigger the newest-approval fallback.
-Explicit active/recent-served legacy references protect the union of recorded
-and per-selection evaluation IDs even without an acceptable approval clock. This
+Explicit active/recent-served legacy references preserve known evaluation IDs.
+Uncertain legacy clocks suspend deletion rather than granting approval. This
 retention-only protection never authorizes serving or replay. Unverifiable references
 stop published-score pruning conservatively with a specific reason, including an
 unreadable output named by an output-path-only pointer. Any unreadable
@@ -1097,3 +1129,14 @@ publication remains successful after ordinary housekeeping errors, with a warnin
 
 Always run `--dry-run` first. Deleting an evaluation still referenced by a live
 release would leave serving unable to justify what it is doing.
+
+Publication protection fails closed on corrupt/non-object releases, malformed or
+unreadable approval events, denied directory listings, corrupt active pointers,
+unreadable served archives and uncertain legacy publication clocks. Every
+published score is retained and `skipped` names the exact source. Only genuine
+pointer absence enables newest-current-approval fallback. Future managed clocks
+remain valid under current sequence ordering; future legacy clocks cannot
+establish retention age. Published-score suspension keeps its existing exit code;
+score coordination release errors still return 1. Dashboard artifact warnings
+expose damaged verification inputs. Repair the named source and rerun a dry run;
+do not delete approval history to silence a warning.

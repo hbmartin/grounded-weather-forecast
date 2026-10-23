@@ -6,7 +6,6 @@ pins override, and any slice with no evidence falls back to a named default —
 never to silence.
 """
 
-import json
 import math
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, replace
@@ -55,6 +54,24 @@ from grounded_weather_forecast.serve.evidence import (
     GateVerdict,
     PromotionEvidenceError,
     ValidatedContexts,
+)
+from grounded_weather_forecast.serve.provenance import (
+    PromotionProvenance as PromotionProvenance,  # noqa: PLC0414 -- preserve compatibility export
+)
+from grounded_weather_forecast.serve.provenance import (
+    contexts_by_evaluation_id as _contexts_by_evaluation_id,
+)
+from grounded_weather_forecast.serve.provenance import (
+    evaluation_compatibility as _evaluation_compatibility,
+)
+from grounded_weather_forecast.serve.provenance import (
+    evaluation_id,
+)
+from grounded_weather_forecast.serve.provenance import (
+    selection_code_version as _release_selection_code_version,
+)
+from grounded_weather_forecast.serve.provenance import (
+    selection_truth_semantics as _release_selection_truth_semantics,
 )
 from grounded_weather_forecast.storage import locked_path
 
@@ -105,14 +122,6 @@ class Selection:
     legacy_context_missing: bool = False
 
 
-@dataclass(frozen=True, slots=True)
-class PromotionProvenance:
-    recorded_at: datetime
-    dataset_fingerprint: str
-    config_fingerprint: str
-    code_version: str
-
-
 @dataclass(slots=True)
 class _PromotionTelemetry:
     provenance: PromotionProvenance | None = None
@@ -123,7 +132,6 @@ type SelectionMap = Mapping[tuple[str, str, str], Selection]
 type SliceKey = tuple[str, str, str]
 type LiveKey = tuple[str, str, str, str]
 type EligibleReleases = Mapping[LiveKey, frozenset[str]]
-type EvaluationCompatibility = tuple[str, frozenset[str], str, tuple[str, ...]]
 
 
 @dataclass(frozen=True, slots=True)
@@ -395,62 +403,6 @@ def _selection_payload(
     }
 
 
-def _contexts_by_evaluation_id(
-    raw_contexts: object,
-) -> dict[str, Mapping[str, object]]:
-    """Well-formed release contexts keyed by their evaluation id."""
-    if not isinstance(raw_contexts, (list, tuple)):
-        return {}
-    contexts: dict[str, Mapping[str, object]] = {}
-    for raw_context in raw_contexts:
-        if not isinstance(raw_context, dict):
-            continue
-        context = cast(Mapping[str, object], raw_context)
-        evaluation_id = context.get("evaluation_id")
-        if isinstance(evaluation_id, str) and evaluation_id:
-            contexts[evaluation_id] = context
-    return contexts
-
-
-def _evaluation_compatibility(
-    context: Mapping[str, object] | None, variable: str
-) -> EvaluationCompatibility | None:
-    """The serving-relevant identity shared by live release cohorts."""
-    if context is None or context.get("source_kind") != "live":
-        return None
-    raw_source_set = context.get("source_set_json")
-    raw_feature_set = context.get("feature_set_json")
-    semantics = context.get("semantics")
-    if (
-        not isinstance(raw_source_set, str)
-        or not isinstance(raw_feature_set, str)
-        or not isinstance(semantics, Mapping)
-    ):
-        return None
-    try:
-        sources = json.loads(raw_source_set)
-        features = json.loads(raw_feature_set)
-    except (json.JSONDecodeError, TypeError):
-        return None
-    semantic = semantics.get(variable)
-    if (
-        not isinstance(sources, list)
-        or not sources
-        or not all(isinstance(source, str) and source for source in sources)
-        or not isinstance(features, list)
-        or not all(isinstance(feature, str) and feature for feature in features)
-        or not isinstance(semantic, str)
-        or not semantic
-    ):
-        return None
-    return (
-        "live",
-        frozenset(cast(str, source) for source in sources),
-        semantic,
-        tuple(cast(str, feature) for feature in features),
-    )
-
-
 def _make_release(
     config: Config,
     selections: Mapping[SliceKey, Selection],
@@ -550,59 +502,6 @@ def _selections_from_release(release: Mapping[str, object]) -> SelectionMap | No
     return selections
 
 
-def _release_selection_code_version(
-    release: Mapping[str, object], selection: Mapping[str, object]
-) -> str | None:
-    """Implementation identity for one persisted selection, including v1 ledgers."""
-    direct = selection.get("code_version")
-    if isinstance(direct, str) and direct:
-        return direct
-    evaluation_id = selection.get("evaluation_id")
-    contexts = release.get("evaluation_contexts")
-    if not isinstance(contexts, list):
-        return None
-    versions: set[str] = set()
-    for raw_context in contexts:
-        if not isinstance(raw_context, dict):
-            continue
-        context = cast(Mapping[str, object], raw_context)
-        version = context.get("code_version")
-        if isinstance(version, str) and (
-            evaluation_id is None or context.get("evaluation_id") == evaluation_id
-        ):
-            versions.add(version)
-    return next(iter(versions)) if len(versions) == 1 else None
-
-
-def _release_selection_truth_semantics(
-    release: Mapping[str, object],
-    selection: Mapping[str, object],
-    variable: str,
-) -> str | None:
-    """Truth target used to evaluate one persisted serving selection."""
-    direct = selection.get("truth_semantics")
-    if isinstance(direct, str) and direct:
-        return direct
-    evaluation_id = selection.get("evaluation_id")
-    contexts = release.get("evaluation_contexts")
-    if not isinstance(contexts, list):
-        return None
-    values: set[str] = set()
-    for raw_context in contexts:
-        if not isinstance(raw_context, dict):
-            continue
-        context = cast(Mapping[str, object], raw_context)
-        raw_semantics = context.get("semantics")
-        semantic = (
-            raw_semantics.get(variable) if isinstance(raw_semantics, Mapping) else None
-        )
-        if isinstance(semantic, str) and (
-            evaluation_id is None or context.get("evaluation_id") == evaluation_id
-        ):
-            values.add(semantic)
-    return next(iter(values)) if len(values) == 1 else None
-
-
 def _eligible_release_ids(
     config: Config,
     selections: Mapping[SliceKey, Selection],
@@ -653,7 +552,7 @@ def _eligible_release_ids(
                 else current_contexts.get(selected.evaluation_id or "")
             )
             release_context = release_contexts.get(
-                str(selection_mapping.get("evaluation_id") or "")
+                evaluation_id(selection_mapping.get("evaluation_id")) or ""
             )
             if selection_mapping.get("legacy_context_missing") is True:
                 release_context = None

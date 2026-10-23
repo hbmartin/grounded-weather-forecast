@@ -352,12 +352,12 @@ def test_unsupplied_assessment_does_not_assert_missing_verdict(tmp_path):
 def test_threshold_decision_warning_and_alert_provenance_share_policy(
     tmp_path, monkeypatch
 ):
-    from grounded_weather_forecast.reports import truth_qc
+    from grounded_weather_forecast import health_policy as truth_qc
     from grounded_weather_forecast.dashboard.derive import derive
     from grounded_weather_forecast.dashboard.writer import _alert_inputs
     from grounded_weather_forecast.reports.alerts import evaluate_alerts
 
-    monkeypatch.setattr(truth_qc, "TRUTH_QC_MAX_AGE", timedelta(hours=24))
+    monkeypatch.setitem(truth_qc.FRESHNESS_THRESHOLDS, "truth_qc_age_minutes", 1440.0)
     ctx = context(tmp_path, generated_at=(NOW - timedelta(hours=30)).isoformat())
     panel = _truth_cross_check(ctx)
     (alert,) = [

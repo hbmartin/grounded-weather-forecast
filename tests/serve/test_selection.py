@@ -2469,3 +2469,96 @@ def test_first_approval_of_orphan_is_not_logged_as_reapproval(
     assert cli._cmd_backtest(config, args).exit_code == 0
     text = capsys.readouterr().out
     assert "approved model release:" in text and "reapproved" not in text
+
+
+@pytest.mark.parametrize(
+    "products",
+    ["hourly,daily,minutely", "daily,minutely,hourly", "minutely,hourly,daily"],
+)
+@pytest.mark.parametrize("evaluation_failed", [False, True])
+def test_publication_failure_preserves_product_outcomes_and_journal(
+    approved_archive, monkeypatch, products, evaluation_failed
+):
+    from grounded_weather_forecast import cli, runs
+    from grounded_weather_forecast.backtest.outcomes import ProductBacktestOutcome
+    from grounded_weather_forecast.serve.approvals import ApprovalPublicationError
+
+    config, _, _, _, _ = approved_archive
+    visited = []
+
+    def evaluate(_config, _args, product, _methods):
+        visited.append(product)
+        if evaluation_failed and product == "daily":
+            return ProductBacktestOutcome(
+                product, "failed", error_detail="daily evaluation fixture"
+            )
+        return ProductBacktestOutcome(product, "evaluated", 1)
+
+    def fail(*_args, **_kwargs):
+        raise ApprovalPublicationError("release publication fixture")
+
+    monkeypatch.setattr(cli, "_evaluate_product", evaluate)
+    monkeypatch.setattr(selection_module, "promote_methods", fail)
+    args = cli.build_parser().parse_args(
+        ["backtest", "--products", products, "--methods", "equal_weight"]
+    )
+    result = cli._cmd_backtest(config, args)
+    assert visited == products.split(",") and result.exit_code == 1
+    assert result.failure_kind == (
+        "backtest_product_failed"
+        if evaluation_failed
+        else "promotion_publication_failed"
+    )
+    assert {d.stage for d in result.diagnostics} == (
+        {"daily", "promotion"} if evaluation_failed else {"promotion"}
+    )
+    cli._record_run(
+        config,
+        args,
+        started_at=datetime.now(UTC),
+        exit_code=result.exit_code,
+        failure_kind=result.failure_kind,
+        diagnostics=result.diagnostics,
+    )
+    journal = runs.read_runs(runs.runs_path(config)).row(-1, named=True)
+    assert "release publication fixture" in journal["failure_details_json"]
+    if evaluation_failed:
+        assert "daily evaluation fixture" in journal["failure_details_json"]
+
+
+def test_unknown_evaluation_context_cannot_enter_live_eligibility(tmp_path):
+    config = write_config(tmp_path)
+    directory = config.artifacts_dir / "releases"
+    directory.mkdir(parents=True)
+    context = {
+        "evaluation_id": "unknown",
+        "source_kind": "live",
+        "source_set_json": '["nws"]',
+        "feature_set_json": "[]",
+        "semantics": {"temp_c": "inst"},
+        "code_version": "code",
+        "config_fingerprint": selection_module.config_fingerprint(config),
+    }
+    raw = {
+        "release_id": "legacy",
+        "promoted_at": "2020-01-01T00:00:00Z",
+        "dataset_fingerprint": "data",
+        "config_fingerprint": selection_module.config_fingerprint(config),
+        "evaluation_contexts": [context],
+        "selections": {
+            "hourly.temp_c.0-1h": {
+                "method_id": "equal_weight",
+                "evaluation_id": "unknown",
+                "code_version": "code",
+            }
+        },
+    }
+    (directory / "legacy.json").write_text(json.dumps(raw))
+    key = ("hourly", "temp_c", "0-1h")
+    selected = Selection(
+        "equal_weight", "old", evaluation_id="eval", code_version="code"
+    )
+    eligible = _eligible_release_ids(
+        config, {key: selected}, (context | {"evaluation_id": "eval"},)
+    )
+    assert not eligible[(*key, "equal_weight")]

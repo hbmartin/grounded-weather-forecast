@@ -205,8 +205,8 @@ default: a wrong quarantine silently deletes truth.
 ### Retained verdict freshness
 
 *Implemented in: `cli.py::_cmd_truth_qc`;
-`reports/truth_qc.py::truth_qc_freshness`;
-`reports/operations.py::FRESHNESS_THRESHOLDS`; `reports/truth_qc.py::truth_qc_age_limit`;
+`health_policy.py::truth_qc_freshness`; `daily_read.py::read_qc`;
+`health_policy.py::FRESHNESS_THRESHOLDS`; `health_policy.py::truth_qc_age_limit`;
 `reports/alerts.py::_truth_qc_alerts`;
 `dashboard/zones/data_trust.py::_truth_cross_check`*
 
@@ -296,3 +296,9 @@ Beyond the sensor, the *pipeline* can drift.
 The unifying idea: a metric that only ever compares methods to each other cannot
 detect a problem that moves them all. Every alarm here is anchored to something
 outside the method pool.
+
+The read-only daily reader shares this assessment, including date-only intervals
+and latest failed refreshes. Optional null shield diagnostics do not invalidate
+other fresh evidence. Malformed optional verdict metadata retains valid freshness
+and alert flags with a limitation. Date-only results do not invent an exact
+refresh instant. `reports/truth_qc.py` preserves the existing import API.

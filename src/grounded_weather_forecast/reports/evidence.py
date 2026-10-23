@@ -54,12 +54,12 @@ from grounded_weather_forecast.serve.approvals import (
     read_approval_snapshot,
     read_approved_releases,
 )
+from grounded_weather_forecast.serve.provenance import PromotionProvenance
 from grounded_weather_forecast.storage import atomic_write_parquet, locked_path
 
 if TYPE_CHECKING:
     from grounded_weather_forecast.reports.eprocess import EProcessStore
     from grounded_weather_forecast.serve.evidence import GateVerdict
-    from grounded_weather_forecast.serve.selection import PromotionProvenance
 
 _LOCK_TIMEOUT_SECONDS = 5.0
 RECENT_WINDOW_DAYS = 14
@@ -823,24 +823,19 @@ def record_live_gate(
             dataset_fingerprint,
         )
 
-        identity = {
-            "recorded_at": provenance.recorded_at if provenance is not None else now,
-            "code_version": provenance.code_version
-            if provenance is not None
-            else code_identity(),
-            "config_fingerprint": provenance.config_fingerprint
-            if provenance is not None
-            else config_fingerprint(config),
-            "dataset_fingerprint": provenance.dataset_fingerprint
-            if provenance is not None
-            else dataset_fingerprint(config),
-        }
+        captured = provenance or PromotionProvenance(
+            now or datetime.now(UTC),
+            dataset_fingerprint(config),
+            config_fingerprint(config),
+            code_identity(),
+        )
+        identity = asdict(captured)
         rows = [asdict(verdict) | identity for verdict in verdicts]
         append_ledger(
             pl.DataFrame(rows, schema=dict(LIVE_GATE_SCHEMA)),
             ledger_path(config, LIVE_GATE_LEDGER),
             LIVE_GATE_LEDGER,
-            now=now,
+            now=captured.recorded_at,
         )
     except _RECORDER_ERRORS:
         return

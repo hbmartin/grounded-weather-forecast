@@ -119,7 +119,9 @@ def synthetic_enabled(mode: str, directory: Path) -> bool:
     return True
 
 
-def run_stage(step: list[str], paths: RuntimePaths) -> int:
+def run_stage(
+    step: list[str], paths: RuntimePaths, *, env: dict[str, str] | None = None
+) -> int:
     started = time.monotonic()
     name = " ".join(step)
     print(f"{timestamp()} == {' '.join(step)} ==", flush=True)
@@ -135,6 +137,7 @@ def run_stage(step: list[str], paths: RuntimePaths) -> int:
                 *step,
             ],
             check=False,
+            env=env,
         ).returncode
         if code < 0:
             code = 128 - code
@@ -158,15 +161,9 @@ def backtest_stage(step: list[str], paths: RuntimePaths) -> "CommandOutcome":
 
     with TemporaryDirectory(prefix="gwf-stage-") as directory:
         path = Path(directory) / "outcome.json"
-        previous = os.environ.get(COMMAND_OUTCOME_PATH)
-        os.environ[COMMAND_OUTCOME_PATH] = str(path)
-        try:
-            code = run_stage(step, paths)
-        finally:
-            if previous is None:
-                os.environ.pop(COMMAND_OUTCOME_PATH, None)
-            else:
-                os.environ[COMMAND_OUTCOME_PATH] = previous
+        code = run_stage(
+            step, paths, env={**os.environ, COMMAND_OUTCOME_PATH: str(path)}
+        )
         return read_outcome_hint(path, code)
 
 
@@ -193,8 +190,8 @@ def maintain(stamp: Path, *, restore: bool, paths: RuntimePaths) -> int:
     try:
         from grounded_weather_forecast.status import (  # noqa: PLC0415 -- guarded startup
             EXIT_NO_FOLDS,
+            PROMOTION_ONLY_FAILURE_KINDS,
             CommandOutcome,
-            read_outcome_hint as _read_outcome_hint,
         )
     except (ImportError,) as exc:  # noqa: B013 -- project convention
         raise RuntimePathError(f"maintenance runtime unavailable: {exc}") from exc
@@ -256,10 +253,10 @@ def maintain(stamp: Path, *, restore: bool, paths: RuntimePaths) -> int:
             if code != 0:
                 failures.append(label)
                 failed_stages.add(name)
-                if name == "backtest" and outcome.failure_kind not in {
-                    "promotion_evidence_conflict",
-                    "promotion_evidence_invalid",
-                }:
+                if (
+                    name == "backtest"
+                    and outcome.failure_kind not in PROMOTION_ONLY_FAILURE_KINDS
+                ):
                     print(f"maintenance stopped: {label} evaluation failed", flush=True)
                     break
         if failures:
@@ -288,11 +285,17 @@ def main(argv: Sequence[str] | None = None) -> int:
         f"{timestamp()} START mode={mode} pid={os.getpid()} ppid={os.getppid()} cwd={working_directory()} host={socket.gethostname()}",
         flush=True,
     )
-    stamp = (
-        Path.home()
-        / "Library/Application Support/grounded-weather-forecast/last-maintenance"
-    )
     try:
+        try:
+            from grounded_weather_forecast.support_paths import (  # noqa: PLC0415
+                application_support_dir,
+            )
+
+            stamp = application_support_dir() / "last-maintenance"
+        except (ImportError, ValueError, RuntimeError) as error:
+            raise RuntimePathError(
+                f"maintenance support path unavailable: {error}"
+            ) from error
         parser = argparse.ArgumentParser(
             description="Daily maintenance or live-only restore"
         )

@@ -801,9 +801,9 @@ class TestPruneScores:
 
         operations.prune_scores_files(config, dry_run=False, now=NOW)
 
-        assert (
-            scores_dir / "scores_hourly_live_expanding_e1.parquet"
-        ).exists() == archived_reference
+        assert (scores_dir / "scores_hourly_live_expanding_e1.parquet").exists() == (
+            archived_reference or pointer_payload is not None
+        )
         assert (scores_dir / "scores_hourly_live_expanding_e2.parquet").exists()
 
     @pytest.mark.parametrize("content", [None, "{broken"])
@@ -920,7 +920,7 @@ def test_naive_legacy_reference_protects_scores_without_authorizing_release(
     assert not result.deleted
     assert (scores_dir / "scores_hourly_live_expanding_e1.parquet").exists()
     assert (scores_dir / "scores_hourly_live_expanding_e2.parquet").exists()
-    assert not any("could not be verified" in note for note in result.skipped)
+    assert any("publication_clock" in note for note in result.skipped)
 
 
 @pytest.mark.parametrize(
@@ -931,7 +931,7 @@ def test_naive_legacy_reference_protects_scores_without_authorizing_release(
             json.dumps(
                 {
                     "release_id": "r1",
-                    "promoted_at": "2026-07-01T00:00:00",
+                    "promoted_at": "2026-07-01T00:00:00+00:00",
                     "evaluation_ids": "broken",
                 }
             ),
@@ -967,7 +967,7 @@ def test_unverifiable_reference_keeps_all_scores_with_specific_reason(
 def test_missing_reference_metadata_suspends_pruning(tmp_path):
     config, scores_dir = TestPruneScores().seeded(tmp_path)
     (config.artifacts_dir / "releases" / "r1.json").write_text(
-        json.dumps({"release_id": "r1", "promoted_at": "2026-07-01T00:00:00"})
+        json.dumps({"release_id": "r1", "promoted_at": "2026-07-01T00:00:00+00:00"})
     )
     activate_release(config.artifacts_dir, "r1")
     result = operations.prune_scores_files(config, dry_run=False, now=NOW)
