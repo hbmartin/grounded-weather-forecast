@@ -24,6 +24,7 @@ from grounded_weather_forecast.contracts import (
 from grounded_weather_forecast.serve.schema import Forecast
 from grounded_weather_forecast.status import (
     EXIT_NO_FOLDS,
+    PROMOTION_ONLY_FAILURE_KINDS,
     CommandOutcome,
     ComponentDiagnostic,
     failure_details_json,
@@ -1185,6 +1186,9 @@ def _cmd_backtest(config: Config, args: argparse.Namespace) -> CommandOutcome:
         ScoreCoordinationReleaseError,
         ScoreCoordinationTimeout,
     )
+    from grounded_weather_forecast.serve.approvals import (  # noqa: PLC0415
+        ApprovalPublicationError,
+    )
     from grounded_weather_forecast.serve.evidence import (  # noqa: PLC0415
         PromotionEvidenceError,
     )
@@ -1192,7 +1196,7 @@ def _cmd_backtest(config: Config, args: argparse.Namespace) -> CommandOutcome:
     result = BacktestResult()
     try:
         return _backtest_products(config, args, result=result)
-    except (PromotionEvidenceError,) as error:  # noqa: B013
+    except (PromotionEvidenceError, ApprovalPublicationError) as error:
         print(f"promotion failed: {error}", file=sys.stderr)
         result.promotion = CommandOutcome(
             1,
@@ -1825,9 +1829,7 @@ def _cmd_maintain(config: Config, args: argparse.Namespace) -> CommandOutcome:
             ("report", lambda: _cmd_report(config)),
         ),
         continue_on_failure=frozenset({"truth-qc"}),
-        continue_on_failure_kinds=frozenset(
-            {"promotion_evidence_conflict", "promotion_evidence_invalid"}
-        ),
+        continue_on_failure_kinds=PROMOTION_ONLY_FAILURE_KINDS,
         stage_args={"truth-qc": truth_args},
         tolerate_pending=True,
     )
@@ -2094,30 +2096,38 @@ def main(argv: Sequence[str] | None = None) -> int:
         )
 
 
+def _read_daily_error(limitation: str) -> int:
+    import json  # noqa: PLC0415
+
+    print(
+        json.dumps(
+            {"schema_version": 1, "status": "error", "limitations": [limitation]}
+        )
+    )
+    return 2
+
+
 def _read_daily(args: argparse.Namespace) -> int:
     import json  # noqa: PLC0415
 
-    from grounded_weather_forecast.daily_read import (  # noqa: PLC0415
-        PUBLISHED_STATION,
-        SCHEMA_VERSION,
-        json_default,
-        read_daily_report,
-        timestamp,
-    )
-
     try:
-        config = load_config(args.config)
-    except (ConfigError, OSError):
-        print(
-            json.dumps(
-                {
-                    "schema_version": SCHEMA_VERSION,
-                    "status": "error",
-                    "limitations": ["invalid_configuration"],
-                }
-            )
+        from grounded_weather_forecast.daily_read import (  # noqa: PLC0415
+            json_default,
+            read_daily_report,
+            timestamp,
         )
-        return 2
+        from grounded_weather_forecast.support_paths import (  # noqa: PLC0415
+            published_station_path,
+        )
+
+        config = load_config(args.config)
+        published = (
+            args.published_station
+            if args.published_station is not None
+            else published_station_path()
+        )
+    except (ConfigError, OSError, ImportError, RuntimeError, ValueError):
+        return _read_daily_error("invalid_configuration")
     try:
         result = read_daily_report(
             config,
@@ -2125,20 +2135,17 @@ def _read_daily(args: argparse.Namespace) -> int:
             start=timestamp(args.start),
             as_of=timestamp(args.as_of),
             hours=args.hours,
-            published_station=args.published_station or PUBLISHED_STATION,
+            published_station=published,
         )
-    except (ValueError, TypeError):
-        print(
-            json.dumps(
-                {
-                    "schema_version": SCHEMA_VERSION,
-                    "status": "error",
-                    "limitations": ["invalid_time_range"],
-                }
-            )
+    except (ValueError, TypeError, OverflowError):
+        return _read_daily_error("invalid_time_range")
+    try:
+        payload = json.dumps(
+            result, default=json_default, allow_nan=False, sort_keys=True
         )
-        return 2
-    print(json.dumps(result, default=json_default, allow_nan=False, sort_keys=True))
+    except (ValueError, TypeError, OverflowError):
+        return _read_daily_error("invalid_report_serialization")
+    print(payload)
     return 0
 
 

@@ -6,6 +6,14 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 
 EXIT_NO_FOLDS = 3
+PROMOTION_ONLY_FAILURE_KINDS = frozenset(
+    {
+        "promotion_evidence_conflict",
+        "promotion_evidence_invalid",
+        "promotion_publication_failed",
+        "promotion_snapshot_stale",
+    }
+)
 # Zero is a maintenance command with expected pending work; one is legacy data.
 PENDING_EXIT_CODES = (0, 1, EXIT_NO_FOLDS)
 # Private, invocation-local transport for the standalone maintenance wrapper.

@@ -297,8 +297,8 @@ def _gate_panel(ctx: DashboardContext) -> Panel | None:
                     f"{r['product']}.{r['variable']}.{r['lead_bucket']}",
                     str(r["method_id"]),
                     str(r["verdict"]),
-                    fmt(r["live_mae"], 3),
-                    fmt(r["backtest_mae"], 3),
+                    fmt(finite_number(r["live_mae"]), 3),
+                    fmt(finite_number(r["backtest_mae"]), 3),
                     fmt(r["n"]),
                     fmt(r["detail"]),
                 )

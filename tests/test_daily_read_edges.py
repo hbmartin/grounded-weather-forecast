@@ -88,7 +88,7 @@ def test_timestamp_freshness_unknown_stale_and_dated_qc(tmp_path):
 def test_station_default_tracks_active_home_and_qc_uses_shared_policy(
     tmp_path, monkeypatch
 ):
-    monkeypatch.setattr(reader.Path, "home", classmethod(lambda _cls: tmp_path))
+    monkeypatch.setenv("HOME", str(tmp_path))
     assert (
         reader.published_station_path()
         == tmp_path
@@ -115,7 +115,12 @@ def test_station_default_tracks_active_home_and_qc_uses_shared_policy(
 def test_empty_provider_and_old_runs_do_not_invent_health(tmp_path):
     config, forecast, _ = setup(tmp_path)
     provider_db(config.forecasts.db_path)
-    result = reader.read_providers(config.forecasts.db_path, NOW + timedelta(days=5))
+    result = reader.read_providers(
+        config.forecasts.db_path,
+        NOW + timedelta(days=5),
+        latitude=config.forecasts.latitude,
+        longitude=config.forecasts.longitude,
+    )
     assert result["status"] == "unknown"
     assert result["limitations"] == ["no_provider_attempts_in_24h"]
     pl.DataFrame(
@@ -126,9 +131,8 @@ def test_empty_provider_and_old_runs_do_not_invent_health(tmp_path):
             "exit_code": [1],
         }
     ).write_parquet(config.dataset.dir / "runs.parquet")
-    assert (
-        read(config, forecast)["operational_health"]["runs"]["latest_by_command"] == []
-    )
+    old = read(config, forecast)["operational_health"]["runs"]["latest_by_command"][0]
+    assert old["freshness"]["status"] == "stale"
 
 
 def test_provider_timestamps_order_by_instant_and_null_run_is_unknown(tmp_path):
@@ -137,7 +141,7 @@ def test_provider_timestamps_order_by_instant_and_null_run_is_unknown(tmp_path):
     connection = sqlite3.connect(config.forecasts.db_path)
     try:
         connection.execute(
-            "INSERT INTO forecast_runs VALUES (4, '2026-10-22T07:10:00-07:00')"
+            "INSERT INTO forecast_runs(id, completed_at) VALUES (4, '2026-10-22T07:10:00-07:00')"
         )
         connection.execute(
             "INSERT INTO provider_results VALUES (5,4,'provider','success',NULL,NULL,NULL)"
@@ -145,7 +149,12 @@ def test_provider_timestamps_order_by_instant_and_null_run_is_unknown(tmp_path):
         connection.commit()
     finally:
         connection.close()
-    row = reader.read_providers(config.forecasts.db_path, NOW)["providers"][0]
+    row = reader.read_providers(
+        config.forecasts.db_path,
+        NOW,
+        latitude=config.forecasts.latitude,
+        longitude=config.forecasts.longitude,
+    )["providers"][0]
     assert row["latest_status"] == "success"
     assert row["completed_at"] == "2026-10-22T14:10:00+00:00"
     pl.DataFrame(

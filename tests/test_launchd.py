@@ -77,7 +77,9 @@ def run_maintenance(
         argv = tuple(command[command.index("--config") + 2 :])
         step = argv[0]
         code = (failures or {}).get(argv, failure_code if step == failure else 0)
-        if step == "backtest" and (path := os.environ.get("_GWF_COMMAND_OUTCOME_PATH")):
+        if step == "backtest" and (
+            path := (_kwargs.get("env") or {}).get("_GWF_COMMAND_OUTCOME_PATH")
+        ):
             Path(path).write_text(
                 json.dumps({"exit_code": code, "failure_kind": failure_kind})
             )
@@ -331,7 +333,13 @@ def test_backtest_exit_one_fails_without_success_stamp(monkeypatch, tmp_path, ca
 
 
 @pytest.mark.parametrize(
-    "failure_kind", ["promotion_evidence_conflict", "promotion_evidence_invalid"]
+    "failure_kind",
+    [
+        "promotion_evidence_conflict",
+        "promotion_evidence_invalid",
+        "promotion_publication_failed",
+        "promotion_snapshot_stale",
+    ],
 )
 def test_promotion_only_wrapper_failure_continues_diagnostics_without_stamp(
     monkeypatch, tmp_path, failure_kind

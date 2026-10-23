@@ -76,7 +76,7 @@ That works on day one. Everything else needs an archive with some history — se
 | Command | What it does | Flags |
 |---|---|---|
 | `qc` | summarize station truth quality control | — |
-| `read-daily-report` | read schema-1 daily JSON from existing artifacts without collection, telemetry, locks, or repairs; see [caller contract](https://hbmartin.github.io/grounded-weather-forecast/reference/cli/#read-daily-report) | `--start` `--as-of` `--hours` `--forecast` `--published-station` |
+| `read-daily-report` | read schema-1 daily JSON with write-free SQLite snapshots, fail-closed WAL fallback, and attributed compatible quality; see [caller contract](https://hbmartin.github.io/grounded-weather-forecast/reference/cli/#read-daily-report) | `--start` `--as-of` `--hours` `--forecast` `--published-station` |
 | `build-dataset` | materialize truth tables and supervised matrices as parquet | — |
 | `backtest` | recover abandoned leased score stages, then run a rolling-origin backtest; allocation and publication each wait at most 60 seconds; a startup-recovery or uncommitted writer guard-release failure returns 1 and suppresses promotion | `--methods` `--hourly-variables` `--daily-variables` `--products` `--window` `--source` `--semantics` |
 | `maintain` | run one locked live build → backtest → truth-QC → report transaction; finish report after a handled truth-QC failure, then return failure | `--methods` `--hourly-variables` `--daily-variables` `--products` `--window` `--semantics` `--truth-qc-days` |
@@ -89,7 +89,7 @@ That works on day one. Everything else needs an archive with some history — se
 | `publish` | safely publish an automatic forecast, holding a matching ready document for up to six hours | `--out` `--semantics` `--recovery-methods` `--recovery-window` |
 | `recover` | recheck degradation, then rebuild live evidence and reports when recovery is still needed | `--semantics` `--methods` `--window` |
 | `hourly-predict-publish.py` (standalone launchd wrapper) | predict first, then render live station data through collector configuration; retain staged station files on render failure | `--station-project` |
-| `prune-scores` | delete superseded scores and recover inactive leased stages one at a time; preview with `--dry-run`; unreadable release files suspend published-score deletion and name the affected paths; recovery guard-release errors retain partial counts, finish published-score retention, then return 1; unexpected recovery errors propagate | `--dry-run` |
+| `prune-scores` | delete superseded scores and recover inactive leased stages one at a time; preview with `--dry-run`; unverifiable releases, approval events, served outputs or listings suspend published-score deletion and name the affected paths; recovery guard-release errors retain partial counts, finish published-score retention, then return 1; unexpected recovery errors propagate | `--dry-run` |
 | `uv run --group profiling python scripts/profile_memory.py -- <command>` | capture a command's memory allocations and write a peak-memory HTML report | `--output-dir` `--trace-python-allocators` `--no-native` `--no-report` |
 | `uv run python scripts/benchmark_selection_memory.py` | compare full selection runs against a Git baseline in fresh processes | `--baseline` `--runs` `--evaluations` `--cases` |
 | `uv run python scripts/benchmark_backtest_memory.py` | compare streamed score generation and writing against an immutable Git baseline | `--baseline` `--runs` `--rows` `--output` |
@@ -129,9 +129,28 @@ without authorizing serving. A per-slice `legacy_context_missing` marker preserv
 exact-dataset restrictions when other selected variables share the evaluation ID.
 The historical `"unknown"` placeholder remains missing provenance. Churn keeps publication and approval clocks separate,
 with additive nullable approval timestamps, sequences and a clock-schema version.
-If the active pointer is unavailable, retention protects both the newest current
-approval and recent served references. Unreadable explicitly referenced outputs
-suspend published-score deletion.
+If the active pointer is genuinely absent, retention protects both the newest current
+approval and recent served references. Corrupt pointers, unreadable archives/events,
+denied listings and uncertain legacy clocks suspend published-score deletion with
+specific diagnostics. Explicit empty pointers retain degraded-output semantics;
+pruning exit codes remain unchanged. Repair the named source before expecting
+retention to resume.
+
+Daily reads query rollback-mode SQLite bytes in memory and never pass source
+filenames to SQLite. WAL or journal-dependent sources fail closed: station reads
+use the published JSON fallback and provider health becomes explicitly unknown.
+Quality keeps evaluation provenance across compatible dataset rebuilds. Realized
+evidence prefers the exact release; otherwise a compatible older cohort is labelled
+with nullable `evidence_match`, `evidence_release_id` and
+`evidence_dataset_fingerprint`, while the forecast release identity remains intact.
+No cohort scores are pooled. Changed inputs invalidate only dependent components.
+
+Approval verification diagnostics are shared by pruning and dashboard warnings.
+Expected approval publication failures record `promotion_publication_failed`; stale
+elections record `promotion_snapshot_stale`. Both retain completed evaluation
+diagnostics and permit maintenance diagnostics when evaluation succeeded. Events
+remain append-only. Rolling back below the #79 approval reader requires a parser
+compatibility backport: old readers silently discard events containing `visible_at`.
 
 The hourly wrapper publishes even if optional restore launch fails, then returns
 1 so monitoring sees that failure. Startup/configuration errors return 2; later

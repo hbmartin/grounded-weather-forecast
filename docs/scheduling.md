@@ -102,7 +102,7 @@ maintenance or restore jobs skip as duplicates. A successful daily run writes
 leave that stamp untouched, and a failed report skips score pruning.
 
 CLI `maintain` also runs truth-QC before report. Build and ordinary backtest errors stop the
-pipeline; coordination failures still stop immediately. Promotion evidence errors
+pipeline; coordination failures still stop immediately. Promotion-only evidence/publication errors
 preserve completed scores and continue truth-QC/report while retaining failure
 status only when evaluation itself succeeded. Product failures outrank promotion
 errors and stop diagnostics; nullable `failure_details_json` retains both components
@@ -175,7 +175,7 @@ clock corrections. Historical queries wait for the conservative `visible_at` flo
 and the publication/approval clocks. These additive fields do not change content
 identity, and legacy events derive floors without migration. Operational pruning
 protects current approvals plus recent served references when the active pointer
-is unavailable; explicitly referenced unreadable outputs suspend score deletion.
+is genuinely absent; explicitly referenced unreadable outputs suspend score deletion.
 
 A failed optional restore launch never prevents the station/publication stages.
 If publication succeeds, the hourly job still returns 1 to expose the failed
@@ -311,3 +311,23 @@ exit behavior, and later analysis commands.
   `synoptic_token = "$SYNOPTIC_TOKEN"` in `config.toml` and provide the
   variable via `launchctl setenv SYNOPTIC_TOKEN ...` instead of the
   `EnvironmentVariables` block.
+
+### Verification failures and approval rollback
+
+Unverifiable retention inputs suspend published-score deletion with exact paths in
+`skipped` and dashboard artifact warnings. This keeps the existing pruning exit
+contract; inspect repeated warnings and repair or restore the named artifact. A
+corrupt pointer is a verification fault, while genuine absence permits the current
+approval fallback. Unreadable archives and event/directory errors are also faults.
+
+`promotion_publication_failed` and `promotion_snapshot_stale` preserve completed
+evaluations and continue maintenance diagnostics only when evaluation succeeded.
+They return failure and never advance `last-maintenance` or complete recovery.
+The child-only outcome environment leaves the wrapper environment unchanged.
+
+Events written since #79 carry `visible_at`; pre-#79 readers reject that additive
+key. Before rolling back, backport the compatible reader. Do not rewrite events,
+publication clocks or visibility floors. Current serving follows sequence across
+clock corrections; historical queries can conservatively remain behind an earlier
+future-skewed floor. Identify the earliest elevated event to explain the cutoff,
+without changing append-only evidence.

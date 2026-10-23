@@ -43,12 +43,31 @@ from launchd_paths import (
     working_directory,
 )
 
-HERE = Path.home() / "Library/Application Support/grounded-weather-forecast"
+HERE: Path | None = None
 
 # The station publisher runs under the collector's environment for its query API.
-STATION_SCRIPT = HERE / "publish_station.py"
-STAGED = HERE / "staged"
+STATION_SCRIPT: Path | None = None
+STAGED: Path | None = None
 STATION_TIMEOUT_S = 180
+
+
+def support_dir() -> Path:
+    if HERE is not None:
+        return HERE
+    try:
+        from grounded_weather_forecast.support_paths import (  # noqa: PLC0415
+            application_support_dir,
+        )
+
+        return application_support_dir()
+    except (ImportError, ValueError, RuntimeError) as error:
+        raise RuntimePathError(
+            f"publishing support path unavailable: {error}"
+        ) from error
+
+
+def staged_dir() -> Path:
+    return STAGED if STAGED is not None else support_dir() / "staged"
 
 
 def timestamp() -> str:
@@ -97,7 +116,7 @@ def run_predict(paths: RuntimePaths) -> int:
     return 0
 
 
-RESTORE_LOG = HERE / "auto-restore.log"
+RESTORE_LOG: Path | None = None
 
 
 def maybe_spawn_restore(paths: RuntimePaths) -> None:
@@ -125,13 +144,15 @@ def maybe_spawn_restore(paths: RuntimePaths) -> None:
         for k, v in os.environ.items()
         if k != "VIRTUAL_ENV" and not k.startswith("UV_")
     }
-    with RESTORE_LOG.open("a", encoding="utf-8") as log:
+    with (
+        RESTORE_LOG if RESTORE_LOG is not None else support_dir() / "auto-restore.log"
+    ).open("a", encoding="utf-8") as log:
         log.write(f"\n== auto-restore spawned {datetime.now(UTC).isoformat()} ==\n")
         log.flush()
         process = subprocess.Popen(  # noqa: S603 - fixed uv binary and script
             [
                 *paths.command(
-                    "python", str(HERE / "daily-maintenance.py"), "--restore"
+                    "python", str(support_dir() / "daily-maintenance.py"), "--restore"
                 ),
             ],
             stdout=log,
@@ -162,9 +183,13 @@ def render_station(paths: PublishingPaths) -> int:
                 "--project",
                 str(paths.station_project),
                 "python",
-                str(STATION_SCRIPT),
+                str(
+                    STATION_SCRIPT
+                    if STATION_SCRIPT is not None
+                    else support_dir() / "publish_station.py"
+                ),
                 "--out-dir",
-                str(STAGED),
+                str(staged_dir()),
             ],
             env=env,
             timeout=STATION_TIMEOUT_S,
@@ -190,7 +215,9 @@ def publish(paths: RuntimePaths, station_project: Path | None = None) -> int:
         f"duration_s={time.monotonic() - station_started:.1f} ==",
         flush=True,
     )
-    staged_documents = sorted(STAGED.glob("*.json")) if STAGED.is_dir() else []
+    staged_documents = (
+        sorted(staged_dir().glob("*.json")) if staged_dir().is_dir() else []
+    )
 
     if station_code != 0:
         print(f"station render exited {station_code}", flush=True)
@@ -212,7 +239,7 @@ def publish(paths: RuntimePaths, station_project: Path | None = None) -> int:
     # cycle finishes) hold the last ready document for up to 6h instead of swapping
     # the public forecast's character for the integration window.
     source = publish_forecast.choose_source(paths.forecast)
-    exit_code = publish_forecast.run(source=source, include_dir=STAGED)
+    exit_code = publish_forecast.run(source=source, include_dir=staged_dir())
     print(
         f"{timestamp()} == publish exited {exit_code} "
         f"duration_s={time.monotonic() - publish_started:.1f} ==",
@@ -247,7 +274,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             f"{timestamp()} PROJECT_CWD cwd={paths.project} project={paths.project} forecast={paths.forecast}",
             flush=True,
         )
-        sys.path.insert(0, str(HERE))
+        sys.path.insert(0, str(support_dir()))
         if run_predict(paths) != 0:
             return 1
         restore_failed = False

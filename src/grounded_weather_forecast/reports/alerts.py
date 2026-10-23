@@ -884,7 +884,7 @@ def _unreadable_artifact_alerts(inputs: AlertInputs) -> tuple[Alert, ...]:
 def _truth_qc_alerts(inputs: AlertInputs) -> tuple[Alert, ...]:
     freshness = inputs.truth_qc_freshness
     threshold = (
-        f"reports/operations.py::FRESHNESS_THRESHOLDS[truth_qc_age_minutes] = "
+        f"health_policy.py::FRESHNESS_THRESHOLDS[truth_qc_age_minutes] = "
         f"{truth_qc_age_limit()}; "
         "unknown refresh time or latest completed refresh failure"
     )

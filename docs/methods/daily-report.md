@@ -1,63 +1,97 @@
 # Daily reporting read contract
 
-Implemented in: `daily_read.py`; the recorder bypass is in `cli.py::_read_daily`.
-The shared read-only identity helper is `config.py::config_fingerprint`;
-`evaluation.py` retains its existing import API. `health_policy.py` owns shared
-freshness constants without importing persistence or filelock (which performs
-an import-time temporary-file probe).
+*Implemented in: `daily_read.py`, `serve/provenance.py`, `support_paths.py`;
+`health_policy.py::truth_qc_freshness`; the recorder bypass and schema-1 error
+boundary are in `cli.py::_read_daily`.*
 
-This is an operational selection policy, not a new forecasting or scoring
-method. See [CLI and schema](../reference/cli.md#read-daily-report) and the
+This is operational evidence-selection policy, not a forecasting or scoring
+method. See the [CLI and schema](../reference/cli.md#read-daily-report) and
 [bibliography](bibliography.md#3-operational-analogues).
 
-The window is exactly 12 elapsed hours, normalized to UTC before arithmetic;
-there are 12 expected unique, hour-aligned timestamps in `[start, end)`.
-The start and as-of must include offsets and as-of must be at or after start.
-Execution after the window ends retains the scheduled window and stale/missing
-data limitations instead of shifting the period.
-Local labels use the configured IANA timezone. Missing timestamps and duplicate
-timestamps produce absent values, never interpolation or arbitrary selection.
-All eight canonical hourly variables declare their metric units; PoP is a
-dimensionless probability on 0–1. Missing keys, explicit null and non-finite or
-non-numeric/out-of-range values have distinct arrays. No conversion or forecast aggregation
-is performed.
+The window is exactly 12 elapsed hours, normalized to UTC before arithmetic,
+with hour-aligned timestamps in `[start, end)`. The start and as-of include UTC
+offsets; as-of must be at or after start. Range arithmetic and timezone labels
+are validated before reads. Delayed execution retains the scheduled window.
+Missing/duplicate hours and invalid values remain explicit, without interpolation,
+arbitrary duplicate selection, conversion or forecast aggregation. Placeholder
+hours without a method and release never become quality cohorts.
 
-Freshness limits are 120 minutes for station/forecast observation, 180 minutes
-for forecast issuance and collector completion, and 2,880 minutes for evidence,
-pipeline history and truth QC. Ages are measured from source timestamps rather
-than file mtimes; missing/future timestamps are unknown. File metadata is used
-only to detect concurrent changes. An unknown source schema or required-column
-change produces an unknown component, preserving the rest of the read.
+## Independent, write-free reads
 
-Provider history joins `provider_results.run_id = forecast_runs.id` and filters
-parent `completed_at` inclusively from `as_of - 24h` to `as_of`, using SQLite
-date normalization. Failed rows need not have `fetched_at`. The output contains
-provider slug, counts, outcome and completion timestamps only. Historical
-pipeline alarms are always historical, even when their artifact was recently
-rewritten. Run outcomes use latest completion by command within 24 hours;
-`failure_kind=no_folds` without an error and an exit in `PENDING_EXIT_CODES`
-is pending, not failed.
+Every tracked byte read records its file identity, size and modification time.
+Bytes, JSON objects and Parquet frames are cached within a snapshot. Component
+footprints include reads served from cache. Changed sources retry only affected
+components and their dependents once; a changed forecast invalidates backtest and
+realized-quality dependents. Continued changes make those components unknown,
+preserving stable station/provider/other evidence. This does not claim a global
+transaction across independently maintained sources.
 
-Quality cohorts are limited to the 12 emitted hourly rows. The current manifest
-fingerprint must match the forecast. Each slice must name one of the forecast's
-releases; its immutable release must match that ID, dataset and current config
-fingerprint, and its selection must match variable, bucket, method and truth
-semantics. Backtest evidence additionally matches that selection's evaluation ID
-and `source_kind=live`. Realized evidence additionally matches the release ID
-and evaluation date. The latest matching evaluation/as-of date wins, then latest
-recording within that cohort; future evaluations/recordings are excluded.
-The output includes MAE, positive sample count, dates and freshness. A null or
-non-finite score or nonpositive count is insufficient; finite evidence with
-positive samples is available, without implying statistical confidence or
-quality improvement. No score is pooled across products/releases/datasets.
-Unknown release IDs after a rebuild cannot inherit older promoted evidence.
+SQLite never receives a source filename. The reader rejects existing WAL, shared
+memory or journal dependencies and WAL-mode headers, reads stable rollback-mode
+bytes, then queries a deserialized in-memory connection with query-only and
+memory-temporary mode. It does not set immutable mode, ignore WAL, create sidecars
+or write private disk snapshots. Unsupported deserialization also fails closed.
+Station failures use the published JSON fallback; provider health is unknown
+when safe database reads are unavailable. Python audit tests and source-byte
+checks cover both missing and existing sidecars.
 
-Legacy truth-QC schema 3 commonly has only a verdict date, not `generated_at`;
-that date is retained but precise freshness/current alerts remain unknown.
-Schema-2 drift lacks dataset attribution and is historical only. Neither alarm
-set is promoted to a current pipeline failure. Sources are independently
-maintained, so two stable reads cannot promise a global atomic snapshot; a
-changed file triggers one complete retry, followed by unknown components if
-changes continue. Live SQLite uses ordinary read-only WAL-aware connections,
-never immutable mode, with a one-second busy timeout and a refusal to create a
-missing WAL shared-memory sidecar.
+The fallback path resolves once at invocation from `$HOME`, or system home lookup
+when unset. An explicit `--published-station` bypasses lookup; an empty or invalid
+home is a configuration error. `published_station_path` identifies the attempted
+fallback. Reader imports do not resolve home, import writers or create locks.
+
+## Health and freshness
+
+`FRESHNESS_THRESHOLDS` owns separate values: 120 minutes for observations,
+180 minutes for forecast/collector completion, and 2,880 minutes each for general
+evidence and truth QC. Equal values remain separate policies. Source clocks,
+never filesystem mtimes, establish freshness. Missing/future timestamps are
+unknown. Overflowing timestamps invalidate their component; invalid CLI ranges
+or serialization return schema-1 errors with exit 2.
+
+Provider results join their parent run and use normalized completion times in
+`[as_of - 24h, as_of]`. Configured latitude/longitude use the ingestion tolerance
+`LOCATION_TOLERANCE = 1e-4`; absent location columns are a limitation. No raw
+payload or credential-bearing error is emitted. Latest completed command outcomes
+at/before as-of retain per-command freshness even outside 24 hours; an old run can
+therefore be stale. Pending classifications preserve the shared exit protocol.
+
+Truth-QC uses the same complete pure assessment as the dashboard: UTC refresh
+instants, legacy date intervals through the following midnight, the 48-hour age
+limit and latest completed failed refreshes. Date-only results retain evaluation
+date and a null exact refresh instant, with conservative age from the interval's
+end. Optional null alert flags do not veto other usable diagnostics. Malformed
+optional verdict metadata retains valid freshness/alerts with a limitation.
+Failed latest refreshes leave retained data visible with partial status and no
+current alerts. Schema-2 drift remains historical because it lacks attribution.
+
+## Quality provenance and attributed fallback
+
+The current manifest must match the forecast dataset. Each actual slice names a
+forecast release, method, variable, bucket and truth semantics. Pure provenance
+decoding shares serving's direct fields and evaluation-context fallbacks. A
+retained selection keeps its original evaluation dataset/code/configuration;
+these may differ from release creation and current serving datasets. Backtest
+rows require that exact evaluation identity and live provenance. Unknown IDs and
+legacy missing contexts are never invented or borrowed from another variable.
+
+Realized rows require matching slice, code and configuration and prefer the exact
+forecast release. Their dataset identifies the actual served cohort, which can
+rotate while a compatible approval remains in use. Only when no exact row exists
+may an older release supply evidence: both recorded contexts must match live
+provenance, provider set, exact feature sequence and truth semantics, as well as
+method/code/configuration. Its publication, recording and evidence date must be
+within the cutoff. Missing compatibility metadata prevents fallback.
+
+The latest matching evaluation/as-of date wins, followed by recording time. One
+existing cohort supplies its MAE and sample count; rows are never pooled across
+releases/datasets. Exact evidence retains precedence when stale or insufficient.
+The forecast `release_id` stays unchanged; nullable additive fields
+`evidence_match`, `evidence_release_id` and `evidence_dataset_fingerprint` identify
+realized evidence. Fallback adds `older_compatible_release_evidence`. A finite MAE
+with positive samples is available evidence, not a prediction-quality verdict.
+
+Filtering, time ordering and latest-cohort reduction run in Polars before slice
+decoding. Each quality ledger is read once and each distinct release is parsed
+once per stable attempt. Unknown components preserve the schema-1 envelope and
+leave unavailable payload fields absent.

@@ -216,7 +216,7 @@ classification. Products are evaluated independently under unchanged gates.
 ### Approved decisions and compatible retention
 
 *Implemented in: `serve/selection.py`, `serve/evidence.py`, `serve/approvals.py`,
-`reports/evidence.py`, `reports/operations.py`, `evaluation.py`, `cli.py`, `status.py`, `runs.py`*
+`reports/evidence.py`, `reports/operations.py`, `serve/provenance.py`, `evaluation.py`, `cli.py`, `status.py`, `runs.py`*
 
 Only completed products in a live backtest may receive new selections. Prediction
 loads approvals without elections, promotion-time live gates, or release writes.
@@ -252,12 +252,33 @@ can protect scores without authorizing predictions. Churn uses separate publicat
 and approval clocks, sequence order and approval identity; old rows normalize in
 memory without rewriting evidence.
 
+Snapshot enumeration uses explicit directory scans. Typed path/category/detail
+issues retain damaged release/event files, invalid identities/clocks and listing
+failures. Visibility and authorization ordering are cached once per snapshot.
+Historical adapters also check externally supplied content publication clocks.
+Expected publication failures and stale decisions are typed promotion-only
+outcomes, preserving evaluation failures and diagnostics. Unknown evaluation
+placeholders never enter live-gate cohorts.
+
 ### Bounded score persistence
 
 *Implemented in: `backtest/engine.py::iter_backtest_scores`,
 `backtest/minutely.py::iter_minutely_scores`, `backtest/scores.py`,
 `backtest/score_storage.py`, `storage.py`,
 `reports/operations.py::prune_scores_files`, `cli.py`*
+
+Published retention keeps the newest 3 scores per product/source/window group,
+current active evidence and approvals from the last 7 days. A genuinely missing
+active pointer protects the newest current approval together with ready documents
+served in the last 6 hours; an explicit empty pointer preserves degraded semantics.
+Corrupt pointers, unreadable archives, unverifiable release/event metadata and
+listing failures suspend all published-score deletion in actual and dry runs.
+Future managed clocks remain usable under current sequence ordering. Uncertain
+legacy clocks suspend protection decisions rather than authorize serving or lose
+scores. `PruneResult.skipped` identifies the exact affected paths; exits retain
+existing semantics and temporary cleanup remains independent. Dashboard artifact
+warnings expose verification failures. No historical artifact is repaired or
+rewritten automatically.
 
 The CLI retains the same fold/variable/method order and fits exactly the same
 models. `SCORE_BATCH_ROWS = 65_536` slices predictions before stamping or quantile

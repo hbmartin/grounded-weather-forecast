@@ -65,6 +65,7 @@ def setup(tmp_path, start=START):
             "method_id": "equal_weight",
             "truth_semantics": "inst",
             "evaluation_id": "eval1",
+            "code_version": "code1",
         }
         for v in HOURLY_VARIABLES
     }
@@ -105,6 +106,7 @@ def quality(config, *, realized=False, **updates):
         "n": 100,
         "mae": 1.2,
         "live_mae": 2.0,
+        "code_version": "code1",
         "dataset_fingerprint": "dataset1",
         "config_fingerprint": config_fingerprint(config),
     }
@@ -124,12 +126,12 @@ def write_quality(config, rows, *, realized=False):
 def provider_db(path):
     connection = sqlite3.connect(path)
     connection.executescript("""
-        CREATE TABLE forecast_runs(id INTEGER PRIMARY KEY, completed_at TEXT);
+        CREATE TABLE forecast_runs(id INTEGER PRIMARY KEY, completed_at TEXT, latitude REAL DEFAULT 34.2768, longitude REAL DEFAULT -117.1692);
         CREATE TABLE provider_results(id INTEGER PRIMARY KEY, run_id INTEGER, provider TEXT,
           status TEXT, fetched_at TEXT, raw_json TEXT, error_message TEXT);
     """)
     connection.executemany(
-        "INSERT INTO forecast_runs VALUES (?, ?)",
+        "INSERT INTO forecast_runs(id, completed_at) VALUES (?, ?)",
         [
             (1, (START - timedelta(hours=25)).isoformat()),
             (2, START.isoformat()),
@@ -411,8 +413,9 @@ def test_station_fallback_is_labeled_and_never_immutable(tmp_path, monkeypatch):
     assert "SECRET" not in json.dumps(result)
 
 
-def test_live_wal_reads_uncheckpointed_observations(tmp_path):
+def test_live_wal_is_refused_without_touching_source(tmp_path):
     config, forecast, _ = setup(tmp_path)
+    write_json(tmp_path / "published.json", {"metadata": {"observed_at": START}})
     connection = sqlite3.connect(config.station.db_path)
     try:
         connection.execute("PRAGMA journal_mode=WAL")
@@ -422,15 +425,16 @@ def test_live_wal_reads_uncheckpointed_observations(tmp_path):
             (START.replace(tzinfo=None).isoformat(),),
         )
         connection.commit()
+        before = file_state(tmp_path)
         result = read(config, forecast)["operational_health"]["station"]
-        assert result["source"] == "live_station_sqlite"
-        assert result["freshness"]["at"] == START.isoformat()
+        assert result["source"] == "published_station_snapshot"
+        assert before == file_state(tmp_path)
     finally:
         connection.close()
-    wal = config.station.db_path.with_name(config.station.db_path.name + "-wal")
-    wal.touch()
-    with pytest.raises(reader.SourceError, match="wal_shared_memory_unavailable"):
+    before = file_state(tmp_path)
+    with pytest.raises(reader.SourceError, match="sqlite_wal_source_unsafe"):
         reader._open_readonly(config.station.db_path)
+    assert before == file_state(tmp_path)
 
 
 def test_historical_alarms_and_latest_completed_runs(tmp_path):
@@ -490,11 +494,11 @@ def test_historical_alarms_and_latest_completed_runs(tmp_path):
     ] == ["ok", "pending"]
 
 
-def test_concurrent_file_replacement_retries_and_discards_mixed_result(
+def test_concurrent_file_replacement_retries_only_affected_components(
     tmp_path, monkeypatch
 ):
     config, forecast, raw = setup(tmp_path)
-    original = reader.Snapshot.changed
+    original = reader.Snapshot.changed_paths
     calls = []
 
     def changed(snapshot):
@@ -503,24 +507,19 @@ def test_concurrent_file_replacement_retries_and_discards_mixed_result(
             write_json(forecast, raw | {"status": "degraded"})
         return original(snapshot)
 
-    monkeypatch.setattr(reader.Snapshot, "changed", changed)
+    monkeypatch.setattr(reader.Snapshot, "changed_paths", changed)
     assert read(config, forecast)["forecast"]["forecast_status"] == "degraded"
     assert len(calls) == 2
-    monkeypatch.setattr(reader.Snapshot, "changed", lambda _: True)
+    monkeypatch.setattr(reader.Snapshot, "changed_paths", lambda _: {forecast})
     result = read(config, forecast)
-    assert "window" in result
-    assert "prediction_quality" in result
     assert result["forecast"]["limitations"] == ["concurrent_replacement_after_retry"]
-    assert "hourly" not in result["forecast"]
-    result["forecast"]["limitations"].append("caller annotation")
-    assert result["operational_health"]["station"]["limitations"] == [
-        "concurrent_replacement_after_retry"
-    ]
-    result["operational_health"]["station"]["limitations"].append("station annotation")
-    assert result["operational_health"]["providers"]["limitations"] == [
-        "concurrent_replacement_after_retry"
-    ]
     assert result["prediction_quality"]["backtest"]["limitations"] == [
+        "concurrent_replacement_after_retry"
+    ]
+    assert result["operational_health"]["station"]["limitations"] != [
+        "concurrent_replacement_after_retry"
+    ]
+    assert result["prediction_quality"]["truth_qc"]["limitations"] != [
         "concurrent_replacement_after_retry"
     ]
 

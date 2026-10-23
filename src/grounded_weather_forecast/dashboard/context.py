@@ -154,12 +154,21 @@ def _releases(
     snapshot: ApprovalSnapshot | None = None,
 ) -> tuple[Mapping[str, object], ...]:
     directory = config.artifacts_dir / "releases"
-    if not directory.exists():
-        return ()
     snapshot = snapshot or read_approval_snapshot(directory, as_of=now)
-    failures.extend(
-        f"artifacts/releases/{Path(issue).name}" for issue in snapshot.issues
+    for issue in snapshot.issues:
+        try:
+            label = "artifacts/" + str(Path(issue).relative_to(config.artifacts_dir))
+        except (ValueError,):  # noqa: B013
+            label = issue
+        failures.append(label)
+    from grounded_weather_forecast.reports.operations import (  # noqa: PLC0415
+        _active_reference_ids,
     )
+
+    try:
+        _active_reference_ids(config, now=snapshot.cutoff)
+    except (ValueError,) as error:  # noqa: B013
+        failures.append(str(error))
     return tuple(
         record.payload()
         for record in snapshot.records()

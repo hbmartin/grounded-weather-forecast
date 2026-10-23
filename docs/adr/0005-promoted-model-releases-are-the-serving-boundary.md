@@ -118,3 +118,24 @@ together; explicit empty pointers retain their existing semantics.
 Churn separates immutable publication and approval clocks with
 additive nullable fields and in-memory legacy normalization; approval identity,
 not only release identity, distinguishes repeated transitions.
+
+Verification uncertainty and authorization are separate. Explicit directory scans
+and typed diagnostics expose unreadable events/releases, invalid clocks/identities
+and listing failures. Pruning conservatively keeps all published scores when
+protection is unverifiable, including corrupt pointers or served archives; only a
+genuinely missing pointer enables approval fallback. Current managed future clocks
+remain valid, while uncertain implicit legacy age cannot justify deletion.
+
+Expected publication failures and stale snapshots produce structured promotion-only
+failures; completed product evidence survives, and real evaluation failures retain
+precedence. One snapshot caches visibility and ordering. Compatibility readers
+accept additive event fields, but rollback to a pre-#79 reader needs a backport
+because existing `visible_at` events cannot be made readable by an unmodified old
+binary without rewriting immutable artifacts. Conservative historical floors remain
+uncapped and append-only.
+
+Daily reads use the same pure provenance decoding without importing persistence.
+Backtest attribution follows each selection's evaluation dataset. Realized evidence
+may select one explicitly labelled compatible older cohort when exact-release
+evidence is absent, retaining its original release and served dataset identity.
+This is reporting evidence, never an approval or a new serving election.

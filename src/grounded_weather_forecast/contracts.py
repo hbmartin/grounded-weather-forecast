@@ -351,3 +351,7 @@ class Blender(Protocol):
     def fit(self, train: SupervisedSlice) -> Self: ...
 
     def predict(self, x: ForecastMatrix) -> BlendResult: ...
+
+
+# Coordinate matching tolerance shared by archive ingestion and read-only diagnostics.
+LOCATION_TOLERANCE = 1e-4

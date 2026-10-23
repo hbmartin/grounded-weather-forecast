@@ -144,3 +144,9 @@ papers and are kept separate so the bibliography above stays a literature claim.
 | **MADIS / GHCN / ECMWF station blacklisting** | `dataset/truth_qc.py` |
 | **ForecastAdvisor / ForecastWatch** | The consumer analogue this system strictly dominates for one location — it scores per hour, to 10 days, with proper scoring rules, against your actual backyard. |
 | **[Polars StringView storage](https://pola.rs/posts/polars-string-type/)** | Column projection and shared-payload memory behavior in `backtest/scores.py`, `serve/score_scan.py`, `dashboard/score_summary.py`, `reports/leaderboard.py`, and `reports/mcs.py`; report/dashboard share completed summaries and release full frames before the next file. An implementation reference rather than a statistical accuracy claim. |
+
+The daily read contract uses SQLite's documented
+[in-memory deserialization](https://www.sqlite.org/c3ref/deserialize.html) for
+validated rollback snapshots and refuses WAL/journal dependencies. It does not use
+immutable live reads or write sidecars/private disk snapshots. See
+[daily reporting](daily-report.md) for evidence compatibility and isolation policy.

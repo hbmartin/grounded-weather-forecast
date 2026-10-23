@@ -110,7 +110,7 @@ def test_interrupted_event_leaves_unapproved_content_and_can_retry(
         raise OSError("event publication fixture")
 
     monkeypatch.setattr(approvals, "atomic_write_text", fail)
-    with pytest.raises(OSError, match="event publication"):
+    with pytest.raises(approvals.ApprovalPublicationError, match="event publication"):
         commit(tmp_path, model)
     assert (tmp_path / f"{model.release_id}.json").exists()
     assert records(tmp_path) == []
@@ -125,7 +125,7 @@ def test_failed_content_publication_cannot_commit_event(tmp_path, monkeypatch):
         raise OSError("content fixture")
 
     monkeypatch.setattr(ModelRelease, "write_once", fail)
-    with pytest.raises(OSError, match="content fixture"):
+    with pytest.raises(approvals.ApprovalPublicationError, match="content fixture"):
         commit(tmp_path, release("a"))
     assert records(tmp_path) == []
     assert not (tmp_path / "approvals").exists()
@@ -429,7 +429,11 @@ def test_stale_snapshot_reserves_fresh_sequence_and_rechecks_current(tmp_path):
     commit(tmp_path, b)
     before = {p: p.read_bytes() for p in (tmp_path / "approvals").glob("*.json")}
     with locked_path(tmp_path / ".approval-ledger"):
-        result = approvals.publish_approval(a, tmp_path, current, snapshot=snapshot)
+        with pytest.raises(
+            approvals.StaleApprovalSnapshotError, match="changed after election"
+        ):
+            approvals.publish_approval(a, tmp_path, current, snapshot=snapshot)
+    result = commit(tmp_path, a)
     assert result.disposition == "reapproval"
     assert records(tmp_path)[0].sequence == 3
     assert all(path.read_bytes() == content for path, content in before.items())

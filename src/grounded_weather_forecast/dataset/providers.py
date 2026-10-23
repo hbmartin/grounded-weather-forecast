@@ -13,6 +13,9 @@ from dataclasses import dataclass
 import polars as pl
 
 from grounded_weather_forecast.config import ForecastsConfig
+from grounded_weather_forecast.contracts import (
+    LOCATION_TOLERANCE as LOCATION_TOLERANCE,  # noqa: PLC0414 -- preserve compatibility export
+)
 from grounded_weather_forecast.contracts import SourceKind
 from grounded_weather_forecast.dataset.station import sqlite_uri
 from grounded_weather_forecast.timeutil import parse_iso_utc_expr
@@ -36,7 +39,6 @@ DAILY_COLUMN_MAP: Mapping[str, str] = {
 }
 
 _SECONDS_PER_HOUR = 3600.0
-LOCATION_TOLERANCE = 1e-4
 
 
 @dataclass(frozen=True, slots=True)
