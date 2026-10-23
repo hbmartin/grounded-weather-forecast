@@ -48,11 +48,21 @@ def _context_values(
         or selection.get("legacy_context_missing") is True
     ):
         return None
-    identifier = evaluation_id(selection.get("evaluation_id"))
-    contexts = contexts_by_evaluation_id(release.get("evaluation_contexts"))
+    raw_identifier = selection.get("evaluation_id")
+    identifier = evaluation_id(raw_identifier)
+    if raw_identifier is not None and identifier is None:
+        return None
+    contexts = release.get("evaluation_contexts")
+    if not isinstance(contexts, (list, tuple)):
+        return None
     values = set()
-    for key, context in contexts.items():
-        if identifier is not None and key != identifier:
+    for context in contexts:
+        if not isinstance(context, Mapping):
+            continue
+        context_id = context.get("evaluation_id")
+        if identifier is not None and context_id != identifier:
+            continue
+        if context_id is not None and evaluation_id(context_id) is None:
             continue
         value = context.get(field)
         if variable is not None:

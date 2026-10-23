@@ -57,6 +57,7 @@ class DashboardContext:
     # archive; a corrupt or permission-denied one is a fault, and collapsing
     # both to None let a broken deployment render as merely early.
     unreadable_artifacts: tuple[str, ...] = ()
+    compatibility_notes: tuple[str, ...] = ()
     history: pl.DataFrame | None = None
     latest_forecast: Forecast | None = None
     latest_publish_attempt: Mapping[str, object] | None = None
@@ -152,21 +153,33 @@ def _releases(
     *,
     now: datetime | None = None,
     snapshot: ApprovalSnapshot | None = None,
+    compatibility_notes: list[str] | None = None,
 ) -> tuple[Mapping[str, object], ...]:
     directory = config.artifacts_dir / "releases"
     snapshot = snapshot or read_approval_snapshot(directory, as_of=now)
+    legacy = {
+        str(item.path)
+        for item in snapshot.diagnostics
+        if item.category == "legacy_identity_missing"
+    }
     for issue in snapshot.issues:
+        if issue in legacy:
+            if compatibility_notes is not None:
+                compatibility_notes.append(
+                    f"{issue}: legacy filename identity is usable for retention only"
+                )
+            continue
         try:
             label = "artifacts/" + str(Path(issue).relative_to(config.artifacts_dir))
         except (ValueError,):  # noqa: B013
             label = issue
         failures.append(label)
     from grounded_weather_forecast.reports.operations import (  # noqa: PLC0415
-        _active_reference_ids,
+        _pointer_reference_ids,
     )
 
     try:
-        _active_reference_ids(config, now=snapshot.cutoff)
+        _pointer_reference_ids(config)
     except (ValueError,) as error:  # noqa: B013
         failures.append(str(error))
     return tuple(
@@ -320,6 +333,7 @@ def collect_context(
         config.artifacts_dir / "releases", as_of=now
     )
     unreadable: list[str] = []
+    compatibility_notes: list[str] = []
     unreadable_scores: tuple[str, ...] = ()
     if score_summaries is None:
         score_summaries, unreadable_scores = _score_summaries(config, unreadable)
@@ -374,7 +388,13 @@ def collect_context(
             unreadable,
             label="artifacts/latest_publish_attempt.json",
         ),
-        releases=_releases(config, unreadable, now=now, snapshot=approval_snapshot),
+        releases=_releases(
+            config,
+            unreadable,
+            now=now,
+            snapshot=approval_snapshot,
+            compatibility_notes=compatibility_notes,
+        ),
         alignment=_try_json(
             config.artifacts_dir / "alignment.json",
             unreadable,
@@ -398,4 +418,5 @@ def collect_context(
             config, unreadable, now=now, snapshot=approval_snapshot
         ),
         unreadable_artifacts=tuple(sorted(set(unreadable))),
+        compatibility_notes=tuple(compatibility_notes),
     )

@@ -1,6 +1,6 @@
 # Daily reporting read contract
 
-*Implemented in: `daily_read.py`, `serve/provenance.py`, `support_paths.py`;
+*Implemented in: `daily_read.py`, `daily_read_contract.py`, `serve/provenance.py`, `support_paths.py`;
 `health_policy.py::truth_qc_freshness`; the recorder bypass and schema-1 error
 boundary are in `cli.py::_read_daily`.*
 
@@ -14,24 +14,28 @@ offsets; as-of must be at or after start. Range arithmetic and timezone labels
 are validated before reads. Delayed execution retains the scheduled window.
 Missing/duplicate hours and invalid values remain explicit, without interpolation,
 arbitrary duplicate selection, conversion or forecast aggregation. Placeholder
-hours without a method and release never become quality cohorts.
+hours without a method never become quality cohorts. A method-bearing slice
+without a release remains visible as unknown and prevents available quality status.
 
 ## Independent, write-free reads
 
 Every tracked byte read records its file identity, size and modification time.
-Bytes, JSON objects and Parquet frames are cached within a snapshot. Component
-footprints include reads served from cache. Changed sources retry only affected
-components and their dependents once; a changed forecast invalidates backtest and
-realized-quality dependents. Continued changes make those components unknown,
+JSON bytes/objects and Parquet frames are cached within a snapshot; SQLite bodies
+are not retained there. Component footprints include reads served from cache.
+Each component gets its initial read and at most one retry. A component first
+affected during another's retry still gets its own retry. A changed forecast
+invalidates backtest and realized-quality dependents. Continued changes beyond
+each component's budget make only the affected components unknown,
 preserving stable station/provider/other evidence. This does not claim a global
 transaction across independently maintained sources.
 
 SQLite never receives a source filename. The reader rejects existing WAL, shared
-memory or journal dependencies and WAL-mode headers, reads stable rollback-mode
+memory or journal dependencies and WAL-mode headers. It validates a 100-byte
+header and its file signature before allocating the full database body. It reads stable rollback-mode
 bytes, then queries a deserialized in-memory connection with query-only and
 memory-temporary mode. It does not set immutable mode, ignore WAL, create sidecars
 or write private disk snapshots. Unsupported deserialization also fails closed.
-Station failures use the published JSON fallback; provider health is unknown
+Connections close after each component query. Station failures use the published JSON fallback; provider health is unknown
 when safe database reads are unavailable. Python audit tests and source-byte
 checks cover both missing and existing sidecars.
 
@@ -55,6 +59,12 @@ Provider results join their parent run and use normalized completion times in
 payload or credential-bearing error is emitted. Latest completed command outcomes
 at/before as-of retain per-command freshness even outside 24 hours; an old run can
 therefore be stale. Pending classifications preserve the shared exit protocol.
+Malformed rows are isolated to relevant commands and add `invalid_run_rows` with
+partial/unknown availability. A valid row supersedes a malformed row only when
+its ending timestamp is provably newer; unorderable uncertainty leaves that
+command unknown. Other commands remain visible. `no_completed_runs_as_of` means
+there are no usable completed relevant outcomes at the cutoff, not merely none
+in the last 24 hours.
 
 Truth-QC uses the same complete pure assessment as the dashboard: UTC refresh
 instants, legacy date intervals through the following midnight, the 48-hour age
@@ -74,18 +84,30 @@ retained selection keeps its original evaluation dataset/code/configuration;
 these may differ from release creation and current serving datasets. Backtest
 rows require that exact evaluation identity and live provenance. Unknown IDs and
 legacy missing contexts are never invented or borrowed from another variable.
+Absent legacy IDs may recover unambiguous recorded code/semantics; empty,
+non-string and `"unknown"` IDs never become wildcard context lookups. Direct
+recorded fields remain usable, and context-free legacy approvals remain restricted
+to their recorded dataset.
 
-Realized rows require matching slice, code and configuration and prefer the exact
+Realized rows require matching slice and configuration and prefer the exact
 forecast release. Their dataset identifies the actual served cohort, which can
-rotate while a compatible approval remains in use. Only when no exact row exists
+rotate while a compatible approval remains in use. Their `code_version` identifies
+the recorder; it is not compared to the selection's evaluation code. Only when no exact row exists
 may an older release supply evidence: both recorded contexts must match live
 provenance, provider set, exact feature sequence and truth semantics, as well as
 method/code/configuration. Its publication, recording and evidence date must be
-within the cutoff. Missing compatibility metadata prevents fallback.
+within the cutoff. Its immutable publication time must also be strictly earlier
+than the forecast release's publication; missing, naive, malformed, equal or later
+clocks cannot establish older content. Approval/reapproval ordering is unchanged.
+Missing compatibility metadata prevents fallback.
 
-The latest matching evaluation/as-of date wins, followed by recording time. One
+The latest matching evaluation/as-of date wins, followed by recording time.
+Among tied rows prefer the forecast dataset, then coalesce identical rows. If
+distinct equally eligible rows remain, the slice is unknown with
+`ambiguous_quality_evidence`. One
 existing cohort supplies its MAE and sample count; rows are never pooled across
-releases/datasets. Exact evidence retains precedence when stale or insufficient.
+releases/datasets. Exact evidence retains precedence when stale, insufficient or
+ambiguous; those conditions do not enable fallback.
 The forecast `release_id` stays unchanged; nullable additive fields
 `evidence_match`, `evidence_release_id` and `evidence_dataset_fingerprint` identify
 realized evidence. Fallback adds `older_compatible_release_evidence`. A finite MAE

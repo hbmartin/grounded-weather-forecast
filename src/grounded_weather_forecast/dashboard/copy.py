@@ -619,6 +619,11 @@ PANEL_COPY: Mapping[str, PanelCopy] = {
             "release promoted in the last 30 days."
         ),
     ),
+    "i7": PanelCopy(
+        what="The latest recorded pruning verification and its recording time.",
+        why="Unverifiable release evidence suspends published-score deletion; the dashboard does not rescan the archive.",
+        thresholds="Clear and suspended are recorded outcomes, not a live verification. Missing legacy diagnostics mean not recorded; pruning verifies freshly before deletion.",
+    ),
     "i6": PanelCopy(
         what=(
             "Every recorded config-fingerprint and code-version "

@@ -291,6 +291,17 @@ conditions do not authorize excluded releases. Genuine pointer absence alone use
 the newest current approval fallback. Pre-#79 readers require a compatibility
 backport before reading events with `visible_at`; no artifacts are migrated.
 
+`PruneResult.verification` additively carries a typed clear/suspended result and
+recording time. The CLI records it as informational `retention_verification`
+components inside the existing `failure_details_json` run field, with exit 0 and
+`retention_clear` or `retention_suspended`. Details are bounded to 400 characters
+per component. Coordination failures retain their original exit/failure metadata.
+No new ledger or artifact is created. The dashboard's published-score protection
+panel and pipeline report show the latest completed check and its timestamp;
+legacy rows without explicit metadata show not recorded. The dashboard does not
+rescan served archives, and a later clear check supersedes a prior suspension.
+Pruning still freshly verifies all protection requirements on every invocation.
+
 ## Daily report reader
 
 Daily-report schema 1 retains its envelope and adds nullable realized-evidence
@@ -298,6 +309,15 @@ attribution: `evidence_match`, `evidence_release_id`, and
 `evidence_dataset_fingerprint`. Forecast release identities remain separate from
 the evidence cohort. Station diagnostics expose the resolved fallback path; latest
 run entries carry individual freshness. Existing ledgers are unchanged.
+
+Equal evidence/recording clocks prefer the forecast dataset; remaining distinct
+cohorts produce `ambiguous_quality_evidence` rather than arbitrary scores.
+Method-bearing unattributed slices remain unknown. Realized recorder code is
+distinct from evaluation code, and compatible fallback requires strictly older
+immutable release content. Malformed relevant run rows produce `invalid_run_rows`
+without discarding independent commands; no completed outcomes at the cutoff use
+`no_completed_runs_as_of`. These are documented schema-1 limitation codes, not a
+schema migration.
 
 ---
 

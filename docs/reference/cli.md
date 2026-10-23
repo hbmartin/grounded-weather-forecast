@@ -30,6 +30,11 @@ together in its existing journal row. Real product failures take precedence over
 promotion-only errors and pending outcomes; they stop routine maintenance even
 when promotion also fails. Older rows load with a null field. This does not
 change the daily-report v1 JSON contract or existing summary counters.
+Pruning also records informational `retention_verification` components with exit
+code 0 and `retention_clear` or `retention_suspended`. These do not set the
+invocation's failure kind or increase failed-run counters. Reports/dashboard show
+the latest completed check and its timestamp; legacy rows without this explicit
+metadata mean not recorded, never verified clean.
 The standalone wrapper supplies an invocation-local private outcome file to its
 backtest child. It checks the recorded classification against the process exit;
 missing or invalid metadata cannot exempt an evaluation failure. The file is
@@ -150,9 +155,20 @@ The existing `release_id` describes the forecast. A fallback adds
 `older_compatible_release_evidence`; it selects one existing cohort without pooling.
 Exact rows take precedence even when stale or insufficient. Missing modern
 source/feature/code/configuration/semantic compatibility prevents fallback.
+Realized ledger code identifies its recorder and does not have to equal the
+selection's evaluation code. Backtest code matching remains exact. Fallback
+requires strictly earlier immutable content publication; equal, later or invalid
+publication clocks cannot establish older evidence.
 
-Each distinct release is parsed once per stable attempt. Changed sources retry
-only dependent components once; repeated changes leave those components unknown
+Evidence date and recording time establish priority. Among tied rows the forecast
+dataset is preferred; identical duplicates coalesce. Remaining distinct ties
+produce `ambiguous_quality_evidence`, including exact rows, without enabling
+fallback or pooling. Method-bearing slices missing release attribution remain
+unknown; only method-free missing-hour placeholders are omitted.
+
+Each distinct release is parsed once per stable attempt. Every component has its
+own initial read and one retry, including components first affected during another
+component's retry. Repeated changes leave only exhausted affected components unknown
 while unrelated evidence remains available.
 
 Source reads use independent stable snapshots. Repeated changes yield the same
@@ -1079,6 +1095,15 @@ exit behavior. Repair the affected release files before retrying. Catalog rows s
 deletion, so the history ledgers stay intact — only the bulky per-case scores are
 removed. Published files the evaluations catalog has never seen are skipped,
 never deleted.
+
+Each completed pruning check records clear/suspended verification through the
+existing structured run diagnostics, also under `--dry-run`. Reports/dashboard
+display that recorded result with its timestamp instead of rescanning the full
+served-document archive. A later clear check replaces an earlier suspension;
+legacy or missing diagnostics show not recorded. Pruning itself always verifies
+freshly before deciding deletions. Direct dashboard checks of loaded artifacts and
+the active pointer remain live. Valid legacy filename identities are compatibility
+information for retention, not serving approval or unreadable-file alarms.
 
 Only private `.score-stage-v1.scores_*.parquet.<16 lowercase hex>.tmp`
 payloads and their `.lease` companions participate in automatic recovery.

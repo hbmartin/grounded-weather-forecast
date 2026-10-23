@@ -1669,10 +1669,15 @@ def _report_pipeline_health(
     from grounded_weather_forecast.reports.render import (  # noqa: PLC0415
         write_markdown_report,
     )
+    from grounded_weather_forecast.retention_status import (  # noqa: PLC0415
+        latest_retention_verification,
+    )
 
+    runs_frame = runs.load_runs(runs.runs_path(config))
+    verification = latest_retention_verification(runs_frame, as_of=datetime.now(UTC))
     health = operations.record_operations(
         config,
-        runs_frame=runs.load_runs(runs.runs_path(config)),
+        runs_frame=runs_frame,
         catalog_rows=catalog_rows,
     )
     if health.alarms:
@@ -1703,6 +1708,7 @@ def _report_pipeline_health(
                 ),
                 ("Identity changes since last report", health.changes),
                 ("Evaluations cataloged this report", health.catalog),
+                ("Latest pruning verification (recorded result)", verification.frame()),
             ],
         )
     )
@@ -1741,8 +1747,10 @@ def _cmd_prune_scores(config: Config, args: argparse.Namespace) -> int | Command
     if result.coordination_release_failure is not None:
         detail = result.coordination_release_failure.diagnostic()
         print(detail, file=sys.stderr)
-        return CommandOutcome(1, "score_coordination_release", detail)
-    return 0
+        return CommandOutcome(
+            1, "score_coordination_release", detail, result.verification.diagnostics()
+        )
+    return CommandOutcome(diagnostics=result.verification.diagnostics())
 
 
 def _run_pipeline_steps(
@@ -2099,9 +2107,17 @@ def main(argv: Sequence[str] | None = None) -> int:
 def _read_daily_error(limitation: str) -> int:
     import json  # noqa: PLC0415
 
+    from grounded_weather_forecast.daily_read_contract import (  # noqa: PLC0415
+        SCHEMA_VERSION,
+    )
+
     print(
         json.dumps(
-            {"schema_version": 1, "status": "error", "limitations": [limitation]}
+            {
+                "schema_version": SCHEMA_VERSION,
+                "status": "error",
+                "limitations": [limitation],
+            }
         )
     )
     return 2

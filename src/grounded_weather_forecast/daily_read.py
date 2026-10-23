@@ -16,6 +16,9 @@ import polars as pl
 
 from grounded_weather_forecast.config import Config, config_fingerprint
 from grounded_weather_forecast.contracts import HOURLY_VARIABLES, LOCATION_TOLERANCE
+from grounded_weather_forecast.daily_read_contract import (
+    SCHEMA_VERSION as SCHEMA_VERSION,  # noqa: PLC0414 -- compatibility export
+)
 from grounded_weather_forecast.health_policy import (
     FRESHNESS_THRESHOLDS,
     truth_qc_freshness,
@@ -35,7 +38,6 @@ def evidence_age_limit() -> int:
     return int(FRESHNESS_THRESHOLDS["evidence_age_minutes"])
 
 
-SCHEMA_VERSION = 1
 WINDOW_HOURS = 12
 
 
@@ -129,6 +131,26 @@ class Snapshot:
         if before != _signature(path):
             raise SourceError("concurrent_replacement")
         self._bytes[path] = data
+        return data
+
+    def read_database(self, path: Path) -> bytes:
+        """Reject unsafe headers before allocating a database; never cache its body."""
+        before = self.track(path)
+        try:
+            with path.open("rb", buffering=0) as source:
+                header = source.read(100)
+                if before != _signature(path):
+                    raise SourceError("concurrent_replacement")
+                if len(header) < 100 or header[:16] != b"SQLite format 3\x00":
+                    raise SourceError("invalid_sqlite_header")
+                if header[18:20] != b"\x01\x01":
+                    raise SourceError("sqlite_wal_source_unsafe")
+                source.seek(0)
+                data = source.read()
+        except (FileNotFoundError,) as exc:  # noqa: B013
+            raise SourceError("missing_source") from exc
+        if before != _signature(path) or data[:100] != header:
+            raise SourceError("concurrent_replacement")
         return data
 
     def document(self, path: Path, version: int | None = None) -> dict[str, Any]:
@@ -359,13 +381,9 @@ def _open_readonly(path: Path, snapshot: Snapshot | None = None) -> sqlite3.Conn
             pass
         else:
             raise SourceError("sqlite_journal_dependent_source")
-    data = snapshot.read(path)
-    if len(data) < 100 or data[:16] != b"SQLite format 3\x00":
-        raise SourceError("invalid_sqlite_header")
-    if data[18:20] != b"\x01\x01":
-        raise SourceError("sqlite_wal_source_unsafe")
     if not hasattr(sqlite3.Connection, "deserialize"):
         raise SourceError("sqlite_memory_snapshot_unavailable")
+    data = snapshot.read_database(path)
     connection = sqlite3.connect(":memory:", timeout=1)
     try:
         connection.deserialize(data)
@@ -521,11 +539,10 @@ def _run_status(row: Mapping[str, Any]) -> str:
 def read_runs(snapshot: Snapshot, path: Path, now: datetime) -> dict[str, Any]:
     frame = snapshot.frame(path, {"command", "started_at", "ended_at", "exit_code"})
     latest: dict[str, dict[str, Any]] = {}
+    invalid: dict[str, list[datetime | None]] = {}
     for row in frame.to_dicts():
-        if not _recent_run(row, now):
-            continue
         key = row["command"]
-        if key not in {
+        if not isinstance(key, str) or key not in {
             "predict",
             "publish",
             "maintain",
@@ -534,6 +551,17 @@ def read_runs(snapshot: Snapshot, path: Path, now: datetime) -> dict[str, Any]:
             "truth-qc",
             "build-dataset",
         }:
+            continue
+        try:
+            if not _recent_run(row, now):
+                continue
+        except (ValueError, TypeError, OverflowError):
+            try:
+                ended = timestamp(row["ended_at"])
+            except (ValueError, TypeError, OverflowError):
+                ended = None
+            if ended is None or ended <= now:
+                invalid.setdefault(key, []).append(ended)
             continue
         if key in latest and timestamp(latest[key]["ended_at"]) >= timestamp(
             row["ended_at"]
@@ -547,12 +575,28 @@ def read_runs(snapshot: Snapshot, path: Path, now: datetime) -> dict[str, Any]:
             "failure_kind": row.get("failure_kind"),
             "freshness": freshness(row["ended_at"], now, evidence_age_limit()),
         }
-    newest = max((r["ended_at"] for r in latest.values()), default=None)
+    for command, clocks in invalid.items():
+        valid = latest.get(command)
+        if valid is None or any(
+            clock is None or clock >= timestamp(valid["ended_at"]) for clock in clocks
+        ):
+            latest[command] = {
+                "command": command,
+                "ended_at": None,
+                "status": "unknown",
+                "exit_code": None,
+                "failure_kind": None,
+                "freshness": freshness(None, now, evidence_age_limit()),
+            }
+    newest = max(
+        (r["ended_at"] for r in latest.values() if r["ended_at"]), default=None
+    )
     return {
-        "status": "ok" if latest else "unknown",
+        "status": ("partial" if invalid else "ok") if newest else "unknown",
         "latest_by_command": list(latest.values()),
         "freshness": freshness(newest, now, evidence_age_limit()),
-        "limitations": [] if latest else ["no_completed_runs_as_of"],
+        "limitations": (["invalid_run_rows"] if invalid else [])
+        + ([] if newest else ["no_completed_runs_as_of"]),
     }
 
 
@@ -667,10 +711,11 @@ def _quality_rows(
         if realized
         else ["evaluation_id", "evaluation_created_at", "source_kind", "mae"]
     )
+    required = identity + extras + ["n", "recorded_at"]
     frame = snapshot.frame(
         config.artifacts_dir / "history" / f"{name}.parquet",
-        set(identity + extras + ["n", "recorded_at"]),
-    )
+        set(required),
+    ).select(required)
     frame = frame.with_columns(_utc_column(frame, "recorded_at").alias("recorded_at"))
     frame = frame.filter(
         (pl.col("recorded_at") <= now) & (pl.col("product") == "hourly")
@@ -690,18 +735,23 @@ def _quality_rows(
         clocks = ["evaluation_created_at", "recorded_at"]
         keys = [*identity, "evaluation_id"]
     # Reduce in Polars before any per-slice decoding or Python conversion.
-    return (
-        frame.sort(clocks)
-        .unique(subset=keys, keep="last")
-        .sort(clocks, descending=True)
-    )
+    frame = frame.unique()
+    for clock in clocks:
+        frame = frame.filter(pl.col(clock) == pl.col(clock).max().over(keys))
+    return frame.sort(clocks, descending=True)
 
 
 def _cohort_rows(
-    frame: pl.DataFrame, cohort: tuple[str, ...], provenance: SelectionProvenance
+    frame: pl.DataFrame,
+    cohort: tuple[str, ...],
+    provenance: SelectionProvenance,
+    *,
+    realized: bool = False,
 ) -> pl.DataFrame:
     variable, bucket, method, semantics, _ = cohort
-    if provenance.code_version is None or provenance.config_fingerprint is None:
+    if provenance.config_fingerprint is None or (
+        not realized and provenance.code_version is None
+    ):
         return frame.clear()
     return frame.filter(
         (pl.col("variable") == variable)
@@ -709,8 +759,33 @@ def _cohort_rows(
         & (pl.col("method_id") == method)
         & (pl.col("truth_semantics") == semantics)
         & (pl.col("config_fingerprint") == provenance.config_fingerprint)
-        & (pl.col("code_version") == provenance.code_version)
+        & (
+            pl.lit(value=True)
+            if realized
+            else pl.col("code_version") == provenance.code_version
+        )
     )
+
+
+def _select_quality_row(
+    rows: pl.DataFrame, *, realized: bool, forecast_dataset: object
+) -> dict[str, Any] | None:
+    if rows.is_empty():
+        return None
+    if rows.height == 1:
+        return rows.row(0, named=True)
+    for clock in (
+        "as_of_date" if realized else "evaluation_created_at",
+        "recorded_at",
+    ):
+        rows = rows.filter(pl.col(clock) == pl.col(clock).max())
+    preferred = rows.filter(pl.col("dataset_fingerprint") == forecast_dataset)
+    if not preferred.is_empty():
+        rows = preferred
+    rows = rows.unique()
+    if rows.height != 1:
+        raise SourceError("ambiguous_quality_evidence")
+    return rows.row(0, named=True)
 
 
 def _compatible_evidence(
@@ -720,9 +795,16 @@ def _compatible_evidence(
     key: str,
     current: SelectionProvenance,
     now: datetime,
+    *,
+    published: object,
+    forecast_dataset: object,
 ) -> dict[str, Any] | None:
-    for row in rows.iter_rows(named=True):
-        identifier = row["release_id"]
+    try:
+        content_clock = timestamp(published)
+    except (ValueError, TypeError, OverflowError):
+        return None
+    eligible = []
+    for identifier in rows["release_id"].unique().to_list():
         if not isinstance(identifier, str) or not identifier.isalnum():
             continue
         try:
@@ -731,15 +813,19 @@ def _compatible_evidence(
             )
             if (
                 release.get("release_id") != identifier
-                or timestamp(release.get("promoted_at")) > now
+                or not timestamp(release.get("promoted_at")) < content_clock <= now
             ):
                 continue
             candidate = selection_provenance(release, key)
             if current.compatible_with(candidate):
-                return row
+                eligible.append(identifier)
         except (OSError, ValueError, TypeError, OverflowError):
             continue
-    return None
+    return _select_quality_row(
+        rows.filter(pl.col("release_id").is_in(eligible)),
+        realized=True,
+        forecast_dataset=forecast_dataset,
+    )
 
 
 def _quality_value(
@@ -825,13 +911,24 @@ def _read_slice(
         or provenance.truth_semantics != semantics
     ):
         raise SourceError("release_selection_mismatch")
-    matching = _cohort_rows(rows, cohort, provenance)
+    matching = _cohort_rows(rows, cohort, provenance, realized=realized)
     fallback = False
     if realized:
         exact = matching.filter(pl.col("release_id") == release_id)
-        row = exact.row(0, named=True) if not exact.is_empty() else None
+        row = _select_quality_row(
+            exact, realized=True, forecast_dataset=forecast.get("dataset_fingerprint")
+        )
         if row is None:
-            row = _compatible_evidence(snapshot, config, matching, key, provenance, now)
+            row = _compatible_evidence(
+                snapshot,
+                config,
+                matching,
+                key,
+                provenance,
+                now,
+                published=release.get("promoted_at"),
+                forecast_dataset=forecast.get("dataset_fingerprint"),
+            )
             fallback = row is not None
     else:
         if provenance.evaluation_id is None or provenance.dataset_fingerprint is None:
@@ -840,7 +937,9 @@ def _read_slice(
             (pl.col("evaluation_id") == provenance.evaluation_id)
             & (pl.col("dataset_fingerprint") == provenance.dataset_fingerprint)
         )
-        row = matching.row(0, named=True) if not matching.is_empty() else None
+        row = _select_quality_row(
+            matching, realized=False, forecast_dataset=provenance.dataset_fingerprint
+        )
     return _quality_value(row, now, realized=realized, fallback=fallback)
 
 
@@ -856,8 +955,6 @@ def read_quality(
     dataset = manifest.get("fingerprint")
     if not dataset or dataset != forecast.get("dataset_fingerprint"):
         raise SourceError("forecast_current_dataset_mismatch")
-    if not forecast.get("release_ids"):
-        raise SourceError("forecast_has_no_release_ids")
     rows = _quality_rows(snapshot, config, now, realized=realized)
     cohorts = {
         (
@@ -869,10 +966,7 @@ def read_quality(
         )
         for point in forecast.get("hourly", [])
         for variable, method in point["methods"].items()
-        if isinstance(method, str)
-        and method
-        and isinstance(point["release_ids"].get(variable), str)
-        and point["release_ids"].get(variable)
+        if isinstance(method, str) and method
     }
     result = []
     for cohort in sorted(cohorts, key=str):
@@ -998,28 +1092,7 @@ def read_daily_report(
         ),
         "drift": lambda: read_drift(snapshot, config.artifacts_dir / "drift.json", now),
     }
-    pending = set(readers)
-    unstable = False
-    for attempt in range(2):
-        for name, read in readers.items():
-            if name in pending:
-                with snapshot.capture(name):
-                    result[name] = component(read)
-        changed = snapshot.changed_paths()
-        affected = {
-            name for name, paths in snapshot.dependencies.items() if paths & changed
-        }
-        if "forecast" in affected:
-            affected.update(("backtest", "realized_live"))
-        if not affected:
-            break
-        if attempt == 0:
-            snapshot.invalidate(changed)
-            pending = affected
-        else:
-            unstable = True
-            for name in affected:
-                result[name] = _unstable_component()
+    unstable = _read_components(snapshot, readers, result)
     return _report_envelope(
         start,
         now,
@@ -1034,6 +1107,35 @@ def read_daily_report(
         if unstable
         else ["sources_are_independent_snapshots_not_a_global_transaction"],
     )
+
+
+def _read_components(
+    snapshot: Snapshot,
+    readers: Mapping[str, Callable[[], dict[str, Any]]],
+    result: dict[str, dict[str, Any]],
+) -> bool:
+    attempts = dict.fromkeys(readers, 0)
+    pending = set(readers)
+    unstable = False
+    while pending:
+        for name, read in readers.items():
+            if name in pending:
+                with snapshot.capture(name):
+                    result[name] = component(read)
+                attempts[name] += 1
+        changed = snapshot.changed_paths()
+        affected = {
+            name for name, paths in snapshot.dependencies.items() if paths & changed
+        }
+        if "forecast" in affected:
+            affected.update(("backtest", "realized_live"))
+        snapshot.invalidate(changed)
+        pending = {name for name in affected if attempts[name] < 2}
+        for name in affected - pending:
+            result[name] = _unstable_component()
+            snapshot.dependencies[name] = set()
+            unstable = True
+    return unstable
 
 
 def json_default(value: object) -> str:
