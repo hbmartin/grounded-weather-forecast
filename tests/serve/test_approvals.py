@@ -30,6 +30,8 @@ def release(method):
 
 
 def records(directory, as_of=None):
+    if as_of is None:
+        return approvals.read_approval_snapshot(directory).records()
     return approvals.ordered_approvals(
         [json.loads(path.read_text()) for path in directory.glob("*.json")],
         directory,
@@ -147,14 +149,12 @@ def test_legacy_implicit_approval_is_unchanged_without_migration(tmp_path):
     "timestamp", ["broken", "2026-08-01T00:00:00", "2999-01-01T00:00:00+00:00", None]
 )
 def test_invalid_or_future_legacy_clocks_are_not_approvals(tmp_path, timestamp):
-    raw = asdict(release("a")) | {"promoted_at": timestamp}
+    raw = asdict(release("a")) | {"promoted_at": timestamp, "approval_required": False}
     (tmp_path / "legacy.json").write_text(json.dumps(raw))
     assert records(tmp_path) == []
 
 
-@pytest.mark.parametrize(
-    "timestamp", ["broken", "2026-08-01T00:00:00", "2999-01-01T00:00:00+00:00"]
-)
+@pytest.mark.parametrize("timestamp", ["broken", "2026-08-01T00:00:00"])
 def test_invalid_event_clocks_do_not_approve_managed_content(tmp_path, timestamp):
     model = release("a")
     result = commit(tmp_path, model)
@@ -253,7 +253,11 @@ def test_clock_correction_never_resurrects_superseded_release(tmp_path, monkeypa
     assert records(tmp_path)[0].release["release_id"] == b.release_id
     clock(monkeypatch, corrected + timedelta(hours=2))
     assert records(tmp_path)[0].release["release_id"] == b.release_id
-    assert records(tmp_path, corrected)[0].release["release_id"] == b.release_id
+    assert records(tmp_path, corrected) == []
+    assert (
+        records(tmp_path, corrected + timedelta(hours=1))[0].release["release_id"]
+        == b.release_id
+    )
 
 
 def test_managed_approval_precedes_newer_implicit_legacy(tmp_path, monkeypatch):
@@ -326,7 +330,9 @@ def test_readers_and_retention_use_sequence_after_recent_window(tmp_path, monkey
     ) == set(low.evaluation_ids)
 
 
-def test_past_report_and_retention_exclude_later_approvals(tmp_path, monkeypatch):
+def test_past_report_excludes_later_approvals_but_retention_protects_current(
+    tmp_path, monkeypatch
+):
     from grounded_weather_forecast.reports import evidence, operations
 
     config = write_config(tmp_path)
@@ -337,7 +343,7 @@ def test_past_report_and_retention_exclude_later_approvals(tmp_path, monkeypatch
     clock(monkeypatch, before + timedelta(days=1))
     commit(directory, release("b"))
     assert evidence.record_selection_churn(config, now=before).is_empty()
-    assert operations._protected_evaluations(config, now=before) == {"a"}
+    assert operations._protected_evaluations(config, now=before) == {"a", "b"}
     assert approvals.read_approved_releases(directory, as_of=before)[0][
         "evaluation_ids"
     ] == ["a"]
@@ -368,3 +374,73 @@ def test_snapshot_preserves_unreadable_and_wrong_shape_diagnostics(tmp_path):
     (tmp_path / "array.json").write_text("[]")
     snapshot = approvals.read_approval_snapshot(tmp_path)
     assert {Path(p).name for p in snapshot.issues} == {"broken.json", "array.json"}
+
+
+@pytest.mark.parametrize("legacy_events", [False, True])
+def test_corrected_clock_reapproval_uses_stored_publication_and_visibility_floor(
+    tmp_path, monkeypatch, legacy_events
+):
+    corrected = PAST + timedelta(days=1)
+    fast = corrected + timedelta(hours=1)
+    b = replace(release("b"), promoted_at=fast.isoformat())
+    a = release("a")
+    clock(monkeypatch, fast)
+    first = commit(tmp_path, b)
+    clock(monkeypatch, corrected)
+    commit(tmp_path, a)
+    clock(monkeypatch, corrected + timedelta(minutes=1))
+    # The newly constructed content has an earlier clock; write_once must use
+    # the publication time in the already stored B, not this caller's value.
+    again = commit(tmp_path, release("b"))
+    assert again.disposition == "reapproval" and not again.created
+    for path in (tmp_path / "approvals").glob("*.json"):
+        raw = json.loads(path.read_text())
+        assert approvals.aware_timestamp(raw["visible_at"]) == fast
+        if legacy_events:
+            raw.pop("visible_at")
+            path.write_text(json.dumps(raw))
+    assert records(tmp_path)[0].approval_id == again.approval_id
+    assert records(tmp_path, corrected + timedelta(minutes=2)) == []
+    clock(monkeypatch, fast + timedelta(hours=1))
+    assert records(tmp_path)[0].approval_id == again.approval_id
+    assert records(tmp_path, fast)[0].approval_id == again.approval_id
+    assert first.approval_id != again.approval_id
+
+
+def test_forward_clock_correction_cannot_revert_current_serving(tmp_path, monkeypatch):
+    corrected = PAST + timedelta(days=1)
+    clock(monkeypatch, corrected)
+    first = commit(tmp_path, release("a"))
+    clock(monkeypatch, corrected + timedelta(hours=1))
+    latest = commit(tmp_path, release("b"))
+    clock(monkeypatch, corrected + timedelta(minutes=1))
+    assert records(tmp_path)[0].approval_id == latest.approval_id
+    assert (
+        records(tmp_path, corrected + timedelta(minutes=1))[0].approval_id
+        == first.approval_id
+    )
+
+
+def test_stale_snapshot_reserves_fresh_sequence_and_rechecks_current(tmp_path):
+    a, b = release("a"), release("b")
+    commit(tmp_path, a)
+    snapshot = approvals.read_approval_snapshot(tmp_path)
+    current = snapshot.records()[0]
+    commit(tmp_path, b)
+    before = {p: p.read_bytes() for p in (tmp_path / "approvals").glob("*.json")}
+    with locked_path(tmp_path / ".approval-ledger"):
+        result = approvals.publish_approval(a, tmp_path, current, snapshot=snapshot)
+    assert result.disposition == "reapproval"
+    assert records(tmp_path)[0].sequence == 3
+    assert all(path.read_bytes() == content for path, content in before.items())
+
+
+@pytest.mark.parametrize(
+    "clock_value", ["bad", "2026-08-01T00:00:00", "9999-12-31T23:59:59-05:00"]
+)
+def test_invalid_visibility_clock_cannot_authorize_content(tmp_path, clock_value):
+    first = commit(tmp_path, release("a"))
+    path = tmp_path / "approvals" / f"{first.approval_id}.json"
+    raw = json.loads(path.read_text()) | {"visible_at": clock_value}
+    path.write_text(json.dumps(raw))
+    assert records(tmp_path) == []

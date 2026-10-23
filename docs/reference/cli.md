@@ -23,6 +23,18 @@ parent keeps its maintenance options; the QC child records its own `{"days": N}`
 options. `failure_kind` belongs to the originating stage and is not inherited by
 unrelated child stages.
 
+The additive nullable `failure_details_json` field holds component diagnostics
+(`stage`, `exit_code`, `failure_kind`, `detail`), with each detail normalized and
+capped at 400 characters. A backtest records evaluation and promotion failures
+together in its existing journal row. Real product failures take precedence over
+promotion-only errors and pending outcomes; they stop routine maintenance even
+when promotion also fails. Older rows load with a null field. This does not
+change the daily-report v1 JSON contract or existing summary counters.
+The standalone wrapper supplies an invocation-local private outcome file to its
+backtest child. It checks the recorded classification against the process exit;
+missing or invalid metadata cannot exempt an evaluation failure. The file is
+removed after the stage and does not replace the durable run journal.
+
 ---
 
 ## Global options
@@ -542,9 +554,12 @@ live-gate method changes belong to live backtests. Scientific gates and
 prediction-time safety guards retain their existing constants. The explicit
 library `select_methods` mapping API remains a promotion compatibility adapter;
 `promote_methods` returns `PromotionResult(selections, release_id, created,
-approval_id, approval_changed, disposition, gate_verdicts)`. `disposition` is
+approval_id, approval_changed, disposition, gate_verdicts, provenance)`. `disposition` is
 `none`, `first`, `reapproval`, or `unchanged`; `gate_verdicts` contains typed
-measurements independent of content identity. `created` means immutable content was created;
+measurements independent of content identity. `provenance` captures the diagnostic
+batch's immutable dataset/configuration/code identity. Telemetry is written after
+the approval lock is released and remains best effort even if publication fails.
+`created` means immutable content was created;
 `approval_changed` means a new approval event committed. `approval_id` is nullable
 for legacy implicit approvals. `load_approved_selections` is the read-only serving
 interface. The library prediction marker distinguishes actually loaded approvals
@@ -562,14 +577,21 @@ legacy approvals are accepted only on their recorded dataset, with matching code
 configuration and truth semantics. New `approval_required` release markers are
 outside content identity: managed content without a committed event is ignored.
 Legacy `promoted_at` provides an implicit approval; managed events provide ordered
-`approval_id`, `release_id`, timezone-aware `approved_at`, and locked `sequence`
+`approval_id`, `release_id`, timezone-aware `approved_at`, nullable `visible_at`, and locked `sequence`
 fields in `releases/approvals/`. Serving, incumbent lookup and historical replay
-share timestamp validation and reject malformed, naive, future, and overflowing
-approval clocks. Eligible managed events sort by locked sequence, ahead of implicit
-legacy approvals; legacy approvals sort by publication time. Clock correction
-cannot resurrect an older sequence. One snapshot and visibility cutoff is shared
-throughout promotion; the event records its own commit clock, not the snapshot's
-read clock. Reader `as_of`/report `now` cutoffs exclude later approvals.
+share timestamp validation and reject malformed, naive, and overflowing clocks.
+Current managed approvals sort by committed sequence without wall-clock eligibility
+checks. A corrected clock cannot restore an older decision. Historical readers
+require publication, approval and visibility clocks within the cutoff. New events
+set `visible_at` to the maximum of actual commit time, stored content publication
+time, and preceding managed visibility floors. Older events derive the same floors
+in sequence order without modifying artifacts. Actual clock readings remain in
+`approved_at`; a valid reapproval can precede the stored publication clock.
+Implicit legacy approvals retain publication-time eligibility behind managed events.
+One immutable snapshot is shared throughout promotion and each dashboard render.
+Explicit reader `as_of`/report `now` queries use historical visibility; operational
+retention always protects current approval state. First versus repeated approval
+is determined from committed history, independently of historical eligibility.
 `active_release.json` still records the locally served document.
 Dashboard lineage and retention fallback use this same approval order. Active or
 recently served legacy references can separately protect scores even when their
@@ -589,11 +611,16 @@ Each selection adds nullable `training_cutoff`. Contexts sharing an evaluation I
 merge compatible selected-variable semantics after validating identity; unused
 historical contexts are removed first. Known context-free legacy evaluation IDs
 remain in the reference list. Newly evaluated selections require context.
+A per-selection `legacy_context_missing` marker is inferred only through the
+accepted context-free legacy path. Marked slices stay restricted to their exact
+dataset and never borrow another variable's context. The old literal `"unknown"`
+evaluation placeholder loads as absent provenance. Raw context APIs always validate
+conflicts; a typed validated-context set permits one merge during promotion.
 Conflicts return 1 with `failure_kind="promotion_evidence_conflict"`, evaluation ID,
 field/variable and both values. Missing required context uses
 `promotion_evidence_invalid`. No content or approval is published on either error;
 completed scores and current approvals remain. Routine maintenance continues
-truth-QC/report diagnostics, returns failure, and preserves the success stamp;
+truth-QC/report diagnostics when no evaluation failed, returns failure, and preserves the success stamp;
 recovery cannot complete. Summaries are
 recomputed from the selected slices' available cutoffs; a legacy aggregate cutoff
 is not assigned to individual slices whose cutoff is unknown.
@@ -1003,11 +1030,14 @@ maintenance or recovery process has already restored readiness.
 Retention: the **newest three files per group** (product × kind × window) are
 always kept, as are evaluations referenced by the active release and releases
 within the last **7 days**. If an upgraded installation has no readable active
-pointer, the newest eligible approval under canonical sequence ordering is treated as active.
+pointer, the newest current approval under canonical sequence ordering is protected
+in addition to recent served-document references. An explicit empty/degraded pointer
+keeps its existing meaning and does not trigger the newest-approval fallback.
 Explicit active/recent-served legacy references protect the union of recorded
 and per-selection evaluation IDs even without an acceptable approval clock. This
 retention-only protection never authorizes serving or replay. Unverifiable references
-stop published-score pruning conservatively with a specific reason. Any unreadable
+stop published-score pruning conservatively with a specific reason, including an
+unreadable output named by an output-path-only pointer. Any unreadable
 or non-object release JSON file suspends published-score deletion, even if it is
 not active: its age and evidence references cannot be verified. The diagnostic
 names the affected paths; invalid references name the release ID. This applies

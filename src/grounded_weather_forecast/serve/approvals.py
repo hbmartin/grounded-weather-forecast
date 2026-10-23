@@ -16,6 +16,7 @@ from grounded_weather_forecast.evaluation import ModelRelease
 from grounded_weather_forecast.storage import atomic_write_text
 
 type ApprovalDisposition = Literal["none", "first", "reapproval", "unchanged"]
+type ApprovalMode = Literal["current", "historical"]
 
 
 def aware_timestamp(value: object) -> datetime | None:
@@ -34,6 +35,7 @@ class ApprovalEvent:
     release_id: str
     approved_at: str
     sequence: int
+    visible_at: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -42,6 +44,7 @@ class ApprovedRelease:
     approved_at: datetime
     sequence: int = 0
     approval_id: str | None = None
+    visible_at: datetime | None = None
 
     @property
     def order(self) -> tuple[bool, int, datetime, str]:
@@ -57,6 +60,7 @@ class ApprovedRelease:
             "approved_at": self.approved_at.isoformat(),
             "approval_id": self.approval_id,
             "approval_sequence": self.sequence,
+            "visible_at": (self.visible_at or self.approved_at).isoformat(),
         }
 
 
@@ -84,6 +88,10 @@ def _events(directory: Path) -> list[ApprovalEvent]:
                 and event.approval_id == path.stem
                 and event.approval_id == f"{event.sequence:020d}-{event.release_id}"
                 and aware_timestamp(event.approved_at) is not None
+                and (
+                    event.visible_at is None
+                    or aware_timestamp(event.visible_at) is not None
+                )
             ):
                 events.append(event)
     return events
@@ -105,14 +113,38 @@ class ApprovalSnapshot:
     cutoff: datetime
     reserved_sequence: int
     issues: tuple[str, ...] = ()
+    mode: ApprovalMode = "current"
+
+    def visibility(self) -> dict[str, datetime]:
+        """Conservative sequence-prefix floors, including pre-watermark events."""
+        publications = {
+            str(raw.get("release_id")): aware_timestamp(raw.get("promoted_at"))
+            for raw in self.releases
+        }
+        floor = datetime.min.replace(tzinfo=UTC)
+        visible = {}
+        for event in sorted(self.events, key=lambda event: event.sequence):
+            moment = aware_timestamp(event.approved_at)
+            stored = aware_timestamp(event.visible_at)
+            if moment is None or (event.visible_at is not None and stored is None):
+                continue
+            floor = max(
+                floor,
+                moment,
+                stored or moment,
+                publications.get(event.release_id) or moment,
+            )
+            visible[event.approval_id] = floor
+        return visible
 
     def records(
         self, releases: Sequence[dict[str, object]] | None = None
     ) -> list[ApprovedRelease]:
         latest: dict[str, ApprovalEvent] = {}
+        visibility = self.visibility()
         for event in self.events:
-            moment = aware_timestamp(event.approved_at)
-            if moment is None or moment > self.cutoff:
+            visible = visibility.get(event.approval_id)
+            if visible is None or (self.mode == "historical" and visible > self.cutoff):
                 continue
             previous = latest.get(event.release_id)
             if previous is None or event.sequence > previous.sequence:
@@ -120,26 +152,35 @@ class ApprovalSnapshot:
         approved = []
         for raw in self.releases if releases is None else releases:
             published = aware_timestamp(raw.get("promoted_at"))
-            if (
-                not isinstance(raw.get("release_id"), str)
-                or published is None
-                or published > self.cutoff
-            ):
+            if not isinstance(raw.get("release_id"), str) or published is None:
                 continue
             event = latest.get(str(raw["release_id"]))
             if event is not None:
                 moment = aware_timestamp(event.approved_at)
-                if moment is not None and moment >= published:
+                if moment is not None:
                     approved.append(
-                        ApprovedRelease(raw, moment, event.sequence, event.approval_id)
+                        ApprovedRelease(
+                            raw,
+                            moment,
+                            event.sequence,
+                            event.approval_id,
+                            visibility[event.approval_id],
+                        )
                     )
-            elif raw.get("approval_required", False) is False:
+            elif (
+                raw.get("approval_required", False) is False
+                and published <= self.cutoff
+            ):
                 approved.append(ApprovedRelease(raw, published))
         return sorted(approved, key=lambda item: item.order, reverse=True)
 
 
 def read_approval_snapshot(
-    directory: Path, *, as_of: datetime | None = None, legacy_references: bool = False
+    directory: Path,
+    *,
+    as_of: datetime | None = None,
+    legacy_references: bool = False,
+    mode: ApprovalMode | None = None,
 ) -> ApprovalSnapshot:
     moment = datetime.now(UTC)
     cutoff = min(as_of, moment) if as_of is not None else moment
@@ -163,6 +204,7 @@ def read_approval_snapshot(
         cutoff,
         _reserved_sequence(directory),
         tuple(issues),
+        mode or ("historical" if as_of is not None else "current"),
     )
 
 
@@ -181,18 +223,34 @@ def publish_approval(
     snapshot: ApprovalSnapshot | None = None,
 ) -> ApprovalCommit:
     """Caller holds the ledger lock; commit the event after immutable content."""
+    snapshot = snapshot or read_approval_snapshot(directory)
+    reserved = _reserved_sequence(directory)
+    if reserved > snapshot.reserved_sequence:
+        snapshot = read_approval_snapshot(directory)
+        records = snapshot.records()
+        current = records[0] if records else None
     if current is not None and current.release["release_id"] == release.release_id:
         return ApprovalCommit(approval_id=current.approval_id, disposition="unchanged")
-    snapshot = snapshot or read_approval_snapshot(directory)
     prior = any(
         record.release["release_id"] == release.release_id
-        for record in snapshot.records()
+        for record in replace(snapshot, mode="current").records()
     )
-    _, created = replace(release, approval_required=True).write_once(directory)
-    sequence = snapshot.reserved_sequence + 1
+    path, created = replace(release, approval_required=True).write_once(directory)
+    published = aware_timestamp(
+        json.loads(path.read_text(encoding="utf-8")).get("promoted_at")
+    )
+    if published is None:
+        raise ValueError(f"release {release.release_id}: invalid publication clock")
+    moment = datetime.now(UTC)
+    visible = max(moment, published, *snapshot.visibility().values())
+    sequence = max(snapshot.reserved_sequence, reserved) + 1
     approval_id = f"{sequence:020d}-{release.release_id}"
     event = ApprovalEvent(
-        approval_id, release.release_id, datetime.now(UTC).isoformat(), sequence
+        approval_id,
+        release.release_id,
+        moment.isoformat(),
+        sequence,
+        visible.isoformat(),
     )
     atomic_write_text(
         json.dumps(asdict(event), indent=2),
@@ -231,10 +289,14 @@ def approval_sort_key(release: Mapping[str, object]) -> tuple[bool, int, datetim
 
 
 def read_approved_releases(
-    directory: Path, *, as_of: datetime | None = None, legacy_references: bool = False
+    directory: Path,
+    *,
+    as_of: datetime | None = None,
+    legacy_references: bool = False,
+    mode: ApprovalMode | None = None,
 ) -> list[dict[str, object]]:
     snapshot = read_approval_snapshot(
-        directory, as_of=as_of, legacy_references=legacy_references
+        directory, as_of=as_of, legacy_references=legacy_references, mode=mode
     )
     return [
         record.payload()

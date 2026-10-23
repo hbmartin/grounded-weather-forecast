@@ -1591,7 +1591,7 @@ def test_partial_context_identity_does_not_invent_other_field(column):
 
 
 @pytest.mark.parametrize("future_clock", ["publication", "approval"])
-def test_approved_loader_orders_sequences_and_rejects_future(
+def test_current_loader_uses_sequence_and_historical_loader_rejects_future(
     approved_archive, monkeypatch, future_clock
 ):
     from grounded_weather_forecast.serve import approvals
@@ -1622,6 +1622,9 @@ def test_approved_loader_orders_sequences_and_rejects_future(
         event = json.loads(event_path.read_text())
         raw = first_raw if event["release_id"] == initial.release_id else second_raw
         event["approved_at"] = raw["promoted_at"]
+        event.pop(
+            "visible_at", None
+        )  # Exercise older events without visibility metadata.
         event_path.write_text(json.dumps(event))
     loaded = selection_module.load_approved_selections(config)
     assert loaded[("hourly", "temp_c", "24-48h")].evaluation_id == "new-evaluation"
@@ -1636,6 +1639,8 @@ def test_approved_loader_orders_sequences_and_rejects_future(
                 event["approved_at"] = future
                 event_path.write_text(json.dumps(event))
     loaded = selection_module.load_approved_selections(config)
+    assert loaded[("hourly", "temp_c", "24-48h")].evaluation_id == "new-evaluation"
+    loaded = selection_module.load_approved_selections(config, as_of=cutoff)
     assert loaded[("hourly", "temp_c", "24-48h")].evaluation_id == "hour-original"
 
 
@@ -2070,6 +2075,99 @@ def test_conflict_maintenance_continues_diagnostics_and_is_not_pending(
     assert called == ["truth-qc", "report"]
 
 
+@pytest.mark.parametrize(
+    "products",
+    [
+        "hourly,daily,minutely",
+        "hourly,minutely,daily",
+        "daily,hourly,minutely",
+        "daily,minutely,hourly",
+        "minutely,hourly,daily",
+        "minutely,daily,hourly",
+    ],
+)
+def test_product_failure_survives_promotion_conflict_and_stops_maintenance(
+    approved_archive, monkeypatch, products
+):
+    from grounded_weather_forecast import cli, runs
+    from grounded_weather_forecast.backtest.outcomes import ProductBacktestOutcome
+
+    config, _, _, _, initial = approved_archive
+    _conflicting_daily_approval(config, initial)
+    called = []
+
+    def evaluate(_config, _args, product, _methods):
+        called.append(product)
+        if product == "daily":
+            return ProductBacktestOutcome(
+                product, "failed", error_detail="daily evaluation fixture"
+            )
+        if product == "minutely":
+            return ProductBacktestOutcome(
+                product, "pending", pending_reason="awaiting_truth"
+            )
+        return ProductBacktestOutcome(product, "evaluated", 10)
+
+    monkeypatch.setattr(cli, "_evaluate_product", evaluate)
+    monkeypatch.setattr(cli, "load_config", lambda *_a: config)
+    monkeypatch.setattr(cli, "_cmd_build_dataset", lambda *_a: 0)
+    monkeypatch.setattr(
+        cli, "_cmd_truth_qc", lambda *_a: called.append("truth-qc") or 0
+    )
+    monkeypatch.setattr(cli, "_cmd_report", lambda *_a: called.append("report") or 0)
+    directory = config.artifacts_dir / "releases"
+    before = {p: p.read_bytes() for p in directory.rglob("*.json")}
+    assert (
+        cli.main(["maintain", "--products", products, "--methods", "equal_weight"]) == 1
+    )
+    assert called == products.split(",")
+    journal = runs.load_runs(runs.runs_path(config))
+    parents = journal.filter(pl.col("record_kind") == "invocation")
+    assert parents["failure_kind"].to_list() == ["backtest_product_failed"]
+    details = json.loads(parents["failure_details_json"][0])
+    assert [(d["stage"], d["failure_kind"]) for d in details] == [
+        ("daily", "backtest_product_failed"),
+        ("promotion", "promotion_evidence_conflict"),
+    ]
+    assert details[0]["detail"] == "daily evaluation fixture"
+    assert "hour-original" in details[1]["detail"]
+    assert before == {p: p.read_bytes() for p in directory.rglob("*.json")}
+
+
+@pytest.mark.parametrize(
+    "products",
+    ["hourly,daily,minutely", "daily,minutely,hourly", "minutely,hourly,daily"],
+)
+def test_completed_product_promotes_independently_of_failed_product(
+    approved_archive, monkeypatch, products
+):
+    from grounded_weather_forecast import cli
+    from grounded_weather_forecast.backtest.outcomes import ProductBacktestOutcome
+
+    config, _, _, evaluate, initial = approved_archive
+    evaluate("hourly", "completed-hourly", 2)
+
+    def run(_config, _args, product, _methods):
+        return (
+            ProductBacktestOutcome(product, "evaluated", 10)
+            if product == "hourly"
+            else ProductBacktestOutcome(
+                product, "failed", error_detail=f"{product} fixture"
+            )
+        )
+
+    monkeypatch.setattr(cli, "_evaluate_product", run)
+    args = cli.build_parser().parse_args(
+        ["backtest", "--products", products, "--methods", "equal_weight"]
+    )
+    result = cli._cmd_backtest(config, args)
+    assert result.exit_code == 1 and result.failure_kind == "backtest_product_failed"
+    loaded = selection_module.load_approved_selections(config)
+    assert loaded[("hourly", "temp_c", "24-48h")].evaluation_id == "completed-hourly"
+    daily = ("daily", "temp_max_c", "D1")
+    assert loaded[daily].evaluation_id == initial.selections[daily].evaluation_id
+
+
 def test_missing_new_context_is_an_explicit_error():
     from grounded_weather_forecast.serve.evidence import (
         EvidenceSummary,
@@ -2081,12 +2179,36 @@ def test_missing_new_context_is_an_explicit_error():
         EvidenceSummary.from_payloads((), {key: None}, {key: "missing"})
     assert failure.value.failure_kind == "promotion_evidence_invalid"
     summary = EvidenceSummary.from_payloads(
-        (), {key: None}, {key: "legacy"}, legacy_missing=frozenset({"legacy"})
+        (), {key: None}, {key: "legacy"}, legacy_missing=frozenset({key})
     )
     assert summary.evaluation_ids == ("legacy",) and summary.contexts == ()
     assert (
         EvidenceSummary.from_payloads((), {key: None}, {key: None}).evaluation_ids == ()
     )
+
+
+def test_raw_context_apis_cannot_bypass_conflict_validation():
+    from grounded_weather_forecast.serve.evidence import (
+        EvidenceSummary,
+        PromotionEvidenceError,
+        ValidatedContexts,
+    )
+
+    raw = {
+        "evaluation_id": "evaluation",
+        "code_version": "one",
+        "semantics": {"temp_c": "inst"},
+    }
+    conflicting = raw | {"code_version": "two"}
+    for construct in (
+        ValidatedContexts,
+        lambda payloads: EvidenceSummary.from_payloads(payloads, {}, {}),
+    ):
+        with pytest.raises(PromotionEvidenceError, match="code_version"):
+            construct((raw, conflicting))
+    validated = ValidatedContexts((raw,))
+    with pytest.raises(TypeError):
+        validated.contexts["evaluation"]["code_version"] = "changed"
 
 
 def test_context_free_carried_selection_keeps_reference_in_combined_release(
@@ -2137,6 +2259,89 @@ def test_one_approval_snapshot_is_read_per_promotion(approved_archive, monkeypat
     assert len(calls) == 1
 
 
+def test_legacy_missing_context_is_per_slice_and_round_trips_without_source_releases(
+    approved_archive,
+):
+    config, frames, publish, evaluate, initial = approved_archive
+    humidity = ("hourly", "humidity_pct", "24-48h")
+
+    def humidity_without_context(raw):
+        selected = raw["selections"]["hourly.temp_c.24-48h"]
+        raw["selections"] = {".".join(humidity): selected}
+        raw["evaluation_ids"] = ["hour-original"]
+        raw["evaluation_contexts"] = []
+
+    _legacy_copy(config, initial, humidity_without_context)
+    evaluate("hourly", "hour-original", 2)
+    path = scores_path(
+        config.dataset.dir / "scores", "hourly", "live", "expanding", "hour-original"
+    )
+    scores = pl.read_parquet(path).with_columns(
+        (
+            pl.col("y_pred")
+            + pl.when(pl.col("method_id") == "inverse_mse").then(2.0).otherwise(0.0)
+        ).alias("y_pred")
+    )
+    scores.write_parquet(path)
+    result = selection_module.promote_methods(
+        config, config.dataset.dir / "scores", products=frozenset({"hourly"})
+    )
+    assert result.created
+    directory = config.artifacts_dir / "releases"
+    raw = json.loads((directory / f"{result.release_id}.json").read_text())
+    assert raw["selections"][".".join(humidity)]["legacy_context_missing"]
+    assert "legacy_context_missing" not in raw["selections"]["hourly.temp_c.24-48h"]
+    assert (
+        "humidity_pct"
+        not in next(
+            c
+            for c in raw["evaluation_contexts"]
+            if c["evaluation_id"] == "hour-original"
+        )["semantics"]
+    )
+    for path in directory.glob("*.json"):
+        if path.stem != result.release_id:
+            path.unlink()
+    loaded = selection_module.load_approved_selections(config, matrices=frames)
+    assert loaded[humidity].evaluation_id == "hour-original"
+    assert loaded[humidity].legacy_context_missing
+    assert not loaded[("hourly", "temp_c", "24-48h")].legacy_context_missing
+    frames["hourly"] = frames["hourly"].with_columns(
+        pl.col("issue_time") + pl.duration(hours=1)
+    )
+    publish()
+    loaded = selection_module.load_approved_selections(config, matrices=frames)
+    assert (
+        humidity not in loaded
+    )  # No cross-dataset authorization from temperature's context.
+    assert ("hourly", "temp_c", "24-48h") in loaded
+
+
+def test_unknown_legacy_evaluation_is_missing_provenance(approved_archive):
+    config, _, _, evaluate, initial = approved_archive
+
+    def unknown_daily(raw):
+        selected = raw["selections"]["daily.temp_max_c.D1"]
+        selected["evaluation_id"] = "unknown"
+        selected.pop("training_cutoff", None)
+        raw["selections"] = {"daily.temp_max_c.D1": selected}
+        raw["evaluation_ids"] = ["unknown"]
+        raw["evaluation_contexts"] = []
+
+    _legacy_copy(config, initial, unknown_daily)
+    evaluate("hourly", "replacement", 2)
+    result = selection_module.promote_methods(
+        config, config.dataset.dir / "scores", products=frozenset({"hourly"})
+    )
+    choice = result.selections[("daily", "temp_max_c", "D1")]
+    assert choice.evaluation_id is None and choice.training_cutoff is None
+    raw = json.loads(
+        (config.artifacts_dir / "releases" / f"{result.release_id}.json").read_text()
+    )
+    assert "unknown" not in raw["evaluation_ids"]
+    assert raw["selections"]["daily.temp_max_c.D1"]["evaluation_id"] is None
+
+
 def test_blocked_gate_measurements_do_not_rotate_approval(
     approved_archive, monkeypatch
 ):
@@ -2179,6 +2384,71 @@ def test_blocked_gate_measurements_do_not_rotate_approval(
     )
     assert ledger["live_mae"].to_list() == [20.0, 21.0]
     assert ledger["n"].to_list() == [30, 31]
+
+
+@pytest.mark.parametrize("publication_fails", [False, True])
+def test_gate_telemetry_uses_supplied_identity_after_unlock_even_on_publication_error(
+    approved_archive, monkeypatch, publication_fails
+):
+    from grounded_weather_forecast.reports import evidence
+    from grounded_weather_forecast.storage import locked_path
+
+    config, _, _, evaluate, _ = approved_archive
+    evaluate("hourly", "replacement", 2)
+    scanned = selection_module._load_evidence(
+        config, config.dataset.dir / "scores", None, None
+    )
+    monkeypatch.setattr(selection_module, "_load_evidence", lambda *_a: scanned)
+
+    def gate(choices, *_a, diagnostics, **_k):
+        key, choice = next(iter(choices.items()))
+        diagnostics.append(
+            selection_module.GateVerdict(
+                *key,
+                choice.method_id,
+                choice.evaluation_id,
+                choice.release_id,
+                "blocked",
+                "fixture",
+                10.0,
+                1.0,
+                30,
+            )
+        )
+        return choices
+
+    monkeypatch.setattr(selection_module, "apply_live_gate", gate)
+    original = evidence.record_live_gate
+    recorded = []
+
+    def record(*args, **kwargs):
+        with locked_path(
+            config.artifacts_dir / "releases" / ".approval-ledger", timeout=0
+        ):
+            recorded.append(kwargs["provenance"])
+        original(*args, **kwargs)
+
+    monkeypatch.setattr(evidence, "record_live_gate", record)
+    if publication_fails:
+
+        def fail(*_a, **_k):
+            raise OSError("approval publication fixture")
+
+        monkeypatch.setattr(selection_module, "publish_approval", fail)
+        with pytest.raises(OSError, match="approval publication fixture"):
+            selection_module.promote_methods(
+                config, config.dataset.dir / "scores", dataset_id="supplied-snapshot"
+            )
+    else:
+        selection_module.promote_methods(
+            config, config.dataset.dir / "scores", dataset_id="supplied-snapshot"
+        )
+    assert len(recorded) == 1 and recorded[0].dataset_fingerprint == "supplied-snapshot"
+    ledger = evidence.read_ledger(
+        evidence.ledger_path(config, evidence.LIVE_GATE_LEDGER),
+        evidence.LIVE_GATE_SCHEMA,
+    )
+    assert ledger["dataset_fingerprint"].to_list() == ["supplied-snapshot"]
 
 
 def test_first_approval_of_orphan_is_not_logged_as_reapproval(

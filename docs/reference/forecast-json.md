@@ -296,10 +296,16 @@ Serialization uses `allow_nan=False`: a missing value is JSON `null`, never
 ## Approval metadata compatibility
 
 Release content is immutable and new release objects require committed approval
-events. Event sequence determines which eligible approval is current; timestamps
-bound historical visibility. Legacy JSON without `approval_required` retains
+events. Current managed approvals follow committed sequence across clock
+corrections. Historical queries require publication, approval and the conservative
+`visible_at` floor within their cutoff. Missing `visible_at` fields derive floors
+in sequence order without rewrites. Malformed, naive and overflowing clocks remain
+invalid. Legacy JSON without `approval_required` retains
 implicit approval only with an acceptable aware publication timestamp. This does
 not change forecast schema 6 or `active_release.json` attribution. Context-free
-legacy selections remain limited to their recorded dataset; known evaluation IDs
-are retained for evidence protection. Gate measurements live in diagnostic history
+legacy selections remain limited to their recorded dataset. Per-slice
+`legacy_context_missing` markers preserve that restriction alongside modern
+contexts sharing an evaluation ID; historical `"unknown"` IDs mean absent
+provenance. Known evaluation IDs are retained for evidence protection.
+Gate measurements live in diagnostic history
 and do not rotate release identity when the incumbent remains approved.

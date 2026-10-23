@@ -3,6 +3,7 @@
 import argparse
 import sys
 from collections.abc import Callable, Mapping, Sequence
+from dataclasses import replace
 from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 
@@ -11,6 +12,7 @@ import polars as pl
 from grounded_weather_forecast import __version__
 from grounded_weather_forecast.backtest.outcomes import (
     BacktestDiagnostics,
+    BacktestResult,
     ProductBacktestOutcome,
 )
 from grounded_weather_forecast.config import Config, ConfigError, load_config
@@ -20,7 +22,13 @@ from grounded_weather_forecast.contracts import (
     VariableSpec,
 )
 from grounded_weather_forecast.serve.schema import Forecast
-from grounded_weather_forecast.status import EXIT_NO_FOLDS, CommandOutcome
+from grounded_weather_forecast.status import (
+    EXIT_NO_FOLDS,
+    CommandOutcome,
+    ComponentDiagnostic,
+    failure_details_json,
+    write_outcome_hint,
+)
 
 HOURLY_DEFAULT_VARIABLES = (
     "temp_c,humidity_pct,dew_point_c,wind_speed_ms,wind_gust_ms,"
@@ -1181,18 +1189,29 @@ def _cmd_backtest(config: Config, args: argparse.Namespace) -> CommandOutcome:
         PromotionEvidenceError,
     )
 
+    result = BacktestResult()
     try:
-        return _backtest_products(config, args)
+        return _backtest_products(config, args, result=result)
     except (PromotionEvidenceError,) as error:  # noqa: B013
         print(f"promotion failed: {error}", file=sys.stderr)
-        return CommandOutcome(1, error.failure_kind, str(error))
+        result.promotion = CommandOutcome(
+            1,
+            error.failure_kind,
+            str(error),
+            (ComponentDiagnostic("promotion", 1, error.failure_kind, str(error)),),
+        )
+        return result.command()
     except (ScoreCoordinationProbeError,) as error:  # noqa: B013
         detail = "; ".join((str(error), *getattr(error, "__notes__", ())))
         print(detail, file=sys.stderr)
-        return CommandOutcome(1, "score_coordination_probe", detail)
+        return _fatal_backtest(
+            result, CommandOutcome(1, "score_coordination_probe", detail)
+        )
     except (ScoreCoordinationTimeout,) as error:  # noqa: B013
         print(f"score directory coordination timed out: {error}", file=sys.stderr)
-        return CommandOutcome(EXIT_CONTENTION, error_detail=str(error))
+        return _fatal_backtest(
+            result, CommandOutcome(EXIT_CONTENTION, error_detail=str(error))
+        )
     except (ScoreCoordinationReleaseError,) as error:  # noqa: B013
         if error.partial_result is not None:
             partial = error.partial_result
@@ -1201,10 +1220,29 @@ def _cmd_backtest(config: Config, args: argparse.Namespace) -> CommandOutcome:
                 print(f"skipped {note}")
         detail = "; ".join((str(error), *getattr(error, "__notes__", ())))
         print(detail, file=sys.stderr)
-        return CommandOutcome(1, "score_coordination_release", detail)
+        return _fatal_backtest(
+            result, CommandOutcome(1, "score_coordination_release", detail)
+        )
 
 
-def _backtest_products(config: Config, args: argparse.Namespace) -> CommandOutcome:
+def _fatal_backtest(result: BacktestResult, outcome: CommandOutcome) -> CommandOutcome:
+    return replace(
+        outcome,
+        diagnostics=(
+            *result.product_diagnostics(),
+            ComponentDiagnostic(
+                "coordination",
+                outcome.exit_code,
+                outcome.failure_kind,
+                outcome.error_detail,
+            ),
+        ),
+    )
+
+
+def _backtest_products(
+    config: Config, args: argparse.Namespace, *, result: BacktestResult | None = None
+) -> CommandOutcome:
     from grounded_weather_forecast.backtest.score_storage import (  # noqa: PLC0415
         cleanup_score_temporaries,
     )
@@ -1234,7 +1272,8 @@ def _backtest_products(config: Config, args: argparse.Namespace) -> CommandOutco
     promotion_semantics = _semantics_by_variable(
         config, args.semantics, HOURLY_VARIABLES
     )
-    outcomes: list[ProductBacktestOutcome] = []
+    result = result or BacktestResult()
+    outcomes = result.products
     for product in products:
         outcome = _evaluate_product(config, args, product, methods)
         outcomes.append(outcome)
@@ -1268,19 +1307,14 @@ def _backtest_products(config: Config, args: argparse.Namespace) -> CommandOutco
             print("retained approved selections; no new model release")
         else:
             print("no eligible model release promoted")
-    if failed := next(
-        (outcome for outcome in outcomes if outcome.status == "failed"), None
+    if not total and not any(
+        outcome.status in {"failed", "pending"} for outcome in outcomes
     ):
-        return CommandOutcome(failed.exit_code, error_detail=failed.error_detail)
-    if any(outcome.status == "pending" for outcome in outcomes):
-        return CommandOutcome(EXIT_NO_FOLDS, "no_folds")
-    if not total:
         print(
             "no requested product is applicable to this source and method selection",
             file=sys.stderr,
         )
-        return CommandOutcome(2)
-    return CommandOutcome()
+    return result.command()
 
 
 def _evaluate_product(
@@ -1750,6 +1784,7 @@ def _run_pipeline_steps(
                 parent_run_id=_parent_run_id(args),
                 failure_kind=result.failure_kind if result is not None else None,
                 error_detail=result.error_detail if result is not None else None,
+                diagnostics=result.diagnostics if result is not None else (),
             )
         if (
             tolerate_pending
@@ -1985,6 +2020,7 @@ def _record_run(
     parent_run_id: str | None = None,
     failure_kind: str | None = None,
     error_detail: str | None = None,
+    diagnostics: tuple[ComponentDiagnostic, ...] = (),
 ) -> None:
     """Append this invocation to the run ledger; never raises."""
     try:
@@ -2020,6 +2056,7 @@ def _record_run(
             parent_run_id=parent_run_id,
             failure_kind=failure_kind,
             error_detail=(str(error) if error is not None else error_detail),
+            failure_details_json=failure_details_json(diagnostics),
         )
         runs.append_run(record, runs.runs_path(config))
     except (Exception,):  # noqa: B013 - project style requires tuple clauses
@@ -2044,6 +2081,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         outcome = CommandOutcome.normalize(_dispatch(config, args, parser))
         return outcome.exit_code
     finally:
+        if args.command == "backtest" and outcome is not None:
+            write_outcome_hint(outcome)
         _record_run(
             config,
             args,
@@ -2051,6 +2090,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             exit_code=outcome.exit_code if outcome is not None else None,
             failure_kind=outcome.failure_kind if outcome is not None else None,
             error_detail=outcome.error_detail if outcome is not None else None,
+            diagnostics=outcome.diagnostics if outcome is not None else (),
         )
 
 

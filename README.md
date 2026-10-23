@@ -109,8 +109,11 @@ choices still pass the live gate; pending, failed, and unrequested products reta
 their approvals. Immutable release content has separate ordered approval events:
 A → B → A reapproves A, while A → A adds no event. Event-managed releases are not
 visible before their approval commits. Committed sequence determines approval
-order; timestamps constrain visibility, so clock correction cannot resurrect a
-superseded decision. New release objects require an event by default; legacy JSON
+order for current serving, even across clock corrections. Historical reads use
+conservative `visible_at` floors: the maximum of the actual approval clock,
+stored content publication clock, and preceding managed visibility times.
+Older events derive these floors without rewrites. Malformed, timezone-less,
+and overflowing clocks remain invalid. New release objects require an event by default; legacy JSON
 without the marker retains implicit approval. First approval of existing content
 is distinguished from reapproval. An unchanged release is not reported as newly promoted. Input hashes remain mandatory when a manifest is
 present; missing or malformed maturity clocks do not prevent positive scoring.
@@ -122,8 +125,13 @@ Blocked live-gate measurements are recorded in `artifacts/history/live_gate.parq
 and shown in the dashboard, without changing carried approval reasons or creating
 new releases. Known legacy evaluation references remain protected even without
 full contexts; explicit active/recent-served legacy references protect scores
-without authorizing serving. Churn keeps publication and approval clocks separate,
+without authorizing serving. A per-slice `legacy_context_missing` marker preserves
+exact-dataset restrictions when other selected variables share the evaluation ID.
+The historical `"unknown"` placeholder remains missing provenance. Churn keeps publication and approval clocks separate,
 with additive nullable approval timestamps, sequences and a clock-schema version.
+If the active pointer is unavailable, retention protects both the newest current
+approval and recent served references. Unreadable explicitly referenced outputs
+suspend published-score deletion.
 
 The hourly wrapper publishes even if optional restore launch fails, then returns
 1 so monitoring sees that failure. Startup/configuration errors return 2; later
@@ -157,6 +165,9 @@ scheduled `maintain` waits for it and holds it across the whole transaction.
 Build and ordinary backtest failures stop CLI maintenance. Promotion-evidence
 failures preserve completed scores and allow truth-QC/report diagnostics, while
 maintenance still returns failure. Coordination failures still stop immediately.
+Evaluation failures outrank promotion-only errors; both are recorded in the nullable
+`failure_details_json` run-ledger field. Completed independent products may still
+promote when another product fails, unless coordination or evidence validation prevents it.
 Conflicting selected provenance blocks every approval change and records
 `promotion_evidence_conflict`; missing new evaluation context records
 `promotion_evidence_invalid`. Neither failure advances the success stamp. Insufficient-history

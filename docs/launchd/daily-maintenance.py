@@ -28,6 +28,11 @@ from collections.abc import Iterator, Sequence
 from contextlib import contextmanager
 from datetime import UTC, datetime
 from pathlib import Path
+from tempfile import TemporaryDirectory
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from grounded_weather_forecast.status import CommandOutcome
 
 from launchd_paths import (
     RuntimePathError,
@@ -145,6 +150,26 @@ def run_stage(step: list[str], paths: RuntimePaths) -> int:
     return code
 
 
+def backtest_stage(step: list[str], paths: RuntimePaths) -> "CommandOutcome":
+    from grounded_weather_forecast.status import (  # noqa: PLC0415
+        COMMAND_OUTCOME_PATH,
+        read_outcome_hint,
+    )
+
+    with TemporaryDirectory(prefix="gwf-stage-") as directory:
+        path = Path(directory) / "outcome.json"
+        previous = os.environ.get(COMMAND_OUTCOME_PATH)
+        os.environ[COMMAND_OUTCOME_PATH] = str(path)
+        try:
+            code = run_stage(step, paths)
+        finally:
+            if previous is None:
+                os.environ.pop(COMMAND_OUTCOME_PATH, None)
+            else:
+                os.environ[COMMAND_OUTCOME_PATH] = previous
+        return read_outcome_hint(path, code)
+
+
 @contextmanager
 def maintenance_lock(stamp: Path) -> Iterator[bool]:
     """Prepare startup state without reclassifying later stage exceptions."""
@@ -168,6 +193,8 @@ def maintain(stamp: Path, *, restore: bool, paths: RuntimePaths) -> int:
     try:
         from grounded_weather_forecast.status import (  # noqa: PLC0415 -- guarded startup
             EXIT_NO_FOLDS,
+            CommandOutcome,
+            read_outcome_hint as _read_outcome_hint,
         )
     except (ImportError,) as exc:  # noqa: B013 -- project convention
         raise RuntimePathError(f"maintenance runtime unavailable: {exc}") from exc
@@ -214,7 +241,12 @@ def maintain(stamp: Path, *, restore: bool, paths: RuntimePaths) -> int:
             if name == "prune-scores" and "report" in failed_stages:
                 print("== prune-scores skipped: report failed this run ==", flush=True)
                 continue
-            code = run_stage(step, paths)
+            outcome = CommandOutcome.normalize(
+                backtest_stage(step, paths)
+                if name == "backtest"
+                else run_stage(step, paths)
+            )
+            code = outcome.exit_code
             if name == "backtest" and code == EXIT_NO_FOLDS:
                 pending.append(label)
                 print(
@@ -224,6 +256,12 @@ def maintain(stamp: Path, *, restore: bool, paths: RuntimePaths) -> int:
             if code != 0:
                 failures.append(label)
                 failed_stages.add(name)
+                if name == "backtest" and outcome.failure_kind not in {
+                    "promotion_evidence_conflict",
+                    "promotion_evidence_invalid",
+                }:
+                    print(f"maintenance stopped: {label} evaluation failed", flush=True)
+                    break
         if failures:
             print(f"maintenance failed stages: {', '.join(failures)}", flush=True)
             return 1

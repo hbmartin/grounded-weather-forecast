@@ -46,10 +46,16 @@ is unchanged. New content carries `approval_required` outside its content hash a
 is invisible until its event commits. Legacy releases retain implicit approval through
 `promoted_at`. All readers use the same aware timestamp validation and ordering;
 historical replay considers only events available by its cutoff. Managed event
-sequence determines supersession; aware clocks determine visibility. Eligible
-managed events precede implicit legacy approvals, which retain publication-time
-ordering. A corrected wall clock cannot revive a lower sequence. Approval events
-use their commit clock, not the earlier promotion snapshot clock. New objects
+sequence determines current supersession without wall-clock eligibility checks.
+Historical visibility is conservative: additive `visible_at` is the maximum of
+actual approval time, stored content publication time, and preceding managed
+visibility floors. Historical reads require all three clocks within the cutoff.
+Older events derive floors in sequence order without artifact rewrites. Malformed,
+timezone-less and overflowing clocks remain invalid. Managed events precede
+implicit legacy approvals, which retain publication-time eligibility and ordering.
+A corrected wall clock cannot revive a lower current sequence or invalidate a
+legitimate reapproval predating stored publication. Approval events keep their
+actual commit clock in `approved_at`, not the earlier snapshot clock. New objects
 require approvals by default; only legacy read compatibility supplies an implicit
 approval for missing markers. First approval and reapproval are distinct outcomes.
 
@@ -60,11 +66,19 @@ identity. Each selected slice preserves its available training cutoff; summaries
 recomputed after replacements, without borrowing a legacy aggregate for an unknown
 slice. Context-free legacy choices can justify only their identical recorded dataset,
 and retain known evaluation references without invented context or cutoffs.
+An additive per-slice `legacy_context_missing` marker prevents modern contexts
+sharing an evaluation ID from authorizing a context-free legacy slice on a newer
+dataset. Historical `"unknown"` evaluation placeholders are absent provenance.
 Final selected contexts are merged once; unused historical contexts cannot poison
 promotion. Conflicts fail the transaction with typed diagnostics and exit 1,
-preserving scores and approvals while maintenance continues diagnostics.
+preserving scores and approvals while maintenance continues diagnostics if the
+evaluations succeeded. Real evaluation failures outrank promotion errors and stop
+maintenance. Typed component diagnostics preserve both in nullable
+`failure_details_json` without duplicate per-product run rows.
 Blocked gate measurements are separate best-effort telemetry, so changing MAE or
-sample count cannot create diagnostic-only approval churn.
+sample count cannot create diagnostic-only approval churn. Promotion captures
+diagnostic identity once and writes telemetry after releasing the approval lock,
+independently of approval publication success.
 
 Release fields are additive. Older single-dataset ledgers remain readable using
 their recorded provenance; missing evaluation context is not invented. The active
@@ -98,6 +112,9 @@ reconstructed with future data.
 Approval snapshots also supply report and retention readers with one cutoff and
 ordering. Retention-only references from active/recent-served legacy documents
 protect evidence without granting serving authorization. Unverifiable references
-suspend pruning. Churn separates immutable publication and approval clocks with
+suspend pruning, including output-only pointer read failures. When the pointer is
+unavailable, current approval fallback and recent served references are protected
+together; explicit empty pointers retain their existing semantics.
+Churn separates immutable publication and approval clocks with
 additive nullable fields and in-memory legacy normalization; approval identity,
 not only release identity, distinguishes repeated transitions.

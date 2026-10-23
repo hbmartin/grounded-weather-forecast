@@ -23,7 +23,10 @@ from grounded_weather_forecast.dataset.matrix import DatasetPaths, matrix_path
 from grounded_weather_forecast.dataset.providers import read_latest_archive_location
 from grounded_weather_forecast.reports.eprocess import EProcessStore
 from grounded_weather_forecast.runs import RUNS_SCHEMA, read_runs, runs_path
-from grounded_weather_forecast.serve.approvals import read_approval_snapshot
+from grounded_weather_forecast.serve.approvals import (
+    ApprovalSnapshot,
+    read_approval_snapshot,
+)
 from grounded_weather_forecast.serve.history import load_history
 from grounded_weather_forecast.serve.observability import (
     OBSERVABILITY_HISTORY_SCHEMA,
@@ -144,12 +147,16 @@ def _latest_forecast(config: Config, failures: list[str]) -> Forecast | None:
 
 
 def _releases(
-    config: Config, failures: list[str], *, now: datetime | None = None
+    config: Config,
+    failures: list[str],
+    *,
+    now: datetime | None = None,
+    snapshot: ApprovalSnapshot | None = None,
 ) -> tuple[Mapping[str, object], ...]:
     directory = config.artifacts_dir / "releases"
     if not directory.exists():
         return ()
-    snapshot = read_approval_snapshot(directory, as_of=now)
+    snapshot = snapshot or read_approval_snapshot(directory, as_of=now)
     failures.extend(
         f"artifacts/releases/{Path(issue).name}" for issue in snapshot.issues
     )
@@ -255,7 +262,11 @@ def _archive_location(config: Config) -> tuple[float, float] | None:
 
 
 def _evidence_history(
-    config: Config, failures: list[str], *, now: datetime | None = None
+    config: Config,
+    failures: list[str],
+    *,
+    now: datetime | None = None,
+    snapshot: ApprovalSnapshot | None = None,
 ) -> dict[str, pl.DataFrame]:
     """All five history ledgers, absent files as empty typed frames."""
     from grounded_weather_forecast.reports.evidence import (  # noqa: PLC0415
@@ -275,6 +286,7 @@ def _evidence_history(
                     frame,
                     config.artifacts_dir / "releases",
                     as_of=now or datetime.now(UTC),
+                    snapshot=snapshot,
                 )
                 if name == "churn"
                 else frame
@@ -295,6 +307,9 @@ def collect_context(
 ) -> DashboardContext:
     """Collect artifacts, or reuse a complete supplied score-summary snapshot."""
     paths = DatasetPaths.in_dir(config.dataset.dir)
+    approval_snapshot = read_approval_snapshot(
+        config.artifacts_dir / "releases", as_of=now
+    )
     unreadable: list[str] = []
     unreadable_scores: tuple[str, ...] = ()
     if score_summaries is None:
@@ -310,7 +325,7 @@ def collect_context(
     hourly_synthetic = matrix_path(config.dataset.dir, "hourly", "synthetic")
     return DashboardContext(
         config=config,
-        now=now or datetime.now(tz=UTC),
+        now=approval_snapshot.cutoff,
         manifest=_try_json(
             paths.manifest, unreadable, label=f"dataset/{paths.manifest.name}"
         ),
@@ -350,7 +365,7 @@ def collect_context(
             unreadable,
             label="artifacts/latest_publish_attempt.json",
         ),
-        releases=_releases(config, unreadable, now=now),
+        releases=_releases(config, unreadable, now=now, snapshot=approval_snapshot),
         alignment=_try_json(
             config.artifacts_dir / "alignment.json",
             unreadable,
@@ -370,6 +385,8 @@ def collect_context(
         observability_history=_observability_history(config, unreadable),
         runs=_runs(config, unreadable),
         archive_location=_archive_location(config),
-        evidence_history=_evidence_history(config, unreadable, now=now),
+        evidence_history=_evidence_history(
+            config, unreadable, now=now, snapshot=approval_snapshot
+        ),
         unreadable_artifacts=tuple(sorted(set(unreadable))),
     )

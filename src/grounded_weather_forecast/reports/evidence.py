@@ -49,6 +49,7 @@ from grounded_weather_forecast.metrics.probabilistic import (
     empirical_coverage,
 )
 from grounded_weather_forecast.serve.approvals import (
+    ApprovalSnapshot,
     aware_timestamp,
     read_approval_snapshot,
     read_approved_releases,
@@ -58,6 +59,7 @@ from grounded_weather_forecast.storage import atomic_write_parquet, locked_path
 if TYPE_CHECKING:
     from grounded_weather_forecast.reports.eprocess import EProcessStore
     from grounded_weather_forecast.serve.evidence import GateVerdict
+    from grounded_weather_forecast.serve.selection import PromotionProvenance
 
 _LOCK_TIMEOUT_SECONDS = 5.0
 RECENT_WINDOW_DAYS = 14
@@ -740,18 +742,51 @@ def selection_churn(
 
 
 def normalize_churn(
-    frame: pl.DataFrame, directory: Path, *, as_of: datetime
+    frame: pl.DataFrame,
+    directory: Path,
+    *,
+    as_of: datetime,
+    snapshot: ApprovalSnapshot | None = None,
 ) -> pl.DataFrame:
     """Normalize old clocks in memory; never rewrite or invent historical evidence."""
     if frame.is_empty():
         return frame
-    snapshot = read_approval_snapshot(directory, as_of=as_of)
+    snapshot = snapshot or read_approval_snapshot(directory, as_of=as_of)
+    indexed = frame.with_row_index("_clock_row")
+    modern = (pl.col("clock_schema_version") == 2).fill_null(value=False)
+    legacy = indexed.filter(~modern)
+    if not legacy.is_empty():
+        legacy = _normalize_legacy_clocks(legacy, snapshot)
+        frame = (
+            pl.concat([indexed.filter(modern), legacy])
+            .sort("_clock_row")
+            .drop("_clock_row")
+        )
+    visibility = snapshot.visibility()
+    visible = (
+        pl.col("to_approval_id").replace_strict(
+            visibility,
+            default=None,
+            return_dtype=pl.Datetime("us", "UTC"),
+        )
+        if visibility
+        else pl.lit(None, dtype=pl.Datetime("us", "UTC"))
+    )
+    historical_clock = pl.coalesce(visible, pl.col("to_approved_at"))
+    return frame.filter(
+        ((visible.is_not_null()) & pl.lit(snapshot.mode == "current"))
+        | historical_clock.is_null()
+        | (historical_clock <= snapshot.cutoff)
+    )
+
+
+def _normalize_legacy_clocks(
+    frame: pl.DataFrame, snapshot: ApprovalSnapshot
+) -> pl.DataFrame:
     releases = {str(r.get("release_id")): r for r in snapshot.releases}
     events = {e.approval_id: e for e in snapshot.events}
     rows = frame.to_dicts()
     for row in rows:
-        if row.get("clock_schema_version") == 2:
-            continue
         for prefix in ("from", "to"):
             approval_id = row.get(f"{prefix}_approval_id")
             event = events.get(str(approval_id))
@@ -770,15 +805,15 @@ def normalize_churn(
             else:
                 row[f"{prefix}_approved_at"] = recorded
                 row[f"{prefix}_approval_sequence"] = 0
-    normalized = pl.DataFrame(rows, schema=dict(CHURN_SCHEMA))
-    return normalized.filter(
-        pl.col("to_approved_at").is_null()
-        | (pl.col("to_approved_at") <= snapshot.cutoff)
-    )
+    return pl.DataFrame(rows, schema=frame.schema)
 
 
 def record_live_gate(
-    config: Config, verdicts: tuple["GateVerdict", ...], *, now: datetime
+    config: Config,
+    verdicts: tuple["GateVerdict", ...],
+    *,
+    now: datetime,
+    provenance: "PromotionProvenance | None" = None,
 ) -> None:
     """Best-effort gate telemetry; independent of approval content and identity."""
     if not verdicts:
@@ -788,16 +823,19 @@ def record_live_gate(
             dataset_fingerprint,
         )
 
-        rows = [
-            asdict(verdict)
-            | {
-                "recorded_at": now,
-                "code_version": code_identity(),
-                "config_fingerprint": config_fingerprint(config),
-                "dataset_fingerprint": dataset_fingerprint(config),
-            }
-            for verdict in verdicts
-        ]
+        identity = {
+            "recorded_at": provenance.recorded_at if provenance is not None else now,
+            "code_version": provenance.code_version
+            if provenance is not None
+            else code_identity(),
+            "config_fingerprint": provenance.config_fingerprint
+            if provenance is not None
+            else config_fingerprint(config),
+            "dataset_fingerprint": provenance.dataset_fingerprint
+            if provenance is not None
+            else dataset_fingerprint(config),
+        }
+        rows = [asdict(verdict) | identity for verdict in verdicts]
         append_ledger(
             pl.DataFrame(rows, schema=dict(LIVE_GATE_SCHEMA)),
             ledger_path(config, LIVE_GATE_LEDGER),
@@ -966,7 +1004,7 @@ def record_selection_churn(
     """Diff the two newest releases; returns the churn frame for rendering."""
     try:
         moment = now or datetime.now(tz=UTC)
-        releases = _readable_releases(config.artifacts_dir / "releases", as_of=moment)
+        releases = _readable_releases(config.artifacts_dir / "releases", as_of=now)
         if len(releases) < 2:
             return pl.DataFrame(schema=CHURN_SCHEMA)
         fresh = selection_churn(

@@ -216,7 +216,7 @@ classification. Products are evaluated independently under unchanged gates.
 ### Approved decisions and compatible retention
 
 *Implemented in: `serve/selection.py`, `serve/evidence.py`, `serve/approvals.py`,
-`reports/evidence.py`, `reports/operations.py`, `evaluation.py`, `cli.py`*
+`reports/evidence.py`, `reports/operations.py`, `evaluation.py`, `cli.py`, `status.py`, `runs.py`*
 
 Only completed products in a live backtest may receive new selections. Prediction
 loads approvals without elections, promotion-time live gates, or release writes.
@@ -230,19 +230,24 @@ invented context. Historical reconstruction retains exact dataset and issue-time
 checks. `PromotionResult.created` is decided under the release write lock so
 retention and duplicate writes are never logged as new promotions.
 
-A single locked approval snapshot supplies promotion decisions. Eligible managed
-approvals sort by committed sequence, not wall-clock time; legacy implicit approvals
-sort by validated publication time behind managed events. UTC conversion overflow,
-missing zones, malformed clocks and future approvals are excluded. Events record
-commit time; historical cutoffs remain strict. First approval of existing content
-is not reapproval.
+A single locked approval snapshot supplies promotion decisions. Current managed
+approvals follow committed sequence without wall-clock eligibility checks; legacy
+implicit approvals require publication-time eligibility behind managed events.
+UTC conversion overflow, missing zones and malformed clocks are excluded.
+Historical queries require publication, approval and conservative visibility within
+the cutoff. `visible_at` is the maximum of actual approval time, stored publication
+time and all preceding managed visibility floors; older events derive this floor
+without rewrites. Events retain actual commit time in `approved_at`. First approval
+versus reapproval uses committed history, independently of historical visibility.
 
 Only final selected-variable contexts are merged. Required context omissions and
 conflicts are typed failures before any content/event publication. Known legacy
 references survive missing context without invented cutoffs. Blocked live gates
 retain selection identity and record measurements separately in the bounded
 `live_gate` telemetry ledger (730 days, 100,000 rows); statistical constants and
-reference qualifications remain unchanged. Active/recent-served legacy references
+reference qualifications remain unchanged. The diagnostic batch captures identity
+once and records after unlocking, even when approval publication fails.
+Active/recent-served legacy references
 can protect scores without authorizing predictions. Churn uses separate publication
 and approval clocks, sequence order and approval identity; old rows normalize in
 memory without rewriting evidence.
@@ -437,9 +442,12 @@ evidence retains its own fingerprint. See
 Release content is immutable; changed approval decisions commit separate ordered
 events under one ledger lock. A → B → A records reapproval, while A → A is unchanged.
 Managed content without an event is not approved. Legacy releases use their aware
-`promoted_at` clock; future, naive and malformed approvals are excluded. Historical
-replay retains its exact dataset and issue-time constraints.
-Reporting and pruning share this visibility and order. Nullable approval IDs in
+`promoted_at` clock with publication-time eligibility. Current managed decisions
+follow sequence across clock corrections. Historical replay requires publication,
+approval and the nondecreasing `visible_at` floor within its cutoff, retaining exact
+dataset and issue-time constraints. Invalid, naive and overflowing clocks are
+excluded in both modes. Reporting shares the same snapshot; operational pruning
+protects current decisions. Nullable approval IDs in
 the churn ledger distinguish repeated transitions without duplicating unchanged
 reports; legacy ledger rows remain readable.
 
@@ -449,6 +457,14 @@ summaries after replacement; a legacy aggregate never supplies an unknown slice'
 cutoff. This is operational provenance policy, not a new statistical gate. Existing
 live-gate constants apply to carried choices in completed products, while pending,
 failed and unrequested products preserve their approvals.
+
+Missing legacy context is marked per slice with `legacy_context_missing`. It is
+inferred only through accepted exact-dataset compatibility and cannot borrow
+another selected variable's context or authorize cross-dataset serving. Historical
+`"unknown"` evaluation IDs normalize to missing provenance. Raw contexts always
+validate conflicts; promotion consumes a typed, once-merged context set.
+Evaluation failures take precedence over promotion-only failures while nullable
+`failure_details_json` component diagnostics retain both; completed scores remain.
 
 ## 8. Self-verification
 

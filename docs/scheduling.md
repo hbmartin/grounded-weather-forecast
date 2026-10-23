@@ -104,7 +104,14 @@ leave that stamp untouched, and a failed report skips score pruning.
 CLI `maintain` also runs truth-QC before report. Build and ordinary backtest errors stop the
 pipeline; coordination failures still stop immediately. Promotion evidence errors
 preserve completed scores and continue truth-QC/report while retaining failure
-status. Promotion evidence conflicts and missing required
+status only when evaluation itself succeeded. Product failures outrank promotion
+errors and stop diagnostics; nullable `failure_details_json` retains both components
+without duplicate product journal rows. Completed independent products may still
+promote unless coordination or promotion validation prevents publication.
+The standalone wrapper uses a private temporary child-outcome file, checked
+against the process exit code, to apply the same continuation boundary. Missing
+or invalid metadata never exempts a failed evaluation; logs remain diagnostic text.
+Promotion evidence conflicts and missing required
 contexts record `promotion_evidence_conflict` or `promotion_evidence_invalid`,
 publish no approval changes, and preserve `last-maintenance`. An insufficient-history
 backtest (exit 3) and a handled truth-QC
@@ -162,6 +169,13 @@ winner qualifies; prediction-time safeguards remain active. Separate approval
 events order decisions without rewriting release content. Reapproving an older
 release becomes current immediately; unchanged reruns add no event. New release
 content is ignored until its approval event commits.
+
+Current managed approvals follow committed sequence across forward and backward
+clock corrections. Historical queries wait for the conservative `visible_at` floor
+and the publication/approval clocks. These additive fields do not change content
+identity, and legacy events derive floors without migration. Operational pruning
+protects current approvals plus recent served references when the active pointer
+is unavailable; explicitly referenced unreadable outputs suspend score deletion.
 
 A failed optional restore launch never prevents the station/publication stages.
 If publication succeeds, the hourly job still returns 1 to expose the failed

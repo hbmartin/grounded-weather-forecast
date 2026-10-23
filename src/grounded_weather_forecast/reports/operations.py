@@ -931,7 +931,9 @@ def _release_references(raw: Mapping[str, object], *, release_id: str) -> set[st
         isinstance(e, str) and e for e in evaluations
     ):
         raise ValueError(f"release {release_id}: invalid evaluation_ids")
-    protected = {str(evaluation) for evaluation in evaluations}
+    protected = {
+        str(evaluation) for evaluation in evaluations if evaluation != "unknown"
+    }
     selections = raw.get("selections", {})
     if not isinstance(selections, Mapping):
         raise ValueError(f"release {release_id}: invalid selections")
@@ -944,12 +946,20 @@ def _release_references(raw: Mapping[str, object], *, release_id: str) -> set[st
                 raise ValueError(
                     f"release {release_id}: invalid selection evaluation_id"
                 )
-            protected.add(evaluation)
+            if evaluation != "unknown":
+                protected.add(evaluation)
     return protected
 
 
-def _active_reference_ids(config: Config, *, now: datetime) -> set[str] | None:
+@dataclass(frozen=True, slots=True)
+class _ServedReferences:
+    active: set[str] | None
+    archived: frozenset[str]
+
+
+def _active_reference_ids(config: Config, *, now: datetime) -> _ServedReferences:
     active_ids: set[str] | None = None
+    referenced_output = False
     try:
         pointer = json.loads(
             active_release_path(config.artifacts_dir).read_text(encoding="utf-8")
@@ -960,14 +970,16 @@ def _active_reference_ids(config: Config, *, now: datetime) -> set[str] | None:
             active_ids = {pointer["release_id"]}
         output_path = pointer.get("output_path")
         if isinstance(output_path, str):
+            referenced_output = True
             served = Forecast.from_json(Path(output_path).read_text(encoding="utf-8"))
             active_ids = (active_ids or set()) | set(served.release_ids)
     except (OSError, ValueError, AttributeError, TypeError, KeyError) as error:
-        if active_ids is not None:
+        if active_ids is not None or referenced_output:
             raise ValueError(
                 f"active served document could not be verified: {error}"
             ) from error
     archived = config.predict.history_path.parent / "served_forecasts"
+    archived_ids: set[str] = set()
     if archived.exists():
         for path in archived.glob("*.json"):
             try:
@@ -979,8 +991,8 @@ def _active_reference_ids(config: Config, *, now: datetime) -> set[str] | None:
                 issued = issued.replace(tzinfo=UTC)
             age = now - issued.astimezone(UTC)
             if document.status == "ready" and timedelta(0) <= age <= timedelta(hours=6):
-                active_ids = (active_ids or set()) | set(document.release_ids)
-    return active_ids
+                archived_ids.update(document.release_ids)
+    return _ServedReferences(active_ids, frozenset(archived_ids))
 
 
 def _protected_evaluations(
@@ -988,7 +1000,10 @@ def _protected_evaluations(
 ) -> set[str] | None:
     """Authorization uses approval clocks; explicit legacy references only protect data."""
     snapshot = read_approval_snapshot(
-        config.artifacts_dir / "releases", as_of=now, legacy_references=True
+        config.artifacts_dir / "releases",
+        as_of=now,
+        legacy_references=True,
+        mode="current",
     )
     try:
         if snapshot.issues:
@@ -996,9 +1011,11 @@ def _protected_evaluations(
         records = snapshot.records()
         raw_by_id = {str(raw.get("release_id")): raw for raw in snapshot.releases}
         known = {str(record.release["release_id"]) for record in records}
-        active_ids = _active_reference_ids(config, now=now)
+        references = _active_reference_ids(config, now=now)
+        active_ids = references.active
         if active_ids is None:
             active_ids = {str(records[0].release["release_id"])} if records else set()
+        active_ids = active_ids | references.archived
         protected: set[str] = set()
         for release_id in active_ids:
             raw = raw_by_id.get(release_id)

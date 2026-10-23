@@ -54,7 +54,7 @@ from grounded_weather_forecast.serve.evidence import (
     EvidenceSummary,
     GateVerdict,
     PromotionEvidenceError,
-    merge_contexts,
+    ValidatedContexts,
 )
 from grounded_weather_forecast.storage import locked_path
 
@@ -102,6 +102,21 @@ class Selection:
     # field order is a compatibility contract.
     retained: bool = False
     training_cutoff: datetime | None = None
+    legacy_context_missing: bool = False
+
+
+@dataclass(frozen=True, slots=True)
+class PromotionProvenance:
+    recorded_at: datetime
+    dataset_fingerprint: str
+    config_fingerprint: str
+    code_version: str
+
+
+@dataclass(slots=True)
+class _PromotionTelemetry:
+    provenance: PromotionProvenance | None = None
+    verdicts: tuple[GateVerdict, ...] = ()
 
 
 type SelectionMap = Mapping[tuple[str, str, str], Selection]
@@ -120,6 +135,7 @@ class PromotionResult:
     approval_changed: bool = False
     disposition: ApprovalDisposition = "none"
     gate_verdicts: tuple[GateVerdict, ...] = ()
+    provenance: PromotionProvenance | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -260,7 +276,11 @@ def _approved_choices(
         approved = _selections_from_release(raw) or {}
         recorded = _contexts_by_evaluation_id(raw.get("evaluation_contexts"))
         for key, selected in approved.items():
-            context = recorded.get(selected.evaluation_id or "")
+            context = (
+                None
+                if selected.legacy_context_missing
+                else recorded.get(selected.evaluation_id or "")
+            )
             if not _approved_context_matches(
                 context, selected, key, raw["config_fingerprint"], code
             ):
@@ -270,7 +290,12 @@ def _approved_choices(
             ):
                 continue
             selections[key] = _ApprovedChoice(
-                replace(selected, pinned=pins.get(key[:2]) == selected.method_id),
+                replace(
+                    selected,
+                    pinned=pins.get(key[:2]) == selected.method_id,
+                    legacy_context_missing=context is None
+                    and selected.evaluation_id is not None,
+                ),
                 context,
             )
     return selections
@@ -357,6 +382,11 @@ def _selection_payload(
             "mae": selected.mae,
             "truth_semantics": selected.truth_semantics,
             "retained": selected.retained,
+            **(
+                {"legacy_context_missing": True}
+                if selected.legacy_context_missing
+                else {}
+            ),
             "training_cutoff": selected.training_cutoff.isoformat()
             if selected.training_cutoff is not None
             else None,
@@ -502,6 +532,7 @@ def _selections_from_release(release: Mapping[str, object]) -> SelectionMap | No
             mae=mae,
             evaluation_id=str(selection_mapping["evaluation_id"])
             if selection_mapping.get("evaluation_id")
+            and selection_mapping["evaluation_id"] != "unknown"
             else None,
             dataset_fingerprint=str(
                 selection_mapping.get("dataset_fingerprint") or dataset
@@ -513,6 +544,8 @@ def _selections_from_release(release: Mapping[str, object]) -> SelectionMap | No
             ),
             retained=bool(selection_mapping.get("retained", False)),
             training_cutoff=aware_timestamp(selection_mapping.get("training_cutoff")),
+            legacy_context_missing=selection_mapping.get("legacy_context_missing")
+            is True,
         )
     return selections
 
@@ -622,6 +655,8 @@ def _eligible_release_ids(
             release_context = release_contexts.get(
                 str(selection_mapping.get("evaluation_id") or "")
             )
+            if selection_mapping.get("legacy_context_missing") is True:
+                release_context = None
             if (
                 selection_mapping.get("method_id") == selected.method_id
                 and selected.code_version is not None
@@ -684,7 +719,7 @@ def _incumbent_methods(
 ) -> dict[SliceKey, tuple[str, str | None]]:
     """The previous release's (method_id, truth_semantics) per slice.
 
-    Newest ``promoted_at`` among config-compatible releases, with the dataset
+    Canonical approval sequence among config-compatible releases, with the dataset
     and code filters deliberately off: the dataset fingerprint rotates on
     every ingest and the code digest on every deploy, so an exact-match
     lookup would make retention dead code on precisely the re-runs it exists
@@ -861,8 +896,24 @@ def promote_methods(
     products: frozenset[str] | None = None,
 ) -> PromotionResult:
     """Serialize elections and approval commits against the same incumbent state."""
-    with locked_path(config.artifacts_dir / "releases" / ".approval-ledger"):
-        return _promote_methods(config, scores_dir, semantics, dataset_id, products)
+    from grounded_weather_forecast.reports.evidence import (  # noqa: PLC0415
+        record_live_gate,
+    )
+
+    telemetry = _PromotionTelemetry()
+    try:
+        with locked_path(config.artifacts_dir / "releases" / ".approval-ledger"):
+            return _promote_methods(
+                config, scores_dir, semantics, dataset_id, products, telemetry
+            )
+    finally:
+        if telemetry.provenance is not None:
+            record_live_gate(
+                config,
+                telemetry.verdicts,
+                now=telemetry.provenance.recorded_at,
+                provenance=telemetry.provenance,
+            )
 
 
 def _elect_slices(
@@ -992,9 +1043,14 @@ def _promote_methods(
     semantics: Mapping[str, TruthSemantics] | None,
     dataset_id: str | None,
     products: frozenset[str] | None,
+    telemetry: _PromotionTelemetry,
 ) -> PromotionResult:
     snapshot = read_approval_snapshot(config.artifacts_dir / "releases")
     dataset = dataset_id or dataset_fingerprint(config)
+    provenance = PromotionProvenance(
+        snapshot.cutoff, dataset, config_fingerprint(config), code_identity()
+    )
+    telemetry.provenance = provenance
     scanned = _load_evidence(config, scores_dir, None, semantics, dataset)
     slices = {
         key: frame
@@ -1017,35 +1073,27 @@ def _promote_methods(
             for key, choice in elected.items()
         }
     )
-    legacy_missing = frozenset(
-        choice.selection.evaluation_id
-        for choice in approved.values()
-        if choice.context is None and choice.selection.evaluation_id is not None
-    )
     diagnostics = _gate_completed(
         config, selections, contexts, candidates, products, scanned, snapshot
     )
-    final_contexts = merge_contexts(
+    telemetry.verdicts = diagnostics
+    final_contexts = ValidatedContexts(
         tuple(
             _project_context(contexts[key], key)
             for key in selections
             if contexts.get(key) is not None
         )
     )
-    evidence = EvidenceSummary.from_payloads(
-        tuple(final_contexts.values()),
+    evidence = EvidenceSummary.from_validated_contexts(
+        final_contexts,
         {key: choice.training_cutoff for key, choice in selections.items()},
         {key: choice.evaluation_id for key, choice in selections.items()},
-        legacy_missing=legacy_missing,
-        merged=True,
+        legacy_missing=frozenset(
+            key for key, choice in selections.items() if choice.legacy_context_missing
+        ),
     )
     records = _approved_records(config, snapshot=snapshot)
     current = records[0] if records else None
-    from grounded_weather_forecast.reports.evidence import (  # noqa: PLC0415
-        record_live_gate,
-    )
-
-    record_live_gate(config, tuple(diagnostics), now=snapshot.cutoff)
     if not selections or _selection_payload(selections) == _selection_payload(carried):
         return PromotionResult(
             carried,
@@ -1053,6 +1101,7 @@ def _promote_methods(
             approval_id=current.approval_id if current else None,
             disposition="unchanged" if current else "none",
             gate_verdicts=tuple(diagnostics),
+            provenance=provenance,
         )
     release = _make_release(config, selections, evidence, dataset)
     commit = publish_approval(
@@ -1069,6 +1118,7 @@ def _promote_methods(
         commit.changed,
         commit.disposition,
         tuple(diagnostics),
+        provenance,
     )
 
 
@@ -1248,7 +1298,7 @@ def apply_live_gate(
     can move to an eligible reference only when the quality guard passes.
     Current backtest error is a proxy; mature live reference error can veto
     it. Failed gates with no qualified replacement keep serving and record
-    the blocked verdict in the release reason.
+    the blocked verdict separately through diagnostics and the live-gate ledger.
 
     Evidence is pooled across ``eligible_releases`` rather than matched to one
     release, mirroring ``ArtifactStore.load_latest_state``: identity that
