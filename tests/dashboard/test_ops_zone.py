@@ -69,8 +69,10 @@ def test_young_history_renders_placeholders(tmp_path):
         "i4",
         "i5",
         "i6",
+        "i7",
     ]
-    assert all(panel.empty_reason is not None for panel in zone.panels)
+    assert all(panel.empty_reason is not None for panel in zone.panels[:6])
+    assert zone.panels[6].stats[0].value == "not recorded"
 
 
 def test_freshness_panel_is_red_with_active_alarms(tmp_path):
@@ -187,7 +189,7 @@ def test_funnel_footprint_and_changes_render_tables(tmp_path):
         ],
     )
     zone = build_zone(ctx)
-    funnel_panel, footprint_panel, changes_panel = zone.panels[3:]
+    funnel_panel, footprint_panel, changes_panel = zone.panels[3:6]
     assert funnel_panel.table is not None
     assert funnel_panel.table.rows[0][0] == "daily"
     assert footprint_panel.stats[0].value == "1"

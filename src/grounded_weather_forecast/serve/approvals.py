@@ -174,15 +174,6 @@ def _event(path: Path, issues: list[ApprovalIssue]) -> ApprovalEvent | None:
     )
 
 
-def _events(directory: Path) -> list[ApprovalEvent]:
-    issues: list[ApprovalIssue] = []
-    return [
-        event
-        for path in json_entries(directory / "approvals", issues)
-        if (event := _event(path, issues)) is not None
-    ]
-
-
 def _reservation(paths: Sequence[Path]) -> int:
     prefixes = (path.stem.partition("-")[0] for path in paths)
     return max((int(p) for p in prefixes if p.isascii() and p.isdecimal()), default=0)
@@ -328,10 +319,16 @@ def _release(
         _issue(
             issues,
             path,
-            "release_identity",
+            "legacy_identity_missing"
+            if (
+                "release_id" not in raw
+                and raw.get("approval_required", False) is False
+                and (clock := aware_timestamp(raw.get("promoted_at"))) is not None
+                and clock <= cutoff
+            )
+            else "release_identity",
             f"release_id does not match filename {path.stem}",
         )
-    if not isinstance(raw.get("release_id"), str) or raw["release_id"] != path.stem:
         return None
     published = aware_timestamp(raw.get("promoted_at"))
     if published is None:

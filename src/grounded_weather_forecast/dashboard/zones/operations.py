@@ -25,6 +25,7 @@ from grounded_weather_forecast.dashboard.model import (
 )
 from grounded_weather_forecast.dashboard.zones.common import empty_panel, fmt
 from grounded_weather_forecast.reports.operations import FRESHNESS_THRESHOLDS
+from grounded_weather_forecast.retention_status import latest_retention_verification
 
 _MAX_POINTS = 60
 _MAX_SERIES = 8
@@ -379,5 +380,37 @@ def build(ctx: DashboardContext, derived: Derived) -> Zone:  # noqa: ARG001
             _funnel_panel(ctx),
             _footprint_panel(ctx),
             _changes_panel(ctx),
+            _retention_panel(ctx),
+        ),
+    )
+
+
+def _retention_panel(ctx: DashboardContext) -> Panel:
+    verification = latest_retention_verification(ctx.runs, as_of=ctx.now)
+    status: PanelStatus = (
+        "amber"
+        if verification.state == "suspended"
+        else "ok"
+        if verification.state == "clear"
+        else "info"
+    )
+    details = (*verification.details, *ctx.compatibility_notes)
+    return Panel(
+        panel_id="i7",
+        title="Published-score protection",
+        status=status,
+        copy=PANEL_COPY["i7"],
+        stats=(
+            Stat("latest verification", verification.state.replace("_", " "), status),
+            Stat(
+                "recorded at",
+                verification.recorded_at.isoformat()
+                if verification.recorded_at
+                else "—",
+                "info",
+            ),
+        ),
+        table=TableSpec(
+            columns=("detail",), rows=tuple((detail,) for detail in details)
         ),
     )

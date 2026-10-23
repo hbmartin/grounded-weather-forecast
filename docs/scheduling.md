@@ -289,6 +289,13 @@ exit behavior, and later analysis commands.
   (product, source, window), anything referenced by the active release, and
   anything a release promoted in the last 7 days are kept. Files the evaluations
   catalog has never seen are never deleted.
+  Every completed check journals clear/suspended protection and its recording
+  time, including dry runs. The next report/dashboard reads that result rather
+  than rescanning the served archive. With report before prune in the daily chain,
+  the displayed verification can be from the preceding run; its timestamp makes
+  that explicit. Pruning still freshly verifies before deleting, and protection
+  suspension keeps exit 0. A later clear check replaces the warning; legacy runs
+  without explicit verification metadata show not recorded.
 - `maintain` waits for `<dataset dir>/pipeline.lock` and holds it once across
   build → live backtest → truth-QC → report. Interactive mutators wait 60 s and
   exit `75` on contention. This prevents another command from slipping between

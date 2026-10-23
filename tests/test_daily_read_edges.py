@@ -191,7 +191,8 @@ def test_changed_source_field_types_cannot_emit_nonfinite_json(tmp_path):
     result = read(config, forecast)
     assert result["forecast"]["limitations"] == ["invalid_lead_bucket"]
     assert result["operational_health"]["runs"]["limitations"] == [
-        "invalid_run_exit_code"
+        "invalid_run_rows",
+        "no_completed_runs_as_of",
     ]
     assert result["operational_health"]["pipeline"]["limitations"] == [
         "invalid_pipeline_alarms"

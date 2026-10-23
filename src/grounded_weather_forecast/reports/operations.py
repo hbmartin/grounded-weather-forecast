@@ -32,7 +32,7 @@ not a crash.
 import json
 import sqlite3
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass, fields, is_dataclass
+from dataclasses import dataclass, field, fields, is_dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import cast
@@ -58,6 +58,7 @@ from grounded_weather_forecast.health_policy import (
     FRESHNESS_THRESHOLDS as FRESHNESS_THRESHOLDS,  # noqa: PLC0414 - compatibility export
 )
 from grounded_weather_forecast.reports import evidence
+from grounded_weather_forecast.retention_status import RetentionVerification
 from grounded_weather_forecast.serve.approvals import (
     json_entries,
     read_approval_snapshot,
@@ -919,6 +920,7 @@ class PruneResult:
     temporary_deleted: tuple[Path, ...] = ()
     temporary_freed_mb: float = 0.0
     coordination_release_failure: ScoreCoordinationFailure | None = None
+    verification: RetentionVerification = field(default_factory=RetentionVerification)
 
 
 def _release_references(raw: Mapping[str, object], *, release_id: str) -> set[str]:
@@ -1009,8 +1011,9 @@ def _served_document_ids(path: Path, *, recent_at: datetime | None = None) -> se
         ) from error
 
 
-def _active_reference_ids(config: Config, *, now: datetime) -> _ServedReferences:
+def _pointer_reference_ids(config: Config) -> set[str] | None:
     active_ids: set[str] | None = None
+    output: Path | None = None
     pointer = _active_pointer(config)
     if pointer is not None:
         try:
@@ -1030,17 +1033,22 @@ def _active_reference_ids(config: Config, *, now: datetime) -> _ServedReferences
                 output_path = pointer["output_path"]
                 if not isinstance(output_path, str) or not output_path:
                     raise ValueError("invalid output_path")
-                active_ids = (active_ids or set()) | _served_document_ids(
-                    Path(output_path)
-                )
-            if active_ids is None:
+                output = Path(output_path)
+            if active_ids is None and output is None:
                 raise ValueError(
                     "pointer has no valid release references or served output"
                 )
         except (OSError, ValueError, AttributeError, TypeError, KeyError) as error:
             raise ValueError(
-                f"active served document could not be verified: {active_release_path(config.artifacts_dir)}: {error}"
+                f"active pointer fields could not be verified: {active_release_path(config.artifacts_dir)}: {error}"
             ) from error
+    if output is not None:
+        active_ids = (active_ids or set()) | _served_document_ids(output)
+    return active_ids
+
+
+def _active_reference_ids(config: Config, *, now: datetime) -> _ServedReferences:
+    active_ids = _pointer_reference_ids(config)
     archived = config.predict.history_path.parent / "served_forecasts"
     issues = []
     entries = json_entries(archived, issues)
@@ -1053,7 +1061,11 @@ def _active_reference_ids(config: Config, *, now: datetime) -> _ServedReferences
 
 
 def _protected_evaluations(
-    config: Config, *, now: datetime, failures: list[str] | None = None
+    config: Config,
+    *,
+    now: datetime,
+    failures: list[str] | None = None,
+    verification_details: list[str] | None = None,
 ) -> set[str] | None:
     """Authorization uses approval clocks; explicit legacy references only protect data."""
     snapshot = read_approval_snapshot(
@@ -1064,6 +1076,11 @@ def _protected_evaluations(
     )
     try:
         if snapshot.issues:
+            if verification_details is not None:
+                verification_details.extend(
+                    [issue.diagnostic() for issue in snapshot.diagnostics]
+                    or snapshot.issues
+                )
             raise ValueError(
                 "unreadable release files or unverifiable metadata: "
                 + (
@@ -1102,6 +1119,8 @@ def _protected_evaluations(
                 )
         return protected
     except (ValueError,) as error:  # noqa: B013 -- explicit protection failure
+        if verification_details is not None and not verification_details:
+            verification_details.append(str(error))
         if failures is not None:
             failures.append(f"release references could not be verified: {error}")
         return None
@@ -1133,7 +1152,18 @@ def prune_scores_files(
         failure = error.snapshot()
     files = sorted(scores_dir.glob("scores_*.parquet")) if scores_dir.exists() else []
     protection_failures: list[str] = []
-    protected = _protected_evaluations(config, now=moment, failures=protection_failures)
+    verification_details: list[str] = []
+    protected = _protected_evaluations(
+        config,
+        now=moment,
+        failures=protection_failures,
+        verification_details=verification_details,
+    )
+    verification = RetentionVerification(
+        "suspended" if protected is None else "clear",
+        moment,
+        tuple(verification_details),
+    )
     if protected is None:
         return PruneResult(
             deleted=(),
@@ -1143,6 +1173,7 @@ def prune_scores_files(
             temporary_deleted=temporary.deleted,
             temporary_freed_mb=temporary.freed_mb,
             coordination_release_failure=failure,
+            verification=verification,
         )
     try:
         cataloged = set(
@@ -1183,4 +1214,5 @@ def prune_scores_files(
         temporary_deleted=temporary.deleted,
         temporary_freed_mb=temporary.freed_mb,
         coordination_release_failure=failure,
+        verification=verification,
     )

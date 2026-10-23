@@ -276,6 +276,7 @@ def test_missing_corrupt_and_stale_forecast(tmp_path):
 def test_rebuild_without_releases_cannot_reuse_historical_quality(tmp_path):
     config, forecast, raw = setup(tmp_path)
     write_quality(config, [quality(config)])
+    write_quality(config, [quality(config, realized=True)], realized=True)
     raw.update(
         status="degraded",
         status_reason="rebuild invalidates promoted evidence",
@@ -285,9 +286,12 @@ def test_rebuild_without_releases_cannot_reuse_historical_quality(tmp_path):
     result = read(config, forecast)
     assert result["forecast"]["forecast_status"] == "degraded"
     for key in ("backtest", "realized_live"):
-        assert result["prediction_quality"][key]["limitations"] == [
-            "forecast_has_no_release_ids"
-        ]
+        slices = result["prediction_quality"][key]["slices"]
+        assert slices and all(row["status"] == "unknown" for row in slices)
+        assert all(
+            row["limitations"] == ["slice_has_no_valid_forecast_release"]
+            for row in slices
+        )
 
 
 @pytest.mark.parametrize("realized", [False, True])

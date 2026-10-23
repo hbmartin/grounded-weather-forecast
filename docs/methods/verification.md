@@ -487,6 +487,30 @@ validate conflicts; promotion consumes a typed, once-merged context set.
 Evaluation failures take precedence over promotion-only failures while nullable
 `failure_details_json` component diagnostics retain both; completed scores remain.
 
+### Published-score protection verification
+
+*Implemented in: `reports/operations.py`, `retention_status.py`,
+`cli.py::_cmd_prune_scores`, `dashboard/zones/operations.py`.*
+
+Pruning freshly verifies release/event metadata, the active pointer and required
+served-document references before deleting published scores. Uncertainty suspends
+all published deletions, including dry runs, with exact affected-path diagnostics;
+temporary cleanup and existing exit meanings remain intact. Retention still keeps
+the newest three files per group, active/recent-served references and approvals
+from the preceding seven days. Legacy reference protection does not authorize
+serving. Pointer-field diagnostics remain distinct from referenced-output errors.
+
+Each completed check carries an additive typed `PruneResult.verification` result
+and records informational `retention_verification` components in the existing
+run ledger, using exit 0 and `retention_clear`/`retention_suspended`; details are
+bounded to 400 characters per component. Coordination failures keep their own
+failure status. Reports/dashboard consume the latest recorded result and its
+timestamp without rescanning the served archive. Missing explicit legacy metadata
+means not recorded; a subsequent clear check replaces an earlier warning.
+Direct loaded-artifact checks remain live. A valid legacy omission of `release_id`
+is compatibility information for retention, not an unreadable-file alarm or a
+serving approval. No ledger migration or historical rewrite is required.
+
 ## 8. Self-verification
 
 *Implemented in: `reports/verification.py`*

@@ -240,7 +240,11 @@ def test_missing_hours_do_not_create_quality_cohorts(tmp_path):
 def test_compatible_fallback_preserves_forecast_and_source_evidence_identity(tmp_path):
     config, forecast, _ = setup(tmp_path)
     modern_release(config)
-    modern_release(config, "olderrelease", "older-evaluation-dataset")
+    older_path, older = modern_release(
+        config, "olderrelease", "older-evaluation-dataset"
+    )
+    older["promoted_at"] = (START - timedelta(days=3)).isoformat()
+    write_json(older_path, older)
     write_quality(
         config,
         [
