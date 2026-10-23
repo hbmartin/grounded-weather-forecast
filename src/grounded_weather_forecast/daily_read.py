@@ -21,10 +21,16 @@ from grounded_weather_forecast.status import PENDING_EXIT_CODES
 SCHEMA_VERSION = 1
 WINDOW_HOURS = 12
 EVIDENCE_MAX_AGE_MINUTES = 2880
-PUBLISHED_STATION = Path(
-    "/Users/haroldmartin/Library/Application Support/grounded-weather-forecast"
-    "/staged/current.json"
-)
+
+
+def published_station_path() -> Path:
+    return (
+        Path.home()
+        / "Library/Application Support/grounded-weather-forecast/staged/current.json"
+    )
+
+
+PUBLISHED_STATION = published_station_path()
 
 
 class SourceError(ValueError):
@@ -465,7 +471,9 @@ def read_pipeline(snapshot: Snapshot, path: Path, now: datetime) -> dict[str, An
 def read_qc(snapshot: Snapshot, path: Path, now: datetime) -> dict[str, Any]:
     raw = snapshot.document(path, 3)
     verdict = raw.get("drift_verdict", {})
-    age = freshness(raw.get("generated_at"), now, EVIDENCE_MAX_AGE_MINUTES)
+    age = freshness(
+        raw.get("generated_at"), now, FRESHNESS_THRESHOLDS["truth_qc_age_minutes"]
+    )
     flags = {
         k: raw.get(k) for k in ("drift_alert", "correlation_alert", "shield_alert")
     }
