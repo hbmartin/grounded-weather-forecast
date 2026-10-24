@@ -60,11 +60,12 @@ from grounded_weather_forecast.health_policy import (
 from grounded_weather_forecast.reports import evidence
 from grounded_weather_forecast.retention_status import RetentionVerification
 from grounded_weather_forecast.serve.approvals import (
+    ApprovalIssue,
     json_entries,
     read_approval_snapshot,
 )
 from grounded_weather_forecast.serve.schema import Forecast
-from grounded_weather_forecast.status import PENDING_EXIT_CODES
+from grounded_weather_forecast.status import PENDING_EXIT_CODES, record_progress
 
 _COLLECTOR_ERRORS = (OSError, ValueError, sqlite3.Error, pl.exceptions.PolarsError)
 
@@ -955,6 +956,7 @@ def _release_references(raw: Mapping[str, object], *, release_id: str) -> set[st
 class _ServedReferences:
     active: set[str] | None
     archived: frozenset[str]
+    issues: tuple[ApprovalIssue, ...] = ()
 
 
 def _active_pointer(config: Config) -> dict[str, object] | None:
@@ -984,6 +986,18 @@ def _active_pointer(config: Config) -> dict[str, object] | None:
     return raw
 
 
+class _ServedDocumentError(ValueError):
+    def __init__(self, path: Path, kind: str, cause: Exception) -> None:
+        self.issue = ApprovalIssue(
+            path,
+            f"{kind}_document_invalid",
+            f"{kind} served document could not be verified: {cause}",
+        )
+        super().__init__(
+            f"{kind} served document could not be verified: {path}: {cause}"
+        )
+
+
 def _served_document_ids(path: Path, *, recent_at: datetime | None = None) -> set[str]:
     try:
         raw = json.loads(path.read_text(encoding="utf-8"))
@@ -1006,9 +1020,7 @@ def _served_document_ids(path: Path, *, recent_at: datetime | None = None) -> se
         return {str(v) for v in ids}
     except (OSError, ValueError, OverflowError, TypeError, KeyError) as error:
         kind = "archived" if recent_at is not None else "active"
-        raise ValueError(
-            f"{kind} served document could not be verified: {path}: {error}"
-        ) from error
+        raise _ServedDocumentError(path, kind, error) from error
 
 
 def _pointer_reference_ids(config: Config) -> set[str] | None:
@@ -1048,16 +1060,33 @@ def _pointer_reference_ids(config: Config) -> set[str] | None:
 
 
 def _active_reference_ids(config: Config, *, now: datetime) -> _ServedReferences:
-    active_ids = _pointer_reference_ids(config)
+    issues: list[ApprovalIssue] = []
+    try:
+        active_ids = _pointer_reference_ids(config)
+    except (ValueError,) as error:  # noqa: B013
+        issues.append(
+            error.issue
+            if isinstance(error, _ServedDocumentError)
+            else ApprovalIssue(
+                active_release_path(config.artifacts_dir),
+                "active_reference_invalid",
+                str(error),
+            )
+        )
+        active_ids = None
     archived = config.predict.history_path.parent / "served_forecasts"
-    issues = []
     entries = json_entries(archived, issues)
-    if issues:
-        raise ValueError("; ".join(issue.diagnostic() for issue in issues))
     archived_ids: set[str] = set()
     for path in entries:
-        archived_ids.update(_served_document_ids(path, recent_at=now))
-    return _ServedReferences(active_ids, frozenset(archived_ids))
+        try:
+            archived_ids.update(_served_document_ids(path, recent_at=now))
+        except (ValueError,) as error:  # noqa: B013
+            issues.append(
+                error.issue
+                if isinstance(error, _ServedDocumentError)
+                else ApprovalIssue(path, "archived_document_invalid", str(error))
+            )
+    return _ServedReferences(active_ids, frozenset(archived_ids), tuple(issues))
 
 
 def _protected_evaluations(
@@ -1066,6 +1095,7 @@ def _protected_evaluations(
     now: datetime,
     failures: list[str] | None = None,
     verification_details: list[str] | None = None,
+    verification_paths: list[str | None] | None = None,
 ) -> set[str] | None:
     """Authorization uses approval clocks; explicit legacy references only protect data."""
     snapshot = read_approval_snapshot(
@@ -1074,30 +1104,34 @@ def _protected_evaluations(
         legacy_references=True,
         mode="current",
     )
+    reference_path: Path | None = None
     try:
-        if snapshot.issues:
+        references = _active_reference_ids(config, now=now)
+        all_issues = (*snapshot.diagnostics, *references.issues)
+        if snapshot.issues or references.issues:
+            if verification_paths is not None:
+                verification_paths.extend(str(issue.path) for issue in all_issues)
             if verification_details is not None:
                 verification_details.extend(
-                    [issue.diagnostic() for issue in snapshot.diagnostics]
-                    or snapshot.issues
+                    [issue.diagnostic() for issue in all_issues] or snapshot.issues
                 )
             raise ValueError(
                 "unreadable release files or unverifiable metadata: "
                 + (
-                    "; ".join(issue.diagnostic() for issue in snapshot.diagnostics)
+                    "; ".join(issue.diagnostic() for issue in all_issues)
                     or ", ".join(snapshot.issues)
                 )
             )
         records = snapshot.records()
         raw_by_id = {str(raw.get("release_id")): raw for raw in snapshot.releases}
         known = {str(record.release["release_id"]) for record in records}
-        references = _active_reference_ids(config, now=now)
         active_ids = references.active
         if active_ids is None:
             active_ids = {str(records[0].release["release_id"])} if records else set()
         active_ids = active_ids | references.archived
         protected: set[str] = set()
         for release_id in active_ids:
+            reference_path = config.artifacts_dir / "releases" / f"{release_id}.json"
             raw = raw_by_id.get(release_id)
             if raw is None:
                 raise ValueError(
@@ -1114,6 +1148,11 @@ def _protected_evaluations(
         horizon = now - timedelta(days=_PROTECT_RELEASE_DAYS)
         for record in records:
             if record.approved_at >= horizon:
+                reference_path = (
+                    config.artifacts_dir
+                    / "releases"
+                    / f"{record.release['release_id']}.json"
+                )
                 protected |= _release_references(
                     record.release, release_id=str(record.release["release_id"])
                 )
@@ -1121,6 +1160,10 @@ def _protected_evaluations(
     except (ValueError,) as error:  # noqa: B013 -- explicit protection failure
         if verification_details is not None and not verification_details:
             verification_details.append(str(error))
+            if verification_paths is not None:
+                verification_paths.append(
+                    str(reference_path) if reference_path is not None else None
+                )
         if failures is not None:
             failures.append(f"release references could not be verified: {error}")
         return None
@@ -1153,17 +1196,21 @@ def prune_scores_files(
     files = sorted(scores_dir.glob("scores_*.parquet")) if scores_dir.exists() else []
     protection_failures: list[str] = []
     verification_details: list[str] = []
+    verification_paths: list[str | None] = []
     protected = _protected_evaluations(
         config,
         now=moment,
         failures=protection_failures,
         verification_details=verification_details,
+        verification_paths=verification_paths,
     )
     verification = RetentionVerification(
         "suspended" if protected is None else "clear",
         moment,
         tuple(verification_details),
+        tuple(verification_paths),
     )
+    record_progress(verification.diagnostics())
     if protected is None:
         return PruneResult(
             deleted=(),

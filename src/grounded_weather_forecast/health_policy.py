@@ -6,6 +6,8 @@ from datetime import UTC, date, datetime, time, timedelta
 
 import polars as pl
 
+from grounded_weather_forecast.run_health import latest_attempt
+
 FRESHNESS_THRESHOLDS: Mapping[str, float] = {
     "truth_age_minutes": 120.0,
     "collector_age_minutes": 180.0,
@@ -78,23 +80,7 @@ def _refresh_time(payload: Mapping[str, object], now: datetime) -> RefreshTime |
 
 
 def _latest_attempt(runs: pl.DataFrame, now: datetime) -> Mapping[str, object] | None:
-    required = {"command", "started_at", "ended_at", "exit_code"}
-    if runs.is_empty() or not required.issubset(runs.columns):
-        return None
-    completed = runs.filter(
-        (pl.col("command") == "truth-qc")
-        & (pl.col("started_at") <= now)
-        & (pl.col("ended_at") <= now)
-        & (pl.col("ended_at") >= pl.col("started_at"))
-    )
-    if "record_kind" in completed.columns:
-        completed = completed.filter(
-            pl.col("record_kind").is_null()
-            | pl.col("record_kind").is_in(["stage", "invocation"])
-        )
-    if completed.is_empty():
-        return None
-    return completed.sort("ended_at", "started_at").row(-1, named=True)
+    return latest_attempt(runs, "truth-qc", now)
 
 
 def _failed_attempt(

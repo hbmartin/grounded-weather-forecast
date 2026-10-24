@@ -295,10 +295,15 @@ backport before reading events with `visible_at`; no artifacts are migrated.
 recording time. The CLI records it as informational `retention_verification`
 components inside the existing `failure_details_json` run field, with exit 0 and
 `retention_clear` or `retention_suspended`. Details are bounded to 400 characters
-per component. Coordination failures retain their original exit/failure metadata.
+per component. Optional `path` preserves full path identity outside that bound;
+optional `recorded_at` records completion of the check. Both are additive fields
+in diagnostic JSON entries; older entries remain readable. Coordination failures
+retain their original exit/failure metadata.
 No new ledger or artifact is created. The dashboard's published-score protection
-panel and pipeline report show the latest completed check and its timestamp;
-legacy rows without explicit metadata show not recorded. The dashboard does not
+panel and pipeline report distinguish the last recorded check (time and age)
+from the latest attempt. Completed verification survives later exceptions in its
+one existing invocation/stage row. Failed/unverified attempts cannot erase a
+suspension; legacy rows do not establish a clean check. The dashboard does not
 rescan served archives, and a later clear check supersedes a prior suspension.
 Pruning still freshly verifies all protection requirements on every invocation.
 
@@ -306,11 +311,15 @@ Pruning still freshly verifies all protection requirements on every invocation.
 
 Daily-report schema 1 retains its envelope and adds nullable realized-evidence
 attribution: `evidence_match`, `evidence_release_id`, and
-`evidence_dataset_fingerprint`. Forecast release identities remain separate from
+`evidence_dataset_fingerprint`, plus nullable `latest_scored_issue_at`. The latter
+also extends verification output and the served-quality ledger; older rows load
+with null clocks and no historical migration. Forecast release identities remain separate from
 the evidence cohort. Station diagnostics expose the resolved fallback path; latest
-run entries carry individual freshness. Existing ledgers are unchanged.
+run entries carry individual freshness. Served-quality daily deduplication now
+includes dataset identity; existing rows and retention bounds remain intact.
 
-Equal evidence/recording clocks prefer the forecast dataset; remaining distinct
+Equal evidence/recording clocks prefer the latest scored issue when all tied
+candidates have trustworthy clocks, then the forecast dataset; remaining distinct
 cohorts produce `ambiguous_quality_evidence` rather than arbitrary scores.
 Method-bearing unattributed slices remain unknown. Realized recorder code is
 distinct from evaluation code, and compatible fallback requires strictly older

@@ -15,6 +15,7 @@ from grounded_weather_forecast.reports import operations
 from grounded_weather_forecast.retention_status import (
     RetentionVerification,
     latest_retention_verification,
+    retention_status,
 )
 from grounded_weather_forecast.serve.approvals import read_approval_snapshot
 from grounded_weather_forecast.status import failure_details_json
@@ -50,7 +51,8 @@ def test_verification_states_and_timestamps_render_without_failure_alarm(
     panel = _retention_panel(ctx)
     assert panel.status == status
     assert panel.stats[0].value == state.replace("_", " ")
-    assert panel.stats[1].value == NOW.isoformat()
+    assert panel.stats[1].value == (NOW.isoformat() if state != "not_recorded" else "—")
+    assert panel.stats[4].value == NOW.isoformat()
     assert operations._run_counts(ctx.runs, NOW) == (0, 0, 0)
 
 
@@ -58,7 +60,7 @@ def test_verification_states_and_timestamps_render_without_failure_alarm(
 def test_legacy_or_malformed_diagnostics_are_not_verified_clean(raw):
     row = run_row() | {"failure_details_json": raw}
     result = latest_retention_verification(pl.DataFrame([row]), as_of=NOW)
-    assert result.state == "not_recorded" and result.recorded_at == NOW
+    assert result.state == "not_recorded" and result.recorded_at is None
 
 
 def test_latest_clear_verification_replaces_prior_suspension_and_respects_cutoff():
@@ -71,17 +73,17 @@ def test_latest_clear_verification_replaces_prior_suspension_and_respects_cutoff
     )
 
 
-def test_legacy_latest_prune_does_not_reuse_older_clean_verification():
+def test_legacy_latest_attempt_does_not_relabel_the_older_check():
     row = run_row() | {
         "ended_at": NOW + timedelta(seconds=1),
         "failure_details_json": None,
     }
-    assert (
-        latest_retention_verification(
-            pl.DataFrame([run_row(), row]), as_of=NOW + timedelta(seconds=2)
-        ).state
-        == "not_recorded"
+    status = retention_status(
+        pl.DataFrame([run_row(), row]), as_of=NOW + timedelta(seconds=2)
     )
+    assert status.verification.state == "clear"
+    assert status.verification.recorded_at == NOW
+    assert status.attempt_state == "unverified" and status.severity == "info"
 
 
 def test_dashboard_does_not_open_full_served_archive_but_pruning_does(
@@ -207,7 +209,7 @@ def test_each_unreadable_path_has_its_own_bounded_diagnostic(tmp_path):
     recorded = json.loads(failure_details_json(result.verification.diagnostics()))
     assert len(recorded) == 3
     for path, diagnostic in zip(paths, recorded, strict=True):
-        assert str(path) in diagnostic["detail"]
+        assert str(path) == diagnostic["path"]
         assert len(diagnostic["detail"]) <= 400
 
 

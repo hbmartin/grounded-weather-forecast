@@ -208,6 +208,7 @@ EPROCESS_WEALTH_SCHEMA = pl.Schema(
 
 SERVED_QUALITY_SCHEMA = pl.Schema(
     {
+        "latest_scored_issue_at": pl.Datetime("us", "UTC"),
         "recorded_at": pl.Datetime("us", "UTC"),
         "as_of_date": pl.Date(),
         "product": pl.String(),
@@ -274,6 +275,7 @@ SERVED_QUALITY_LEDGER = LedgerSpec(
         "lead_bucket",
         "method_id",
         "release_id",
+        "dataset_fingerprint",
     ),
     max_rows=500_000,
 )
@@ -961,7 +963,11 @@ def served_quality_rows(
     if served.is_empty():
         return pl.DataFrame(schema=SERVED_QUALITY_SCHEMA)
     frame = served
-    for column, dtype in (("backtest_mae", pl.Float64()), ("mae_gap", pl.Float64())):
+    for column, dtype in (
+        ("backtest_mae", pl.Float64()),
+        ("mae_gap", pl.Float64()),
+        ("latest_scored_issue_at", pl.Datetime("us", "UTC")),
+    ):
         if column not in frame.columns:
             frame = frame.with_columns(pl.lit(None, dtype=dtype).alias(column))
     return (
