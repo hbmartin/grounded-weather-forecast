@@ -71,7 +71,7 @@ def test_young_history_renders_placeholders(tmp_path):
         "i6",
         "i7",
     ]
-    assert all(panel.empty_reason is not None for panel in zone.panels[:6])
+    assert all(panel.empty_reason is not None for panel in zone.panels)
     assert zone.panels[6].stats[0].value == "not recorded"
 
 

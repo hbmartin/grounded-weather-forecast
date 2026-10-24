@@ -25,7 +25,7 @@ from grounded_weather_forecast.dashboard.model import (
 )
 from grounded_weather_forecast.dashboard.zones.common import empty_panel, fmt
 from grounded_weather_forecast.reports.operations import FRESHNESS_THRESHOLDS
-from grounded_weather_forecast.retention_status import latest_retention_verification
+from grounded_weather_forecast.retention_status import retention_status
 
 _MAX_POINTS = 60
 _MAX_SERIES = 8
@@ -386,31 +386,57 @@ def build(ctx: DashboardContext, derived: Derived) -> Zone:  # noqa: ARG001
 
 
 def _retention_panel(ctx: DashboardContext) -> Panel:
-    verification = latest_retention_verification(ctx.runs, as_of=ctx.now)
-    status: PanelStatus = (
-        "amber"
-        if verification.state == "suspended"
-        else "ok"
-        if verification.state == "clear"
-        else "info"
+    recorded = retention_status(ctx.runs, as_of=ctx.now)
+    verification = recorded.verification
+    status: PanelStatus = recorded.severity
+    details = [
+        f"{verification.paths[index]}: {detail.removeprefix(f'{verification.paths[index]}: ')}"
+        if index < len(verification.paths) and verification.paths[index]
+        else detail
+        for index, detail in enumerate(verification.details)
+    ] + list(ctx.compatibility_notes)
+    # Render relative labels; full path identity stays in structured run evidence.
+    for prefix, label in (
+        (ctx.config.artifacts_dir, "artifacts"),
+        (ctx.config.dataset.dir, "dataset"),
+        (ctx.config.predict.history_path.parent, "predict"),
+    ):
+        details = [detail.replace(str(prefix), label) for detail in details]
+    age = (
+        (ctx.now - verification.recorded_at).total_seconds() / 60
+        if verification.recorded_at
+        else None
     )
-    details = (*verification.details, *ctx.compatibility_notes)
     return Panel(
         panel_id="i7",
         title="Published-score protection",
         status=status,
         copy=PANEL_COPY["i7"],
         stats=(
-            Stat("latest verification", verification.state.replace("_", " "), status),
+            Stat("last recorded check", verification.state.replace("_", " "), status),
             Stat(
-                "recorded at",
+                "check recorded at",
                 verification.recorded_at.isoformat()
                 if verification.recorded_at
                 else "—",
                 "info",
             ),
+            Stat("check age", f"{age:.0f}m" if age is not None else "—", "info"),
+            Stat("latest attempt", recorded.attempt_state.replace("_", " "), status),
+            Stat(
+                "attempt recorded at",
+                recorded.attempt_at.isoformat() if recorded.attempt_at else "—",
+                "info",
+            ),
         ),
         table=TableSpec(
             columns=("detail",), rows=tuple((detail,) for detail in details)
-        ),
+        )
+        if details
+        else None,
+        empty_reason="No recorded protection verification; legacy or incomplete attempts do not establish a clean check."
+        if verification.state == "not_recorded"
+        else "No protection problems recorded in the completed check."
+        if not details
+        else None,
     )

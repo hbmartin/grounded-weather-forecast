@@ -150,7 +150,8 @@ temporary disk snapshots are created. The default fallback resolves lazily, and 
 explicit `--published-station` avoids home lookup.
 
 Realized slices add nullable `evidence_match` (`exact_release` or
-`compatible_release`), `evidence_release_id` and `evidence_dataset_fingerprint`.
+`compatible_release`), `evidence_release_id`, `evidence_dataset_fingerprint` and
+`latest_scored_issue_at` (UTC, or null for legacy/unusable recency metadata).
 The existing `release_id` describes the forecast. A fallback adds
 `older_compatible_release_evidence`; it selects one existing cohort without pooling.
 Exact rows take precedence even when stale or insufficient. Missing modern
@@ -160,13 +161,29 @@ selection's evaluation code. Backtest code matching remains exact. Fallback
 requires strictly earlier immutable content publication; equal, later or invalid
 publication clocks cannot establish older evidence.
 
-Evidence date and recording time establish priority. Among tied rows the forecast
-dataset is preferred; identical duplicates coalesce. Remaining distinct ties
+Evidence date and recording time establish priority. When every remaining tied
+row has a valid timezone-aware scored-issue clock at or before its recording time,
+the latest `latest_scored_issue_at` wins, then the forecast dataset is preferred.
+The clock describes forecasts actually matched to truth and scored; dataset IDs,
+file times and sample counts never substitute for it. Missing, naive, malformed or
+future clocks disable that tie-break for the whole tied group. Legacy rows retain
+dataset preference and ambiguity handling. Identical duplicates coalesce. Remaining distinct ties
 produce `ambiguous_quality_evidence`, including exact rows, without enabling
 fallback or pooling. Method-bearing slices missing release attribution remain
 unknown; only method-free missing-hour placeholders are omitted.
 
-Each distinct release is parsed once per stable attempt. Every component has its
+Run health filters command/record-kind eligibility before validating fields.
+`superseded_invalid_run_rows` is informational when every damaged row is provably
+older than a valid result; it does not make current health partial. Newer, equally
+timed or unorderable damaged evidence leaves its command unknown with
+`invalid_run_rows`. Independent commands remain available. Otherwise valid rows
+without an ending time are incomplete and skipped. `no_completed_runs_as_of`
+means no usable completed run exists at the cutoff, not merely within 24 hours.
+
+Compatible fallback inspects descending date/recording groups and stops after the
+first group with compatible evidence, checking all its tied candidates. Older
+irrelevant releases are not read or added as retry dependencies. Each distinct
+release is parsed once per stable attempt. Every component has its
 own initial read and one retry, including components first affected during another
 component's retry. Repeated changes leave only exhausted affected components unknown
 while unrelated evidence remains available.
@@ -1100,7 +1117,11 @@ Each completed pruning check records clear/suspended verification through the
 existing structured run diagnostics, also under `--dry-run`. Reports/dashboard
 display that recorded result with its timestamp instead of rescanning the full
 served-document archive. A later clear check replaces an earlier suspension;
-legacy or missing diagnostics show not recorded. Pruning itself always verifies
+a failed or unverified attempt does not erase the last recorded check. The check
+time/age and latest attempt are displayed separately; later failures remain amber.
+Legacy diagnostics cannot establish a clean check. Completed verification survives
+later deletion/output exceptions in the same invocation or stage journal row,
+without changing the original exception or pruning exits. Pruning itself always verifies
 freshly before deciding deletions. Direct dashboard checks of loaded artifacts and
 the active pointer remain live. Valid legacy filename identities are compatibility
 information for retention, not serving approval or unreadable-file alarms.

@@ -2,6 +2,9 @@
 
 import json
 import os
+from collections.abc import Iterator
+from contextlib import contextmanager
+from contextvars import ContextVar
 from dataclasses import asdict, dataclass
 from pathlib import Path
 
@@ -26,6 +29,35 @@ class ComponentDiagnostic:
     exit_code: int
     failure_kind: str | None = None
     detail: str | None = None
+    path: str | None = None
+    recorded_at: str | None = None
+
+
+_progress: ContextVar[list[ComponentDiagnostic] | None] = ContextVar(
+    "command_progress", default=None
+)
+
+
+@contextmanager
+def diagnostic_progress() -> Iterator[list[ComponentDiagnostic]]:
+    """Isolate typed partial results to one invocation or embedded stage."""
+    progress: list[ComponentDiagnostic] = []
+    token = _progress.set(progress)
+    try:
+        yield progress
+    finally:
+        _progress.reset(token)
+
+
+def record_progress(diagnostics: tuple[ComponentDiagnostic, ...]) -> None:
+    if (progress := _progress.get()) is not None:
+        progress.extend(diagnostics)
+
+
+def merge_diagnostics(
+    *batches: tuple[ComponentDiagnostic, ...],
+) -> tuple[ComponentDiagnostic, ...]:
+    return tuple(dict.fromkeys(item for batch in batches for item in batch))
 
 
 def failure_details_json(diagnostics: tuple[ComponentDiagnostic, ...]) -> str | None:
@@ -36,7 +68,12 @@ def failure_details_json(diagnostics: tuple[ComponentDiagnostic, ...]) -> str | 
 
     return json.dumps(
         [
-            asdict(item) | {"detail": normalize_error_detail(item.detail)}
+            {
+                key: value
+                for key, value in asdict(item).items()
+                if key not in {"path", "recorded_at"} or value is not None
+            }
+            | {"detail": normalize_error_detail(item.detail)}
             for item in diagnostics
         ]
     )

@@ -24,6 +24,11 @@ from grounded_weather_forecast.health_policy import (
     truth_qc_freshness,
     truth_qc_refresh_time,
 )
+from grounded_weather_forecast.run_health import (
+    aware_moment,
+    completed_at,
+    eligible_run,
+)
 from grounded_weather_forecast.serve.provenance import (
     SelectionProvenance,
     selection_provenance,
@@ -46,15 +51,14 @@ class SourceError(ValueError):
 
 
 def timestamp(value: object) -> datetime:
-    if isinstance(value, datetime):
-        result = value
-    elif isinstance(value, str):
-        result = datetime.fromisoformat(value)
-    else:
+    result = aware_moment(value)
+    if result is None:
+        if isinstance(value, datetime) and value.tzinfo is None:
+            raise SourceError("timezone_required")
+        if isinstance(value, str) and datetime.fromisoformat(value).tzinfo is None:
+            raise SourceError("timezone_required")
         raise SourceError("missing_timestamp")
-    if result.tzinfo is None or result.utcoffset() is None:
-        raise SourceError("timezone_required")
-    return result.astimezone(UTC)
+    return result
 
 
 def freshness(value: object, now: datetime, limit: float) -> dict[str, Any]:
@@ -509,17 +513,7 @@ def _recent_rows(
 
 
 def _recent_run(row: Mapping[str, Any], now: datetime) -> bool:
-    if row["exit_code"] is not None and type(row["exit_code"]) is not int:
-        raise SourceError("invalid_run_exit_code")
-    if row.get("failure_kind") is not None and not isinstance(row["failure_kind"], str):
-        raise SourceError("invalid_run_failure_kind")
-    if (
-        row.get("record_kind") not in (None, "invocation", "stage")
-        or row["ended_at"] is None
-    ):
-        return False
-    ended = timestamp(row["ended_at"])
-    return ended <= now and timestamp(row["started_at"]) <= ended
+    return eligible_run(row) and completed_at(row, now) is not None
 
 
 def _run_status(row: Mapping[str, Any]) -> str:
@@ -552,6 +546,8 @@ def read_runs(snapshot: Snapshot, path: Path, now: datetime) -> dict[str, Any]:
             "build-dataset",
         }:
             continue
+        if not eligible_run(row):
+            continue
         try:
             if not _recent_run(row, now):
                 continue
@@ -575,11 +571,13 @@ def read_runs(snapshot: Snapshot, path: Path, now: datetime) -> dict[str, Any]:
             "failure_kind": row.get("failure_kind"),
             "freshness": freshness(row["ended_at"], now, evidence_age_limit()),
         }
+    unresolved = set()
     for command, clocks in invalid.items():
         valid = latest.get(command)
         if valid is None or any(
             clock is None or clock >= timestamp(valid["ended_at"]) for clock in clocks
         ):
+            unresolved.add(command)
             latest[command] = {
                 "command": command,
                 "ended_at": None,
@@ -592,10 +590,11 @@ def read_runs(snapshot: Snapshot, path: Path, now: datetime) -> dict[str, Any]:
         (r["ended_at"] for r in latest.values() if r["ended_at"]), default=None
     )
     return {
-        "status": ("partial" if invalid else "ok") if newest else "unknown",
+        "status": ("partial" if unresolved else "ok") if newest else "unknown",
         "latest_by_command": list(latest.values()),
         "freshness": freshness(newest, now, evidence_age_limit()),
-        "limitations": (["invalid_run_rows"] if invalid else [])
+        "limitations": (["invalid_run_rows"] if unresolved else [])
+        + (["superseded_invalid_run_rows"] if invalid.keys() - unresolved else [])
         + ([] if newest else ["no_completed_runs_as_of"]),
     }
 
@@ -715,7 +714,24 @@ def _quality_rows(
     frame = snapshot.frame(
         config.artifacts_dir / "history" / f"{name}.parquet",
         set(required),
-    ).select(required)
+    )
+    if realized:
+        frame = frame.with_columns(
+            _utc_column(frame, "latest_scored_issue_at").alias("latest_scored_issue_at")
+            if "latest_scored_issue_at" in frame.columns
+            and (
+                frame.schema["latest_scored_issue_at"] == pl.String
+                or (
+                    isinstance(frame.schema["latest_scored_issue_at"], pl.Datetime)
+                    and frame.schema["latest_scored_issue_at"].time_zone is not None
+                )
+            )
+            else pl.lit(None, dtype=pl.Datetime("us", "UTC")).alias(
+                "latest_scored_issue_at"
+            )
+        )
+        required.append("latest_scored_issue_at")
+    frame = frame.select(required)
     frame = frame.with_columns(_utc_column(frame, "recorded_at").alias("recorded_at"))
     frame = frame.filter(
         (pl.col("recorded_at") <= now) & (pl.col("product") == "hourly")
@@ -735,10 +751,9 @@ def _quality_rows(
         clocks = ["evaluation_created_at", "recorded_at"]
         keys = [*identity, "evaluation_id"]
     # Reduce in Polars before any per-slice decoding or Python conversion.
-    frame = frame.unique()
     for clock in clocks:
         frame = frame.filter(pl.col(clock) == pl.col(clock).max().over(keys))
-    return frame.sort(clocks, descending=True)
+    return frame.unique().sort(clocks, descending=True)
 
 
 def _cohort_rows(
@@ -767,8 +782,16 @@ def _cohort_rows(
     )
 
 
+def _scored_issue_clock(row: Mapping[str, Any]) -> datetime | None:
+    try:
+        value = timestamp(row.get("latest_scored_issue_at"))
+        return value if value <= timestamp(row["recorded_at"]) else None
+    except (ValueError, TypeError, OverflowError):
+        return None
+
+
 def _select_quality_row(
-    rows: pl.DataFrame, *, realized: bool, forecast_dataset: object
+    rows: pl.DataFrame, *, realized: bool, forecast_dataset: object = None
 ) -> dict[str, Any] | None:
     if rows.is_empty():
         return None
@@ -779,10 +802,14 @@ def _select_quality_row(
         "recorded_at",
     ):
         rows = rows.filter(pl.col(clock) == pl.col(clock).max())
-    preferred = rows.filter(pl.col("dataset_fingerprint") == forecast_dataset)
-    if not preferred.is_empty():
-        rows = preferred
-    rows = rows.unique()
+    if realized:
+        clocks = [_scored_issue_clock(row) for row in rows.iter_rows(named=True)]
+        if all(clock is not None for clock in clocks):
+            newest = max(clock for clock in clocks if clock is not None)
+            rows = rows.filter(pl.col("latest_scored_issue_at") == newest)
+        preferred = rows.filter(pl.col("dataset_fingerprint") == forecast_dataset)
+        if not preferred.is_empty():
+            rows = preferred
     if rows.height != 1:
         raise SourceError("ambiguous_quality_evidence")
     return rows.row(0, named=True)
@@ -803,29 +830,35 @@ def _compatible_evidence(
         content_clock = timestamp(published)
     except (ValueError, TypeError, OverflowError):
         return None
-    eligible = []
-    for identifier in rows["release_id"].unique().to_list():
-        if not isinstance(identifier, str) or not identifier.isalnum():
-            continue
-        try:
-            release = snapshot.document(
-                config.artifacts_dir / "releases" / f"{identifier}.json"
-            )
-            if (
-                release.get("release_id") != identifier
-                or not timestamp(release.get("promoted_at")) < content_clock <= now
-            ):
+    # Inspect every tie, but do not read older tiers once eligible evidence exists.
+    for tier in rows.sort(["as_of_date", "recorded_at"], descending=True).partition_by(
+        ["as_of_date", "recorded_at"], maintain_order=True
+    ):
+        eligible = []
+        for identifier in tier["release_id"].unique().to_list():
+            if not isinstance(identifier, str) or not identifier.isalnum():
                 continue
-            candidate = selection_provenance(release, key)
-            if current.compatible_with(candidate):
-                eligible.append(identifier)
-        except (OSError, ValueError, TypeError, OverflowError):
-            continue
-    return _select_quality_row(
-        rows.filter(pl.col("release_id").is_in(eligible)),
-        realized=True,
-        forecast_dataset=forecast_dataset,
-    )
+            try:
+                release = snapshot.document(
+                    config.artifacts_dir / "releases" / f"{identifier}.json"
+                )
+                if (
+                    release.get("release_id") != identifier
+                    or not timestamp(release.get("promoted_at")) < content_clock <= now
+                ):
+                    continue
+                candidate = selection_provenance(release, key)
+                if current.compatible_with(candidate):
+                    eligible.append(identifier)
+            except (OSError, ValueError, TypeError, OverflowError):
+                continue
+        if eligible:
+            return _select_quality_row(
+                tier.filter(pl.col("release_id").is_in(eligible)),
+                realized=True,
+                forecast_dataset=forecast_dataset,
+            )
+    return None
 
 
 def _quality_value(
@@ -864,6 +897,7 @@ def _quality_value(
             evidence_match="compatible_release" if fallback else "exact_release",
             evidence_release_id=row["release_id"],
             evidence_dataset_fingerprint=row["dataset_fingerprint"],
+            latest_scored_issue_at=_scored_issue_clock(row),
         )
     return {
         "status": status,
@@ -937,9 +971,7 @@ def _read_slice(
             (pl.col("evaluation_id") == provenance.evaluation_id)
             & (pl.col("dataset_fingerprint") == provenance.dataset_fingerprint)
         )
-        row = _select_quality_row(
-            matching, realized=False, forecast_dataset=provenance.dataset_fingerprint
-        )
+        row = _select_quality_row(matching, realized=False)
     return _quality_value(row, now, realized=realized, fallback=fallback)
 
 

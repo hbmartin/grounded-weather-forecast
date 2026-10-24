@@ -294,8 +294,10 @@ exit behavior, and later analysis commands.
   than rescanning the served archive. With report before prune in the daily chain,
   the displayed verification can be from the preceding run; its timestamp makes
   that explicit. Pruning still freshly verifies before deleting, and protection
-  suspension keeps exit 0. A later clear check replaces the warning; legacy runs
-  without explicit verification metadata show not recorded.
+  suspension keeps exit 0. Check age and the latest attempt are distinct; completed
+  verification survives later errors. Failed/unverified attempts do not erase a
+  suspension, and legacy attempts do not establish a clean check. A later explicit
+  clear check replaces the warning; existing failure/exit meanings remain intact.
 - `maintain` waits for `<dataset dir>/pipeline.lock` and holds it once across
   build → live backtest → truth-QC → report. Interactive mutators wait 60 s and
   exit `75` on contention. This prevents another command from slipping between

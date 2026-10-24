@@ -203,6 +203,22 @@
         },
         "source_schema_version": {
           "const": 6
+        },
+        "slices": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "properties": {
+              "latest_scored_issue_at": {
+                "type": [
+                  "string",
+                  "null"
+                ],
+                "format": "date-time",
+                "description": "Latest issue time among forecasts actually scored for this realized evidence cohort; null when legacy or unusable."
+              }
+            }
+          }
         }
       },
       "additionalProperties": true

@@ -163,16 +163,16 @@ def _releases(
         if item.category == "legacy_identity_missing"
     }
     for issue in snapshot.issues:
-        if issue in legacy:
-            if compatibility_notes is not None:
-                compatibility_notes.append(
-                    f"{issue}: legacy filename identity is usable for retention only"
-                )
-            continue
         try:
             label = "artifacts/" + str(Path(issue).relative_to(config.artifacts_dir))
         except (ValueError,):  # noqa: B013
-            label = issue
+            label = Path(issue).name
+        if issue in legacy:
+            if compatibility_notes is not None:
+                compatibility_notes.append(
+                    f"{label}: legacy filename identity is usable for retention only"
+                )
+            continue
         failures.append(label)
     from grounded_weather_forecast.reports.operations import (  # noqa: PLC0415
         _pointer_reference_ids,

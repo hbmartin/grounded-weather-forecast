@@ -204,9 +204,9 @@ class TestLedgerEngine:
             "code_version": "code1",
             "config_fingerprint": "cfg1",
         }
-        frame = pl.DataFrame(
-            [row], schema_overrides=dict(SERVED_QUALITY_SCHEMA)
-        ).select(SERVED_QUALITY_SCHEMA.names())
+        frame = pl.DataFrame([row], schema=dict(SERVED_QUALITY_SCHEMA)).select(
+            SERVED_QUALITY_SCHEMA.names()
+        )
         append_ledger(frame, path, SERVED_QUALITY_LEDGER, now=NOW)
         append_ledger(frame, path, SERVED_QUALITY_LEDGER, now=NOW)
         assert read_ledger(path, SERVED_QUALITY_SCHEMA).height == 1

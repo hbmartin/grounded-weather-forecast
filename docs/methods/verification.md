@@ -490,7 +490,8 @@ Evaluation failures take precedence over promotion-only failures while nullable
 ### Published-score protection verification
 
 *Implemented in: `reports/operations.py`, `retention_status.py`,
-`cli.py::_cmd_prune_scores`, `dashboard/zones/operations.py`.*
+`cli.py::_cmd_prune_scores`, `status.py::diagnostic_progress`, `run_health.py`,
+`dashboard/zones/operations.py`.*
 
 Pruning freshly verifies release/event metadata, the active pointer and required
 served-document references before deleting published scores. Uncertainty suspends
@@ -503,17 +504,24 @@ serving. Pointer-field diagnostics remain distinct from referenced-output errors
 Each completed check carries an additive typed `PruneResult.verification` result
 and records informational `retention_verification` components in the existing
 run ledger, using exit 0 and `retention_clear`/`retention_suspended`; details are
-bounded to 400 characters per component. Coordination failures keep their own
-failure status. Reports/dashboard consume the latest recorded result and its
-timestamp without rescanning the served archive. Missing explicit legacy metadata
-means not recorded; a subsequent clear check replaces an earlier warning.
+bounded to 400 characters per component; an additive optional `path` preserves
+the complete affected path independently. Archive errors are collected per file,
+not stopped at the first failure. An optional `recorded_at` carries the completed
+check clock. Invocation/stage-scoped context-local progress preserves completed
+checks through later deletion or output exceptions without duplicate journal rows
+or changed exception semantics. Coordination failures keep their own failure
+status. Reports/dashboard display the last recorded check and its age separately
+from the latest eligible attempt, without rescanning the archive. Failed or
+unverified attempts cannot erase a suspension or establish a clean check. Missing
+legacy metadata is unverified; only an explicit later clear check establishes
+verified protection. See the [operational references](bibliography.md#3-operational-analogues).
 Direct loaded-artifact checks remain live. A valid legacy omission of `release_id`
 is compatibility information for retention, not an unreadable-file alarm or a
 serving approval. No ledger migration or historical rewrite is required.
 
 ## 8. Self-verification
 
-*Implemented in: `reports/verification.py`*
+*Implemented in: `reports/verification.py`, `reports/evidence.py::served_quality_rows`*
 
 The backtest can only measure the backtest. Serving has its own code path,
 its own snapshot construction, and its own failure modes, so the system scores
@@ -522,7 +530,12 @@ its own snapshot construction, and its own failure modes, so the system scores
 `verify_history` joins served forecasts to subsequently-arrived truth and
 computes `live_mae`, `live_rmse`, `live_bias` per
 (product, variable, truth semantics, lead bucket, method, dataset fingerprint,
-release id), with `_MIN_SCORED = 5`. `compare_to_backtest` places
+release id), with `_MIN_SCORED = 5`. Each qualifying cohort records the maximum `issued_at`
+among its truth-matched scored rows as `latest_scored_issue_at`; unmatched newer
+forecasts do not advance it. This metadata changes neither the cohort nor its
+metrics or live gates. The served-quality ledger deduplicates daily per dataset
+and release cohort, preserving first-write behavior and its 500,000-row cap.
+`compare_to_backtest` places
 
 $$\text{mae\_gap} = \text{live\_mae} - \text{backtest\_mae}$$
 

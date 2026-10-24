@@ -27,7 +27,9 @@ from grounded_weather_forecast.status import (
     PROMOTION_ONLY_FAILURE_KINDS,
     CommandOutcome,
     ComponentDiagnostic,
+    diagnostic_progress,
     failure_details_json,
+    merge_diagnostics,
     write_outcome_hint,
 )
 
@@ -1670,11 +1672,11 @@ def _report_pipeline_health(
         write_markdown_report,
     )
     from grounded_weather_forecast.retention_status import (  # noqa: PLC0415
-        latest_retention_verification,
+        retention_status,
     )
 
     runs_frame = runs.load_runs(runs.runs_path(config))
-    verification = latest_retention_verification(runs_frame, as_of=datetime.now(UTC))
+    verification = retention_status(runs_frame, as_of=datetime.now(UTC))
     health = operations.record_operations(
         config,
         runs_frame=runs_frame,
@@ -1775,29 +1777,33 @@ def _run_pipeline_steps(
         record_args = (stage_args or {}).get(name, fallback)
         print(f"pipeline step: {name}")
         started_at = datetime.now(tz=UTC)
-        result: CommandOutcome | None = None
-        try:
-            result = CommandOutcome.normalize(step())
-        finally:
-            stage = argparse.Namespace(
-                **{
-                    key: value
-                    for key, value in vars(record_args).items()
-                    if not key.startswith("_")
-                }
-            )
-            stage.command = name.split()[0]
-            _record_run(
-                config,
-                stage,
-                started_at=started_at,
-                exit_code=result.exit_code if result is not None else None,
-                record_kind="stage",
-                parent_run_id=_parent_run_id(args),
-                failure_kind=result.failure_kind if result is not None else None,
-                error_detail=result.error_detail if result is not None else None,
-                diagnostics=result.diagnostics if result is not None else (),
-            )
+        with diagnostic_progress() as progress:
+            result: CommandOutcome | None = None
+            try:
+                result = CommandOutcome.normalize(step())
+            finally:
+                stage = argparse.Namespace(
+                    **{
+                        key: value
+                        for key, value in vars(record_args).items()
+                        if not key.startswith("_")
+                    }
+                )
+                stage.command = name.split()[0]
+                _record_run(
+                    config,
+                    stage,
+                    started_at=started_at,
+                    exit_code=result.exit_code if result is not None else None,
+                    record_kind="stage",
+                    parent_run_id=_parent_run_id(args),
+                    failure_kind=result.failure_kind if result is not None else None,
+                    error_detail=result.error_detail if result is not None else None,
+                    diagnostics=merge_diagnostics(
+                        tuple(progress),
+                        result.diagnostics if result is not None else (),
+                    ),
+                )
         if (
             tolerate_pending
             and name.startswith("backtest")
@@ -2086,22 +2092,25 @@ def main(argv: Sequence[str] | None = None) -> int:
     except ConfigError as exc:
         print(f"config error: {exc}")
         return 2
-    outcome: CommandOutcome | None = None
-    try:
-        outcome = CommandOutcome.normalize(_dispatch(config, args, parser))
-        return outcome.exit_code
-    finally:
-        if args.command == "backtest" and outcome is not None:
-            write_outcome_hint(outcome)
-        _record_run(
-            config,
-            args,
-            started_at=started_at,
-            exit_code=outcome.exit_code if outcome is not None else None,
-            failure_kind=outcome.failure_kind if outcome is not None else None,
-            error_detail=outcome.error_detail if outcome is not None else None,
-            diagnostics=outcome.diagnostics if outcome is not None else (),
-        )
+    with diagnostic_progress() as progress:
+        outcome: CommandOutcome | None = None
+        try:
+            outcome = CommandOutcome.normalize(_dispatch(config, args, parser))
+            return outcome.exit_code
+        finally:
+            if args.command == "backtest" and outcome is not None:
+                write_outcome_hint(outcome)
+            _record_run(
+                config,
+                args,
+                started_at=started_at,
+                exit_code=outcome.exit_code if outcome is not None else None,
+                failure_kind=outcome.failure_kind if outcome is not None else None,
+                error_detail=outcome.error_detail if outcome is not None else None,
+                diagnostics=merge_diagnostics(
+                    tuple(progress), outcome.diagnostics if outcome is not None else ()
+                ),
+            )
 
 
 def _read_daily_error(limitation: str) -> int:
