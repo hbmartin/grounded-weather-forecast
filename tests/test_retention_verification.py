@@ -27,6 +27,7 @@ def run_row(state="clear", *, when=NOW):
         "started_at": when - timedelta(seconds=1),
         "ended_at": when,
         "exit_code": 0,
+        "args_json": json.dumps({"dry_run": False}),
         "failure_details_json": failure_details_json(
             RetentionVerification(
                 state, when, ("affected/path.json",) if state == "suspended" else ()

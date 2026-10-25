@@ -12,7 +12,7 @@ from typing import cast
 
 import polars as pl
 
-from grounded_weather_forecast.artifact_labels import diagnostic_label
+from grounded_weather_forecast.artifact_labels import audit_label, diagnostic_label
 from grounded_weather_forecast.dashboard.charts import line_chart
 from grounded_weather_forecast.dashboard.context import DashboardContext
 from grounded_weather_forecast.dashboard.copy import PANEL_COPY, ZONE_INTROS
@@ -30,6 +30,7 @@ from grounded_weather_forecast.retention_status import (
     VERIFICATION_SAMPLE_LIMIT,
     retention_status,
 )
+from grounded_weather_forecast.verification_text import public_detail
 
 _MAX_POINTS = 60
 _MAX_SERIES = 8
@@ -389,6 +390,10 @@ def build(ctx: DashboardContext, derived: Derived) -> Zone:  # noqa: ARG001
     )
 
 
+def _mode_label(*, dry_run: bool | None) -> str:
+    return "dry run" if dry_run is True else "apply" if dry_run is False else "unknown"
+
+
 def _retention_panel(ctx: DashboardContext) -> Panel:
     recorded = retention_status(ctx.runs, as_of=ctx.now)
     verification = recorded.verification
@@ -402,17 +407,25 @@ def _retention_panel(ctx: DashboardContext) -> Panel:
         for index, detail in enumerate(verification.details[:VERIFICATION_SAMPLE_LIMIT])
     ]
     notes = list(ctx.compatibility_notes)
-    details += notes[: max(0, VERIFICATION_SAMPLE_LIMIT - len(details))]
-    if verification.audit_error:
-        details.append(
-            "Full verification audit is unavailable; diagnostic samples are retained."
-        )
+    audit_note = (
+        "Full verification audit is unavailable; diagnostic samples are retained."
+        if verification.audit_error
+        else None
+    )
+    compatibility = [public_detail(note) for note in notes[:VERIFICATION_SAMPLE_LIMIT]]
+    omitted_notes = max(0, len(notes) - len(compatibility))
+    introduction = [audit_note] if audit_note else []
+    if compatibility:
+        introduction.append("Compatibility information: " + "; ".join(compatibility))
+    if omitted_notes:
+        introduction.append(f"{omitted_notes} additional compatibility notes omitted.")
     age = recorded.check_age_minutes
     return Panel(
         panel_id="i7",
         title="Published-score protection",
         status=status,
         copy=PANEL_COPY["i7"],
+        intro=" ".join(introduction) or None,
         stats=(
             Stat("last recorded check", verification.state.replace("_", " "), status),
             Stat(
@@ -444,7 +457,7 @@ def _retention_panel(ctx: DashboardContext) -> Panel:
             Stat("omitted from samples", str(verification.omitted), "info"),
             Stat(
                 "full audit",
-                "artifacts/" + verification.audit_path
+                audit_label(verification.audit_path, ctx.config)
                 if verification.audit_path
                 else "—",
                 "info",
@@ -454,6 +467,17 @@ def _retention_panel(ctx: DashboardContext) -> Panel:
                 "yes" if recorded.outstanding_failure else "no",
                 status,
             ),
+            Stat(
+                "check mode",
+                _mode_label(dry_run=verification.dry_run),
+                "info",
+            ),
+            Stat(
+                "latest attempt mode",
+                _mode_label(dry_run=recorded.attempt_dry_run),
+                "info",
+            ),
+            Stat("compatibility notes omitted", str(omitted_notes), "info"),
         ),
         table=TableSpec(
             columns=("detail",),

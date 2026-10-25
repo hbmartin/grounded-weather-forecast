@@ -72,7 +72,7 @@ from grounded_weather_forecast.serve.approvals import (
     read_approval_snapshot,
 )
 from grounded_weather_forecast.serve.schema import Forecast
-from grounded_weather_forecast.status import PENDING_EXIT_CODES, record_progress
+from grounded_weather_forecast.status import PENDING_EXIT_CODES
 
 _COLLECTOR_ERRORS = (OSError, ValueError, sqlite3.Error, pl.exceptions.PolarsError)
 
@@ -1098,28 +1098,12 @@ def _active_reference_ids(config: Config, *, now: datetime) -> _ServedReferences
     return _ServedReferences(active_ids, frozenset(archived_ids), tuple(issues))
 
 
-def _capture_verification_issues(
-    issues: tuple[ApprovalIssue, ...],
-    details: list[str] | None,
-    paths: list[str | None] | None,
-    categories: list[str] | None,
-) -> None:
-    if details is not None:
-        details.extend(issue.diagnostic() for issue in issues)
-    if paths is not None:
-        paths.extend(str(issue.path) for issue in issues)
-    if categories is not None:
-        categories.extend(issue.category for issue in issues)
-
-
 def _protected_evaluations(
     config: Config,
     *,
     now: datetime,
     failures: list[str] | None = None,
-    verification_details: list[str] | None = None,
-    verification_paths: list[str | None] | None = None,
-    verification_categories: list[str] | None = None,
+    issues: list[ApprovalIssue] | None = None,
 ) -> set[str] | None:
     """Authorization uses approval clocks; explicit legacy references only protect data."""
     snapshot = read_approval_snapshot(
@@ -1135,12 +1119,8 @@ def _protected_evaluations(
         all_issues = (*snapshot.diagnostics, *references.issues)
         if snapshot.issues or references.issues:
             captured_issues = all_issues
-            _capture_verification_issues(
-                all_issues,
-                verification_details,
-                verification_paths,
-                verification_categories,
-            )
+            if issues is not None:
+                issues.extend(all_issues)
             raise ValueError("score protection could not be verified")
         records = snapshot.records()
         raw_by_id = {str(raw.get("release_id")): raw for raw in snapshot.releases}
@@ -1178,14 +1158,16 @@ def _protected_evaluations(
                 )
         return protected
     except (ValueError,) as error:  # noqa: B013 -- explicit protection failure
-        if verification_details is not None and not verification_details:
-            verification_details.append(str(error))
-            if verification_categories is not None:
-                verification_categories.append("release_reference_invalid")
-            if verification_paths is not None:
-                verification_paths.append(
-                    str(reference_path) if reference_path is not None else None
+        if issues is not None and not issues:
+            issues.append(
+                ApprovalIssue(
+                    reference_path
+                    if reference_path is not None
+                    else config.artifacts_dir / "releases",
+                    "release_reference_invalid",
+                    str(error),
                 )
+            )
         if failures is not None:
             failures.append(f"release references could not be verified: {error}")
             failures.extend(
@@ -1221,26 +1203,20 @@ def prune_scores_files(
         failure = error.snapshot()
     files = sorted(scores_dir.glob("scores_*.parquet")) if scores_dir.exists() else []
     protection_failures: list[str] = []
-    verification_details: list[str] = []
-    verification_paths: list[str | None] = []
-    verification_categories: list[str] = []
+    issues: list[ApprovalIssue] = []
     protected = _protected_evaluations(
         config,
         now=moment,
         failures=protection_failures,
-        verification_details=verification_details,
-        verification_paths=verification_paths,
-        verification_categories=verification_categories,
+        issues=issues,
     )
     verification = RetentionVerification(
         "suspended" if protected is None else "clear",
         moment,
-        tuple(verification_details),
-        tuple(verification_paths),
-        categories=tuple(verification_categories),
     )
-    verification = publish_verification(config, verification, dry_run=dry_run)
-    record_progress(verification.diagnostics())
+    verification = publish_verification(
+        config, verification, dry_run=dry_run, issues=tuple(issues)
+    )
     audit_notes = cleanup_audits(config, now=moment, dry_run=dry_run)
     if protected is None:
         return PruneResult(

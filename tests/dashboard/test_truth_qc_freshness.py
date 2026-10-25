@@ -160,12 +160,21 @@ def test_unfinished_future_and_unrelated_attempts_are_ignored(tmp_path, row):
     assert "failed" not in panel.intro
 
 
-def test_reversed_interval_retains_verdict_with_unknown_attempt_warning(tmp_path):
+@pytest.mark.parametrize(
+    "refresh,unknown", [(NOW, False), (NOW - timedelta(minutes=12), True)]
+)
+def test_reversed_interval_is_superseded_only_by_newer_refresh(
+    tmp_path, refresh, unknown
+):
     panel = _truth_cross_check(
-        context(tmp_path, runs=[attempt(ended=NOW - timedelta(minutes=11))])
+        context(
+            tmp_path,
+            generated_at=refresh.isoformat(),
+            runs=[attempt(ended=NOW - timedelta(minutes=11))],
+        )
     )
-    assert panel.status == "amber"
-    assert "outcome is unknown" in panel.intro
+    assert panel.status == ("amber" if unknown else "ok")
+    assert ("outcome is unknown" in panel.intro) == unknown
     assert "previous quiet verdict" in panel.intro
     assert "refresh failed" not in panel.intro
 

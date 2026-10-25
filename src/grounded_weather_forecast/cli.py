@@ -10,7 +10,7 @@ from pathlib import Path
 import polars as pl
 
 from grounded_weather_forecast import __version__
-from grounded_weather_forecast.artifact_labels import artifact_label
+from grounded_weather_forecast.artifact_labels import artifact_label, audit_label
 from grounded_weather_forecast.backtest.outcomes import (
     BacktestDiagnostics,
     BacktestResult,
@@ -1717,7 +1717,8 @@ def _report_pipeline_health(
                 (
                     "Latest pruning verification (recorded result)",
                     verification.frame(
-                        path_label=lambda value: artifact_label(Path(value), config)
+                        path_label=lambda value: artifact_label(Path(value), config),
+                        audit_path_label=lambda value: audit_label(value, config),
                     ),
                 ),
             ],
@@ -1751,7 +1752,7 @@ def _cmd_prune_scores(config: Config, args: argparse.Namespace) -> int | Command
     check = result.verification
     if check.issue_count is not None and check.total:
         print(
-            f"protection suspended: {check.total} issues; {check.omitted} omitted from samples; audit: {check.audit_path or chr(8212)}"
+            f"protection suspended: {check.total} issues; {check.omitted} omitted from samples; audit: {audit_label(check.audit_path, config) if check.audit_path else chr(8212)}"
         )
     if check.audit_error:
         print(check.audit_error)

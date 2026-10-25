@@ -4,6 +4,7 @@ import os
 from pathlib import Path
 
 from grounded_weather_forecast.config import Config
+from grounded_weather_forecast.verification_text import public_detail
 
 
 def _absolute(path: Path) -> Path:
@@ -29,7 +30,11 @@ def artifact_label(path: Path, config: Config) -> str:
 
 
 def diagnostic_label(detail: str, path: str | None, config: Config) -> str:
+    explanation = public_detail(detail, path)
     if path:
-        explanation = detail.removeprefix(f"{path}: ")
         return f"{artifact_label(Path(path), config)}: {explanation}"
-    return detail
+    return explanation
+
+
+def audit_label(reference: str, config: Config) -> str:
+    return artifact_label(config.artifacts_dir / reference, config)

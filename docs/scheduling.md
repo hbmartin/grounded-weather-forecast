@@ -297,7 +297,9 @@ exit behavior, and later analysis commands.
   suspension keeps exit 0. Check age and the latest attempt are distinct; completed
   verification survives later errors. Failed/unverified attempts do not erase a
   suspension, and legacy attempts do not establish a clean check. A later explicit
-  clear successful check replaces the warning; existing failure/exit meanings remain intact.
+  clear successful check replaces a protection suspension. Only a successful clear
+  non-dry-run prune clears an execution failure. Check metadata takes precedence
+  over recorded arguments; unknown legacy execution mode cannot establish recovery.
   Lock contention (75) is a distinct informational attempt, not a new protection
   failure, and clears no older warning. Relevant malformed newer run evidence
   is unknown/amber rather than exposing an old success as current.
@@ -305,8 +307,16 @@ exit behavior, and later analysis commands.
   Audits under `artifacts/history/pruning_verifications/` preserve every affected
   path, survive for 90 days and while referenced by retained run rows, and are
   cleaned only when verifiably old/unreferenced. Dry runs can record an audit
-  but never delete one. Audit failures remain explicit without changing pruning
-  exit semantics. Reports/dashboard display check age using their own cutoff.
+  but never delete one or an abandoned audit stage. Completed bounded progress
+  is recorded before audit I/O and enriched under the same check ID afterward.
+  Catchable interruptions preserve it; SIGKILL and power loss do not guarantee
+  journaling. Audit publication requires hard links and file/directory synchronization.
+  A dedicated nonblocking audit lock coordinates publication and cleanup; contention
+  is informational. Known regular unchanged stages older than 90 days can expire;
+  fresh, active, unrecognized and unverifiable files remain. Audit failures remain
+  explicit without changing pruning exit semantics. Reports/dashboard display check
+  age and dry-run mode using their own cutoff; audit availability and bounded
+  compatibility notes remain visible independently of issue samples.
 - `maintain` waits for `<dataset dir>/pipeline.lock` and holds it once across
   build → live backtest → truth-QC → report. Interactive mutators wait 60 s and
   exit `75` on contention. This prevents another command from slipping between

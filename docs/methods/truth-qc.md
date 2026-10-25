@@ -302,3 +302,8 @@ and latest failed refreshes. Optional null shield diagnostics do not invalidate
 other fresh evidence. Malformed optional verdict metadata retains valid freshness
 and alert flags with a limitation. Date-only results do not invent an exact
 refresh instant. `reports/truth_qc.py` preserves the existing import API.
+
+A valid refresh also supersedes malformed attempt evidence whose ending clock is
+provably older than the earliest refresh bound. Equal/newer or unorderable damaged
+evidence remains an unknown-refresh warning. Failure and uncertainty share one
+run assessment; dashboard consumers reuse the derived freshness result.

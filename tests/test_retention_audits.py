@@ -92,7 +92,8 @@ def test_audit_publish_failure_is_explicit_and_nonfatal(tmp_path, monkeypatch):
         and "audit unavailable" in result.audit_error
     )
     assert result.total == 23 and result.omitted == 3
-    assert not list(audit_directory(config).iterdir())
+    assert not list(audit_directory(config).glob("*.jsonl"))
+    assert not list(audit_directory(config).glob("*.tmp"))
     row = {
         "command": "prune-scores",
         "started_at": START,
@@ -110,7 +111,8 @@ def test_cancellation_cleans_staging_and_propagates(tmp_path, monkeypatch):
     )
     with pytest.raises(KeyboardInterrupt):
         publish_verification(config, verification(), dry_run=False)
-    assert not list(audit_directory(config).iterdir())
+    assert not list(audit_directory(config).glob("*.jsonl"))
+    assert not list(audit_directory(config).glob("*.tmp"))
 
 
 def test_exclusive_publication_does_not_rewrite_existing_audit(tmp_path, monkeypatch):

@@ -135,5 +135,9 @@ only after eligibility. A provably older malformed record produces informational
 `superseded_invalid_run_rows`; newer, equally timed and unorderable damage keeps
 only its command unknown with `invalid_run_rows`. An otherwise valid unfinished
 row is skipped. Valid outcomes sort by ending time, starting time, and persisted row position; the last row wins exact-clock ties. The same typed assessment preserves unresolved/superseded damage for truth-QC and pruning. Truth-QC retains available verdict data with an unknown-refresh warning when current attempt evidence cannot be verified. Retention remains 90 days and 50,000 rows; null-start records are
-bounded by the existing row cap. See the operational references in the
+bounded by the existing row cap. A valid truth-QC refresh supersedes damaged attempt
+evidence only when its earliest refresh bound is strictly later than the damaged
+row's valid ending time. Equal/newer or unorderable damage remains unknown. The
+shared freshness calculation assesses runs once, and the dashboard reuses it.
+See the operational references in the
 [bibliography](bibliography.md#3-operational-analogues).

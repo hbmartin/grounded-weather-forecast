@@ -79,7 +79,9 @@ def test_clear_and_missing_empty_states_and_bounded_compatibility_notes(tmp_path
     noisy = panel(
         config, RetentionVerification(), notes=tuple(f"legacy {i}" for i in range(100))
     )
-    assert len(noisy.table.rows) == 20 and noisy.empty_reason
+    assert noisy.table is None and noisy.empty_reason
+    assert "legacy 19" in noisy.intro and "legacy 20;" not in noisy.intro
+    assert "80 additional compatibility notes omitted" in noisy.intro
 
 
 def test_audit_unavailable_remains_visible_when_issue_table_is_full(tmp_path):
@@ -99,3 +101,4 @@ def test_audit_unavailable_remains_visible_when_issue_table_is_full(tmp_path):
         stat.label == "audit state" and stat.value == "unavailable"
         for stat in result.stats
     )
+    assert "Full verification audit is unavailable" in result.intro

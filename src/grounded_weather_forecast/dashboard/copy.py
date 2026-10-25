@@ -622,7 +622,7 @@ PANEL_COPY: Mapping[str, PanelCopy] = {
     "i7": PanelCopy(
         what="The last recorded protection check, its age, and the latest pruning attempt.",
         why="Unverifiable release evidence suspends published-score deletion; the dashboard does not rescan the archive.",
-        thresholds="Recorded checks are historical. Later failed attempts remain amber; unverified attempts cannot erase a suspension or establish a clean check. Pruning verifies freshly before deletion.",
+        thresholds="Recorded checks are historical. Dry runs may verify protection; only a successful clear apply run clears an execution failure. Unknown legacy mode cannot prove recovery. Audit availability and compatibility notes are separate from bounded issue samples. Pruning verifies freshly before deletion.",
     ),
     "i6": PanelCopy(
         what=(

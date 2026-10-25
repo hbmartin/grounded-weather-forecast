@@ -37,6 +37,7 @@ class ComponentDiagnostic:
     issue_count: int | None = None
     omitted_count: int | None = None
     audit_error: str | None = None
+    dry_run: bool | None = None
 
 
 _progress: ContextVar[list[ComponentDiagnostic] | None] = ContextVar(
@@ -58,6 +59,22 @@ def diagnostic_progress() -> Iterator[list[ComponentDiagnostic]]:
 def record_progress(diagnostics: tuple[ComponentDiagnostic, ...]) -> None:
     if (progress := _progress.get()) is not None:
         progress.extend(diagnostics)
+
+
+def record_verification_progress(diagnostics: tuple[ComponentDiagnostic, ...]) -> None:
+    """Replace one identified check atomically, preserving other partial results."""
+    if (progress := _progress.get()) is None:
+        return
+    identities = {
+        item.check_id
+        for item in diagnostics
+        if item.stage == "retention_verification" and item.check_id is not None
+    }
+    progress[:] = [
+        item
+        for item in progress
+        if item.stage != "retention_verification" or item.check_id not in identities
+    ] + list(diagnostics)
 
 
 def merge_diagnostics(
@@ -86,6 +103,7 @@ def failure_details_json(diagnostics: tuple[ComponentDiagnostic, ...]) -> str | 
                     "issue_count",
                     "omitted_count",
                     "audit_error",
+                    "dry_run",
                 }
                 or value is not None
             }

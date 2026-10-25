@@ -10,6 +10,7 @@ import polars as pl
 
 from grounded_weather_forecast.run_health import assess_attempts, aware_moment
 from grounded_weather_forecast.status import EXIT_CONTENTION, ComponentDiagnostic
+from grounded_weather_forecast.verification_text import normalize_detail, public_detail
 
 VERIFICATION_SAMPLE_LIMIT = 20
 
@@ -25,6 +26,7 @@ class RetentionVerification:
     issue_count: int | None = None
     audit_error: str | None = None
     categories: tuple[str, ...] = ()
+    dry_run: bool | None = None
 
     @property
     def total(self) -> int:
@@ -48,6 +50,7 @@ class RetentionVerification:
             failure_kind=f"retention_{self.state}",
             recorded_at=self.recorded_at.isoformat() if self.recorded_at else None,
             check_id=self.check_id,
+            dry_run=self.dry_run,
         )
         summary = (
             (
@@ -69,20 +72,25 @@ class RetentionVerification:
         return summary + tuple(
             replace(
                 common,
-                detail=detail.removeprefix(f"{self.paths[index]}: ")
-                if index < len(self.paths) and self.paths[index]
-                else detail,
+                detail=normalize_detail(
+                    detail, self.paths[index] if index < len(self.paths) else None
+                ),
                 path=self.paths[index] if index < len(self.paths) else None,
             )
             for index, detail in enumerate(samples)
         )
 
-    def frame(self, *, path_label: Callable[[str], str] | None = None) -> pl.DataFrame:
+    def frame(
+        self,
+        *,
+        path_label: Callable[[str], str] | None = None,
+        audit_path_label: Callable[[str], str] | None = None,
+    ) -> pl.DataFrame:
         label = path_label or str
         details = [
-            detail.removeprefix(f"{self.paths[index]}: ")
-            if index < len(self.paths) and self.paths[index]
-            else detail
+            public_detail(
+                detail, self.paths[index] if index < len(self.paths) else None
+            )
             for index, detail in enumerate(self.details[:VERIFICATION_SAMPLE_LIMIT])
         ]
         return pl.DataFrame(
@@ -102,8 +110,15 @@ class RetentionVerification:
                 ],
                 "issue_count": [self.total],
                 "omitted_count": [self.omitted],
-                "audit_path": [self.audit_path],
-                "audit_error": [self.audit_error],
+                "audit_path": [
+                    (audit_path_label or str)(self.audit_path)
+                    if self.audit_path
+                    else None
+                ],
+                "audit_error": [
+                    public_detail(self.audit_error) if self.audit_error else None
+                ],
+                "dry_run": pl.Series([self.dry_run], dtype=pl.Boolean),
             }
         )
 
@@ -120,6 +135,7 @@ class RetentionStatus:
     attempt_state: AttemptState = "not_recorded"
     outstanding_failure: bool = False
     as_of: datetime | None = None
+    attempt_dry_run: bool | None = None
 
     @property
     def severity(self) -> Literal["ok", "amber", "info"]:
@@ -141,18 +157,53 @@ class RetentionStatus:
             return None
         return (self.as_of - self.verification.recorded_at).total_seconds() / 60
 
-    def frame(self, *, path_label: Callable[[str], str] | None = None) -> pl.DataFrame:
-        return self.verification.frame(path_label=path_label).with_columns(
+    def frame(
+        self,
+        *,
+        path_label: Callable[[str], str] | None = None,
+        audit_path_label: Callable[[str], str] | None = None,
+    ) -> pl.DataFrame:
+        return self.verification.frame(
+            path_label=path_label, audit_path_label=audit_path_label
+        ).with_columns(
             pl.lit(self.attempt_at.isoformat() if self.attempt_at else None).alias(
                 "latest_attempt_at"
             ),
             pl.lit(self.attempt_state).alias("latest_attempt"),
             pl.lit(self.check_age_minutes, dtype=pl.Float64).alias("check_age_minutes"),
             pl.lit(self.outstanding_failure).alias("outstanding_failure"),
+            pl.lit(self.attempt_dry_run, dtype=pl.Boolean).alias(
+                "latest_attempt_dry_run"
+            ),
         )
 
 
-def _check_batch(items: list[dict[str, Any]], ended: datetime) -> RetentionVerification:
+def _argument_mode(row: Mapping[str, Any]) -> bool | None:
+    try:
+        arguments = json.loads(row.get("args_json") or "null")
+    except (ValueError, TypeError):
+        return None
+    value = arguments.get("dry_run") if isinstance(arguments, dict) else None
+    return value if type(value) is bool else None
+
+
+def _check_mode(items: list[dict[str, Any]], *, fallback: bool | None) -> bool | None:
+    values = [item["dry_run"] for item in items if item.get("dry_run") is not None]
+    if not values:
+        return fallback
+    return (
+        values[0]
+        if all(type(value) is bool and value == values[0] for value in values)
+        else None
+    )
+
+
+def _check_batch(
+    items: list[dict[str, Any]],
+    ended: datetime,
+    *,
+    mode: bool | None,
+) -> RetentionVerification:
     kinds = {item.get("failure_kind") for item in items}
     clocks = [
         aware_moment(item["recorded_at"])
@@ -195,6 +246,7 @@ def _check_batch(items: list[dict[str, Any]], ended: datetime) -> RetentionVerif
         text("audit_path"),
         summary.get("issue_count", 0 if kinds == {"retention_clear"} else len(items)),
         text("audit_error"),
+        dry_run=_check_mode(items, fallback=mode),
     )
 
 
@@ -219,7 +271,10 @@ def _recorded_checks(
                 else ("clock", item.get("recorded_at"))
             )
             groups.setdefault(identity, []).append(item)
-        checks = [_check_batch(items, ended) for items in groups.values()]
+        checks = [
+            _check_batch(items, ended, mode=_argument_mode(row))
+            for items in groups.values()
+        ]
         return tuple(
             sorted(
                 (check for check in checks if check.recorded_at is not None),
@@ -236,9 +291,11 @@ def retention_status(runs: pl.DataFrame, *, as_of: datetime) -> RetentionStatus:
     state: AttemptState = "not_recorded"
     latest = None
     outstanding = False
+    mode = None
     for attempt in assessment.attempts:
         row, latest = attempt.row, attempt.ended_at
         checks = _recorded_checks(row, latest)
+        mode = checks[-1].dry_run if checks else _argument_mode(row)
         if checks:
             check = checks[-1]
             if check.recorded_at is not None and (
@@ -252,15 +309,16 @@ def retention_status(runs: pl.DataFrame, *, as_of: datetime) -> RetentionStatus:
             state, outstanding = "failed", True
         elif checks:
             state = "completed"
-            if checks[-1].state == "clear":
+            if checks[-1].state == "clear" and mode is False:
                 outstanding = False
         else:
             state = "unverified"
     if assessment.unresolved:
         state = "unknown"
+        mode = None
         clocks = assessment.invalid_ended
         latest = None if None in clocks else max(clocks) if clocks else latest
-    return RetentionStatus(verification, latest, state, outstanding, as_of)
+    return RetentionStatus(verification, latest, state, outstanding, as_of, mode)
 
 
 def latest_retention_verification(
