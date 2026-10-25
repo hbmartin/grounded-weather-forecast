@@ -151,7 +151,7 @@ explicit `--published-station` avoids home lookup.
 
 Realized slices add nullable `evidence_match` (`exact_release` or
 `compatible_release`), `evidence_release_id`, `evidence_dataset_fingerprint` and
-`latest_scored_issue_at` (UTC, or null for legacy/unusable recency metadata).
+`latest_scored_issue_at` (UTC, or null for legacy/unusable recency metadata, no matching evidence, and errored realized slices).
 The existing `release_id` describes the forecast. A fallback adds
 `older_compatible_release_evidence`; it selects one existing cohort without pooling.
 Exact rows take precedence even when stale or insufficient. Missing modern
@@ -177,12 +177,12 @@ Run health filters command/record-kind eligibility before validating fields.
 older than a valid result; it does not make current health partial. Newer, equally
 timed or unorderable damaged evidence leaves its command unknown with
 `invalid_run_rows`. Independent commands remain available. Otherwise valid rows
-without an ending time are incomplete and skipped. `no_completed_runs_as_of`
+without an ending time are incomplete and skipped. Exact start/end ties use the last persisted ledger row, shared with truth-QC and pruning assessment. A non-null timezone with no UTC offset is rejected rather than interpreted as local time. `no_completed_runs_as_of`
 means no usable completed run exists at the cutoff, not merely within 24 hours.
 
 Compatible fallback inspects descending date/recording groups and stops after the
 first group with compatible evidence, checking all its tied candidates. Older
-irrelevant releases are not read or added as retry dependencies. Each distinct
+irrelevant releases are not read or added as retry dependencies. Eligibility is cached per release/slice within an attempt; older time groups are traversed incrementally. Each distinct
 release is parsed once per stable attempt. Every component has its
 own initial read and one retry, including components first affected during another
 component's retry. Repeated changes leave only exhausted affected components unknown
@@ -1125,6 +1125,21 @@ without changing the original exception or pruning exits. Pruning itself always 
 freshly before deciding deletions. Direct dashboard checks of loaded artifacts and
 the active pointer remain live. Valid legacy filename identities are compatibility
 information for retention, not serving approval or unreadable-file alarms.
+
+Protection diagnostics show at most 20 issue samples plus counts and the full
+JSONL audit reference. Every affected path remains in
+`<artifacts dir>/history/pruning_verifications/<check-id>.jsonl`; journal rows
+carry the unique check ID and nullable audit/count/error metadata. Audit write
+failure is explicit and cannot permit score deletion. Audits use the
+[documented layout and 90-day/reference retention](outputs.md).
+Dry runs may write diagnostic telemetry/audits but never delete audits or scores.
+
+The latest attempt may be `contended` (exit 75) or `unknown` (unresolved malformed
+run evidence). Contention creates no protection-failure warning and clears none;
+known suspensions and outstanding failures remain visible. A successful explicitly
+clear verification supersedes them. Multiple completed checks in one journal row
+remain independently readable; the newest recorded check wins. Public path labels
+are derived from stored paths, never by replacing directory names in prose.
 
 Only private `.score-stage-v1.scores_*.parquet.<16 lowercase hex>.tmp`
 payloads and their `.lease` companions participate in automatic recovery.

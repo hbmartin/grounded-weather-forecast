@@ -58,7 +58,14 @@ from grounded_weather_forecast.health_policy import (
     FRESHNESS_THRESHOLDS as FRESHNESS_THRESHOLDS,  # noqa: PLC0414 - compatibility export
 )
 from grounded_weather_forecast.reports import evidence
-from grounded_weather_forecast.retention_status import RetentionVerification
+from grounded_weather_forecast.retention_audit import (
+    cleanup_audits,
+    publish_verification,
+)
+from grounded_weather_forecast.retention_status import (
+    VERIFICATION_SAMPLE_LIMIT,
+    RetentionVerification,
+)
 from grounded_weather_forecast.serve.approvals import (
     ApprovalIssue,
     json_entries,
@@ -993,9 +1000,11 @@ class _ServedDocumentError(ValueError):
             f"{kind}_document_invalid",
             f"{kind} served document could not be verified: {cause}",
         )
-        super().__init__(
-            f"{kind} served document could not be verified: {path}: {cause}"
-        )
+        super().__init__(path, kind, cause)
+
+    def __str__(self) -> str:
+        path, kind, cause = self.args
+        return f"{kind} served document could not be verified: {path}: {cause}"
 
 
 def _served_document_ids(path: Path, *, recent_at: datetime | None = None) -> set[str]:
@@ -1089,6 +1098,20 @@ def _active_reference_ids(config: Config, *, now: datetime) -> _ServedReferences
     return _ServedReferences(active_ids, frozenset(archived_ids), tuple(issues))
 
 
+def _capture_verification_issues(
+    issues: tuple[ApprovalIssue, ...],
+    details: list[str] | None,
+    paths: list[str | None] | None,
+    categories: list[str] | None,
+) -> None:
+    if details is not None:
+        details.extend(issue.diagnostic() for issue in issues)
+    if paths is not None:
+        paths.extend(str(issue.path) for issue in issues)
+    if categories is not None:
+        categories.extend(issue.category for issue in issues)
+
+
 def _protected_evaluations(
     config: Config,
     *,
@@ -1096,6 +1119,7 @@ def _protected_evaluations(
     failures: list[str] | None = None,
     verification_details: list[str] | None = None,
     verification_paths: list[str | None] | None = None,
+    verification_categories: list[str] | None = None,
 ) -> set[str] | None:
     """Authorization uses approval clocks; explicit legacy references only protect data."""
     snapshot = read_approval_snapshot(
@@ -1105,23 +1129,19 @@ def _protected_evaluations(
         mode="current",
     )
     reference_path: Path | None = None
+    captured_issues: tuple[ApprovalIssue, ...] = ()
     try:
         references = _active_reference_ids(config, now=now)
         all_issues = (*snapshot.diagnostics, *references.issues)
         if snapshot.issues or references.issues:
-            if verification_paths is not None:
-                verification_paths.extend(str(issue.path) for issue in all_issues)
-            if verification_details is not None:
-                verification_details.extend(
-                    [issue.diagnostic() for issue in all_issues] or snapshot.issues
-                )
-            raise ValueError(
-                "unreadable release files or unverifiable metadata: "
-                + (
-                    "; ".join(issue.diagnostic() for issue in all_issues)
-                    or ", ".join(snapshot.issues)
-                )
+            captured_issues = all_issues
+            _capture_verification_issues(
+                all_issues,
+                verification_details,
+                verification_paths,
+                verification_categories,
             )
+            raise ValueError("score protection could not be verified")
         records = snapshot.records()
         raw_by_id = {str(raw.get("release_id")): raw for raw in snapshot.releases}
         known = {str(record.release["release_id"]) for record in records}
@@ -1160,12 +1180,18 @@ def _protected_evaluations(
     except (ValueError,) as error:  # noqa: B013 -- explicit protection failure
         if verification_details is not None and not verification_details:
             verification_details.append(str(error))
+            if verification_categories is not None:
+                verification_categories.append("release_reference_invalid")
             if verification_paths is not None:
                 verification_paths.append(
                     str(reference_path) if reference_path is not None else None
                 )
         if failures is not None:
             failures.append(f"release references could not be verified: {error}")
+            failures.extend(
+                issue.diagnostic()
+                for issue in captured_issues[:VERIFICATION_SAMPLE_LIMIT]
+            )
         return None
 
 
@@ -1197,25 +1223,30 @@ def prune_scores_files(
     protection_failures: list[str] = []
     verification_details: list[str] = []
     verification_paths: list[str | None] = []
+    verification_categories: list[str] = []
     protected = _protected_evaluations(
         config,
         now=moment,
         failures=protection_failures,
         verification_details=verification_details,
         verification_paths=verification_paths,
+        verification_categories=verification_categories,
     )
     verification = RetentionVerification(
         "suspended" if protected is None else "clear",
         moment,
         tuple(verification_details),
         tuple(verification_paths),
+        categories=tuple(verification_categories),
     )
+    verification = publish_verification(config, verification, dry_run=dry_run)
     record_progress(verification.diagnostics())
+    audit_notes = cleanup_audits(config, now=moment, dry_run=dry_run)
     if protected is None:
         return PruneResult(
             deleted=(),
             kept=tuple(files),
-            skipped=(*temporary.skipped, *protection_failures),
+            skipped=(*temporary.skipped, *protection_failures, *audit_notes),
             freed_mb=0.0,
             temporary_deleted=temporary.deleted,
             temporary_freed_mb=temporary.freed_mb,
@@ -1240,7 +1271,7 @@ def prune_scores_files(
         members.sort(key=lambda p: p.stat().st_mtime, reverse=True)
         keep |= set(members[:_KEEP_NEWEST_PER_GROUP])
     deleted: list[Path] = []
-    skipped: list[str] = list(temporary.skipped)
+    skipped: list[str] = [*temporary.skipped, *audit_notes]
     freed = 0.0
     for path in files:
         evaluation_id = path.stem.split("_")[-1]

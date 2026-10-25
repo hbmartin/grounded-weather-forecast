@@ -207,7 +207,8 @@ def test_each_unreadable_path_has_its_own_bounded_diagnostic(tmp_path):
         path.write_text("{bad")
     result = operations.prune_scores_files(config, dry_run=True, now=NOW)
     recorded = json.loads(failure_details_json(result.verification.diagnostics()))
-    assert len(recorded) == 3
+    assert len(recorded) == 4
+    recorded = [item for item in recorded if item.get("path")]
     for path, diagnostic in zip(paths, recorded, strict=True):
         assert str(path) == diagnostic["path"]
         assert len(diagnostic["detail"]) <= 400

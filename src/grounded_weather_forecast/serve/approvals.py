@@ -7,13 +7,13 @@ never authorizes an approval and is reported separately for conservative retenti
 import json
 import os
 from collections.abc import Mapping, Sequence
-from contextlib import suppress
 from dataclasses import asdict, dataclass, field, replace
 from datetime import UTC, datetime
 from pathlib import Path
 from types import MappingProxyType
 from typing import Literal
 
+from grounded_weather_forecast.clocks import aware_utc
 from grounded_weather_forecast.evaluation import ModelRelease
 from grounded_weather_forecast.storage import atomic_write_text
 
@@ -23,12 +23,7 @@ type ApprovalMode = Literal["current", "historical"]
 
 def aware_timestamp(value: object) -> datetime | None:
     """Reject missing zones and clocks that overflow during UTC conversion."""
-    if isinstance(value, str):
-        with suppress(ValueError, OverflowError):
-            moment = datetime.fromisoformat(value)
-            if moment.tzinfo is not None and moment.utcoffset() is not None:
-                return moment.astimezone(UTC)
-    return None
+    return aware_utc(value) if isinstance(value, str) else None
 
 
 def approval_cutoff(as_of: datetime | None) -> datetime:

@@ -25,9 +25,8 @@ from grounded_weather_forecast.health_policy import (
     truth_qc_refresh_time,
 )
 from grounded_weather_forecast.run_health import (
+    assess_attempts,
     aware_moment,
-    completed_at,
-    eligible_run,
 )
 from grounded_weather_forecast.serve.provenance import (
     SelectionProvenance,
@@ -53,7 +52,9 @@ class SourceError(ValueError):
 def timestamp(value: object) -> datetime:
     result = aware_moment(value)
     if result is None:
-        if isinstance(value, datetime) and value.tzinfo is None:
+        if isinstance(value, datetime) and (
+            value.tzinfo is None or value.utcoffset() is None
+        ):
             raise SourceError("timezone_required")
         if isinstance(value, str) and datetime.fromisoformat(value).tzinfo is None:
             raise SourceError("timezone_required")
@@ -512,10 +513,6 @@ def _recent_rows(
     return [r for r in frame.to_dicts() if timestamp(r["recorded_at"]) <= now]
 
 
-def _recent_run(row: Mapping[str, Any], now: datetime) -> bool:
-    return eligible_run(row) and completed_at(row, now) is not None
-
-
 def _run_status(row: Mapping[str, Any]) -> str:
     if (
         row.get("failure_kind") == "no_folds"
@@ -532,69 +529,52 @@ def _run_status(row: Mapping[str, Any]) -> str:
 
 def read_runs(snapshot: Snapshot, path: Path, now: datetime) -> dict[str, Any]:
     frame = snapshot.frame(path, {"command", "started_at", "ended_at", "exit_code"})
-    latest: dict[str, dict[str, Any]] = {}
-    invalid: dict[str, list[datetime | None]] = {}
-    for row in frame.to_dicts():
-        key = row["command"]
-        if not isinstance(key, str) or key not in {
-            "predict",
-            "publish",
-            "maintain",
-            "backtest",
-            "report",
-            "truth-qc",
-            "build-dataset",
-        }:
-            continue
-        if not eligible_run(row):
-            continue
-        try:
-            if not _recent_run(row, now):
-                continue
-        except (ValueError, TypeError, OverflowError):
-            try:
-                ended = timestamp(row["ended_at"])
-            except (ValueError, TypeError, OverflowError):
-                ended = None
-            if ended is None or ended <= now:
-                invalid.setdefault(key, []).append(ended)
-            continue
-        if key in latest and timestamp(latest[key]["ended_at"]) >= timestamp(
-            row["ended_at"]
-        ):
-            continue
-        latest[key] = {
-            "command": key,
-            "ended_at": timestamp(row["ended_at"]).isoformat(),
-            "status": _run_status(row),
-            "exit_code": row["exit_code"],
-            "failure_kind": row.get("failure_kind"),
-            "freshness": freshness(row["ended_at"], now, evidence_age_limit()),
-        }
-    unresolved = set()
-    for command, clocks in invalid.items():
-        valid = latest.get(command)
-        if valid is None or any(
-            clock is None or clock >= timestamp(valid["ended_at"]) for clock in clocks
-        ):
-            unresolved.add(command)
-            latest[command] = {
-                "command": command,
-                "ended_at": None,
-                "status": "unknown",
-                "exit_code": None,
-                "failure_kind": None,
-                "freshness": freshness(None, now, evidence_age_limit()),
-            }
-    newest = max(
-        (r["ended_at"] for r in latest.values() if r["ended_at"]), default=None
-    )
+    latest = []
+    unresolved = False
+    superseded = False
+    commands = [
+        "predict",
+        "publish",
+        "maintain",
+        "backtest",
+        "report",
+        "truth-qc",
+        "build-dataset",
+    ]
+    for command in commands:
+        assessment = assess_attempts(frame, command, now)
+        superseded |= assessment.superseded
+        if assessment.unresolved:
+            unresolved = True
+            latest.append(
+                {
+                    "command": command,
+                    "ended_at": None,
+                    "status": "unknown",
+                    "exit_code": None,
+                    "failure_kind": None,
+                    "freshness": freshness(None, now, evidence_age_limit()),
+                }
+            )
+        elif (attempt := assessment.latest) is not None:
+            row = attempt.row
+            latest.append(
+                {
+                    "command": command,
+                    "ended_at": attempt.ended_at.isoformat(),
+                    "status": _run_status(row),
+                    "exit_code": row["exit_code"],
+                    "failure_kind": row.get("failure_kind"),
+                    "freshness": freshness(attempt.ended_at, now, evidence_age_limit()),
+                }
+            )
+    newest = max((row["ended_at"] for row in latest if row["ended_at"]), default=None)
     return {
         "status": ("partial" if unresolved else "ok") if newest else "unknown",
-        "latest_by_command": list(latest.values()),
+        "latest_by_command": latest,
         "freshness": freshness(newest, now, evidence_age_limit()),
         "limitations": (["invalid_run_rows"] if unresolved else [])
-        + (["superseded_invalid_run_rows"] if invalid.keys() - unresolved else [])
+        + (["superseded_invalid_run_rows"] if superseded else [])
         + ([] if newest else ["no_completed_runs_as_of"]),
     }
 
@@ -656,7 +636,11 @@ def read_qc(
         limitations.append("insufficient_or_undated_truth_qc")
     if assessment.failed_attempt is not None:
         limitations.append("latest_truth_qc_refresh_failed")
-    current = usable and assessment.failed_attempt is None
+    if assessment.attempt_unknown:
+        limitations.append("latest_truth_qc_refresh_unknown")
+    current = (
+        usable and assessment.failed_attempt is None and not assessment.attempt_unknown
+    )
     return {
         "status": "ok"
         if current and not limitations
@@ -750,10 +734,12 @@ def _quality_rows(
         )
         clocks = ["evaluation_created_at", "recorded_at"]
         keys = [*identity, "evaluation_id"]
+    if not realized:
+        frame = frame.unique()
     # Reduce in Polars before any per-slice decoding or Python conversion.
     for clock in clocks:
         frame = frame.filter(pl.col(clock) == pl.col(clock).max().over(keys))
-    return frame.unique().sort(clocks, descending=True)
+    return (frame.unique() if realized else frame).sort(clocks, descending=True)
 
 
 def _cohort_rows(
@@ -815,6 +801,44 @@ def _select_quality_row(
     return rows.row(0, named=True)
 
 
+def _compatible_release(
+    snapshot: Snapshot,
+    config: Config,
+    identifier: str,
+    key: str,
+    current: SelectionProvenance,
+    content_clock: datetime,
+    now: datetime,
+) -> bool:
+    try:
+        release = snapshot.document(
+            config.artifacts_dir / "releases" / f"{identifier}.json"
+        )
+        return (
+            release.get("release_id") == identifier
+            and timestamp(release.get("promoted_at")) < content_clock <= now
+            and current.compatible_with(selection_provenance(release, key))
+        )
+    except (OSError, ValueError, TypeError, OverflowError):
+        return False
+
+
+def _quality_tiers(rows: pl.DataFrame) -> Iterator[pl.DataFrame]:
+    """Yield contiguous clock tiers without materializing all groups or rescanning."""
+    ordered = rows.sort(["as_of_date", "recorded_at"], descending=True)
+    start = 0
+    previous = None
+    for index, clocks in enumerate(
+        ordered.select("as_of_date", "recorded_at").iter_rows()
+    ):
+        if previous is not None and clocks != previous:
+            yield ordered.slice(start, index - start)
+            start = index
+        previous = clocks
+    if previous is not None:
+        yield ordered.slice(start)
+
+
 def _compatible_evidence(
     snapshot: Snapshot,
     config: Config,
@@ -830,28 +854,18 @@ def _compatible_evidence(
         content_clock = timestamp(published)
     except (ValueError, TypeError, OverflowError):
         return None
-    # Inspect every tie, but do not read older tiers once eligible evidence exists.
-    for tier in rows.sort(["as_of_date", "recorded_at"], descending=True).partition_by(
-        ["as_of_date", "recorded_at"], maintain_order=True
-    ):
+    eligibility: dict[str, bool] = {}
+    for tier in _quality_tiers(rows):
         eligible = []
         for identifier in tier["release_id"].unique().to_list():
             if not isinstance(identifier, str) or not identifier.isalnum():
                 continue
-            try:
-                release = snapshot.document(
-                    config.artifacts_dir / "releases" / f"{identifier}.json"
+            if identifier not in eligibility:
+                eligibility[identifier] = _compatible_release(
+                    snapshot, config, identifier, key, current, content_clock, now
                 )
-                if (
-                    release.get("release_id") != identifier
-                    or not timestamp(release.get("promoted_at")) < content_clock <= now
-                ):
-                    continue
-                candidate = selection_provenance(release, key)
-                if current.compatible_with(candidate):
-                    eligible.append(identifier)
-            except (OSError, ValueError, TypeError, OverflowError):
-                continue
+            if eligibility[identifier]:
+                eligible.append(identifier)
         if eligible:
             return _select_quality_row(
                 tier.filter(pl.col("release_id").is_in(eligible)),
@@ -873,6 +887,8 @@ def _quality_value(
         "evidence_release_id": None,
         "evidence_dataset_fingerprint": None,
     }
+    if realized:
+        attribution["latest_scored_issue_at"] = None
     if row is None:
         return {
             "status": "unknown",
@@ -1011,6 +1027,8 @@ def read_quality(
             "truth_semantics": semantics,
             "release_id": release_id,
         }
+        if realized:
+            base["latest_scored_issue_at"] = None
         result.append(
             base
             | component(

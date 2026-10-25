@@ -10,6 +10,7 @@ from pathlib import Path
 import polars as pl
 
 from grounded_weather_forecast import __version__
+from grounded_weather_forecast.artifact_labels import artifact_label
 from grounded_weather_forecast.backtest.outcomes import (
     BacktestDiagnostics,
     BacktestResult,
@@ -22,6 +23,9 @@ from grounded_weather_forecast.contracts import (
     VariableSpec,
 )
 from grounded_weather_forecast.serve.schema import Forecast
+from grounded_weather_forecast.status import (
+    EXIT_CONTENTION as EXIT_CONTENTION,  # noqa: PLC0414 -- compatibility export
+)
 from grounded_weather_forecast.status import (
     EXIT_NO_FOLDS,
     PROMOTION_ONLY_FAILURE_KINDS,
@@ -1710,7 +1714,12 @@ def _report_pipeline_health(
                 ),
                 ("Identity changes since last report", health.changes),
                 ("Evaluations cataloged this report", health.catalog),
-                ("Latest pruning verification (recorded result)", verification.frame()),
+                (
+                    "Latest pruning verification (recorded result)",
+                    verification.frame(
+                        path_label=lambda value: artifact_label(Path(value), config)
+                    ),
+                ),
             ],
         )
     )
@@ -1739,6 +1748,13 @@ def _cmd_prune_scores(config: Config, args: argparse.Namespace) -> int | Command
         print(f"{verb} {path.name}")
     for note in result.skipped:
         print(f"skipped {note}")
+    check = result.verification
+    if check.issue_count is not None and check.total:
+        print(
+            f"protection suspended: {check.total} issues; {check.omitted} omitted from samples; audit: {check.audit_path or chr(8212)}"
+        )
+    if check.audit_error:
+        print(check.audit_error)
     print(
         f"{verb} {len(result.deleted)} scores files ({result.freed_mb:.1f} MB), "
         f"kept {len(result.kept)}"
@@ -1943,7 +1959,6 @@ _LOCKED_COMMANDS = frozenset(
 )
 # EX_TEMPFAIL: lets the runs ledger and scheduler scripts tell lock
 # contention apart from a genuine command failure (1) or config error (2).
-EXIT_CONTENTION = 75
 
 
 def _dispatch(

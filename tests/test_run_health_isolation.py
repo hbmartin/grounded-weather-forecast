@@ -74,7 +74,7 @@ def test_shared_clocks_fail_closed(clock):
     assert aware_moment(clock) is None
 
 
-def test_shared_truth_qc_selection_ignores_invalid_or_unrelated_attempts():
+def test_shared_truth_qc_selection_retains_uncertain_relevant_attempts():
     good = run(command="truth-qc", started_at=START, ended_at=NOW)
     rows = [
         good,
@@ -84,7 +84,7 @@ def test_shared_truth_qc_selection_ignores_invalid_or_unrelated_attempts():
     assert (
         _latest_attempt(pl.DataFrame(rows), NOW)
         == latest_attempt(pl.DataFrame(rows), "truth-qc", NOW)
-        == good
+        is None
     )
 
 

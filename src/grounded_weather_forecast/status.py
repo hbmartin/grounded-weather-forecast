@@ -9,6 +9,7 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 
 EXIT_NO_FOLDS = 3
+EXIT_CONTENTION = 75
 PROMOTION_ONLY_FAILURE_KINDS = frozenset(
     {
         "promotion_evidence_conflict",
@@ -31,6 +32,11 @@ class ComponentDiagnostic:
     detail: str | None = None
     path: str | None = None
     recorded_at: str | None = None
+    check_id: str | None = None
+    audit_path: str | None = None
+    issue_count: int | None = None
+    omitted_count: int | None = None
+    audit_error: str | None = None
 
 
 _progress: ContextVar[list[ComponentDiagnostic] | None] = ContextVar(
@@ -71,7 +77,17 @@ def failure_details_json(diagnostics: tuple[ComponentDiagnostic, ...]) -> str | 
             {
                 key: value
                 for key, value in asdict(item).items()
-                if key not in {"path", "recorded_at"} or value is not None
+                if key
+                not in {
+                    "path",
+                    "recorded_at",
+                    "check_id",
+                    "audit_path",
+                    "issue_count",
+                    "omitted_count",
+                    "audit_error",
+                }
+                or value is not None
             }
             | {"detail": normalize_error_detail(item.detail)}
             for item in diagnostics
