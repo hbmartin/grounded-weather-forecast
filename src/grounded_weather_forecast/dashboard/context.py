@@ -12,6 +12,7 @@ from pathlib import Path
 
 import polars as pl
 
+from grounded_weather_forecast.artifact_labels import CompatibilityNote, artifact_label
 from grounded_weather_forecast.backtest.scores import load_scores
 from grounded_weather_forecast.config import Config
 from grounded_weather_forecast.contracts import MixedProvenanceError
@@ -21,6 +22,7 @@ from grounded_weather_forecast.dashboard.score_summary import (
 )
 from grounded_weather_forecast.dataset.matrix import DatasetPaths, matrix_path
 from grounded_weather_forecast.dataset.providers import read_latest_archive_location
+from grounded_weather_forecast.evaluation import active_release_path
 from grounded_weather_forecast.reports.eprocess import EProcessStore
 from grounded_weather_forecast.runs import RUNS_SCHEMA, read_runs, runs_path
 from grounded_weather_forecast.serve.approvals import (
@@ -163,25 +165,26 @@ def _releases(
         if item.category == "legacy_identity_missing"
     }
     for issue in snapshot.issues:
-        try:
-            label = "artifacts/" + str(Path(issue).relative_to(config.artifacts_dir))
-        except (ValueError,):  # noqa: B013
-            label = Path(issue).name
+        label = artifact_label(Path(issue), config)
         if issue in legacy:
             if compatibility_notes is not None:
-                compatibility_notes.append(
-                    f"{label}: legacy filename identity is usable for retention only"
-                )
+                compatibility_notes.append(CompatibilityNote(Path(issue), config))
             continue
         failures.append(label)
     from grounded_weather_forecast.reports.operations import (  # noqa: PLC0415
         _pointer_reference_ids,
+        _ServedDocumentError,
     )
 
     try:
         _pointer_reference_ids(config)
     except (ValueError,) as error:  # noqa: B013
-        failures.append(str(error))
+        path = (
+            error.issue.path
+            if isinstance(error, _ServedDocumentError)
+            else active_release_path(config.artifacts_dir)
+        )
+        failures.append(artifact_label(path, config))
     return tuple(
         record.payload()
         for record in snapshot.records()

@@ -317,6 +317,13 @@ exit behavior, and later analysis commands.
   explicit without changing pruning exit semantics. Reports/dashboard display check
   age and dry-run mode using their own cutoff; audit availability and bounded
   compatibility notes remain visible independently of issue samples.
+  A linked complete audit is recorded immediately as an unconfirmed candidate;
+  confirmation requires synchronization and successful lock release. Retained runs
+  protect both references. Catchable interruptions preserve the candidate without
+  claiming crash durability. Public diagnostics use safe category/reason templates;
+  raw paths and causes remain in diagnostic evidence. File-local cleanup failures
+  do not block independent candidates; global reference uncertainty still does.
+  Bounded cleanup notes always retain an abort summary and omitted count.
 - `maintain` waits for `<dataset dir>/pipeline.lock` and holds it once across
   build → live backtest → truth-QC → report. Interactive mutators wait 60 s and
   exit `75` on contention. This prevents another command from slipping between

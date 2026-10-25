@@ -493,7 +493,7 @@ Evaluation failures take precedence over promotion-only failures while nullable
 `artifact_labels.py`, `verification_text.py`,
 `cli.py::_cmd_prune_scores`, `status.py::diagnostic_progress`,
 `status.py::record_verification_progress`, `run_health.py`,
-`dashboard/zones/operations.py`.*
+`dashboard/context.py`, `dashboard/zones/operations.py`.*
 
 Pruning freshly verifies release/event metadata, the active pointer and required
 served-document references before deleting published scores. Uncertainty suspends
@@ -538,6 +538,25 @@ publishers and cleanup; contention remains informational. Cleanup scans candidat
 before reading run references. Exact known staging names are reclaimed only when
 regular, unchanged and older than 90 days under the same lock. Other uncertain
 metadata still prevents deletion. SIGKILL and power loss do not guarantee journaling.
+
+A successful exclusive link records nullable `audit_candidate_path` immediately in
+bounded progress, before directory synchronization. This complete but unconfirmed
+reference remains separate from confirmed `audit_path` until synchronization and
+lock release succeed. Catchable post-link failures preserve the candidate; collisions
+never adopt an existing file. Both relative references remain protected by retained
+run diagnostics. Valid legacy check IDs protect exact matching complete audits
+without inventing publication confirmation. Per-file cleanup failures retain that
+candidate and allow independent verified candidates to proceed. Global reference
+uncertainty continues to block all audit/staging cleanup. The 20-note cleanup bound
+reserves room for an overall abort summary and reports omitted file issues.
+
+Public explanations use fixed category/reason templates, validated when reading
+run diagnostics; raw exception prose is never public text. Unknown codes and
+unstructured legacy details use a neutral diagnostic reference. Full original
+path/category/detail and nullable reason code remain in audit evidence. Unknown
+issue paths remain null. Exact legacy path/category prefixes are removed once;
+embedded prose is not rewritten. Audit-publication causes have separate templates.
+This retains the existing `fsync` policy without a stronger power-loss guarantee.
 
 Checks group by ID, or by recorded clock for legacy diagnostics. Multiple checks
 in one row select the latest completed clock, with persisted order breaking ties.

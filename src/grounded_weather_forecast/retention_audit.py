@@ -4,15 +4,15 @@ import json
 import os
 import re
 import stat
-from collections.abc import Iterator, Sequence
+from collections.abc import Callable, Iterator, Sequence
 from contextlib import contextmanager
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from datetime import datetime, timedelta
 from pathlib import Path
 from uuid import uuid4
 
 import polars as pl
-from filelock import FileLock, Timeout
+from filelock import FileLock
 
 from grounded_weather_forecast.clocks import aware_utc
 from grounded_weather_forecast.config import Config
@@ -24,7 +24,11 @@ from grounded_weather_forecast.runs import read_runs, runs_path
 from grounded_weather_forecast.serve.approvals import ApprovalIssue
 from grounded_weather_forecast.status import record_verification_progress
 from grounded_weather_forecast.storage import temporary_sibling
-from grounded_weather_forecast.verification_text import normalize_detail
+from grounded_weather_forecast.verification_text import (
+    VerificationIssue,
+    normalize_detail,
+    reason_for_error,
+)
 
 AUDIT_RETENTION_DAYS = 90
 _AUDIT_NAME = re.compile(r"[0-9a-f]{32}\.jsonl")
@@ -62,26 +66,23 @@ def _sync_directory(directory: Path) -> None:
         os.close(descriptor)
 
 
-@dataclass(frozen=True, slots=True)
-class _VerificationIssue:
-    path: Path | None
-    category: str
-    detail: str
+class _AuditPublicationError(OSError):
+    def __init__(self, reason_code: str, cause: OSError) -> None:
+        self.reason_code = reason_code
+        super().__init__(reason_code, cause)
 
-    def diagnostic(self) -> str:
-        return (
-            f"{self.path}: {self.category}: {self.detail}" if self.path else self.detail
-        )
+    def __str__(self) -> str:
+        cause = self.args[1]
+        return f"{type(cause).__name__}: {cause}"
 
 
 def _legacy_issues(
     verification: RetentionVerification,
-) -> tuple[_VerificationIssue, ...]:
+) -> tuple[VerificationIssue, ...]:
     return tuple(
-        _VerificationIssue(
+        VerificationIssue(
             Path(source)
-            if index < len(verification.paths)
-            and (source := verification.paths[index]) is not None
+            if index < len(verification.paths) and (source := verification.paths[index])
             else None,
             verification.categories[index]
             if index < len(verification.categories)
@@ -89,7 +90,13 @@ def _legacy_issues(
             normalize_detail(
                 detail,
                 verification.paths[index] if index < len(verification.paths) else None,
+                verification.categories[index]
+                if index < len(verification.categories)
+                else None,
             ),
+            verification.reason_codes[index]
+            if index < len(verification.reason_codes)
+            else None,
         )
         for index, detail in enumerate(verification.details)
     )
@@ -100,7 +107,8 @@ def _publish_audit(
     verification: RetentionVerification,
     *,
     dry_run: bool,
-    issues: Sequence[_VerificationIssue],
+    issues: Sequence[VerificationIssue],
+    on_link: Callable[[], None],
 ) -> None:
     temporary = temporary_sibling(path)
     primary: BaseException | None = None
@@ -128,6 +136,7 @@ def _publish_audit(
                             "path": str(issue.path) if issue.path is not None else None,
                             "category": issue.category,
                             "detail": issue.detail,
+                            "reason_code": issue.reason_code,
                         }
                     )
                     + "\n"
@@ -138,8 +147,17 @@ def _publish_audit(
             stream.flush()
             os.fsync(stream.fileno())
         # Exclusive publication: even an ID collision must never rewrite an audit.
-        os.link(temporary, path)
-        _sync_directory(path.parent)
+        try:
+            os.link(temporary, path)
+        except (OSError,) as error:  # noqa: B013
+            raise _AuditPublicationError(
+                reason_for_error(error) or "audit_link_failed", error
+            ) from error
+        on_link()
+        try:
+            _sync_directory(path.parent)
+        except (OSError,) as error:  # noqa: B013
+            raise _AuditPublicationError("audit_sync_failed", error) from error
     except (BaseException,) as error:  # noqa: B013 -- preserve cancellation through cleanup
         primary = error
         raise
@@ -148,7 +166,7 @@ def _publish_audit(
             temporary.unlink(missing_ok=True)
         except (OSError,) as error:  # noqa: B013 -- preserve the original interruption
             if primary is None:
-                raise
+                raise _AuditPublicationError("audit_cleanup_failed", error) from error
             primary.add_note(
                 f"audit staging cleanup also failed: {type(error).__name__}"
             )
@@ -159,11 +177,13 @@ def publish_verification(
     verification: RetentionVerification,
     *,
     dry_run: bool,
-    issues: tuple[ApprovalIssue, ...] | None = None,
+    issues: tuple[ApprovalIssue | VerificationIssue, ...] | None = None,
 ) -> RetentionVerification:
     problems = (
         tuple(
-            _VerificationIssue(issue.path, issue.category, issue.detail)
+            VerificationIssue(
+                issue.path, issue.category, issue.detail, issue.reason_code
+            )
             for issue in issues
         )
         if issues is not None
@@ -184,31 +204,56 @@ def publish_verification(
         categories=tuple(
             issue.category for issue in problems[:VERIFICATION_SAMPLE_LIMIT]
         ),
+        reason_codes=tuple(
+            issue.reason_code for issue in problems[:VERIFICATION_SAMPLE_LIMIT]
+        ),
         audit_path=None,
+        audit_candidate_path=None,
+        audit_reason_code="audit_incomplete" if problems else None,
         audit_error="audit publication not completed" if problems else None,
     )
     record_verification_progress(identified.diagnostics())
-    audit_path = None
-    error = None
+    current = identified
+
+    def linked() -> None:
+        nonlocal current
+        current = replace(identified, audit_candidate_path=reference)
+        record_verification_progress(current.diagnostics())
+
     if identified.total:
         path = audit_directory(config) / f"{identified.check_id}.jsonl"
+        reference = str(path.relative_to(config.artifacts_dir))
         try:
             path.parent.mkdir(parents=True, exist_ok=True)
             with _audit_lock(path.parent):
-                _publish_audit(path, identified, dry_run=dry_run, issues=problems)
-            audit_path = str(path.relative_to(config.artifacts_dir))
-        except (OSError, ValueError, TypeError, Timeout) as problem:
-            error = f"audit unavailable: {type(problem).__name__}: {problem}"[:400]
-    completed = replace(
-        identified,
-        details=identified.details[:VERIFICATION_SAMPLE_LIMIT],
-        paths=identified.paths[:VERIFICATION_SAMPLE_LIMIT],
-        audit_path=audit_path,
-        audit_error=error,
-        categories=identified.categories[:VERIFICATION_SAMPLE_LIMIT],
-    )
-    record_verification_progress(completed.diagnostics())
-    return completed
+                _publish_audit(
+                    path, identified, dry_run=dry_run, issues=problems, on_link=linked
+                )
+            current = replace(
+                current,
+                audit_path=reference,
+                audit_candidate_path=None,
+                audit_error=None,
+                audit_reason_code=None,
+            )
+        except (OSError, ValueError, TypeError) as problem:
+            current = replace(
+                current,
+                audit_error=f"audit unavailable: {type(problem).__name__}: {problem}"[
+                    :400
+                ],
+                audit_reason_code=(
+                    problem.reason_code
+                    if isinstance(problem, _AuditPublicationError)
+                    else "audit_cleanup_failed"
+                    if current.audit_candidate_path
+                    else "audit_lock_contended"
+                    if isinstance(problem, TimeoutError)
+                    else reason_for_error(problem) or "audit_io_failed"
+                ),
+            )
+    record_verification_progress(current.diagnostics())
+    return current
 
 
 def _referenced_audits(config: Config) -> set[str]:
@@ -228,15 +273,27 @@ def _referenced_audits(config: Config) -> set[str]:
         if not isinstance(raw, list) or any(not isinstance(item, dict) for item in raw):
             raise ValueError("run diagnostic references could not be verified")
         for item in raw:
-            if item.get("audit_path") is None:
-                continue
-            reference = item["audit_path"]
-            if not isinstance(reference, str):
-                raise ValueError("invalid audit reference")
-            expected = Path("history/pruning_verifications") / Path(reference).name
-            if Path(reference) != expected or not _AUDIT_NAME.fullmatch(expected.name):
-                raise ValueError("invalid audit reference")
-            references.add(expected.name)
+            for key in ("audit_path", "audit_candidate_path"):
+                reference = item.get(key)
+                if reference is None:
+                    continue
+                if not isinstance(reference, str):
+                    raise ValueError("invalid audit reference")
+                expected = Path("history/pruning_verifications") / Path(reference).name
+                if Path(reference) != expected or not _AUDIT_NAME.fullmatch(
+                    expected.name
+                ):
+                    raise ValueError("invalid audit reference")
+                references.add(expected.name)
+            # Older interrupted publishers recorded a check ID but no audit path.
+            # A complete candidate has independently validated its matching header.
+            identity = item.get("check_id")
+            if (
+                item.get("stage") == "retention_verification"
+                and isinstance(identity, str)
+                and _AUDIT_NAME.fullmatch(f"{identity}.jsonl")
+            ):
+                references.add(f"{identity}.jsonl")
     return references
 
 
@@ -278,16 +335,42 @@ def _signature(path: Path) -> tuple[int, ...] | None:
     )
 
 
+@dataclass(slots=True)
+class _CleanupNotes:
+    samples: list[str] = field(default_factory=list)
+    count: int = 0
+    abort: str | None = None
+
+    def add(self, note: str) -> None:
+        self.count += 1
+        if len(self.samples) < VERIFICATION_SAMPLE_LIMIT:
+            self.samples.append(note)
+
+    def finish(self) -> tuple[str, ...]:
+        prefix = [self.abort] if self.abort else []
+        budget = VERIFICATION_SAMPLE_LIMIT - len(prefix)
+        shown = min(self.count, budget)
+        if self.count > shown:
+            shown = max(0, budget - 1)
+            return tuple(
+                prefix
+                + self.samples[:shown]
+                + [f"{self.count - shown} additional audit cleanup issues omitted."]
+            )
+        return tuple(prefix + self.samples[:shown])
+
+
 def _cleanup_candidates(
     directory: Path,
     now: datetime,
-    notes: list[str],
+    notes: "_CleanupNotes",
 ) -> dict[Path, tuple[int, ...]]:
     candidates = {}
     with os.scandir(directory) as entries:
         paths = sorted(directory / entry.name for entry in entries)
     for path in paths:
-        if not (_AUDIT_NAME.fullmatch(path.name) or _STAGING_NAME.fullmatch(path.name)):
+        staging = bool(_STAGING_NAME.fullmatch(path.name))
+        if not (_AUDIT_NAME.fullmatch(path.name) or staging):
             continue
         try:
             signature = _signature(path)
@@ -296,22 +379,19 @@ def _cleanup_candidates(
             expired = (
                 signature[3] / 1e9
                 < (now - timedelta(days=AUDIT_RETENTION_DAYS)).timestamp()
-                if _STAGING_NAME.fullmatch(path.name)
+                if staging
                 else _expired_audit(path, now)
             )
             if expired and _signature(path) == signature:
                 candidates[path] = signature
         except (OSError, ValueError, TypeError, OverflowError, StopIteration) as error:
-            if len(notes) < VERIFICATION_SAMPLE_LIMIT:
-                notes.append(
-                    f"audit cleanup kept {path.name}: {type(error).__name__}"[:400]
-                )
+            notes.add(f"audit cleanup kept {path.name}: {type(error).__name__}"[:400])
     return candidates
 
 
 def cleanup_audits(config: Config, *, now: datetime, dry_run: bool) -> tuple[str, ...]:
     """Expire known audit/staging files only after coordinated revalidation."""
-    notes: list[str] = []
+    notes = _CleanupNotes()
     try:
         cutoff = aware_utc(now)
         if cutoff is None:
@@ -331,21 +411,25 @@ def cleanup_audits(config: Config, *, now: datetime, dry_run: bool) -> tuple[str
                 else set()
             )
             for path, signature in candidates.items():
-                if (
-                    path.name not in references
-                    and not dry_run
-                    and _signature(path) == signature
-                ):
-                    path.unlink()
+                try:
+                    if (
+                        path.name not in references
+                        and _signature(path) == signature
+                        and not dry_run
+                    ):
+                        path.unlink()
+                except (OSError,) as error:  # noqa: B013 -- one damaged file cannot block independent cleanup
+                    notes.add(
+                        f"audit cleanup kept {path.name}: {type(error).__name__}"[:400]
+                    )
     except (
         OSError,
         ValueError,
         TypeError,
         OverflowError,
-        Timeout,
         pl.exceptions.PolarsError,
     ) as error:
-        notes.append(
-            f"audit cleanup not completed: {type(error).__name__}: {error}"[:400]
-        )
-    return tuple(notes[:VERIFICATION_SAMPLE_LIMIT])
+        notes.abort = f"audit cleanup not completed: {type(error).__name__}: {error}"[
+            :400
+        ]
+    return notes.finish()

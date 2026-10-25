@@ -41,7 +41,9 @@ def test_shipped_relative_roots_and_prose_are_not_rewritten(tmp_path):
     )
     result = panel(config, check)
     assert result.table.rows == (
-        ("dataset/served_forecasts/x.json: metadata invalid. A . B",),
+        (
+            "dataset/served_forecasts/x.json: Protection could not be verified; see the stored diagnostic.",
+        ),
     )
     config = replace(
         config, predict=replace(config.predict, history_path=Path("history.parquet"))
@@ -67,7 +69,10 @@ def test_legacy_prefix_normalization_is_idempotent(tmp_path):
         "suspended", START, (f"{path}: invalid metadata",), (path,)
     )
     value = panel(config, check).table.rows[0][0]
-    assert value == "artifacts/releases/bad.json: invalid metadata"
+    assert (
+        value
+        == "artifacts/releases/bad.json: Protection could not be verified; see the stored diagnostic."
+    )
 
 
 def test_clear_and_missing_empty_states_and_bounded_compatibility_notes(tmp_path):
@@ -80,7 +85,7 @@ def test_clear_and_missing_empty_states_and_bounded_compatibility_notes(tmp_path
         config, RetentionVerification(), notes=tuple(f"legacy {i}" for i in range(100))
     )
     assert noisy.table is None and noisy.empty_reason
-    assert "legacy 19" in noisy.intro and "legacy 20;" not in noisy.intro
+    assert noisy.intro.count("Protection could not be verified") == 20
     assert "80 additional compatibility notes omitted" in noisy.intro
 
 

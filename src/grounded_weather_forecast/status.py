@@ -38,6 +38,10 @@ class ComponentDiagnostic:
     omitted_count: int | None = None
     audit_error: str | None = None
     dry_run: bool | None = None
+    category: str | None = None
+    reason_code: str | None = None
+    audit_candidate_path: str | None = None
+    audit_reason_code: str | None = None
 
 
 _progress: ContextVar[list[ComponentDiagnostic] | None] = ContextVar(
@@ -104,6 +108,10 @@ def failure_details_json(diagnostics: tuple[ComponentDiagnostic, ...]) -> str | 
                     "omitted_count",
                     "audit_error",
                     "dry_run",
+                    "category",
+                    "reason_code",
+                    "audit_candidate_path",
+                    "audit_reason_code",
                 }
                 or value is not None
             }
