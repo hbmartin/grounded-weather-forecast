@@ -308,20 +308,27 @@ rescan served archives, and a later clear check supersedes a prior suspension.
 Pruning still freshly verifies all protection requirements on every invocation.
 
 Each new check has a unique `check_id`. Additive diagnostic fields `audit_path`,
-`issue_count`, `omitted_count`, and `audit_error` accompany that identity. A check
+`issue_count`, `omitted_count`, `audit_error`, and nullable boolean `dry_run` accompany that identity. A check
 records one summary and at most 20 issue samples, each with the existing
 400-character explanatory bound; full stored sample paths remain separate.
 Legacy rows remain readable and their rendering is also bounded. Each audit is
 UTF-8 JSON Lines schema 1: a header (`kind=pruning_verification`, check ID,
 recording time, dry-run flag), one `kind=issue` record per affected path with its
 category/detail, and a final `kind=complete` record carrying `issue_count`.
-The closed staged file is published exclusively; collisions cannot rewrite an
-audit. Clear checks need no audit. An unavailable audit is explicit, preserves
+The staged file is flushed and synchronized before exclusive hard-link publication;
+the directory is synchronized afterward. Collisions cannot rewrite an audit.
+Unsupported hard links or synchronization failures are explicit best-effort audit
+failures. Clear checks need no audit. An unavailable audit is explicit, preserves
 samples and suspension, and changes no command exit or cancellation behavior.
 
 Audits are kept for 90 days and while referenced by retained run rows. Pruning
 removes only recognized, complete, verifiably older unreferenced files; uncertain
-run references, corrupt/future clocks and symlinks prevent their removal. Cleanup
+run references, corrupt/future clocks and symlinks prevent their removal. Reference
+ledgers are inspected only when expired committed-audit candidates exist. A shared
+nonblocking audit lock protects publishers and cleanup. Exact staging names
+`.<32 lowercase hex>.jsonl.<16 lowercase hex>.tmp` may be removed only when regular,
+unchanged on revalidation and older than 90 days. Fresh, active, unrecognized or
+unverifiable files remain. Cleanup
 failures are informational. Dry runs can record audits and telemetry but delete
 neither audits nor scores. Dashboard rendering never opens the audit archive.
 
@@ -330,7 +337,14 @@ The report adds nullable `check_age_minutes` from its reporting cutoff and shows
 no warning; unresolved malformed evidence is amber. Equal start/end clocks use
 the last persisted row. Multiple checks are grouped by check ID (legacy rows by
 recorded time), independently of their parent attempt. Only a later successful
-explicitly clear check clears an outstanding pruning failure.
+explicitly clear non-dry-run check clears an outstanding pruning execution failure.
+Dry runs can update verification independently. Check metadata precedes recorded
+arguments when determining mode; unknown legacy mode does not establish recovery.
+Reports add nullable `dry_run` and `latest_attempt_dry_run` fields. Identified bounded
+progress precedes audit I/O and is replaced for that check after publication,
+preserving one check through catchable interruptions without duplicate rows.
+No journaling guarantee is made for SIGKILL or power loss. Public path labels and
+safe explanations do not replace full internal path/detail evidence.
 
 ## Daily report reader
 

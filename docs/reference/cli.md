@@ -1120,7 +1120,7 @@ served-document archive. A later clear check replaces an earlier suspension;
 a failed or unverified attempt does not erase the last recorded check. The check
 time/age and latest attempt are displayed separately; later failures remain amber.
 Legacy diagnostics cannot establish a clean check. Completed verification survives
-later deletion/output exceptions in the same invocation or stage journal row,
+catchable audit interruptions and later deletion/output exceptions in the same invocation or stage journal row,
 without changing the original exception or pruning exits. Pruning itself always verifies
 freshly before deciding deletions. Direct dashboard checks of loaded artifacts and
 the active pointer remain live. Valid legacy filename identities are compatibility
@@ -1132,14 +1132,32 @@ JSONL audit reference. Every affected path remains in
 carry the unique check ID and nullable audit/count/error metadata. Audit write
 failure is explicit and cannot permit score deletion. Audits use the
 [documented layout and 90-day/reference retention](outputs.md).
-Dry runs may write diagnostic telemetry/audits but never delete audits or scores.
+Dry runs may write diagnostic telemetry/audits but never delete audits, abandoned
+audit staging files, or scores. A clear dry run can supersede an earlier protection
+suspension, but cannot clear an outstanding pruning execution failure. Recovery
+requires a successful clear non-dry-run prune. Nullable `dry_run` check metadata
+takes precedence over valid recorded arguments; absent or malformed legacy mode
+is unknown and cannot establish execution recovery.
+
+Checks are identified and bounded progress is recorded before audit I/O. Audit
+publication flushes and synchronizes the staged file, links it exclusively, then
+synchronizes its directory. Hard-link or synchronization failures leave an explicit
+unavailable audit and preserve samples and score protection without changing exits.
+A nonblocking audit-directory lock coordinates publication and cleanup; its
+contention is informational, not command exit 75. Catchable interruptions retain
+an incomplete-publication diagnostic; SIGKILL and power loss cannot guarantee a
+journal entry. There is no alternative publisher for filesystems without hard links.
 
 The latest attempt may be `contended` (exit 75) or `unknown` (unresolved malformed
 run evidence). Contention creates no protection-failure warning and clears none;
 known suspensions and outstanding failures remain visible. A successful explicitly
-clear verification supersedes them. Multiple completed checks in one journal row
+clear non-dry-run verification supersedes execution failures. Multiple completed checks in one journal row
 remain independently readable; the newest recorded check wins. Public path labels
 are derived from stored paths, never by replacing directory names in prose.
+Public explanations omit unsafe embedded filesystem paths; original detail remains
+in diagnostic evidence. Audit availability and up to 20 compatibility notes are
+shown separately from the 20 issue samples, with omitted-note counts. Audit labels
+use the same formatter in CLI, report, and dashboard output.
 
 Only private `.score-stage-v1.scores_*.parquet.<16 lowercase hex>.tmp`
 payloads and their `.lease` companions participate in automatic recovery.

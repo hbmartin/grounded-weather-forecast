@@ -490,7 +490,9 @@ Evaluation failures take precedence over promotion-only failures while nullable
 ### Published-score protection verification
 
 *Implemented in: `reports/operations.py`, `retention_status.py`, `retention_audit.py`, `clocks.py`,
-`cli.py::_cmd_prune_scores`, `status.py::diagnostic_progress`, `run_health.py`,
+`artifact_labels.py`, `verification_text.py`,
+`cli.py::_cmd_prune_scores`, `status.py::diagnostic_progress`,
+`status.py::record_verification_progress`, `run_health.py`,
 `dashboard/zones/operations.py`.*
 
 Pruning freshly verifies release/event metadata, the active pointer and required
@@ -508,7 +510,7 @@ bounded to 400 characters per component; an additive optional `path` preserves
 the complete affected path independently. Archive errors are collected per file,
 not stopped at the first failure. An optional `recorded_at` carries the completed
 check clock. Invocation/stage-scoped context-local progress preserves completed
-checks through later deletion or output exceptions without duplicate journal rows
+checks before audit I/O and through catchable audit/deletion/output exceptions without duplicate journal rows
 or changed exception semantics. Coordination failures keep their own failure
 status. Reports/dashboard display the last recorded check and its age separately
 from the latest eligible attempt, without rescanning the archive. Failed or
@@ -524,12 +526,18 @@ Each new check has a unique ID. Run diagnostics retain one summary and at most
 full path/category/detail records stream to an immutable JSON Lines audit beneath
 `artifacts/history/pruning_verifications/`. Its schema-1 header identifies the
 check/time/dry-run, and its footer confirms the total issue count. Exclusive
-publication occurs only after the staged stream closes; incomplete or colliding
-publication cannot overwrite an audit. Audit failure is explicit and cannot lift
+publication flushes and synchronizes the complete staged stream before linking,
+then synchronizes the directory; incomplete or colliding publication cannot
+overwrite an audit. Hard-link and synchronization support are required for a
+confirmed audit. Audit failure is explicit and cannot lift
 suspension. Dry runs still record diagnostics without deleting scores or audits.
 Audits expire only after 90 days and after all retained run references disappear;
 uncertain references or audit metadata prevent cleanup. This does not change
-scientific-evidence retention.
+scientific-evidence retention. A dedicated nonblocking audit lock coordinates
+publishers and cleanup; contention remains informational. Cleanup scans candidates
+before reading run references. Exact known staging names are reclaimed only when
+regular, unchanged and older than 90 days under the same lock. Other uncertain
+metadata still prevents deletion. SIGKILL and power loss do not guarantee journaling.
 
 Checks group by ID, or by recorded clock for legacy diagnostics. Multiple checks
 in one row select the latest completed clock, with persisted order breaking ties.
@@ -537,9 +545,16 @@ The report's nullable `check_age_minutes` and dashboard age share the explicit
 reporting cutoff. Relevant malformed newer/unorderable runs remain unknown/amber;
 provably superseded damage is informational. Exit 75 is contention, not a new
 protection failure, and cannot clear a suspension/outstanding failure. Only a
-later successful clear check establishes clean protection. Path labels use
+later successful clear non-dry-run check clears an execution failure. Nullable
+`dry_run` metadata takes precedence over recorded arguments; unknown legacy mode
+cannot establish execution recovery. A dry run may still establish a clear
+protection check. Progress replacement uses check identity and preserves unrelated
+diagnostics and distinct checks. Path labels use
 lexical relative paths with specific-root precedence and never edit prose or
-resolve links. The [operational references](bibliography.md#3-operational-analogues)
+resolve links. Unsafe legacy/raw explanations receive neutral public text while
+original detail remains in diagnostic evidence. Audit availability and at most
+20 compatibility notes are separate from the 20 issue samples; omitted notes are
+counted. The [operational references](bibliography.md#3-operational-analogues)
 cover the clock, stream, and atomic-publication mechanisms.
 
 ## 8. Self-verification

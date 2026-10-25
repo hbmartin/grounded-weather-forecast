@@ -6,7 +6,12 @@ from datetime import UTC, date, datetime, time, timedelta
 
 import polars as pl
 
-from grounded_weather_forecast.run_health import assess_attempts, latest_attempt
+from grounded_weather_forecast.run_health import (
+    AttemptAssessment,
+    RunAttempt,
+    assess_attempts,
+    latest_attempt,
+)
 
 FRESHNESS_THRESHOLDS: Mapping[str, float] = {
     "truth_age_minutes": 120.0,
@@ -85,14 +90,14 @@ def _latest_attempt(runs: pl.DataFrame, now: datetime) -> Mapping[str, object] |
 
 
 def _failed_attempt(
-    runs: pl.DataFrame, now: datetime, refresh: RefreshTime | None
+    latest: RunAttempt | None, refresh: RefreshTime | None
 ) -> str | None:
-    attempt = _latest_attempt(runs, now)
-    if attempt is None or (attempt["exit_code"] == 0 and not attempt.get("error")):
+    if latest is None:
         return None
-    ended = attempt["ended_at"]
-    if not isinstance(ended, datetime):  # normalized run ledgers carry UTC instants
+    attempt = latest.row
+    if attempt["exit_code"] == 0 and not attempt.get("error"):
         return None
+    ended = latest.ended_at
     if refresh is not None and refresh.earliest > ended:
         return None
     outcome = (
@@ -107,16 +112,32 @@ def _failed_attempt(
     return f"{ended.isoformat()} ({outcome}" + (f": {error})" if error else ")")
 
 
+def _attempt_unknown(
+    assessment: AttemptAssessment, refresh: RefreshTime | None
+) -> bool:
+    floors = [attempt.ended_at for attempt in assessment.attempts[-1:]]
+    if refresh is not None:
+        floors.append(refresh.earliest)
+    floor = max(floors) if floors else None
+    return any(
+        clock is None or floor is None or clock >= floor
+        for clock in assessment.invalid_ended
+    )
+
+
 def truth_qc_freshness(
     payload: Mapping[str, object] | None, runs: pl.DataFrame, now: datetime
 ) -> TruthQCFreshness:
     payload = payload if payload is not None else {}
     refresh = _refresh_time(payload, now)
-    failed = _failed_attempt(runs, now, refresh)
+    assessment = assess_attempts(runs, "truth-qc", now)
+    attempt_unknown = _attempt_unknown(assessment, refresh)
+    failed = (
+        _failed_attempt(assessment.latest, refresh) if not attempt_unknown else None
+    )
     verdict = payload.get("drift_verdict")
     has_verdict = isinstance(verdict, Mapping) and bool(verdict)
     warnings: list[str] = []
-    attempt_unknown = assess_attempts(runs, "truth-qc", now).unresolved
     if attempt_unknown:
         warnings.append(
             "latest truth-QC refresh outcome is unknown: invalid run evidence"

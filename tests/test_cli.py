@@ -621,7 +621,7 @@ def test_prune_scores_unreadable_release_is_a_protection_skip(
 
     output = capsys.readouterr()
     assert "score protection could not be verified" in output.out
-    assert "audit: history/pruning_verifications/" in output.out
+    assert "audit: artifacts/history/pruning_verifications/" in output.out
     assert str(release) in output.out
     assert "0 scores files (0.0 MB), kept 4" in output.out
     assert output.err == ""

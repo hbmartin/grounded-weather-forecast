@@ -1,6 +1,6 @@
 """Pure eligibility, chronology, and uncertainty rules for CLI run evidence."""
 
-from collections.abc import Iterator, Mapping
+from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Any
@@ -104,21 +104,6 @@ def assess_attempts(
     return AttemptAssessment(
         tuple(sorted(attempts, key=lambda attempt: attempt.order)), tuple(invalid)
     )
-
-
-def completed_attempts(
-    runs: pl.DataFrame, command: str, now: datetime
-) -> Iterator[tuple[datetime, Mapping[str, Any]]]:
-    """Compatibility iterator; status consumers must also assess uncertainty."""
-    for attempt in assess_attempts(runs, command, now).attempts:
-        yield attempt.ended_at, attempt.row
-
-
-def attempt_order(
-    item: tuple[datetime, Mapping[str, Any]],
-) -> tuple[datetime, datetime]:
-    ended, row = item
-    return ended, aware_moment(row["started_at"]) or ended
 
 
 def latest_attempt(
