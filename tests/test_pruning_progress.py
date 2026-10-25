@@ -112,7 +112,9 @@ def test_late_failures_preserve_checks_without_duplicate_journal_rows(
     )
     if phase != "before_check":
         diagnostic = json.loads(frame["failure_details_json"][0])
-        assert len(diagnostic) == 1 and diagnostic[0]["recorded_at"] is not None
+        assert len(diagnostic) == (1 if phase == "deletion" else 2)
+        assert len({item["check_id"] for item in diagnostic}) == 1
+        assert diagnostic[0]["recorded_at"] is not None
 
 
 def test_scopes_reset_and_success_diagnostics_are_not_duplicated(tmp_path):
@@ -126,7 +128,7 @@ def test_scopes_reset_and_success_diagnostics_are_not_duplicated(tmp_path):
         )
     frame = runs.load_runs(runs.runs_path(config))
     assert frame.height == 2
-    assert all(len(json.loads(raw)) == 1 for raw in frame["failure_details_json"])
+    assert all(len(json.loads(raw)) == 2 for raw in frame["failure_details_json"])
     with diagnostic_progress() as outer:
         with diagnostic_progress() as inner:
             record_progress(RetentionVerification("clear", NOW).diagnostics())
@@ -170,7 +172,10 @@ def test_ineligible_attempts_cannot_override_a_check(damage):
     status = retention_status(
         pl.DataFrame([previous, run_row("clear") | damage]), as_of=NOW
     )
-    assert status.verification.state == "suspended" and status.attempt_at == START
+    assert status.verification.state == "suspended"
+    assert status.attempt_at == (START if damage.get("record_kind") == "other" else NOW)
+    if "started_at" in damage:
+        assert status.attempt_state == "unknown" and status.severity == "amber"
 
 
 def test_multiple_archive_failures_keep_paths_independently_in_bounded_diagnostics(
@@ -207,7 +212,8 @@ def test_multiple_archive_failures_keep_paths_independently_in_bounded_diagnosti
         path.write_text("{broken")
     result = operations.prune_scores_files(config, dry_run=True, now=NOW)
     stored = json.loads(failure_details_json(result.verification.diagnostics()))
-    assert result.verification.state == "suspended" and len(stored) == 3
+    assert result.verification.state == "suspended" and len(stored) == 4
+    stored = [item for item in stored if item.get("path")]
     assert {item["path"] for item in stored} == {str(path) for path in paths}
     assert all(len(item["detail"]) <= 400 for item in stored)
     for path in paths:

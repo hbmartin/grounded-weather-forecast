@@ -6,7 +6,7 @@ from datetime import UTC, date, datetime, time, timedelta
 
 import polars as pl
 
-from grounded_weather_forecast.run_health import latest_attempt
+from grounded_weather_forecast.run_health import assess_attempts, latest_attempt
 
 FRESHNESS_THRESHOLDS: Mapping[str, float] = {
     "truth_age_minutes": 120.0,
@@ -43,6 +43,7 @@ class TruthQCFreshness:
     refresh_unknown: bool = False
     age_unusable: bool = False
     has_verdict: bool = False
+    attempt_unknown: bool = False
 
 
 def _refresh_time(payload: Mapping[str, object], now: datetime) -> RefreshTime | None:
@@ -115,6 +116,11 @@ def truth_qc_freshness(
     verdict = payload.get("drift_verdict")
     has_verdict = isinstance(verdict, Mapping) and bool(verdict)
     warnings: list[str] = []
+    attempt_unknown = assess_attempts(runs, "truth-qc", now).unresolved
+    if attempt_unknown:
+        warnings.append(
+            "latest truth-QC refresh outcome is unknown: invalid run evidence"
+        )
     age = "unknown"
     age_unusable = refresh is None
     if has_verdict:
@@ -148,6 +154,7 @@ def truth_qc_freshness(
         refresh_unknown=refresh is None,
         age_unusable=age_unusable,
         has_verdict=has_verdict,
+        attempt_unknown=attempt_unknown,
     )
 
 

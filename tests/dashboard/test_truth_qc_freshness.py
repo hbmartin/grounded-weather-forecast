@@ -150,7 +150,6 @@ def test_failed_refresh_keeps_verdict_and_chart_with_warning(
     [
         attempt(ended=None),
         attempt(ended=NOW + timedelta(seconds=1)),
-        attempt(ended=NOW - timedelta(minutes=11)),
         attempt(command="maintain"),
         attempt(kind="other"),
     ],
@@ -159,6 +158,16 @@ def test_unfinished_future_and_unrelated_attempts_are_ignored(tmp_path, row):
     panel = _truth_cross_check(context(tmp_path, runs=[row]))
     assert panel.status == "ok"
     assert "failed" not in panel.intro
+
+
+def test_reversed_interval_retains_verdict_with_unknown_attempt_warning(tmp_path):
+    panel = _truth_cross_check(
+        context(tmp_path, runs=[attempt(ended=NOW - timedelta(minutes=11))])
+    )
+    assert panel.status == "amber"
+    assert "outcome is unknown" in panel.intro
+    assert "previous quiet verdict" in panel.intro
+    assert "refresh failed" not in panel.intro
 
 
 @pytest.mark.parametrize("new_ledger_success", [False, True])

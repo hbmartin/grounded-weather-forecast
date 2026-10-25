@@ -12,6 +12,7 @@ from typing import cast
 
 import polars as pl
 
+from grounded_weather_forecast.artifact_labels import diagnostic_label
 from grounded_weather_forecast.dashboard.charts import line_chart
 from grounded_weather_forecast.dashboard.context import DashboardContext
 from grounded_weather_forecast.dashboard.copy import PANEL_COPY, ZONE_INTROS
@@ -25,7 +26,10 @@ from grounded_weather_forecast.dashboard.model import (
 )
 from grounded_weather_forecast.dashboard.zones.common import empty_panel, fmt
 from grounded_weather_forecast.reports.operations import FRESHNESS_THRESHOLDS
-from grounded_weather_forecast.retention_status import retention_status
+from grounded_weather_forecast.retention_status import (
+    VERIFICATION_SAMPLE_LIMIT,
+    retention_status,
+)
 
 _MAX_POINTS = 60
 _MAX_SERIES = 8
@@ -390,23 +394,20 @@ def _retention_panel(ctx: DashboardContext) -> Panel:
     verification = recorded.verification
     status: PanelStatus = recorded.severity
     details = [
-        f"{verification.paths[index]}: {detail.removeprefix(f'{verification.paths[index]}: ')}"
-        if index < len(verification.paths) and verification.paths[index]
-        else detail
-        for index, detail in enumerate(verification.details)
-    ] + list(ctx.compatibility_notes)
-    # Render relative labels; full path identity stays in structured run evidence.
-    for prefix, label in (
-        (ctx.config.artifacts_dir, "artifacts"),
-        (ctx.config.dataset.dir, "dataset"),
-        (ctx.config.predict.history_path.parent, "predict"),
-    ):
-        details = [detail.replace(str(prefix), label) for detail in details]
-    age = (
-        (ctx.now - verification.recorded_at).total_seconds() / 60
-        if verification.recorded_at
-        else None
-    )
+        diagnostic_label(
+            detail,
+            verification.paths[index] if index < len(verification.paths) else None,
+            ctx.config,
+        )
+        for index, detail in enumerate(verification.details[:VERIFICATION_SAMPLE_LIMIT])
+    ]
+    notes = list(ctx.compatibility_notes)
+    details += notes[: max(0, VERIFICATION_SAMPLE_LIMIT - len(details))]
+    if verification.audit_error:
+        details.append(
+            "Full verification audit is unavailable; diagnostic samples are retained."
+        )
+    age = recorded.check_age_minutes
     return Panel(
         panel_id="i7",
         title="Published-score protection",
@@ -428,15 +429,45 @@ def _retention_panel(ctx: DashboardContext) -> Panel:
                 recorded.attempt_at.isoformat() if recorded.attempt_at else "—",
                 "info",
             ),
+            Stat("verification issues", str(verification.total), "info"),
+            Stat(
+                "audit state",
+                "unavailable"
+                if verification.audit_error
+                else "recorded"
+                if verification.audit_path
+                else "not needed"
+                if verification.state == "clear"
+                else "not recorded",
+                "amber" if verification.audit_error else "info",
+            ),
+            Stat("omitted from samples", str(verification.omitted), "info"),
+            Stat(
+                "full audit",
+                "artifacts/" + verification.audit_path
+                if verification.audit_path
+                else "—",
+                "info",
+            ),
+            Stat(
+                "outstanding failure",
+                "yes" if recorded.outstanding_failure else "no",
+                status,
+            ),
         ),
         table=TableSpec(
-            columns=("detail",), rows=tuple((detail,) for detail in details)
+            columns=("detail",),
+            rows=tuple((detail,) for detail in details[:VERIFICATION_SAMPLE_LIMIT]),
         )
         if details
         else None,
-        empty_reason="No recorded protection verification; legacy or incomplete attempts do not establish a clean check."
-        if verification.state == "not_recorded"
-        else "No protection problems recorded in the completed check."
-        if not details
+        empty_reason=(
+            "No recorded protection verification; legacy or incomplete attempts do not establish a clean check."
+            if verification.state == "not_recorded"
+            else "Protection was verified clear; no affected artifacts."
+            if verification.state == "clear"
+            else "Deletion is suspended; no individual problem details were recorded."
+        )
+        if not details or verification.state == "not_recorded"
         else None,
     )

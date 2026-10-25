@@ -297,7 +297,16 @@ exit behavior, and later analysis commands.
   suspension keeps exit 0. Check age and the latest attempt are distinct; completed
   verification survives later errors. Failed/unverified attempts do not erase a
   suspension, and legacy attempts do not establish a clean check. A later explicit
-  clear check replaces the warning; existing failure/exit meanings remain intact.
+  clear successful check replaces the warning; existing failure/exit meanings remain intact.
+  Lock contention (75) is a distinct informational attempt, not a new protection
+  failure, and clears no older warning. Relevant malformed newer run evidence
+  is unknown/amber rather than exposing an old success as current.
+  Each check records at most 20 issue samples with a full JSONL audit reference.
+  Audits under `artifacts/history/pruning_verifications/` preserve every affected
+  path, survive for 90 days and while referenced by retained run rows, and are
+  cleaned only when verifiably old/unreferenced. Dry runs can record an audit
+  but never delete one. Audit failures remain explicit without changing pruning
+  exit semantics. Reports/dashboard display check age using their own cutoff.
 - `maintain` waits for `<dataset dir>/pipeline.lock` and holds it once across
   build → live backtest → truth-QC → report. Interactive mutators wait 60 s and
   exit `75` on contention. This prevents another command from slipping between

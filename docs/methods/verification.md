@@ -489,7 +489,7 @@ Evaluation failures take precedence over promotion-only failures while nullable
 
 ### Published-score protection verification
 
-*Implemented in: `reports/operations.py`, `retention_status.py`,
+*Implemented in: `reports/operations.py`, `retention_status.py`, `retention_audit.py`, `clocks.py`,
 `cli.py::_cmd_prune_scores`, `status.py::diagnostic_progress`, `run_health.py`,
 `dashboard/zones/operations.py`.*
 
@@ -518,6 +518,29 @@ verified protection. See the [operational references](bibliography.md#3-operatio
 Direct loaded-artifact checks remain live. A valid legacy omission of `release_id`
 is compatibility information for retention, not an unreadable-file alarm or a
 serving approval. No ledger migration or historical rewrite is required.
+
+Each new check has a unique ID. Run diagnostics retain one summary and at most
+20 issue samples with 400-character bounded explanations and separate exact paths;
+full path/category/detail records stream to an immutable JSON Lines audit beneath
+`artifacts/history/pruning_verifications/`. Its schema-1 header identifies the
+check/time/dry-run, and its footer confirms the total issue count. Exclusive
+publication occurs only after the staged stream closes; incomplete or colliding
+publication cannot overwrite an audit. Audit failure is explicit and cannot lift
+suspension. Dry runs still record diagnostics without deleting scores or audits.
+Audits expire only after 90 days and after all retained run references disappear;
+uncertain references or audit metadata prevent cleanup. This does not change
+scientific-evidence retention.
+
+Checks group by ID, or by recorded clock for legacy diagnostics. Multiple checks
+in one row select the latest completed clock, with persisted order breaking ties.
+The report's nullable `check_age_minutes` and dashboard age share the explicit
+reporting cutoff. Relevant malformed newer/unorderable runs remain unknown/amber;
+provably superseded damage is informational. Exit 75 is contention, not a new
+protection failure, and cannot clear a suspension/outstanding failure. Only a
+later successful clear check establishes clean protection. Path labels use
+lexical relative paths with specific-root precedence and never edit prose or
+resolve links. The [operational references](bibliography.md#3-operational-analogues)
+cover the clock, stream, and atomic-publication mechanisms.
 
 ## 8. Self-verification
 

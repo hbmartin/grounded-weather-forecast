@@ -926,7 +926,7 @@ def test_naive_legacy_reference_protects_scores_without_authorizing_release(
 @pytest.mark.parametrize(
     "payload, detail",
     [
-        ("broken", "unreadable release files"),
+        ("broken", "score protection could not be verified"),
         (
             json.dumps(
                 {
@@ -1012,9 +1012,9 @@ def test_unreadable_non_active_release_keeps_all_published_scores(
     assert set(result.kept) == set(before)
     assert result.freed_mb == 0
     assert any(
-        "unreadable release files" in reason and str(path) in reason
-        for reason in result.skipped
+        "score protection could not be verified" in reason for reason in result.skipped
     )
+    assert any(str(path) in reason for reason in result.skipped)
     assert before == {p: p.read_bytes() for p in scores_dir.glob("*.parquet")}
 
 

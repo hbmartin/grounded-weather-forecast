@@ -299,7 +299,7 @@ per component. Optional `path` preserves full path identity outside that bound;
 optional `recorded_at` records completion of the check. Both are additive fields
 in diagnostic JSON entries; older entries remain readable. Coordination failures
 retain their original exit/failure metadata.
-No new ledger or artifact is created. The dashboard's published-score protection
+No new ledger is created. Suspended verification publishes an immutable diagnostic audit at `artifacts/history/pruning_verifications/<check-id>.jsonl`. This is operational telemetry, separate from scientific evidence and approvals. The dashboard's published-score protection
 panel and pipeline report distinguish the last recorded check (time and age)
 from the latest attempt. Completed verification survives later exceptions in its
 one existing invocation/stage row. Failed/unverified attempts cannot erase a
@@ -307,12 +307,37 @@ suspension; legacy rows do not establish a clean check. The dashboard does not
 rescan served archives, and a later clear check supersedes a prior suspension.
 Pruning still freshly verifies all protection requirements on every invocation.
 
+Each new check has a unique `check_id`. Additive diagnostic fields `audit_path`,
+`issue_count`, `omitted_count`, and `audit_error` accompany that identity. A check
+records one summary and at most 20 issue samples, each with the existing
+400-character explanatory bound; full stored sample paths remain separate.
+Legacy rows remain readable and their rendering is also bounded. Each audit is
+UTF-8 JSON Lines schema 1: a header (`kind=pruning_verification`, check ID,
+recording time, dry-run flag), one `kind=issue` record per affected path with its
+category/detail, and a final `kind=complete` record carrying `issue_count`.
+The closed staged file is published exclusively; collisions cannot rewrite an
+audit. Clear checks need no audit. An unavailable audit is explicit, preserves
+samples and suspension, and changes no command exit or cancellation behavior.
+
+Audits are kept for 90 days and while referenced by retained run rows. Pruning
+removes only recognized, complete, verifiably older unreferenced files; uncertain
+run references, corrupt/future clocks and symlinks prevent their removal. Cleanup
+failures are informational. Dry runs can record audits and telemetry but delete
+neither audits nor scores. Dashboard rendering never opens the audit archive.
+
+The report adds nullable `check_age_minutes` from its reporting cutoff and shows
+`contended`/`unknown` attempt states. Contention alone is informational and clears
+no warning; unresolved malformed evidence is amber. Equal start/end clocks use
+the last persisted row. Multiple checks are grouped by check ID (legacy rows by
+recorded time), independently of their parent attempt. Only a later successful
+explicitly clear check clears an outstanding pruning failure.
+
 ## Daily report reader
 
 Daily-report schema 1 retains its envelope and adds nullable realized-evidence
 attribution: `evidence_match`, `evidence_release_id`, and
 `evidence_dataset_fingerprint`, plus nullable `latest_scored_issue_at`. The latter
-also extends verification output and the served-quality ledger; older rows load
+is present as null even on no-match/error realized slices and also extends verification output and the served-quality ledger; older rows load
 with null clocks and no historical migration. Forecast release identities remain separate from
 the evidence cohort. Station diagnostics expose the resolved fallback path; latest
 run entries carry individual freshness. Served-quality daily deduplication now

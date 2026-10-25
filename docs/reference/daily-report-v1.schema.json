@@ -215,7 +215,7 @@
                   "null"
                 ],
                 "format": "date-time",
-                "description": "Latest issue time among forecasts actually scored for this realized evidence cohort; null when legacy or unusable."
+                "description": "Latest issue time among forecasts actually scored for this realized evidence cohort; null when legacy, unusable, missing, or the realized slice has an error."
               }
             }
           }

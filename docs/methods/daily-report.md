@@ -119,22 +119,21 @@ The forecast `release_id` stays unchanged; nullable additive fields
 realized evidence. Fallback adds `older_compatible_release_evidence`. A finite MAE
 with positive samples is available evidence, not a prediction-quality verdict.
 
-Filtering, time ordering and latest-cohort reduction run in Polars before full-row
-deduplication and slice decoding. Compatible fallback validates all candidates in
+Realized filtering, time ordering and latest-cohort reduction run in Polars before full-row deduplication and slice decoding. Backtest rows deduplicate earlier to bound duplicate-heavy window work; neither order changes cohort semantics. Compatible fallback validates all candidates in
 the newest qualifying time group, then stops before older groups. Each quality ledger is read once and each distinct release is parsed
-once per stable attempt. Unknown components preserve the schema-1 envelope and
-leave unavailable payload fields absent.
+once per stable attempt. Fallback compatibility is cached per release/slice while time groups are traversed incrementally. Unknown components preserve the schema-1 envelope and
+leave unavailable payload fields absent, except that every realized slice explicitly carries nullable `latest_scored_issue_at`, including no-match/error results.
 
 ### Relevant run evidence
 
-*Implemented in: `run_health.py`, `health_policy.py`, `daily_read.py::read_runs`.*
+*Implemented in: `clocks.py`, `run_health.py`, `health_policy.py`, `daily_read.py::read_runs`.*
 
 Eligible records have the requested command and a null, invocation or stage kind.
-Shared aware-clock validation rejects missing zones, overflow and reversed run
+Shared aware-clock validation requires both a timezone and a non-null UTC offset, rejecting missing zones, overflow and reversed run
 intervals; future completions are outside the cutoff. Outcome fields are checked
 only after eligibility. A provably older malformed record produces informational
 `superseded_invalid_run_rows`; newer, equally timed and unorderable damage keeps
 only its command unknown with `invalid_run_rows`. An otherwise valid unfinished
-row is skipped. Retention remains 90 days and 50,000 rows; null-start records are
+row is skipped. Valid outcomes sort by ending time, starting time, and persisted row position; the last row wins exact-clock ties. The same typed assessment preserves unresolved/superseded damage for truth-QC and pruning. Truth-QC retains available verdict data with an unknown-refresh warning when current attempt evidence cannot be verified. Retention remains 90 days and 50,000 rows; null-start records are
 bounded by the existing row cap. See the operational references in the
 [bibliography](bibliography.md#3-operational-analogues).
