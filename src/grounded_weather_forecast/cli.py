@@ -10,7 +10,11 @@ from pathlib import Path
 import polars as pl
 
 from grounded_weather_forecast import __version__
-from grounded_weather_forecast.artifact_labels import artifact_label, audit_label
+from grounded_weather_forecast.artifact_labels import (
+    artifact_label,
+    audit_label,
+    diagnostic_label,
+)
 from grounded_weather_forecast.backtest.outcomes import (
     BacktestDiagnostics,
     BacktestResult,
@@ -36,6 +40,7 @@ from grounded_weather_forecast.status import (
     merge_diagnostics,
     write_outcome_hint,
 )
+from grounded_weather_forecast.verification_text import public_detail
 
 HOURLY_DEFAULT_VARIABLES = (
     "temp_c,humidity_pct,dew_point_c,wind_speed_ms,wind_gust_ms,"
@@ -1748,14 +1753,35 @@ def _cmd_prune_scores(config: Config, args: argparse.Namespace) -> int | Command
     for path in result.deleted:
         print(f"{verb} {path.name}")
     for note in result.skipped:
-        print(f"skipped {note}")
+        if note not in result.protection_skipped:
+            print(f"skipped {note}")
     check = result.verification
+    for index, detail in enumerate(check.details):
+        print(
+            diagnostic_label(
+                detail,
+                check.paths[index] if index < len(check.paths) else None,
+                config,
+                category=check.categories[index]
+                if index < len(check.categories)
+                else None,
+                reason_code=check.reason_codes[index]
+                if index < len(check.reason_codes)
+                else None,
+            )
+        )
     if check.issue_count is not None and check.total:
         print(
-            f"protection suspended: {check.total} issues; {check.omitted} omitted from samples; audit: {audit_label(check.audit_path, config) if check.audit_path else chr(8212)}"
+            f"score protection could not be verified; protection suspended: {check.total} issues; {check.omitted} omitted from samples; audit: {audit_label(check.audit_path, config) if check.audit_path else chr(8212)}"
         )
+    if check.audit_candidate_path:
+        print(f"unconfirmed audit: {audit_label(check.audit_candidate_path, config)}")
     if check.audit_error:
-        print(check.audit_error)
+        print(
+            public_detail(
+                check.audit_error, reason_code=check.audit_reason_code, audit=True
+            )
+        )
     print(
         f"{verb} {len(result.deleted)} scores files ({result.freed_mb:.1f} MB), "
         f"kept {len(result.kept)}"

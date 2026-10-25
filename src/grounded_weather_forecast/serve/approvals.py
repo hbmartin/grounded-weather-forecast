@@ -16,6 +16,7 @@ from typing import Literal
 from grounded_weather_forecast.clocks import aware_utc
 from grounded_weather_forecast.evaluation import ModelRelease
 from grounded_weather_forecast.storage import atomic_write_text
+from grounded_weather_forecast.verification_text import reason_for_error
 
 type ApprovalDisposition = Literal["none", "first", "reapproval", "unchanged"]
 type ApprovalMode = Literal["current", "historical"]
@@ -41,13 +42,18 @@ class ApprovalIssue:
     path: Path
     category: str
     detail: str
+    reason_code: str | None = None
 
     def diagnostic(self) -> str:
         return f"{self.path}: {self.category}: {self.detail}"
 
 
 def _issue(issues: list[ApprovalIssue], path: Path, kind: str, detail: object) -> None:
-    issues.append(ApprovalIssue(path, kind, str(detail).replace("\n", " ")[:400]))
+    issues.append(
+        ApprovalIssue(
+            path, kind, str(detail).replace("\n", " ")[:400], reason_for_error(detail)
+        )
+    )
 
 
 def json_entries(directory: Path, issues: list[ApprovalIssue]) -> tuple[Path, ...]:

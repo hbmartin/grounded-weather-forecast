@@ -1142,11 +1142,22 @@ is unknown and cannot establish execution recovery.
 Checks are identified and bounded progress is recorded before audit I/O. Audit
 publication flushes and synchronizes the staged file, links it exclusively, then
 synchronizes its directory. Hard-link or synchronization failures leave an explicit
-unavailable audit and preserve samples and score protection without changing exits.
+unavailable or unconfirmed audit and preserve samples and score protection without changing exits.
 A nonblocking audit-directory lock coordinates publication and cleanup; its
 contention is informational, not command exit 75. Catchable interruptions retain
 an incomplete-publication diagnostic; SIGKILL and power loss cannot guarantee a
-journal entry. There is no alternative publisher for filesystems without hard links.
+journal entry. There is no alternative publisher for filesystems without hard links. A successful exclusive link records an
+`audit_candidate_path` immediately under the same check ID. It identifies a complete
+but **unconfirmed** audit until synchronization and lock release succeed; only then
+is `audit_path` confirmed. Failures after linking retain the candidate, never adopt
+an existing collision target, and do not permit score deletion. Confirmed and
+unconfirmed references use the same relative artifact labels in CLI, reports and
+dashboard. Retained run references protect both; a valid older check ID can protect
+its exact matching complete audit without asserting confirmation or rewriting history.
+Cleanup handles file-local revalidation/deletion failures independently, while
+uncertain run references still stop all audit/staging cleanup. Within 20 cleanup
+notes, an overall abort summary takes precedence and omitted issues are counted.
+Dry runs perform the same reference verification but delete nothing.
 
 The latest attempt may be `contended` (exit 75) or `unknown` (unresolved malformed
 run evidence). Contention creates no protection-failure warning and clears none;
@@ -1154,8 +1165,7 @@ known suspensions and outstanding failures remain visible. A successful explicit
 clear non-dry-run verification supersedes execution failures. Multiple completed checks in one journal row
 remain independently readable; the newest recorded check wins. Public path labels
 are derived from stored paths, never by replacing directory names in prose.
-Public explanations omit unsafe embedded filesystem paths; original detail remains
-in diagnostic evidence. Audit availability and up to 20 compatibility notes are
+Public explanations come only from allowlisted category/reason templates; raw exception prose never supplies public text. Unknown codes and unstructured legacy details receive a neutral explanation and diagnostic reference. Original detail and full paths remain in diagnostic evidence. Audit-publication causes are separate from protection causes. Audit availability and up to 20 compatibility notes are
 shown separately from the 20 issue samples, with omitted-note counts. Audit labels
 use the same formatter in CLI, report, and dashboard output.
 

@@ -29,8 +29,17 @@ def artifact_label(path: Path, config: Config) -> str:
     return path.name
 
 
-def diagnostic_label(detail: str, path: str | None, config: Config) -> str:
-    explanation = public_detail(detail, path)
+def diagnostic_label(
+    detail: str,
+    path: str | None,
+    config: Config,
+    *,
+    category: str | None = None,
+    reason_code: str | None = None,
+) -> str:
+    explanation = public_detail(
+        detail, path, category=category, reason_code=reason_code
+    )
     if path:
         return f"{artifact_label(Path(path), config)}: {explanation}"
     return explanation
@@ -38,3 +47,25 @@ def diagnostic_label(detail: str, path: str | None, config: Config) -> str:
 
 def audit_label(reference: str, config: Config) -> str:
     return artifact_label(config.artifacts_dir / reference, config)
+
+
+class CompatibilityNote(str):
+    """A fixed explanation with a formatted artifact label; legacy str API retained."""
+
+    __slots__ = ()
+
+    def __new__(cls, path: Path, config: Config) -> "CompatibilityNote":
+        return super().__new__(
+            cls,
+            f"{artifact_label(path, config)}: "
+            + public_detail("", category="legacy_identity_missing"),
+        )
+
+    def __reduce__(self) -> tuple[object, tuple[str]]:
+        return (_restore_compatibility_note, (str(self),))
+
+
+def _restore_compatibility_note(value: str) -> CompatibilityNote:
+    # Python object reconstruction preserves the already formatted trusted value;
+    # JSON/legacy strings still take the neutral public rendering path.
+    return str.__new__(CompatibilityNote, value)

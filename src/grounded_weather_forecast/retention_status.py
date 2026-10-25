@@ -27,6 +27,9 @@ class RetentionVerification:
     audit_error: str | None = None
     categories: tuple[str, ...] = ()
     dry_run: bool | None = None
+    reason_codes: tuple[str | None, ...] = ()
+    audit_candidate_path: str | None = None
+    audit_reason_code: str | None = None
 
     @property
     def total(self) -> int:
@@ -35,6 +38,16 @@ class RetentionVerification:
     @property
     def omitted(self) -> int:
         return max(0, self.total - min(len(self.details), VERIFICATION_SAMPLE_LIMIT))
+
+    @property
+    def audit_state(self) -> str:
+        if self.audit_candidate_path:
+            return "unconfirmed"
+        if self.audit_error:
+            return "unavailable"
+        if self.audit_path:
+            return "recorded"
+        return "not_needed" if self.state == "clear" else "not_recorded"
 
     def diagnostics(self) -> tuple[ComponentDiagnostic, ...]:
         if self.state == "not_recorded":
@@ -61,6 +74,8 @@ class RetentionVerification:
                     issue_count=self.total,
                     omitted_count=self.omitted,
                     audit_error=self.audit_error,
+                    audit_candidate_path=self.audit_candidate_path,
+                    audit_reason_code=self.audit_reason_code,
                 ),
             )
             if self.check_id is not None or self.omitted
@@ -73,9 +88,17 @@ class RetentionVerification:
             replace(
                 common,
                 detail=normalize_detail(
-                    detail, self.paths[index] if index < len(self.paths) else None
+                    detail,
+                    self.paths[index] if index < len(self.paths) else None,
+                    self.categories[index] if index < len(self.categories) else None,
                 ),
                 path=self.paths[index] if index < len(self.paths) else None,
+                category=self.categories[index]
+                if index < len(self.categories)
+                else None,
+                reason_code=self.reason_codes[index]
+                if index < len(self.reason_codes)
+                else None,
             )
             for index, detail in enumerate(samples)
         )
@@ -89,7 +112,14 @@ class RetentionVerification:
         label = path_label or str
         details = [
             public_detail(
-                detail, self.paths[index] if index < len(self.paths) else None
+                detail,
+                self.paths[index] if index < len(self.paths) else None,
+                category=self.categories[index]
+                if index < len(self.categories)
+                else None,
+                reason_code=self.reason_codes[index]
+                if index < len(self.reason_codes)
+                else None,
             )
             for index, detail in enumerate(self.details[:VERIFICATION_SAMPLE_LIMIT])
         ]
@@ -110,13 +140,23 @@ class RetentionVerification:
                 ],
                 "issue_count": [self.total],
                 "omitted_count": [self.omitted],
+                "audit_state": [self.audit_state],
                 "audit_path": [
                     (audit_path_label or str)(self.audit_path)
                     if self.audit_path
                     else None
                 ],
                 "audit_error": [
-                    public_detail(self.audit_error) if self.audit_error else None
+                    public_detail(
+                        self.audit_error, reason_code=self.audit_reason_code, audit=True
+                    )
+                    if self.audit_error
+                    else None
+                ],
+                "audit_candidate_path": [
+                    (audit_path_label or str)(self.audit_candidate_path)
+                    if self.audit_candidate_path
+                    else None
                 ],
                 "dry_run": pl.Series([self.dry_run], dtype=pl.Boolean),
             }
@@ -247,6 +287,18 @@ def _check_batch(
         summary.get("issue_count", 0 if kinds == {"retention_clear"} else len(items)),
         text("audit_error"),
         dry_run=_check_mode(items, fallback=mode),
+        categories=tuple(
+            value if isinstance(value := item.get("category"), str) else ""
+            for item in samples
+        ),
+        reason_codes=tuple(
+            item.get("reason_code")
+            if isinstance(item.get("reason_code"), str)
+            else None
+            for item in samples
+        ),
+        audit_candidate_path=text("audit_candidate_path"),
+        audit_reason_code=text("audit_reason_code"),
     )
 
 

@@ -318,7 +318,7 @@ def test_panel_notes_and_public_paths_do_not_consume_issue_samples(tmp_path):
     )
     assert len(panel.table.rows) == 20 and str(tmp_path) not in str(panel)
     assert "audit is unavailable" in panel.intro and "5 additional" in panel.intro
-    assert "legacy 19" in panel.intro and "legacy 20;" not in panel.intro
+    assert panel.intro.count("Protection could not be verified") == 20
     assert normalize_detail(f"{path}: metadata.", path) == "metadata."
 
 
@@ -421,8 +421,11 @@ def test_concurrent_colliding_publishers_never_overwrite(
 @pytest.mark.parametrize(
     "text", ["metadata invalid. A . B", "3 / 4 cases", "see https://example.org/help"]
 )
-def test_safe_diagnostic_prose_is_preserved(text):
-    assert public_detail(text) == text
+def test_unstructured_legacy_prose_uses_neutral_public_explanation(text):
+    assert (
+        public_detail(text)
+        == "Protection could not be verified; see the stored diagnostic."
+    )
 
 
 @pytest.mark.parametrize(
@@ -466,7 +469,7 @@ def test_handled_outer_exception_cannot_hide_audit_cleanup_failure(
         monkeypatch.setattr(FileLock, "release", unlock)
     try:
         raise RuntimeError("caller is already handling this unrelated exception")
-    except RuntimeError:
+    except (RuntimeError,):
         result = retention_audit.publish_verification(
             config, verification(), dry_run=False
         )

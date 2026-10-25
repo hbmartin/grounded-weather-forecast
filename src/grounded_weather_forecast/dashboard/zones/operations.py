@@ -12,7 +12,11 @@ from typing import cast
 
 import polars as pl
 
-from grounded_weather_forecast.artifact_labels import audit_label, diagnostic_label
+from grounded_weather_forecast.artifact_labels import (
+    CompatibilityNote,
+    audit_label,
+    diagnostic_label,
+)
 from grounded_weather_forecast.dashboard.charts import line_chart
 from grounded_weather_forecast.dashboard.context import DashboardContext
 from grounded_weather_forecast.dashboard.copy import PANEL_COPY, ZONE_INTROS
@@ -403,18 +407,37 @@ def _retention_panel(ctx: DashboardContext) -> Panel:
             detail,
             verification.paths[index] if index < len(verification.paths) else None,
             ctx.config,
+            category=verification.categories[index]
+            if index < len(verification.categories)
+            else None,
+            reason_code=verification.reason_codes[index]
+            if index < len(verification.reason_codes)
+            else None,
         )
         for index, detail in enumerate(verification.details[:VERIFICATION_SAMPLE_LIMIT])
     ]
     notes = list(ctx.compatibility_notes)
     audit_note = (
-        "Full verification audit is unavailable; diagnostic samples are retained."
+        "Full verification audit exists but is unconfirmed; diagnostic samples are retained."
+        if verification.audit_candidate_path
+        else "Full verification audit is unavailable; diagnostic samples are retained."
         if verification.audit_error
         else None
     )
-    compatibility = [public_detail(note) for note in notes[:VERIFICATION_SAMPLE_LIMIT]]
+    compatibility = [
+        str(note) if isinstance(note, CompatibilityNote) else public_detail(note)
+        for note in notes[:VERIFICATION_SAMPLE_LIMIT]
+    ]
     omitted_notes = max(0, len(notes) - len(compatibility))
     introduction = [audit_note] if audit_note else []
+    if verification.audit_error:
+        introduction.append(
+            public_detail(
+                verification.audit_error,
+                reason_code=verification.audit_reason_code,
+                audit=True,
+            )
+        )
     if compatibility:
         introduction.append("Compatibility information: " + "; ".join(compatibility))
     if omitted_notes:
@@ -445,13 +468,7 @@ def _retention_panel(ctx: DashboardContext) -> Panel:
             Stat("verification issues", str(verification.total), "info"),
             Stat(
                 "audit state",
-                "unavailable"
-                if verification.audit_error
-                else "recorded"
-                if verification.audit_path
-                else "not needed"
-                if verification.state == "clear"
-                else "not recorded",
+                verification.audit_state.replace("_", " "),
                 "amber" if verification.audit_error else "info",
             ),
             Stat("omitted from samples", str(verification.omitted), "info"),
@@ -459,6 +476,8 @@ def _retention_panel(ctx: DashboardContext) -> Panel:
                 "full audit",
                 audit_label(verification.audit_path, ctx.config)
                 if verification.audit_path
+                else audit_label(verification.audit_candidate_path, ctx.config)
+                if verification.audit_candidate_path
                 else "—",
                 "info",
             ),

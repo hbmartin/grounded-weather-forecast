@@ -73,6 +73,10 @@ from grounded_weather_forecast.serve.approvals import (
 )
 from grounded_weather_forecast.serve.schema import Forecast
 from grounded_weather_forecast.status import PENDING_EXIT_CODES
+from grounded_weather_forecast.verification_text import (
+    VerificationIssue,
+    reason_for_error,
+)
 
 _COLLECTOR_ERRORS = (OSError, ValueError, sqlite3.Error, pl.exceptions.PolarsError)
 
@@ -929,6 +933,7 @@ class PruneResult:
     temporary_freed_mb: float = 0.0
     coordination_release_failure: ScoreCoordinationFailure | None = None
     verification: RetentionVerification = field(default_factory=RetentionVerification)
+    protection_skipped: tuple[str, ...] = ()
 
 
 def _release_references(raw: Mapping[str, object], *, release_id: str) -> set[str]:
@@ -999,6 +1004,7 @@ class _ServedDocumentError(ValueError):
             path,
             f"{kind}_document_invalid",
             f"{kind} served document could not be verified: {cause}",
+            reason_for_error(cause),
         )
         super().__init__(path, kind, cause)
 
@@ -1080,6 +1086,7 @@ def _active_reference_ids(config: Config, *, now: datetime) -> _ServedReferences
                 active_release_path(config.artifacts_dir),
                 "active_reference_invalid",
                 str(error),
+                reason_for_error(error),
             )
         )
         active_ids = None
@@ -1093,7 +1100,12 @@ def _active_reference_ids(config: Config, *, now: datetime) -> _ServedReferences
             issues.append(
                 error.issue
                 if isinstance(error, _ServedDocumentError)
-                else ApprovalIssue(path, "archived_document_invalid", str(error))
+                else ApprovalIssue(
+                    path,
+                    "archived_document_invalid",
+                    str(error),
+                    reason_for_error(error),
+                )
             )
     return _ServedReferences(active_ids, frozenset(archived_ids), tuple(issues))
 
@@ -1103,7 +1115,7 @@ def _protected_evaluations(
     *,
     now: datetime,
     failures: list[str] | None = None,
-    issues: list[ApprovalIssue] | None = None,
+    issues: list[ApprovalIssue | VerificationIssue] | None = None,
 ) -> set[str] | None:
     """Authorization uses approval clocks; explicit legacy references only protect data."""
     snapshot = read_approval_snapshot(
@@ -1160,10 +1172,8 @@ def _protected_evaluations(
     except (ValueError,) as error:  # noqa: B013 -- explicit protection failure
         if issues is not None and not issues:
             issues.append(
-                ApprovalIssue(
-                    reference_path
-                    if reference_path is not None
-                    else config.artifacts_dir / "releases",
+                VerificationIssue(
+                    reference_path,
                     "release_reference_invalid",
                     str(error),
                 )
@@ -1203,7 +1213,7 @@ def prune_scores_files(
         failure = error.snapshot()
     files = sorted(scores_dir.glob("scores_*.parquet")) if scores_dir.exists() else []
     protection_failures: list[str] = []
-    issues: list[ApprovalIssue] = []
+    issues: list[ApprovalIssue | VerificationIssue] = []
     protected = _protected_evaluations(
         config,
         now=moment,
@@ -1223,6 +1233,7 @@ def prune_scores_files(
             deleted=(),
             kept=tuple(files),
             skipped=(*temporary.skipped, *protection_failures, *audit_notes),
+            protection_skipped=tuple(protection_failures),
             freed_mb=0.0,
             temporary_deleted=temporary.deleted,
             temporary_freed_mb=temporary.freed_mb,

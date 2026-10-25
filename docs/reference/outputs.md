@@ -308,20 +308,32 @@ rescan served archives, and a later clear check supersedes a prior suspension.
 Pruning still freshly verifies all protection requirements on every invocation.
 
 Each new check has a unique `check_id`. Additive diagnostic fields `audit_path`,
-`issue_count`, `omitted_count`, `audit_error`, and nullable boolean `dry_run` accompany that identity. A check
+`issue_count`, `omitted_count`, `audit_error`, and nullable boolean `dry_run` accompany that identity. Nullable `category` and `reason_code` describe each issue; nullable `audit_reason_code` describes publication failures. Renderers accept only known fixed explanations and never publish raw exception prose. Unknown or missing codes use neutral diagnostic-reference wording. A check
 records one summary and at most 20 issue samples, each with the existing
 400-character explanatory bound; full stored sample paths remain separate.
 Legacy rows remain readable and their rendering is also bounded. Each audit is
 UTF-8 JSON Lines schema 1: a header (`kind=pruning_verification`, check ID,
 recording time, dry-run flag), one `kind=issue` record per affected path with its
-category/detail, and a final `kind=complete` record carrying `issue_count`.
+category/detail and nullable reason code, and a final `kind=complete` record carrying `issue_count`.
 The staged file is flushed and synchronized before exclusive hard-link publication;
-the directory is synchronized afterward. Collisions cannot rewrite an audit.
+the directory is synchronized afterward. Immediately after its own exclusive link
+succeeds, a check records nullable `audit_candidate_path`, relative to the artifacts
+directory. This means complete but unconfirmed, not successful publication. Only
+after synchronization and lock release succeed does `audit_path` replace that
+candidate reference. Catchable post-link failures retain the candidate and failure
+reason in the same check summary. Collisions cannot rewrite or adopt an audit.
 Unsupported hard links or synchronization failures are explicit best-effort audit
 failures. Clear checks need no audit. An unavailable audit is explicit, preserves
-samples and suspension, and changes no command exit or cancellation behavior.
+samples and suspension, and changes no command exit or cancellation behavior. The
+report's additive `audit_state` is `recorded` for confirmed publication,
+`unconfirmed` for a linked candidate, `unavailable` for a failed publication without
+a candidate, `not_needed` for a clear check, or `not_recorded` for legacy unknown
+publication. `audit_candidate_path` is displayed separately from `audit_path`.
+These are operational diagnostics; the daily-report schema remains version 1.
 
-Audits are kept for 90 days and while referenced by retained run rows. Pruning
+Audits are kept for 90 days and while referenced by retained run rows, including
+unconfirmed `audit_candidate_path` references. Valid legacy check IDs protect exact
+matching complete audits without granting confirmation or rewriting old rows. Pruning
 removes only recognized, complete, verifiably older unreferenced files; uncertain
 run references, corrupt/future clocks and symlinks prevent their removal. Reference
 ledgers are inspected only when expired committed-audit candidates exist. A shared
@@ -329,7 +341,11 @@ nonblocking audit lock protects publishers and cleanup. Exact staging names
 `.<32 lowercase hex>.jsonl.<16 lowercase hex>.tmp` may be removed only when regular,
 unchanged on revalidation and older than 90 days. Fresh, active, unrecognized or
 unverifiable files remain. Cleanup
-failures are informational. Dry runs can record audits and telemetry but delete
+failures are informational. A file-local revalidation or deletion failure keeps that
+file while cleanup continues for independent verified candidates. Uncertain run
+references remain a global stop, including staging cleanup. Cleanup returns at most
+20 notes, reserving space for an abort summary and an explicit omitted count.
+Dry runs can record audits and telemetry but delete
 neither audits nor scores. Dashboard rendering never opens the audit archive.
 
 The report adds nullable `check_age_minutes` from its reporting cutoff and shows
