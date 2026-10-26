@@ -1,10 +1,14 @@
 """Public artifact labels without rewriting prose or resolving filesystem links."""
 
 import os
+from dataclasses import dataclass
 from pathlib import Path
 
 from grounded_weather_forecast.config import Config
-from grounded_weather_forecast.verification_text import public_detail
+from grounded_weather_forecast.verification_text import (
+    VerificationIssue,
+    public_explanation,
+)
 
 
 def _absolute(path: Path) -> Path:
@@ -37,16 +41,43 @@ def diagnostic_label(
     category: str | None = None,
     reason_code: str | None = None,
 ) -> str:
-    explanation = public_detail(
-        detail, path, category=category, reason_code=reason_code
+    return issue_label(
+        VerificationIssue(
+            Path(path) if path else None,
+            category or "verification_invalid",
+            detail,
+            reason_code,
+        ),
+        config,
     )
+
+
+def issue_label(issue: VerificationIssue, config: Config) -> str:
+    explanation = public_explanation(
+        category=issue.category, reason_code=issue.reason_code
+    )
+    path = issue.path
     if path:
-        return f"{artifact_label(Path(path), config)}: {explanation}"
+        return f"{artifact_label(path, config)}: {explanation}"
     return explanation
 
 
 def audit_label(reference: str, config: Config) -> str:
     return artifact_label(config.artifacts_dir / reference, config)
+
+
+@dataclass(frozen=True, slots=True)
+class CompatibilityNotice:
+    path: Path | None = None
+    category: str = "legacy_identity_missing"
+
+    def label(self, config: Config) -> str:
+        if self.category != "legacy_identity_missing":
+            return "Legacy compatibility information is available; see diagnostic evidence."
+        explanation = public_explanation(category=self.category)
+        if self.path is not None:
+            return f"{artifact_label(self.path, config)}: {explanation}"
+        return explanation
 
 
 class CompatibilityNote(str):
@@ -57,8 +88,7 @@ class CompatibilityNote(str):
     def __new__(cls, path: Path, config: Config) -> "CompatibilityNote":
         return super().__new__(
             cls,
-            f"{artifact_label(path, config)}: "
-            + public_detail("", category="legacy_identity_missing"),
+            CompatibilityNotice(path).label(config),
         )
 
     def __reduce__(self) -> tuple[object, tuple[str]]:
@@ -66,6 +96,6 @@ class CompatibilityNote(str):
 
 
 def _restore_compatibility_note(value: str) -> CompatibilityNote:
-    # Python object reconstruction preserves the already formatted trusted value;
-    # JSON/legacy strings still take the neutral public rendering path.
+    # Object reconstruction preserves the old string API. Renderers use structured
+    # notices or fixed informational text rather than trusting this subtype.
     return str.__new__(CompatibilityNote, value)

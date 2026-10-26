@@ -227,7 +227,7 @@ def test_sync_precedes_link_and_directory_sync_follows(tmp_path, monkeypatch):
     assert result.audit_path and actions == ["sync", "link", "sync"]
 
 
-def test_audit_lock_defers_publish_and_cleanup_without_command_contention(tmp_path):
+def test_audit_lock_skips_publish_and_cleanup_without_command_contention(tmp_path):
     config, _, _ = setup(tmp_path)
     directory = retention_audit.audit_directory(config)
     directory.mkdir(parents=True)
@@ -237,7 +237,7 @@ def test_audit_lock_defers_publish_and_cleanup_without_command_contention(tmp_pa
         )
         notes = retention_audit.cleanup_audits(config, now=NOW, dry_run=False)
     assert result.audit_error and "Timeout" in result.audit_error
-    assert notes and "Timeout" in notes[0]
+    assert notes and "busy" in notes[0]
 
 
 @pytest.mark.parametrize(
@@ -318,7 +318,8 @@ def test_panel_notes_and_public_paths_do_not_consume_issue_samples(tmp_path):
     )
     assert len(panel.table.rows) == 20 and str(tmp_path) not in str(panel)
     assert "audit is unavailable" in panel.intro and "5 additional" in panel.intro
-    assert panel.intro.count("Protection could not be verified") == 20
+    assert "20 legacy compatibility notes" in panel.intro
+    assert "Protection could not be verified" not in panel.intro
     assert normalize_detail(f"{path}: metadata.", path) == "metadata."
 
 

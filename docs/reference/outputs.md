@@ -308,7 +308,7 @@ rescan served archives, and a later clear check supersedes a prior suspension.
 Pruning still freshly verifies all protection requirements on every invocation.
 
 Each new check has a unique `check_id`. Additive diagnostic fields `audit_path`,
-`issue_count`, `omitted_count`, `audit_error`, and nullable boolean `dry_run` accompany that identity. Nullable `category` and `reason_code` describe each issue; nullable `audit_reason_code` describes publication failures. Renderers accept only known fixed explanations and never publish raw exception prose. Unknown or missing codes use neutral diagnostic-reference wording. A check
+`issue_count`, `omitted_count`, `audit_error`, and nullable boolean `dry_run` accompany that identity. Nullable `category` and `reason_code` describe each issue; nullable `audit_reason_code` identifies the failed publication operation and nullable `audit_cause_code` records its known underlying cause. Missing legacy cause metadata remains null. Renderers accept only known fixed explanations and never publish raw exception prose. Unknown or missing codes use neutral diagnostic-reference wording. A check
 records one summary and at most 20 issue samples, each with the existing
 400-character explanatory bound; full stored sample paths remain separate.
 Legacy rows remain readable and their rendering is also bounded. Each audit is
@@ -361,6 +361,24 @@ progress precedes audit I/O and is replaced for that check after publication,
 preserving one check through catchable interruptions without duplicate rows.
 No journaling guarantee is made for SIGKILL or power loss. Public path labels and
 safe explanations do not replace full internal path/detail evidence.
+
+`RetentionVerification.sample_issues()` supplies the same normalized, at-most-20
+issue projection to CLI, dashboard, reports and diagnostic serialization. Empty
+paths remain null, empty/missing categories become `verification_invalid`, and
+absent reasons remain null. Unknown codes keep their original internal values
+and receive neutral public wording. Report explanation summaries are deduplicated
+in first-seen order; affected paths and complete audit rows are not collapsed.
+The legacy full-audit adapter streams every supplied issue, beyond the sample cap.
+
+`PruneResult.audit_cleanup` additively exposes a typed cleanup result: bounded
+issues, abort state, omitted count and recording time. Informational
+`retention_audit_cleanup` run components retain original bounded details and
+separate paths in the same invocation/stage row. Their exit code is zero; they
+change neither failed-run counters nor pruning exits. The existing tuple-returning
+cleanup adapter emits safe public notes. `skipped` and `protection_skipped` retain
+their compatibility interfaces. Compatibility notices use structured path/category
+metadata; old unstructured strings receive informational wording and never imply
+a failed protection check.
 
 ## Daily report reader
 

@@ -85,7 +85,8 @@ def test_clear_and_missing_empty_states_and_bounded_compatibility_notes(tmp_path
         config, RetentionVerification(), notes=tuple(f"legacy {i}" for i in range(100))
     )
     assert noisy.table is None and noisy.empty_reason
-    assert noisy.intro.count("Protection could not be verified") == 20
+    assert "20 legacy compatibility notes" in noisy.intro
+    assert "Protection could not be verified" not in noisy.intro
     assert "80 additional compatibility notes omitted" in noisy.intro
 
 

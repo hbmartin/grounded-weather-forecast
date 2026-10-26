@@ -59,7 +59,8 @@ from grounded_weather_forecast.health_policy import (
 )
 from grounded_weather_forecast.reports import evidence
 from grounded_weather_forecast.retention_audit import (
-    cleanup_audits,
+    AuditCleanupResult,
+    cleanup_audits_result,
     publish_verification,
 )
 from grounded_weather_forecast.retention_status import (
@@ -72,7 +73,7 @@ from grounded_weather_forecast.serve.approvals import (
     read_approval_snapshot,
 )
 from grounded_weather_forecast.serve.schema import Forecast
-from grounded_weather_forecast.status import PENDING_EXIT_CODES
+from grounded_weather_forecast.status import PENDING_EXIT_CODES, record_progress
 from grounded_weather_forecast.verification_text import (
     VerificationIssue,
     reason_for_error,
@@ -934,30 +935,51 @@ class PruneResult:
     coordination_release_failure: ScoreCoordinationFailure | None = None
     verification: RetentionVerification = field(default_factory=RetentionVerification)
     protection_skipped: tuple[str, ...] = ()
+    audit_cleanup: AuditCleanupResult = field(default_factory=AuditCleanupResult)
+
+
+class _ReleaseReferenceError(ValueError):
+    def __init__(self, reason_code: str, detail: str) -> None:
+        self.reason_code = reason_code
+        super().__init__(reason_code, detail)
+
+    def __str__(self) -> str:
+        return self.args[1]
 
 
 def _release_references(raw: Mapping[str, object], *, release_id: str) -> set[str]:
     if "evaluation_ids" not in raw and "selections" not in raw:
-        raise ValueError(f"release {release_id}: missing evaluation references")
+        raise _ReleaseReferenceError(
+            "release_evidence_invalid",
+            f"release {release_id}: missing evaluation references",
+        )
     evaluations = raw.get("evaluation_ids", [])
     if not isinstance(evaluations, (list, tuple)) or not all(
         isinstance(e, str) and e for e in evaluations
     ):
-        raise ValueError(f"release {release_id}: invalid evaluation_ids")
+        raise _ReleaseReferenceError(
+            "release_evidence_invalid", f"release {release_id}: invalid evaluation_ids"
+        )
     protected = {
         str(evaluation) for evaluation in evaluations if evaluation != "unknown"
     }
     selections = raw.get("selections", {})
     if not isinstance(selections, Mapping):
-        raise ValueError(f"release {release_id}: invalid selections")
+        raise _ReleaseReferenceError(
+            "release_evidence_invalid", f"release {release_id}: invalid selections"
+        )
     for selected in selections.values():
         if not isinstance(selected, Mapping):
-            raise ValueError(f"release {release_id}: invalid selection evidence")
+            raise _ReleaseReferenceError(
+                "release_evidence_invalid",
+                f"release {release_id}: invalid selection evidence",
+            )
         evaluation = selected.get("evaluation_id")
         if evaluation is not None:
             if not isinstance(evaluation, str) or not evaluation:
-                raise ValueError(
-                    f"release {release_id}: invalid selection evaluation_id"
+                raise _ReleaseReferenceError(
+                    "release_evidence_invalid",
+                    f"release {release_id}: invalid selection evaluation_id",
                 )
             if evaluation != "unknown":
                 protected.add(evaluation)
@@ -1146,15 +1168,16 @@ def _protected_evaluations(
             reference_path = config.artifacts_dir / "releases" / f"{release_id}.json"
             raw = raw_by_id.get(release_id)
             if raw is None:
-                raise ValueError(
-                    f"referenced release {release_id} is missing or has a filename/identity mismatch"
+                raise _ReleaseReferenceError(
+                    "release_missing", f"referenced release {release_id} is missing"
                 )
             if (
                 release_id not in known
                 and raw.get("approval_required", False) is not False
             ):
-                raise ValueError(
-                    f"referenced release {release_id} has no eligible approval"
+                raise _ReleaseReferenceError(
+                    "release_unapproved",
+                    f"referenced release {release_id} has no eligible approval",
                 )
             protected |= _release_references(raw, release_id=release_id)
         horizon = now - timedelta(days=_PROTECT_RELEASE_DAYS)
@@ -1176,6 +1199,9 @@ def _protected_evaluations(
                     reference_path,
                     "release_reference_invalid",
                     str(error),
+                    error.reason_code
+                    if isinstance(error, _ReleaseReferenceError)
+                    else None,
                 )
             )
         if failures is not None:
@@ -1227,7 +1253,9 @@ def prune_scores_files(
     verification = publish_verification(
         config, verification, dry_run=dry_run, issues=tuple(issues)
     )
-    audit_notes = cleanup_audits(config, now=moment, dry_run=dry_run)
+    audit_cleanup = cleanup_audits_result(config, now=moment, dry_run=dry_run)
+    record_progress(audit_cleanup.diagnostics(check_id=verification.check_id))
+    audit_notes = audit_cleanup.public_notes(config)
     if protected is None:
         return PruneResult(
             deleted=(),
@@ -1239,6 +1267,7 @@ def prune_scores_files(
             temporary_freed_mb=temporary.freed_mb,
             coordination_release_failure=failure,
             verification=verification,
+            audit_cleanup=audit_cleanup,
         )
     try:
         cataloged = set(
@@ -1280,4 +1309,5 @@ def prune_scores_files(
         temporary_freed_mb=temporary.freed_mb,
         coordination_release_failure=failure,
         verification=verification,
+        audit_cleanup=audit_cleanup,
     )

@@ -12,7 +12,10 @@ from pathlib import Path
 
 import polars as pl
 
-from grounded_weather_forecast.artifact_labels import CompatibilityNote, artifact_label
+from grounded_weather_forecast.artifact_labels import (
+    CompatibilityNotice,
+    artifact_label,
+)
 from grounded_weather_forecast.backtest.scores import load_scores
 from grounded_weather_forecast.config import Config
 from grounded_weather_forecast.contracts import MixedProvenanceError
@@ -74,6 +77,7 @@ class DashboardContext:
     # The artifacts/history ledgers, keyed by ledger name; every key from
     # evidence.LEDGERS is always present (empty typed frame when absent).
     evidence_history: Mapping[str, pl.DataFrame] = field(default_factory=dict)
+    compatibility_notices: tuple[CompatibilityNotice, ...] | None = None
 
 
 def _try_parquet(
@@ -156,6 +160,7 @@ def _releases(
     now: datetime | None = None,
     snapshot: ApprovalSnapshot | None = None,
     compatibility_notes: list[str] | None = None,
+    compatibility_notices: list[CompatibilityNotice] | None = None,
 ) -> tuple[Mapping[str, object], ...]:
     directory = config.artifacts_dir / "releases"
     snapshot = snapshot or read_approval_snapshot(directory, as_of=now)
@@ -167,8 +172,11 @@ def _releases(
     for issue in snapshot.issues:
         label = artifact_label(Path(issue), config)
         if issue in legacy:
+            notice = CompatibilityNotice(Path(issue))
             if compatibility_notes is not None:
-                compatibility_notes.append(CompatibilityNote(Path(issue), config))
+                compatibility_notes.append(notice.label(config))
+            if compatibility_notices is not None:
+                compatibility_notices.append(notice)
             continue
         failures.append(label)
     from grounded_weather_forecast.reports.operations import (  # noqa: PLC0415
@@ -337,6 +345,7 @@ def collect_context(
     )
     unreadable: list[str] = []
     compatibility_notes: list[str] = []
+    compatibility_notices: list[CompatibilityNotice] = []
     unreadable_scores: tuple[str, ...] = ()
     if score_summaries is None:
         score_summaries, unreadable_scores = _score_summaries(config, unreadable)
@@ -397,6 +406,7 @@ def collect_context(
             now=now,
             snapshot=approval_snapshot,
             compatibility_notes=compatibility_notes,
+            compatibility_notices=compatibility_notices,
         ),
         alignment=_try_json(
             config.artifacts_dir / "alignment.json",
@@ -422,4 +432,5 @@ def collect_context(
         ),
         unreadable_artifacts=tuple(sorted(set(unreadable))),
         compatibility_notes=tuple(compatibility_notes),
+        compatibility_notices=tuple(compatibility_notices),
     )
