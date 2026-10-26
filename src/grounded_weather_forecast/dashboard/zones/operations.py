@@ -13,9 +13,8 @@ from typing import cast
 import polars as pl
 
 from grounded_weather_forecast.artifact_labels import (
-    CompatibilityNote,
     audit_label,
-    diagnostic_label,
+    issue_label,
 )
 from grounded_weather_forecast.dashboard.charts import line_chart
 from grounded_weather_forecast.dashboard.context import DashboardContext
@@ -34,7 +33,7 @@ from grounded_weather_forecast.retention_status import (
     VERIFICATION_SAMPLE_LIMIT,
     retention_status,
 )
-from grounded_weather_forecast.verification_text import public_detail
+from grounded_weather_forecast.verification_text import public_explanation
 
 _MAX_POINTS = 60
 _MAX_SERIES = 8
@@ -402,21 +401,9 @@ def _retention_panel(ctx: DashboardContext) -> Panel:
     recorded = retention_status(ctx.runs, as_of=ctx.now)
     verification = recorded.verification
     status: PanelStatus = recorded.severity
-    details = [
-        diagnostic_label(
-            detail,
-            verification.paths[index] if index < len(verification.paths) else None,
-            ctx.config,
-            category=verification.categories[index]
-            if index < len(verification.categories)
-            else None,
-            reason_code=verification.reason_codes[index]
-            if index < len(verification.reason_codes)
-            else None,
-        )
-        for index, detail in enumerate(verification.details[:VERIFICATION_SAMPLE_LIMIT])
-    ]
-    notes = list(ctx.compatibility_notes)
+    details = [issue_label(issue, ctx.config) for issue in verification.sample_issues()]
+    notices = getattr(ctx, "compatibility_notices", None)
+    notes = ctx.compatibility_notes
     audit_note = (
         "Full verification audit exists but is unconfirmed; diagnostic samples are retained."
         if verification.audit_candidate_path
@@ -424,17 +411,27 @@ def _retention_panel(ctx: DashboardContext) -> Panel:
         if verification.audit_error
         else None
     )
-    compatibility = [
-        str(note) if isinstance(note, CompatibilityNote) else public_detail(note)
-        for note in notes[:VERIFICATION_SAMPLE_LIMIT]
-    ]
-    omitted_notes = max(0, len(notes) - len(compatibility))
+    if notices is not None:
+        compatibility = [
+            notice.label(ctx.config) for notice in notices[:VERIFICATION_SAMPLE_LIMIT]
+        ]
+        omitted_notes = max(0, len(notices) - len(compatibility))
+    else:
+        shown = min(len(notes), VERIFICATION_SAMPLE_LIMIT)
+        compatibility = (
+            [
+                f"{shown} legacy compatibility notes are available; see diagnostic evidence."
+            ]
+            if shown
+            else []
+        )
+        omitted_notes = max(0, len(notes) - shown)
     introduction = [audit_note] if audit_note else []
     if verification.audit_error:
         introduction.append(
-            public_detail(
-                verification.audit_error,
+            public_explanation(
                 reason_code=verification.audit_reason_code,
+                cause_code=verification.audit_cause_code,
                 audit=True,
             )
         )
@@ -500,7 +497,7 @@ def _retention_panel(ctx: DashboardContext) -> Panel:
         ),
         table=TableSpec(
             columns=("detail",),
-            rows=tuple((detail,) for detail in details[:VERIFICATION_SAMPLE_LIMIT]),
+            rows=tuple((detail,) for detail in details),
         )
         if details
         else None,

@@ -211,7 +211,7 @@ def test_denied_ledger_stat_cannot_be_mistaken_for_absence(tmp_path, monkeypatch
 
     monkeypatch.setattr(Path, "stat", denied)
     notes = cleanup_audits(config, now=NOW, dry_run=False)
-    assert notes and "PermissionError" in notes[0]
+    assert notes and "Access denied" in notes[0]
     assert audit.exists()
 
 

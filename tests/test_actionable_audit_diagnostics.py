@@ -18,6 +18,7 @@ from test_retention_verification import run_row
 from grounded_weather_forecast import cli, retention_audit, runs
 from grounded_weather_forecast.artifact_labels import (
     CompatibilityNote,
+    CompatibilityNotice,
     artifact_label,
     audit_label,
 )
@@ -411,7 +412,13 @@ def test_compatibility_note_retains_formatted_path(tmp_path):
     note = CompatibilityNote(config.artifacts_dir / "releases/legacy.json", config)
     panel = _retention_panel(
         SimpleNamespace(
-            config=config, runs=pl.DataFrame(), now=NOW, compatibility_notes=(note,)
+            config=config,
+            runs=pl.DataFrame(),
+            now=NOW,
+            compatibility_notes=(note,),
+            compatibility_notices=(
+                CompatibilityNotice(config.artifacts_dir / "releases/legacy.json"),
+            ),
         )
     )
     assert "artifacts/releases/legacy.json" in panel.intro

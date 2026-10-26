@@ -1169,6 +1169,21 @@ Public explanations come only from allowlisted category/reason templates; raw ex
 shown separately from the 20 issue samples, with omitted-note counts. Audit labels
 use the same formatter in CLI, report, and dashboard output.
 
+Cleanup notes also use fixed safe explanations: an abort never prints raw
+filesystem exception prose. Detailed internal diagnostics retain the original
+cause and exact path when known. Cleanup remains informational, including lock
+contention; ordinary I/O timeouts are not classified as lock contention. Audit
+publication reports the failed operation (link, synchronization, cleanup or I/O)
+separately from its known cause, so access-denied or missing-path messages do not
+hide hard-link failures. A busy audit directory means no audit was published for
+that check; no retry is scheduled. Missing releases, releases without eligible
+approvals and invalid evaluation evidence have distinct explanations.
+
+Report explanation summaries coalesce repeated fixed messages while retaining
+individual affected paths and issue counts. Compatibility notices are informational,
+including legacy unstructured notes; they do not change protection health. The
+same bounded typed sample projection and artifact formatter serve all renderers.
+
 Only private `.score-stage-v1.scores_*.parquet.<16 lowercase hex>.tmp`
 payloads and their `.lease` companions participate in automatic recovery.
 Recovery discovers candidate names outside the guard, then coordinates one

@@ -1,16 +1,21 @@
 """Recorded protection checks and pruning attempts, without live archive reads."""
 
 import json
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Iterator, Mapping
 from dataclasses import dataclass, field, replace
 from datetime import datetime
+from itertools import islice
 from typing import Any, Literal
 
 import polars as pl
 
 from grounded_weather_forecast.run_health import assess_attempts, aware_moment
 from grounded_weather_forecast.status import EXIT_CONTENTION, ComponentDiagnostic
-from grounded_weather_forecast.verification_text import normalize_detail, public_detail
+from grounded_weather_forecast.verification_text import (
+    VerificationIssue,
+    category_code,
+    public_explanation,
+)
 
 VERIFICATION_SAMPLE_LIMIT = 20
 
@@ -30,6 +35,8 @@ class RetentionVerification:
     reason_codes: tuple[str | None, ...] = ()
     audit_candidate_path: str | None = None
     audit_reason_code: str | None = None
+    audit_cause_code: str | None = None
+    _details_normalized: bool = field(default=False, repr=False, compare=False)
 
     @property
     def total(self) -> int:
@@ -48,6 +55,25 @@ class RetentionVerification:
         if self.audit_path:
             return "recorded"
         return "not_needed" if self.state == "clear" else "not_recorded"
+
+    def iter_issues(self) -> Iterator[VerificationIssue]:
+        """Normalize legacy parallel metadata once; full audits may stream all rows."""
+        for index, detail in enumerate(self.details):
+            yield VerificationIssue.from_legacy(
+                detail,
+                path=self.paths[index] if index < len(self.paths) else None,
+                category=self.categories[index]
+                if index < len(self.categories)
+                else None,
+                reason_code=self.reason_codes[index]
+                if index < len(self.reason_codes)
+                else None,
+                normalize_prefix=not self._details_normalized,
+            )
+
+    def sample_issues(self) -> tuple[VerificationIssue, ...]:
+        """One bounded projection shared by all diagnostic and public renderers."""
+        return tuple(islice(self.iter_issues(), VERIFICATION_SAMPLE_LIMIT))
 
     def diagnostics(self) -> tuple[ComponentDiagnostic, ...]:
         if self.state == "not_recorded":
@@ -76,31 +102,24 @@ class RetentionVerification:
                     audit_error=self.audit_error,
                     audit_candidate_path=self.audit_candidate_path,
                     audit_reason_code=self.audit_reason_code,
+                    audit_cause_code=self.audit_cause_code,
                 ),
             )
             if self.check_id is not None or self.omitted
             else ()
         )
-        samples = self.details[:VERIFICATION_SAMPLE_LIMIT]
+        samples = self.sample_issues()
         if not summary and not samples:
-            samples = (fallback,)
+            return (replace(common, detail=fallback),)
         return summary + tuple(
             replace(
                 common,
-                detail=normalize_detail(
-                    detail,
-                    self.paths[index] if index < len(self.paths) else None,
-                    self.categories[index] if index < len(self.categories) else None,
-                ),
-                path=self.paths[index] if index < len(self.paths) else None,
-                category=self.categories[index]
-                if index < len(self.categories)
-                else None,
-                reason_code=self.reason_codes[index]
-                if index < len(self.reason_codes)
-                else None,
+                detail=issue.detail,
+                path=str(issue.path) if issue.path is not None else None,
+                category=issue.category,
+                reason_code=issue.reason_code,
             )
-            for index, detail in enumerate(samples)
+            for issue in samples
         )
 
     def frame(
@@ -110,19 +129,11 @@ class RetentionVerification:
         audit_path_label: Callable[[str], str] | None = None,
     ) -> pl.DataFrame:
         label = path_label or str
-        details = [
-            public_detail(
-                detail,
-                self.paths[index] if index < len(self.paths) else None,
-                category=self.categories[index]
-                if index < len(self.categories)
-                else None,
-                reason_code=self.reason_codes[index]
-                if index < len(self.reason_codes)
-                else None,
-            )
-            for index, detail in enumerate(self.details[:VERIFICATION_SAMPLE_LIMIT])
-        ]
+        samples = self.sample_issues()
+        details = dict.fromkeys(
+            public_explanation(category=issue.category, reason_code=issue.reason_code)
+            for issue in samples
+        )
         return pl.DataFrame(
             {
                 "verification": [self.state],
@@ -132,9 +143,9 @@ class RetentionVerification:
                 "detail": ["; ".join(details) or None],
                 "affected_paths": [
                     "; ".join(
-                        label(path)
-                        for path in self.paths[:VERIFICATION_SAMPLE_LIMIT]
-                        if path
+                        label(str(issue.path))
+                        for issue in samples
+                        if issue.path is not None
                     )
                     or None
                 ],
@@ -147,8 +158,10 @@ class RetentionVerification:
                     else None
                 ],
                 "audit_error": [
-                    public_detail(
-                        self.audit_error, reason_code=self.audit_reason_code, audit=True
+                    public_explanation(
+                        reason_code=self.audit_reason_code,
+                        cause_code=self.audit_cause_code,
+                        audit=True,
                     )
                     if self.audit_error
                     else None
@@ -287,10 +300,7 @@ def _check_batch(
         summary.get("issue_count", 0 if kinds == {"retention_clear"} else len(items)),
         text("audit_error"),
         dry_run=_check_mode(items, fallback=mode),
-        categories=tuple(
-            value if isinstance(value := item.get("category"), str) else ""
-            for item in samples
-        ),
+        categories=tuple(category_code(item.get("category")) for item in samples),
         reason_codes=tuple(
             item.get("reason_code")
             if isinstance(item.get("reason_code"), str)
@@ -299,6 +309,10 @@ def _check_batch(
         ),
         audit_candidate_path=text("audit_candidate_path"),
         audit_reason_code=text("audit_reason_code"),
+        audit_cause_code=text("audit_cause_code"),
+        # Component detail is already raw evidence, separate from its path/category.
+        # Never strip an evidence prefix a second time on journal reads.
+        _details_normalized=True,
     )
 
 

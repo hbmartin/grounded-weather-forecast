@@ -558,6 +558,35 @@ issue paths remain null. Exact legacy path/category prefixes are removed once;
 embedded prose is not rewritten. Audit-publication causes have separate templates.
 This retains the existing `fsync` policy without a stronger power-loss guarantee.
 
+The bounded `RetentionVerification.sample_issues()` projection normalizes empty
+paths to null, empty/missing categories to `verification_invalid`, and absent
+reason codes to null. All renderers and run diagnostic serialization share it;
+the full legacy audit adapter streams every supplied issue through the same
+normalizer. Unknown codes retain their internal evidence but render neutrally.
+Report explanations deduplicate in first-seen order without collapsing paths,
+samples or full audit rows. Required-path `ApprovalIssue` remains distinct from
+nullable-path `VerificationIssue`, with a shared conversion preserving normalized
+instances.
+
+Audit classification is operation-specific. Only `filelock.Timeout` during lock
+acquisition establishes contention; ordinary I/O timeouts remain I/O, link or sync
+failures. `audit_reason_code` preserves the failed operation, while additive nullable
+`audit_cause_code` records a known cause independently. Link EPERM/ENOENT do not
+erase exclusive-publication context or establish filesystem capabilities. Busy
+publication is skipped for that check without a retry. Missing referenced releases,
+absent eligible approvals and malformed evidence have distinct typed reason codes;
+unlocated failures remain pathless.
+
+Cleanup yields a typed bounded result and safe tuple compatibility notes. Raw
+exception prose never supplies public cleanup text, including global aborts.
+Informational `retention_audit_cleanup` components preserve original details and
+paths in the existing journal row; they cannot change command exits or failure
+counters. The 20-note cap still reserves abort and omission slots, and dry runs
+retain deletion-phase revalidation for diagnostic parity. Structured compatibility
+notices supply artifact labels and fixed informational text; legacy string notes
+remain informational without being trusted as prose. The old string constructor
+remains a compatibility helper, not a rendering trust marker.
+
 Checks group by ID, or by recorded clock for legacy diagnostics. Multiple checks
 in one row select the latest completed clock, with persisted order breaking ties.
 The report's nullable `check_age_minutes` and dashboard age share the explicit

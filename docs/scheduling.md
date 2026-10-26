@@ -323,7 +323,15 @@ exit behavior, and later analysis commands.
   claiming crash durability. Public diagnostics use safe category/reason templates;
   raw paths and causes remain in diagnostic evidence. File-local cleanup failures
   do not block independent candidates; global reference uncertainty still does.
-  Bounded cleanup notes always retain an abort summary and omitted count.
+  Bounded cleanup notes always retain an abort summary and omitted count. Their
+  public text uses fixed safe explanations; original details and nullable paths
+  remain in informational run diagnostics without affecting failure counts or exits.
+  Audit publication preserves its operation and known cause separately. Only an
+  actual audit-lock acquisition timeout is contention; a busy directory means no
+  publication for that check, with no scheduled retry. Dry runs retain the same
+  revalidation and uncertainty diagnostics while deleting nothing. Compatibility
+  notices, including legacy strings, remain informational rather than claiming
+  protection failure.
 - `maintain` waits for `<dataset dir>/pipeline.lock` and holds it once across
   build → live backtest → truth-QC → report. Interactive mutators wait 60 s and
   exit `75` on contention. This prevents another command from slipping between
