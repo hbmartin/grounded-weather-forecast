@@ -5,7 +5,6 @@ import json
 from dataclasses import replace
 from datetime import timedelta
 from pathlib import Path
-from types import SimpleNamespace
 
 import polars as pl
 import pytest
@@ -16,6 +15,7 @@ from test_retention_verification import run_row
 
 from grounded_weather_forecast import cli, retention_audit as audit, runs
 from grounded_weather_forecast.artifact_labels import CompatibilityNotice
+from grounded_weather_forecast.dashboard.context import DashboardContext
 from grounded_weather_forecast.dashboard.zones.operations import _retention_panel
 from grounded_weather_forecast.reports import operations
 from grounded_weather_forecast.retention_status import (
@@ -23,7 +23,7 @@ from grounded_weather_forecast.retention_status import (
     retention_status,
 )
 from grounded_weather_forecast.serve.approvals import ApprovalIssue
-from grounded_weather_forecast.status import diagnostic_progress, failure_details_json
+from grounded_weather_forecast.status import failure_details_json
 from grounded_weather_forecast.verification_text import (
     VerificationIssue,
     public_detail,
@@ -145,7 +145,7 @@ def test_actual_lock_contention_has_no_retry_claim_or_command_contention(tmp_pat
         cleanup = audit.cleanup_audits_result(config, now=NOW, dry_run=False)
     assert check.audit_reason_code == "audit_lock_contended"
     text = check.frame()["audit_error"][0]
-    assert "no audit was published for this check" in text and "deferred" not in text
+    assert "No audit was published for this check" in text and "deferred" not in text
     assert "busy" in cleanup.public_notes(config)[0]
     assert all(item.exit_code == 0 for item in cleanup.diagnostics())
 
@@ -362,12 +362,12 @@ def test_compatibility_notices_are_structured_and_legacy_notes_are_informational
         "now": NOW,
         "compatibility_notes": ("raw /Users/private-user/path",) * 25,
     }
-    legacy = _retention_panel(SimpleNamespace(**common))
-    modern = _retention_panel(SimpleNamespace(**common, compatibility_notices=(note,)))
+    legacy = _retention_panel(DashboardContext(**common))
+    modern = _retention_panel(DashboardContext(**common, compatibility_notices=(note,)))
     assert legacy.status == modern.status == "ok"
     assert (
-        "20 legacy compatibility notes" in legacy.intro
-        and "5 additional" in legacy.intro
+        "25 legacy compatibility notes" in legacy.intro
+        and "additional" not in legacy.intro
     )
     assert "Protection could not be verified" not in legacy.intro
     assert (

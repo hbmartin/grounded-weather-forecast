@@ -2,13 +2,13 @@
 
 from dataclasses import replace
 from pathlib import Path
-from types import SimpleNamespace
 
 import polars as pl
 from test_daily_read import NOW, START, setup
 from test_retention_verification import run_row
 
 from grounded_weather_forecast.artifact_labels import artifact_label
+from grounded_weather_forecast.dashboard.context import DashboardContext
 from grounded_weather_forecast.dashboard.zones.operations import _retention_panel
 from grounded_weather_forecast.retention_status import RetentionVerification
 from grounded_weather_forecast.status import failure_details_json
@@ -19,7 +19,7 @@ def panel(config, check, notes=()):
         "failure_details_json": failure_details_json(check.diagnostics())
     }
     return _retention_panel(
-        SimpleNamespace(
+        DashboardContext(
             config=config, runs=pl.DataFrame([row]), now=NOW, compatibility_notes=notes
         )
     )
@@ -85,9 +85,9 @@ def test_clear_and_missing_empty_states_and_bounded_compatibility_notes(tmp_path
         config, RetentionVerification(), notes=tuple(f"legacy {i}" for i in range(100))
     )
     assert noisy.table is None and noisy.empty_reason
-    assert "20 legacy compatibility notes" in noisy.intro
+    assert "100 legacy compatibility notes" in noisy.intro
     assert "Protection could not be verified" not in noisy.intro
-    assert "80 additional compatibility notes omitted" in noisy.intro
+    assert "additional compatibility notes omitted" not in noisy.intro
 
 
 def test_audit_unavailable_remains_visible_when_issue_table_is_full(tmp_path):

@@ -558,7 +558,13 @@ issue paths remain null. Exact legacy path/category prefixes are removed once;
 embedded prose is not rewritten. Audit-publication causes have separate templates.
 This retains the existing `fsync` policy without a stronger power-loss guarantee.
 
-The bounded `RetentionVerification.sample_issues()` projection normalizes empty
+`RetentionVerification` stores canonical immutable typed issues. Legacy prefixed
+parallel tuples normalize once during construction; structured/journal raw details
+use the typed path and are never stripped again. Metadata-only replacements retain
+the canonical issues, while replacement legacy details normalize the new inputs.
+Equal objects have identical issue projections; no hidden normalization mode is
+carried across replacements. The bounded `sample_issues()` projection shares these
+canonical values. Input adapters normalize empty
 paths to null, empty/missing categories to `verification_invalid`, and absent
 reason codes to null. All renderers and run diagnostic serialization share it;
 the full legacy audit adapter streams every supplied issue through the same
@@ -579,12 +585,28 @@ unlocated failures remain pathless.
 
 Cleanup yields a typed bounded result and safe tuple compatibility notes. Raw
 exception prose never supplies public cleanup text, including global aborts.
-Informational `retention_audit_cleanup` components preserve original details and
-paths in the existing journal row; they cannot change command exits or failure
+Typed audit failures carry the operation, nullable path, reason and underlying
+cause at the failure site. Cleanup uses this context rather than a mutable location
+sentinel. Captured issue details use the shared single-line 400-character bound;
+original raw failure details remain internal. `operation` also survives publication
+summary round-trips: pre-link failures report no audit publication, while post-link
+failures retain an unconfirmed candidate. Legacy unknown phases remain neutral.
+
+Every cleanup emits one informational summary with nullable `dry_run`,
+`deleted_audit_count`, and `deleted_staging_count`. New counts increase only after
+successful unlink, including before a later lock-release failure; dry runs record
+zero, and missing legacy values remain unknown. The same immutable cleanup
+component batch is built once, recorded immediately and reused by the command
+outcome, including through later output/deletion failures.
+Informational `retention_audit_cleanup` components preserve bounded details and
+separate full paths in the existing journal row; they cannot change command exits or failure
 counters. The 20-note cap still reserves abort and omission slots, and dry runs
 retain deletion-phase revalidation for diagnostic parity. Structured compatibility
 notices supply artifact labels and fixed informational text; legacy string notes
-remain informational without being trusted as prose. The old string constructor
+remain informational without being trusted as prose. Legacy strings display the
+full aggregate count; structured notices display at most 20 individual entries
+with an omitted count. Normal dashboard collection derives the string view from
+structured notices and uses direct typed access. The old string constructor
 remains a compatibility helper, not a rendering trust marker.
 
 Checks group by ID, or by recorded clock for legacy diagnostics. Multiple checks

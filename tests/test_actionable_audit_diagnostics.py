@@ -22,7 +22,10 @@ from grounded_weather_forecast.artifact_labels import (
     artifact_label,
     audit_label,
 )
-from grounded_weather_forecast.dashboard.context import collect_context
+from grounded_weather_forecast.dashboard.context import (
+    DashboardContext,
+    collect_context,
+)
 from grounded_weather_forecast.dashboard.zones.operations import _retention_panel
 from grounded_weather_forecast.reports import operations
 from grounded_weather_forecast.retention_status import (
@@ -247,7 +250,7 @@ def test_post_link_failures_retain_unconfirmed_reference(tmp_path, monkeypatch, 
     row = run_row() | {
         "failure_details_json": failure_details_json(check.diagnostics())
     }
-    ctx = SimpleNamespace(
+    ctx = DashboardContext(
         config=config, runs=pl.DataFrame([row]), now=NOW, compatibility_notes=()
     )
     panel = _retention_panel(ctx)
@@ -363,7 +366,7 @@ def test_cleanup_abort_survives_full_sample_budget(tmp_path, monkeypatch, dry_ru
     )
     before = (config.artifacts_dir / check.audit_path).read_bytes()
     notes = retention_audit.cleanup_audits(config, now=NOW, dry_run=dry_run)
-    assert len(notes) == 20 and "not completed" in notes[0]
+    assert len(notes) == 20 and "did not complete" in notes[0]
     assert notes[-1] == "7 additional audit cleanup issues omitted."
     assert (config.artifacts_dir / check.audit_path).read_bytes() == before
 
@@ -411,7 +414,7 @@ def test_compatibility_note_retains_formatted_path(tmp_path):
     config, _, _ = setup(tmp_path)
     note = CompatibilityNote(config.artifacts_dir / "releases/legacy.json", config)
     panel = _retention_panel(
-        SimpleNamespace(
+        DashboardContext(
             config=config,
             runs=pl.DataFrame(),
             now=NOW,
@@ -454,7 +457,7 @@ def test_invalid_candidate_reference_stops_all_cleanup(tmp_path, reference):
     ).write_parquet(runs.runs_path(config))
     before = path.read_bytes()
     notes = retention_audit.cleanup_audits(config, now=NOW, dry_run=False)
-    assert "not completed" in notes[0] and path.read_bytes() == before
+    assert "did not complete" in notes[0] and path.read_bytes() == before
 
 
 def test_compatibility_note_copy_preserves_trusted_value(tmp_path):

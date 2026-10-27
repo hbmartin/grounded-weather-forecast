@@ -4,7 +4,6 @@ import json
 from collections.abc import Callable, Iterator, Mapping
 from dataclasses import dataclass, field, replace
 from datetime import datetime
-from itertools import islice
 from typing import Any, Literal
 
 import polars as pl
@@ -13,38 +12,122 @@ from grounded_weather_forecast.run_health import assess_attempts, aware_moment
 from grounded_weather_forecast.status import EXIT_CONTENTION, ComponentDiagnostic
 from grounded_weather_forecast.verification_text import (
     VerificationIssue,
-    category_code,
+    optional_code,
     public_explanation,
 )
 
 VERIFICATION_SAMPLE_LIMIT = 20
 
 
-@dataclass(frozen=True, slots=True)
+def _verification_issues(
+    issues: tuple[VerificationIssue, ...],
+    details: tuple[str, ...] | None,
+    paths: tuple[str | None, ...] | None,
+    categories: tuple[str, ...] | None,
+    reasons: tuple[str | None, ...] | None,
+) -> tuple[VerificationIssue, ...]:
+    if all(value is None for value in (details, paths, categories, reasons)):
+        return issues
+    prefixed = details is not None
+    raw = details if prefixed else tuple(issue.detail for issue in issues)
+    sources = (
+        paths
+        if paths is not None
+        else tuple(str(i.path) if i.path is not None else None for i in issues)
+    )
+    kinds = categories if categories is not None else tuple(i.category for i in issues)
+    codes = reasons if reasons is not None else tuple(i.reason_code for i in issues)
+    return tuple(
+        VerificationIssue.from_legacy(
+            detail,
+            path=sources[index] if index < len(sources) else None,
+            category=kinds[index] if index < len(kinds) else None,
+            reason_code=codes[index] if index < len(codes) else None,
+            normalize_prefix=prefixed,
+        )
+        for index, detail in enumerate(raw)
+    )
+
+
+@dataclass(frozen=True, slots=True, init=False)
 class RetentionVerification:
     state: Literal["clear", "suspended", "not_recorded"] = "not_recorded"
     recorded_at: datetime | None = None
-    details: tuple[str, ...] = ()
-    paths: tuple[str | None, ...] = ()
+    issues: tuple[VerificationIssue, ...] = ()
     check_id: str | None = None
     audit_path: str | None = None
     issue_count: int | None = None
     audit_error: str | None = None
-    categories: tuple[str, ...] = ()
     dry_run: bool | None = None
-    reason_codes: tuple[str | None, ...] = ()
     audit_candidate_path: str | None = None
     audit_reason_code: str | None = None
     audit_cause_code: str | None = None
-    _details_normalized: bool = field(default=False, repr=False, compare=False)
+    audit_operation: str | None = None
+
+    def __init__(
+        self,
+        state: Literal["clear", "suspended", "not_recorded"] = "not_recorded",
+        recorded_at: datetime | None = None,
+        details: tuple[str, ...] | None = None,
+        paths: tuple[str | None, ...] | None = None,
+        check_id: str | None = None,
+        audit_path: str | None = None,
+        issue_count: int | None = None,
+        audit_error: str | None = None,
+        categories: tuple[str, ...] | None = None,
+        dry_run: bool | None = None,  # noqa: FBT001 -- preserve positional construction compatibility
+        reason_codes: tuple[str | None, ...] | None = None,
+        audit_candidate_path: str | None = None,
+        audit_reason_code: str | None = None,
+        audit_cause_code: str | None = None,
+        *,
+        issues: tuple[VerificationIssue, ...] = (),
+        audit_operation: str | None = None,
+    ) -> None:
+        # Only the legacy tuple adapter strips prefixes. Typed/journal evidence
+        # goes straight into canonical immutable issues, including during replace.
+        object.__setattr__(self, "state", state)
+        object.__setattr__(self, "recorded_at", recorded_at)
+        object.__setattr__(
+            self,
+            "issues",
+            _verification_issues(issues, details, paths, categories, reason_codes),
+        )
+        object.__setattr__(self, "check_id", check_id)
+        object.__setattr__(self, "audit_path", audit_path)
+        object.__setattr__(self, "issue_count", issue_count)
+        object.__setattr__(self, "audit_error", audit_error)
+        object.__setattr__(self, "dry_run", dry_run)
+        object.__setattr__(self, "audit_candidate_path", audit_candidate_path)
+        object.__setattr__(self, "audit_reason_code", optional_code(audit_reason_code))
+        object.__setattr__(self, "audit_cause_code", optional_code(audit_cause_code))
+        object.__setattr__(self, "audit_operation", optional_code(audit_operation))
+
+    @property
+    def details(self) -> tuple[str, ...]:
+        return tuple(issue.diagnostic() for issue in self.issues)
+
+    @property
+    def paths(self) -> tuple[str | None, ...]:
+        return tuple(
+            str(issue.path) if issue.path is not None else None for issue in self.issues
+        )
+
+    @property
+    def categories(self) -> tuple[str, ...]:
+        return tuple(issue.category for issue in self.issues)
+
+    @property
+    def reason_codes(self) -> tuple[str | None, ...]:
+        return tuple(issue.reason_code for issue in self.issues)
 
     @property
     def total(self) -> int:
-        return self.issue_count if self.issue_count is not None else len(self.details)
+        return self.issue_count if self.issue_count is not None else len(self.issues)
 
     @property
     def omitted(self) -> int:
-        return max(0, self.total - min(len(self.details), VERIFICATION_SAMPLE_LIMIT))
+        return max(0, self.total - min(len(self.issues), VERIFICATION_SAMPLE_LIMIT))
 
     @property
     def audit_state(self) -> str:
@@ -57,23 +140,21 @@ class RetentionVerification:
         return "not_needed" if self.state == "clear" else "not_recorded"
 
     def iter_issues(self) -> Iterator[VerificationIssue]:
-        """Normalize legacy parallel metadata once; full audits may stream all rows."""
-        for index, detail in enumerate(self.details):
-            yield VerificationIssue.from_legacy(
-                detail,
-                path=self.paths[index] if index < len(self.paths) else None,
-                category=self.categories[index]
-                if index < len(self.categories)
-                else None,
-                reason_code=self.reason_codes[index]
-                if index < len(self.reason_codes)
-                else None,
-                normalize_prefix=not self._details_normalized,
-            )
+        """Stream canonical evidence without interpreting its raw prose again."""
+        return iter(self.issues)
 
     def sample_issues(self) -> tuple[VerificationIssue, ...]:
         """One bounded projection shared by all diagnostic and public renderers."""
-        return tuple(islice(self.iter_issues(), VERIFICATION_SAMPLE_LIMIT))
+        return self.issues[:VERIFICATION_SAMPLE_LIMIT]
+
+    def audit_explanation(self) -> str:
+        return public_explanation(
+            reason_code=self.audit_reason_code,
+            cause_code=self.audit_cause_code,
+            audit=True,
+            audit_state=self.audit_state,
+            operation=self.audit_operation,
+        )
 
     def diagnostics(self) -> tuple[ComponentDiagnostic, ...]:
         if self.state == "not_recorded":
@@ -103,6 +184,7 @@ class RetentionVerification:
                     audit_candidate_path=self.audit_candidate_path,
                     audit_reason_code=self.audit_reason_code,
                     audit_cause_code=self.audit_cause_code,
+                    operation=self.audit_operation,
                 ),
             )
             if self.check_id is not None or self.omitted
@@ -157,15 +239,7 @@ class RetentionVerification:
                     if self.audit_path
                     else None
                 ],
-                "audit_error": [
-                    public_explanation(
-                        reason_code=self.audit_reason_code,
-                        cause_code=self.audit_cause_code,
-                        audit=True,
-                    )
-                    if self.audit_error
-                    else None
-                ],
+                "audit_error": [self.audit_explanation() if self.audit_error else None],
                 "audit_candidate_path": [
                     (audit_path_label or str)(self.audit_candidate_path)
                     if self.audit_candidate_path
@@ -290,29 +364,27 @@ def _check_batch(
     return RetentionVerification(
         "suspended" if "retention_suspended" in kinds else "clear",
         clocks[0],
-        tuple(str(item.get("detail") or "")[:400] for item in samples),
-        tuple(
-            item.get("path") if isinstance(item.get("path"), str) else None
-            for item in samples
+        check_id=items[0].get("check_id"),
+        audit_path=text("audit_path"),
+        issue_count=summary.get(
+            "issue_count", 0 if kinds == {"retention_clear"} else len(items)
         ),
-        items[0].get("check_id"),
-        text("audit_path"),
-        summary.get("issue_count", 0 if kinds == {"retention_clear"} else len(items)),
-        text("audit_error"),
+        audit_error=text("audit_error"),
         dry_run=_check_mode(items, fallback=mode),
-        categories=tuple(category_code(item.get("category")) for item in samples),
-        reason_codes=tuple(
-            item.get("reason_code")
-            if isinstance(item.get("reason_code"), str)
-            else None
+        issues=tuple(
+            VerificationIssue.from_legacy(
+                str(item.get("detail") or "")[:400],
+                path=item.get("path"),
+                category=item.get("category"),
+                reason_code=item.get("reason_code"),
+                normalize_prefix=False,
+            )
             for item in samples
         ),
         audit_candidate_path=text("audit_candidate_path"),
         audit_reason_code=text("audit_reason_code"),
         audit_cause_code=text("audit_cause_code"),
-        # Component detail is already raw evidence, separate from its path/category.
-        # Never strip an evidence prefix a second time on journal reads.
-        _details_normalized=True,
+        audit_operation=text("operation"),
     )
 
 

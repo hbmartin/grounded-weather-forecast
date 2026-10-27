@@ -369,11 +369,27 @@ absent reasons remain null. Unknown codes keep their original internal values
 and receive neutral public wording. Report explanation summaries are deduplicated
 in first-seen order; affected paths and complete audit rows are not collapsed.
 The legacy full-audit adapter streams every supplied issue, beyond the sample cap.
+Verification stores canonical immutable typed issues. Legacy prefixed tuple inputs
+are normalized once at construction; structured journal details stay raw and are
+never stripped again. Legacy tuple views remain readable. Equality, metadata-only
+replacement, and replacement legacy details use the same canonical evidence.
+A nullable `operation` in publication summaries distinguishes phases such as
+`staging_sync`, `directory_sync`, `link`, and `lock_release`; renderers combine
+that phase with linked-candidate state. A failure before linking is unavailable,
+not an unconfirmed publication. Unknown legacy phases are described neutrally.
 
 `PruneResult.audit_cleanup` additively exposes a typed cleanup result: bounded
-issues, abort state, omitted count and recording time. Informational
+issues, abort state, omitted count, recording time, nullable `dry_run`, and
+nullable `deleted_audit_count` / `deleted_staging_count`. New invocations record
+known counts, incremented only after successful deletion; dry runs record zero.
+Legacy missing values remain unknown. Cleanup records one summary even when clean;
+a failure after deletion preserves completed counts. The immutable diagnostic
+batch is captured once, recorded immediately, and reused in the command result. Informational
 `retention_audit_cleanup` run components retain original bounded details and
-separate paths in the same invocation/stage row. Their exit code is zero; they
+separate paths in the same invocation/stage row. Nullable `operation` records the
+failed phase, independently of its reason and underlying cause. Captured sample
+details are single-line and bounded to 400 characters; original cleanup failure
+details remain available internally, outside public rendering. Their exit code is zero; they
 change neither failed-run counters nor pruning exits. The existing tuple-returning
 cleanup adapter emits safe public notes. `skipped` and `protection_skipped` retain
 their compatibility interfaces. Compatibility notices use structured path/category

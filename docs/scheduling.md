@@ -331,7 +331,15 @@ exit behavior, and later analysis commands.
   publication for that check, with no scheduled retry. Dry runs retain the same
   revalidation and uncertainty diagnostics while deleting nothing. Compatibility
   notices, including legacy strings, remain informational rather than claiming
-  protection failure.
+  protection failure. Legacy note counts include all notes; only structured
+  notices receive per-item sampling and omission counts. Every cleanup records
+  one informational summary with nullable mode and completed audit/staging deletion
+  counts. Dry-run deletion counts are zero, and a later lock-release failure
+  preserves earlier completed deletions without implying rollback. Staging sync
+  failures before linking report no publication; post-link failures preserve an
+  unconfirmed candidate. Legacy unknown phases remain neutral. Cleanup samples
+  are single-line and bounded to 400 characters, with full raw evidence retained
+  internally and never rendered publicly.
 - `maintain` waits for `<dataset dir>/pipeline.lock` and holds it once across
   build → live backtest → truth-QC → report. Interactive mutators wait 60 s and
   exit `75` on contention. This prevents another command from slipping between
