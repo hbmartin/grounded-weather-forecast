@@ -21,7 +21,7 @@ from grounded_weather_forecast.retention_status import (
     VERIFICATION_SAMPLE_LIMIT,
     RetentionVerification,
 )
-from grounded_weather_forecast.runs import read_runs, runs_path
+from grounded_weather_forecast.runs import normalize_error_detail, read_runs, runs_path
 from grounded_weather_forecast.serve.approvals import ApprovalIssue
 from grounded_weather_forecast.status import (
     ComponentDiagnostic,
@@ -44,11 +44,17 @@ def audit_directory(config: Config) -> Path:
 
 @contextmanager
 def _audit_lock(directory: Path) -> Iterator[None]:
-    lock = FileLock(directory / ".audit.lock", timeout=0)
     try:
+        lock = FileLock(directory / ".audit.lock", timeout=0)
         lock.acquire()
     except (Timeout,) as error:  # noqa: B013 -- only acquisition establishes contention
-        raise _AuditPublicationError("audit_lock_contended", error) from error
+        raise _AuditPublicationError(
+            "audit_lock_contended", error, "lock_acquire", directory
+        ) from error
+    except (OSError,) as error:  # noqa: B013
+        raise _AuditPublicationError(
+            "audit_io_failed", error, "lock_acquire", directory
+        ) from error
     primary: BaseException | None = None
     try:
         yield
@@ -60,7 +66,9 @@ def _audit_lock(directory: Path) -> Iterator[None]:
             lock.release()
         except (OSError,) as error:  # noqa: B013 -- cleanup must preserve cancellation
             if primary is None:
-                raise _AuditPublicationError("audit_cleanup_failed", error) from error
+                raise _AuditPublicationError(
+                    "audit_cleanup_failed", error, "lock_release", directory
+                ) from error
             primary.add_note(f"audit lock release also failed: {type(error).__name__}")
 
 
@@ -73,13 +81,44 @@ def _sync_directory(directory: Path) -> None:
 
 
 class _AuditPublicationError(OSError):
-    def __init__(self, reason_code: str, cause: OSError) -> None:
+    def __init__(
+        self,
+        reason_code: str,
+        cause: Exception,
+        operation: str | None = None,
+        path: Path | None = None,
+    ) -> None:
         self.reason_code = reason_code
+        self.operation = operation
+        self.path = path
         super().__init__(reason_code, cause)
+        self.args = (reason_code, cause, operation, path)
 
     def __str__(self) -> str:
         cause = self.args[1]
         return f"{type(cause).__name__}: {cause}"
+
+
+@contextmanager
+def _audit_operation(
+    operation: str,
+    path: Path | None,
+    reason_code: str = "audit_io_failed",
+) -> Iterator[None]:
+    try:
+        yield
+    except (_AuditPublicationError,):  # noqa: B013 -- preserve the original operation
+        raise
+    except (
+        OSError,
+        ValueError,
+        TypeError,
+        OverflowError,
+        pl.exceptions.PolarsError,
+    ) as error:
+        source = error.filename if isinstance(error, OSError) else None
+        location = Path(source) if isinstance(source, str) and source else path
+        raise _AuditPublicationError(reason_code, error, operation, location) from error
 
 
 def _legacy_issues(
@@ -136,17 +175,23 @@ def _publish_audit(
             try:
                 os.fsync(stream.fileno())
             except (OSError,) as error:  # noqa: B013
-                raise _AuditPublicationError("audit_sync_failed", error) from error
+                raise _AuditPublicationError(
+                    "audit_sync_failed", error, "staging_sync", temporary
+                ) from error
         # Exclusive publication: even an ID collision must never rewrite an audit.
         try:
             os.link(temporary, path)
         except (OSError,) as error:  # noqa: B013
-            raise _AuditPublicationError("audit_link_failed", error) from error
+            raise _AuditPublicationError(
+                "audit_link_failed", error, "link", path
+            ) from error
         on_link()
         try:
             _sync_directory(path.parent)
         except (OSError,) as error:  # noqa: B013
-            raise _AuditPublicationError("audit_sync_failed", error) from error
+            raise _AuditPublicationError(
+                "audit_sync_failed", error, "directory_sync", path.parent
+            ) from error
     except (BaseException,) as error:  # noqa: B013 -- preserve cancellation through cleanup
         primary = error
         raise
@@ -155,7 +200,9 @@ def _publish_audit(
             temporary.unlink(missing_ok=True)
         except (OSError,) as error:  # noqa: B013 -- preserve the original interruption
             if primary is None:
-                raise _AuditPublicationError("audit_cleanup_failed", error) from error
+                raise _AuditPublicationError(
+                    "audit_cleanup_failed", error, "staging_cleanup", temporary
+                ) from error
             primary.add_note(
                 f"audit staging cleanup also failed: {type(error).__name__}"
             )
@@ -178,24 +225,12 @@ def publish_verification(
         check_id=uuid4().hex,
         issue_count=len(problems),
         dry_run=dry_run,
-        details=tuple(
-            issue.diagnostic() for issue in problems[:VERIFICATION_SAMPLE_LIMIT]
-        ),
-        paths=tuple(
-            str(issue.path) if issue.path is not None else None
-            for issue in problems[:VERIFICATION_SAMPLE_LIMIT]
-        ),
-        categories=tuple(
-            issue.category for issue in problems[:VERIFICATION_SAMPLE_LIMIT]
-        ),
-        reason_codes=tuple(
-            issue.reason_code for issue in problems[:VERIFICATION_SAMPLE_LIMIT]
-        ),
+        issues=problems[:VERIFICATION_SAMPLE_LIMIT],
         audit_path=None,
         audit_candidate_path=None,
         audit_reason_code="audit_incomplete" if problems else None,
         audit_cause_code=None,
-        _details_normalized=False,
+        audit_operation=None,
         audit_error="audit publication not completed" if problems else None,
     )
     record_verification_progress(identified.diagnostics())
@@ -210,10 +245,15 @@ def publish_verification(
         path = audit_directory(config) / f"{identified.check_id}.jsonl"
         reference = str(path.relative_to(config.artifacts_dir))
         try:
-            path.parent.mkdir(parents=True, exist_ok=True)
-            with _audit_lock(path.parent):
+            with _audit_operation("directory_create", path.parent):
+                path.parent.mkdir(parents=True, exist_ok=True)
+            with _audit_lock(path.parent), _audit_operation("staging_write", path):
                 _publish_audit(
-                    path, identified, dry_run=dry_run, issues=problems, on_link=linked
+                    path,
+                    identified,
+                    dry_run=dry_run,
+                    issues=problems,
+                    on_link=linked,
                 )
             current = replace(
                 current,
@@ -222,6 +262,7 @@ def publish_verification(
                 audit_error=None,
                 audit_reason_code=None,
                 audit_cause_code=None,
+                audit_operation=None,
             )
         except (OSError, ValueError, TypeError) as problem:
             current = replace(
@@ -231,6 +272,9 @@ def publish_verification(
                 ],
                 audit_reason_code=_publication_reason(problem),
                 audit_cause_code=reason_for_error(problem),
+                audit_operation=problem.operation
+                if isinstance(problem, _AuditPublicationError)
+                else None,
             )
     record_verification_progress(current.diagnostics())
     return current
@@ -322,11 +366,65 @@ def _signature(path: Path) -> tuple[int, ...] | None:
 
 
 @dataclass(frozen=True, slots=True)
+class AuditCleanupFailure:
+    operation: str | None
+    path: Path | None
+    raw_detail: str
+    reason_code: str | None = None
+    cause_code: str | None = None
+
+    @classmethod
+    def capture(
+        cls, error: Exception, *, operation: str, path: Path | None
+    ) -> "AuditCleanupFailure":
+        if isinstance(error, _AuditPublicationError):
+            return cls(
+                error.operation,
+                error.path,
+                str(error.args[1]),
+                error.reason_code,
+                reason_for_error(error),
+            )
+        return cls(operation, path, str(error), None, reason_for_error(error))
+
+    def issue(self, *, aborted: bool = False) -> VerificationIssue:
+        return VerificationIssue(
+            self.path,
+            "audit_cleanup_aborted" if aborted else "audit_cleanup_file_failed",
+            normalize_error_detail(self.raw_detail) or "Audit operation failed.",
+            self.cause_code
+            if self.reason_code in {None, "audit_io_failed"}
+            else self.reason_code,
+        )
+
+
+@dataclass(frozen=True, slots=True)
 class AuditCleanupResult:
     issues: tuple[VerificationIssue, ...] = ()
     aborted: bool = False
     omitted_count: int = 0
     recorded_at: datetime | None = None
+    dry_run: bool | None = None
+    deleted_audit_count: int | None = None
+    deleted_staging_count: int | None = None
+    raw_failures: tuple[AuditCleanupFailure, ...] = ()
+
+    def summary(self) -> str:
+        state = (
+            "did not complete"
+            if self.aborted
+            else "completed with issues"
+            if self.issues
+            else "completed"
+        )
+        counts = (
+            f"Deleted {self.deleted_audit_count} audits and {self.deleted_staging_count} staging files."
+            if self.deleted_audit_count is not None
+            and self.deleted_staging_count is not None
+            else "Completed deletion counts were not recorded."
+        )
+        mode = " (dry run)" if self.dry_run is True else ""
+        return f"Audit cleanup {state}{mode}. {counts}"
 
     def public_notes(self, config: Config) -> tuple[str, ...]:
         notes = tuple(issue_label(issue, config) for issue in self.issues)
@@ -337,24 +435,25 @@ class AuditCleanupResult:
     def diagnostics(
         self, *, check_id: str | None = None
     ) -> tuple[ComponentDiagnostic, ...]:
-        if not self.issues:
-            return ()
         common = ComponentDiagnostic(
             stage="retention_audit_cleanup",
             exit_code=0,
             recorded_at=self.recorded_at.isoformat() if self.recorded_at else None,
             check_id=check_id,
+            dry_run=self.dry_run,
         )
         summary = replace(
             common,
             failure_kind="audit_cleanup_aborted"
             if self.aborted
-            else "audit_cleanup_issues",
-            detail="Audit cleanup stopped conservatively."
-            if self.aborted
-            else "Audit cleanup preserved uncertain files.",
+            else "audit_cleanup_issues"
+            if self.issues
+            else "audit_cleanup_complete",
+            detail=self.summary(),
             issue_count=len(self.issues) + self.omitted_count,
             omitted_count=self.omitted_count,
+            deleted_audit_count=self.deleted_audit_count,
+            deleted_staging_count=self.deleted_staging_count,
         )
         samples = tuple(
             replace(
@@ -363,41 +462,56 @@ class AuditCleanupResult:
                 path=str(issue.path) if issue.path is not None else None,
                 category=issue.category,
                 reason_code=issue.reason_code,
+                operation=self.raw_failures[index].operation
+                if index < len(self.raw_failures)
+                else None,
+                audit_cause_code=self.raw_failures[index].cause_code
+                if index < len(self.raw_failures)
+                else None,
             )
-            for issue in self.issues
+            for index, issue in enumerate(self.issues)
         )
         return (summary, *samples)
 
 
 @dataclass(slots=True)
 class _CleanupNotes:
-    samples: list[VerificationIssue] = field(default_factory=list)
+    samples: list[AuditCleanupFailure] = field(default_factory=list)
     count: int = 0
-    abort: VerificationIssue | None = None
+    abort: AuditCleanupFailure | None = None
+    deleted_audit_count: int = 0
+    deleted_staging_count: int = 0
 
-    def add(self, path: Path, error: Exception) -> None:
+    def add(
+        self, path: Path, error: Exception, *, operation: str = "candidate_verify"
+    ) -> None:
         self.count += 1
         if len(self.samples) < VERIFICATION_SAMPLE_LIMIT:
             self.samples.append(
-                VerificationIssue(
-                    path,
-                    "audit_cleanup_file_failed",
-                    str(error),
-                    reason_for_error(error),
-                )
+                AuditCleanupFailure.capture(error, operation=operation, path=path)
             )
 
-    def finish(self, recorded_at: datetime | None) -> AuditCleanupResult:
+    def finish(
+        self, recorded_at: datetime | None, *, dry_run: bool
+    ) -> AuditCleanupResult:
         prefix = (self.abort,) if self.abort is not None else ()
         budget = VERIFICATION_SAMPLE_LIMIT - len(prefix)
         shown = min(self.count, budget)
         if self.count > shown:
             shown = max(0, budget - 1)
+        failures = prefix + tuple(self.samples[:shown])
         return AuditCleanupResult(
-            prefix + tuple(self.samples[:shown]),
-            self.abort is not None,
-            self.count - shown,
-            recorded_at,
+            issues=tuple(
+                failure.issue(aborted=self.abort is not None and index == 0)
+                for index, failure in enumerate(failures)
+            ),
+            aborted=self.abort is not None,
+            omitted_count=self.count - shown,
+            recorded_at=recorded_at,
+            dry_run=dry_run,
+            deleted_audit_count=self.deleted_audit_count,
+            deleted_staging_count=self.deleted_staging_count,
+            raw_failures=failures,
         )
 
 
@@ -407,7 +521,7 @@ def _cleanup_candidates(
     notes: "_CleanupNotes",
 ) -> dict[Path, tuple[int, ...]]:
     candidates = {}
-    with os.scandir(directory) as entries:
+    with _audit_operation("enumerate", directory), os.scandir(directory) as entries:
         paths = sorted(directory / entry.name for entry in entries)
     for path in paths:
         staging = bool(_STAGING_NAME.fullmatch(path.name))
@@ -436,38 +550,40 @@ def cleanup_audits_result(
     """Expire known audit/staging files only after coordinated revalidation."""
     notes = _CleanupNotes()
     cutoff = None
-    location: Path | None = None
     try:
-        cutoff = aware_utc(now)
-        if cutoff is None:
-            raise ValueError("audit cutoff must be timezone-aware")
+        with _audit_operation("cutoff_validate", None):
+            cutoff = aware_utc(now)
+            if cutoff is None:
+                raise ValueError("audit cutoff must be timezone-aware")
         directory = audit_directory(config)
-        location = directory
-        try:
-            directory.stat()
-        except (FileNotFoundError,):  # noqa: B013 -- a dangling directory is uncertain
-            if not directory.is_symlink():
-                return notes.finish(cutoff)
-            raise ValueError("audit directory is a dangling reference") from None
+        with _audit_operation("directory_stat", directory):
+            try:
+                directory.stat()
+            except (FileNotFoundError,):  # noqa: B013 -- a dangling directory is uncertain
+                if not directory.is_symlink():
+                    return notes.finish(cutoff, dry_run=dry_run)
+                raise ValueError("audit directory is a dangling reference") from None
         with _audit_lock(directory):
             candidates = _cleanup_candidates(directory, cutoff, notes)
             references: set[str] = set()
             if any(_AUDIT_NAME.fullmatch(path.name) for path in candidates):
-                # The ledger reader also validates its dataset. Without a typed
-                # source location, a generic failure must not guess either path.
-                location = None
-                references = _referenced_audits(config)
-            location = directory
+                with _audit_operation("references", None):
+                    references = _referenced_audits(config)
             for path, signature in candidates.items():
                 try:
-                    if (
-                        path.name not in references
-                        and _signature(path) == signature
-                        and not dry_run
-                    ):
-                        path.unlink()
-                except (OSError,) as error:  # noqa: B013 -- one damaged file cannot block independent cleanup
-                    notes.add(path, error)
+                    if path.name in references:
+                        continue
+                    with _audit_operation("revalidate", path):
+                        unchanged = _signature(path) == signature
+                    if unchanged and not dry_run:
+                        with _audit_operation("delete", path):
+                            path.unlink()
+                        if _AUDIT_NAME.fullmatch(path.name):
+                            notes.deleted_audit_count += 1
+                        else:
+                            notes.deleted_staging_count += 1
+                except (OSError,) as error:  # noqa: B013 -- independent files still proceed
+                    notes.add(path, error, operation="delete")
     except (
         OSError,
         ValueError,
@@ -475,18 +591,8 @@ def cleanup_audits_result(
         OverflowError,
         pl.exceptions.PolarsError,
     ) as error:
-        source = error.filename if isinstance(error, OSError) else None
-        path = Path(source) if isinstance(source, str) and source else location
-        reason = reason_for_error(error)
-        if (
-            isinstance(error, _AuditPublicationError)
-            and error.reason_code == "audit_lock_contended"
-        ):
-            reason = "audit_directory_busy"
-        notes.abort = VerificationIssue(
-            path, "audit_cleanup_aborted", str(error), reason
-        )
-    return notes.finish(cutoff)
+        notes.abort = AuditCleanupFailure.capture(error, operation="cleanup", path=None)
+    return notes.finish(cutoff, dry_run=dry_run)
 
 
 def cleanup_audits(config: Config, *, now: datetime, dry_run: bool) -> tuple[str, ...]:

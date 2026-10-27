@@ -79,6 +79,16 @@ class DashboardContext:
     evidence_history: Mapping[str, pl.DataFrame] = field(default_factory=dict)
     compatibility_notices: tuple[CompatibilityNotice, ...] | None = None
 
+    def __post_init__(self) -> None:
+        if self.compatibility_notices is not None:
+            object.__setattr__(
+                self,
+                "compatibility_notes",
+                tuple(
+                    notice.label(self.config) for notice in self.compatibility_notices
+                ),
+            )
+
 
 def _try_parquet(
     path: Path, failures: list[str] | None = None, *, label: str | None = None
@@ -344,7 +354,6 @@ def collect_context(
         config.artifacts_dir / "releases", as_of=now
     )
     unreadable: list[str] = []
-    compatibility_notes: list[str] = []
     compatibility_notices: list[CompatibilityNotice] = []
     unreadable_scores: tuple[str, ...] = ()
     if score_summaries is None:
@@ -405,7 +414,6 @@ def collect_context(
             unreadable,
             now=now,
             snapshot=approval_snapshot,
-            compatibility_notes=compatibility_notes,
             compatibility_notices=compatibility_notices,
         ),
         alignment=_try_json(
@@ -431,6 +439,5 @@ def collect_context(
             config, unreadable, now=now, snapshot=approval_snapshot
         ),
         unreadable_artifacts=tuple(sorted(set(unreadable))),
-        compatibility_notes=tuple(compatibility_notes),
         compatibility_notices=tuple(compatibility_notices),
     )

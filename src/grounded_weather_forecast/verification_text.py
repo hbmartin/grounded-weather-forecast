@@ -13,10 +13,10 @@ _REASONS = {
     "permission_denied": "Access denied; check filesystem permissions.",
     "not_found": "Referenced artifact is missing.",
     "invalid_json": "Artifact contains invalid JSON.",
-    "audit_lock_contended": "Audit directory is busy; no audit was published for this check.",
-    "audit_sync_failed": "Audit synchronization failed; publication is unconfirmed.",
+    "audit_lock_contended": "Audit directory is busy.",
+    "audit_sync_failed": "Audit synchronization failed.",
     "audit_link_failed": "Exclusive audit publication failed; check hard-link support and permissions.",
-    "audit_cleanup_failed": "Audit staging or lock cleanup failed; publication is unconfirmed.",
+    "audit_cleanup_failed": "Audit staging or lock cleanup failed.",
     "audit_io_failed": "Audit I/O failed; inspect the stored diagnostic.",
     "audit_incomplete": "Audit publication did not complete.",
     "audit_directory_busy": "Audit directory is busy.",
@@ -38,7 +38,7 @@ _CATEGORIES = {
     "archived_document_invalid": "Archived served document could not be verified.",
     "release_reference_invalid": "Release evidence references could not be verified.",
     "audit_cleanup_file_failed": "Audit cleanup kept this file because verification or deletion failed.",
-    "audit_cleanup_aborted": "Audit cleanup was not completed; uncertain files were preserved.",
+    "audit_cleanup_aborted": "Audit cleanup did not complete; earlier verified deletions may have completed.",
 }
 
 
@@ -69,6 +69,8 @@ def public_explanation(
     reason_code: str | None = None,
     cause_code: str | None = None,
     audit: bool = False,
+    audit_state: str | None = None,
+    operation: str | None = None,
 ) -> str:
     """Render structured codes only; raw prose is never an input."""
     explanation = _CATEGORIES.get(category or "")
@@ -76,7 +78,13 @@ def public_explanation(
     cause = _REASONS.get(cause_code or "")
     if audit and reason:
         return " ".join(
-            value for value in (f"Audit publication: {reason}", cause) if value
+            value
+            for value in (
+                f"Audit publication: {reason}",
+                cause,
+                _publication_outcome(audit_state, operation),
+            )
+            if value
         )
     if explanation or reason:
         return " ".join(value for value in (explanation, reason) if value)
@@ -85,6 +93,20 @@ def public_explanation(
         if audit
         else "Protection could not be verified; see the stored diagnostic."
     )
+
+
+def _publication_outcome(state: str | None, operation: str | None) -> str:
+    if state == "unconfirmed":
+        return "The linked audit remains unconfirmed."
+    if state == "unavailable" and operation in {
+        "lock_acquire",
+        "staging_write",
+        "staging_sync",
+        "link",
+        "directory_create",
+    }:
+        return "No audit was published for this check."
+    return "No confirmed audit reference is available."
 
 
 def public_detail(
@@ -127,6 +149,10 @@ class VerificationIssue:
     category: str
     detail: str
     reason_code: str | None = None
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "category", category_code(self.category))
+        object.__setattr__(self, "reason_code", optional_code(self.reason_code))
 
     @classmethod
     def from_issue(cls, issue: IssueSource) -> "VerificationIssue":

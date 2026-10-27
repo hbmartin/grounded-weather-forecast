@@ -73,7 +73,11 @@ from grounded_weather_forecast.serve.approvals import (
     read_approval_snapshot,
 )
 from grounded_weather_forecast.serve.schema import Forecast
-from grounded_weather_forecast.status import PENDING_EXIT_CODES, record_progress
+from grounded_weather_forecast.status import (
+    PENDING_EXIT_CODES,
+    ComponentDiagnostic,
+    record_progress,
+)
 from grounded_weather_forecast.verification_text import (
     VerificationIssue,
     reason_for_error,
@@ -936,6 +940,7 @@ class PruneResult:
     verification: RetentionVerification = field(default_factory=RetentionVerification)
     protection_skipped: tuple[str, ...] = ()
     audit_cleanup: AuditCleanupResult = field(default_factory=AuditCleanupResult)
+    audit_cleanup_diagnostics: tuple[ComponentDiagnostic, ...] = ()
 
 
 class _ReleaseReferenceError(ValueError):
@@ -1254,7 +1259,8 @@ def prune_scores_files(
         config, verification, dry_run=dry_run, issues=tuple(issues)
     )
     audit_cleanup = cleanup_audits_result(config, now=moment, dry_run=dry_run)
-    record_progress(audit_cleanup.diagnostics(check_id=verification.check_id))
+    cleanup_diagnostics = audit_cleanup.diagnostics(check_id=verification.check_id)
+    record_progress(cleanup_diagnostics)
     audit_notes = audit_cleanup.public_notes(config)
     if protected is None:
         return PruneResult(
@@ -1268,6 +1274,7 @@ def prune_scores_files(
             coordination_release_failure=failure,
             verification=verification,
             audit_cleanup=audit_cleanup,
+            audit_cleanup_diagnostics=cleanup_diagnostics,
         )
     try:
         cataloged = set(
@@ -1310,4 +1317,5 @@ def prune_scores_files(
         coordination_release_failure=failure,
         verification=verification,
         audit_cleanup=audit_cleanup,
+        audit_cleanup_diagnostics=cleanup_diagnostics,
     )

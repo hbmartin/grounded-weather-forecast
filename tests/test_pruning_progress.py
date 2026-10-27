@@ -112,7 +112,22 @@ def test_late_failures_preserve_checks_without_duplicate_journal_rows(
     )
     if phase != "before_check":
         diagnostic = json.loads(frame["failure_details_json"][0])
-        assert len(diagnostic) == (1 if phase == "deletion" else 2)
+        checks = [
+            item for item in diagnostic if item["stage"] == "retention_verification"
+        ]
+        cleanup = [
+            item for item in diagnostic if item["stage"] == "retention_audit_cleanup"
+        ]
+        assert len(checks) == (1 if phase == "deletion" else 2)
+        assert (
+            len(cleanup) == 1 and cleanup[0]["failure_kind"] == "audit_cleanup_complete"
+        )
+        assert cleanup[0]["dry_run"] is (phase != "deletion")
+        assert (
+            cleanup[0]["deleted_audit_count"]
+            == cleanup[0]["deleted_staging_count"]
+            == 0
+        )
         assert len({item["check_id"] for item in diagnostic}) == 1
         assert diagnostic[0]["recorded_at"] is not None
 
@@ -128,7 +143,13 @@ def test_scopes_reset_and_success_diagnostics_are_not_duplicated(tmp_path):
         )
     frame = runs.load_runs(runs.runs_path(config))
     assert frame.height == 2
-    assert all(len(json.loads(raw)) == 2 for raw in frame["failure_details_json"])
+    for raw in frame["failure_details_json"]:
+        diagnostic = json.loads(raw)
+        assert len(diagnostic) == 3
+        assert len({json.dumps(item, sort_keys=True) for item in diagnostic}) == 3
+        assert (
+            sum(item["stage"] == "retention_audit_cleanup" for item in diagnostic) == 1
+        )
     with diagnostic_progress() as outer:
         with diagnostic_progress() as inner:
             record_progress(RetentionVerification("clear", NOW).diagnostics())

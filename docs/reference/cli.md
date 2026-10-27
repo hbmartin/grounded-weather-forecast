@@ -1158,6 +1158,18 @@ Cleanup handles file-local revalidation/deletion failures independently, while
 uncertain run references still stop all audit/staging cleanup. Within 20 cleanup
 notes, an overall abort summary takes precedence and omitted issues are counted.
 Dry runs perform the same reference verification but delete nothing.
+Every cleanup records one informational summary, including clean/no-op cleanup.
+Nullable `dry_run`, `deleted_audit_count`, and `deleted_staging_count` metadata
+report the actual mode and successfully completed unlinks. Dry-run counts are
+zero; missing legacy counts/mode remain unknown. A later lock-release failure
+preserves completed counts and does not imply earlier deletions were undone.
+These diagnostics change neither the command exit nor failure counters.
+
+Publication explanations use the recorded link checkpoint and nullable `operation`
+metadata. A staging-file synchronization failure before linking means no audit
+was published; failures after linking keep the candidate explicitly unconfirmed.
+Legacy records without a known phase receive neutral wording. Raw error prose
+never supplies these explanations.
 
 The latest attempt may be `contended` (exit 75) or `unknown` (unresolved malformed
 run evidence). Contention creates no protection-failure warning and clears none;
@@ -1166,7 +1178,7 @@ clear non-dry-run verification supersedes execution failures. Multiple completed
 remain independently readable; the newest recorded check wins. Public path labels
 are derived from stored paths, never by replacing directory names in prose.
 Public explanations come only from allowlisted category/reason templates; raw exception prose never supplies public text. Unknown codes and unstructured legacy details receive a neutral explanation and diagnostic reference. Original detail and full paths remain in diagnostic evidence. Audit-publication causes are separate from protection causes. Audit availability and up to 20 compatibility notes are
-shown separately from the 20 issue samples, with omitted-note counts. Audit labels
+shown separately from the 20 issue samples. Structured notices have omitted-note counts; legacy strings display their full aggregate count without revealing raw text. Audit labels
 use the same formatter in CLI, report, and dashboard output.
 
 Cleanup notes also use fixed safe explanations: an abort never prints raw

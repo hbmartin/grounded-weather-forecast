@@ -15,6 +15,7 @@ from test_retention_verification import run_row
 
 from grounded_weather_forecast import cli, health_policy, retention_audit, runs
 from grounded_weather_forecast.artifact_labels import audit_label
+from grounded_weather_forecast.dashboard.context import DashboardContext
 from grounded_weather_forecast.dashboard.zones.operations import _retention_panel
 from grounded_weather_forecast.reports import operations
 from grounded_weather_forecast.retention_status import (
@@ -214,7 +215,10 @@ def test_sync_or_capability_failure_keeps_check_without_confirming_audit(
         result = operations.prune_scores_files(config, dry_run=False, now=NOW)
     assert result.verification.state == "suspended" and not result.deleted
     assert result.verification.audit_path is None and result.verification.audit_error
-    assert tuple(progress) == result.verification.diagnostics()
+    assert (
+        tuple(progress)
+        == result.verification.diagnostics() + result.audit_cleanup_diagnostics
+    )
 
 
 def test_sync_precedes_link_and_directory_sync_follows(tmp_path, monkeypatch):
@@ -309,7 +313,7 @@ def test_panel_notes_and_public_paths_do_not_consume_issue_samples(tmp_path):
         "failure_details_json": failure_details_json(check.diagnostics())
     }
     panel = _retention_panel(
-        SimpleNamespace(
+        DashboardContext(
             config=config,
             runs=pl.DataFrame([row]),
             now=NOW,
@@ -317,8 +321,8 @@ def test_panel_notes_and_public_paths_do_not_consume_issue_samples(tmp_path):
         )
     )
     assert len(panel.table.rows) == 20 and str(tmp_path) not in str(panel)
-    assert "audit is unavailable" in panel.intro and "5 additional" in panel.intro
-    assert "20 legacy compatibility notes" in panel.intro
+    assert "audit is unavailable" in panel.intro and "additional" not in panel.intro
+    assert "25 legacy compatibility notes" in panel.intro
     assert "Protection could not be verified" not in panel.intro
     assert normalize_detail(f"{path}: metadata.", path) == "metadata."
 

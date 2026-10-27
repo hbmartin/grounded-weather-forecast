@@ -40,7 +40,6 @@ from grounded_weather_forecast.status import (
     merge_diagnostics,
     write_outcome_hint,
 )
-from grounded_weather_forecast.verification_text import public_explanation
 
 HOURLY_DEFAULT_VARIABLES = (
     "temp_c,humidity_pct,dew_point_c,wind_speed_ms,wind_gust_ms,"
@@ -1749,15 +1748,14 @@ def _cmd_prune_scores(config: Config, args: argparse.Namespace) -> int | Command
     )
 
     result = prune_scores_files(config, dry_run=args.dry_run)
-    diagnostics = result.verification.diagnostics() + result.audit_cleanup.diagnostics(
-        check_id=result.verification.check_id
-    )
+    diagnostics = result.verification.diagnostics() + result.audit_cleanup_diagnostics
     verb = "would delete" if args.dry_run else "deleted"
     for path in result.deleted:
         print(f"{verb} {path.name}")
     for note in result.skipped:
         if note not in result.protection_skipped:
             print(f"skipped {note}")
+    print(result.audit_cleanup.summary())
     check = result.verification
     for issue in check.sample_issues():
         print(issue_label(issue, config))
@@ -1768,13 +1766,7 @@ def _cmd_prune_scores(config: Config, args: argparse.Namespace) -> int | Command
     if check.audit_candidate_path:
         print(f"unconfirmed audit: {audit_label(check.audit_candidate_path, config)}")
     if check.audit_error:
-        print(
-            public_explanation(
-                reason_code=check.audit_reason_code,
-                cause_code=check.audit_cause_code,
-                audit=True,
-            )
-        )
+        print(check.audit_explanation())
     print(
         f"{verb} {len(result.deleted)} scores files ({result.freed_mb:.1f} MB), "
         f"kept {len(result.kept)}"

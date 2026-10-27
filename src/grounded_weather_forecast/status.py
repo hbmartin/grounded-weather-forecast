@@ -43,6 +43,9 @@ class ComponentDiagnostic:
     audit_candidate_path: str | None = None
     audit_reason_code: str | None = None
     audit_cause_code: str | None = None
+    operation: str | None = None
+    deleted_audit_count: int | None = None
+    deleted_staging_count: int | None = None
 
 
 _progress: ContextVar[list[ComponentDiagnostic] | None] = ContextVar(
@@ -114,6 +117,9 @@ def failure_details_json(diagnostics: tuple[ComponentDiagnostic, ...]) -> str | 
                     "audit_candidate_path",
                     "audit_reason_code",
                     "audit_cause_code",
+                    "operation",
+                    "deleted_audit_count",
+                    "deleted_staging_count",
                 }
                 or value is not None
             }

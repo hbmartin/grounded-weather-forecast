@@ -33,7 +33,6 @@ from grounded_weather_forecast.retention_status import (
     VERIFICATION_SAMPLE_LIMIT,
     retention_status,
 )
-from grounded_weather_forecast.verification_text import public_explanation
 
 _MAX_POINTS = 60
 _MAX_SERIES = 8
@@ -402,7 +401,7 @@ def _retention_panel(ctx: DashboardContext) -> Panel:
     verification = recorded.verification
     status: PanelStatus = recorded.severity
     details = [issue_label(issue, ctx.config) for issue in verification.sample_issues()]
-    notices = getattr(ctx, "compatibility_notices", None)
+    notices = ctx.compatibility_notices
     notes = ctx.compatibility_notes
     audit_note = (
         "Full verification audit exists but is unconfirmed; diagnostic samples are retained."
@@ -417,24 +416,17 @@ def _retention_panel(ctx: DashboardContext) -> Panel:
         ]
         omitted_notes = max(0, len(notices) - len(compatibility))
     else:
-        shown = min(len(notes), VERIFICATION_SAMPLE_LIMIT)
         compatibility = (
             [
-                f"{shown} legacy compatibility notes are available; see diagnostic evidence."
+                f"{len(notes)} legacy compatibility notes are available; see diagnostic evidence."
             ]
-            if shown
+            if notes
             else []
         )
-        omitted_notes = max(0, len(notes) - shown)
+        omitted_notes = 0
     introduction = [audit_note] if audit_note else []
     if verification.audit_error:
-        introduction.append(
-            public_explanation(
-                reason_code=verification.audit_reason_code,
-                cause_code=verification.audit_cause_code,
-                audit=True,
-            )
-        )
+        introduction.append(verification.audit_explanation())
     if compatibility:
         introduction.append("Compatibility information: " + "; ".join(compatibility))
     if omitted_notes:

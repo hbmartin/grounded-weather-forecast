@@ -56,10 +56,15 @@ def issue_label(issue: VerificationIssue, config: Config) -> str:
     explanation = public_explanation(
         category=issue.category, reason_code=issue.reason_code
     )
-    path = issue.path
-    if path:
-        return f"{artifact_label(path, config)}: {explanation}"
-    return explanation
+    return _label_explanation(issue.path, explanation, config)
+
+
+def _label_explanation(path: Path | None, explanation: str, config: Config) -> str:
+    return (
+        f"{artifact_label(path, config)}: {explanation}"
+        if path is not None
+        else explanation
+    )
 
 
 def audit_label(reference: str, config: Config) -> str:
@@ -75,9 +80,7 @@ class CompatibilityNotice:
         if self.category != "legacy_identity_missing":
             return "Legacy compatibility information is available; see diagnostic evidence."
         explanation = public_explanation(category=self.category)
-        if self.path is not None:
-            return f"{artifact_label(self.path, config)}: {explanation}"
-        return explanation
+        return _label_explanation(self.path, explanation, config)
 
 
 class CompatibilityNote(str):
