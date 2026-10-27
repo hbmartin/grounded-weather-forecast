@@ -5,9 +5,10 @@ at rendering time so unrecognized legacy/additive metadata cannot expose paths.
 """
 
 import json
+from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Protocol
+from typing import Protocol, cast
 
 _REASONS = {
     "permission_denied": "Access denied; check filesystem permissions.",
@@ -38,7 +39,7 @@ _CATEGORIES = {
     "archived_document_invalid": "Archived served document could not be verified.",
     "release_reference_invalid": "Release evidence references could not be verified.",
     "audit_cleanup_file_failed": "Audit cleanup kept this file because verification or deletion failed.",
-    "audit_cleanup_aborted": "Audit cleanup did not complete; earlier verified deletions may have completed.",
+    "audit_cleanup_aborted": "Audit cleanup did not complete; see the recorded cleanup progress.",
 }
 
 
@@ -82,7 +83,7 @@ def public_explanation(
             for value in (
                 f"Audit publication: {reason}",
                 cause,
-                _publication_outcome(audit_state, operation),
+                _publication_outcome(audit_state, operation, reason_code),
             )
             if value
         )
@@ -95,16 +96,22 @@ def public_explanation(
     )
 
 
-def _publication_outcome(state: str | None, operation: str | None) -> str:
+def _publication_outcome(
+    state: str | None, operation: str | None, reason: str | None
+) -> str:
     if state == "unconfirmed":
         return "The linked audit remains unconfirmed."
-    if state == "unavailable" and operation in {
-        "lock_acquire",
-        "staging_write",
-        "staging_sync",
-        "link",
-        "directory_create",
-    }:
+    if reason in {"audit_lock_contended", "audit_link_failed"} or (
+        state == "unavailable"
+        and operation
+        in {
+            "lock_acquire",
+            "staging_write",
+            "staging_sync",
+            "link",
+            "directory_create",
+        }
+    ):
         return "No audit was published for this check."
     return "No confirmed audit reference is available."
 
@@ -184,3 +191,12 @@ class VerificationIssue:
     def diagnostic(self) -> str:
         prefix = f"{self.path}: " if self.path is not None else ""
         return f"{prefix}{self.category}: {self.detail}"
+
+
+def canonical_issues(issues: Sequence[IssueSource]) -> tuple[VerificationIssue, ...]:
+    """Freeze input evidence, retaining an already canonical immutable tuple."""
+    if isinstance(issues, tuple) and all(
+        isinstance(issue, VerificationIssue) for issue in issues
+    ):
+        return cast(tuple[VerificationIssue, ...], issues)
+    return tuple(VerificationIssue.from_issue(issue) for issue in issues)

@@ -7,6 +7,7 @@ from pathlib import Path
 from grounded_weather_forecast.config import Config
 from grounded_weather_forecast.verification_text import (
     VerificationIssue,
+    category_code,
     public_explanation,
 )
 
@@ -44,7 +45,7 @@ def diagnostic_label(
     return issue_label(
         VerificationIssue(
             Path(path) if path else None,
-            category or "verification_invalid",
+            category_code(category),
             detail,
             reason_code,
         ),

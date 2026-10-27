@@ -371,8 +371,15 @@ in first-seen order; affected paths and complete audit rows are not collapsed.
 The legacy full-audit adapter streams every supplied issue, beyond the sample cap.
 Verification stores canonical immutable typed issues. Legacy prefixed tuple inputs
 are normalized once at construction; structured journal details stay raw and are
-never stripped again. Legacy tuple views remain readable. Equality, metadata-only
-replacement, and replacement legacy details use the same canonical evidence.
+never stripped again. Accepted lists and compatible issue objects are copied into immutable canonical
+tuples; already canonical tuples are reused. `details` exposes canonical raw text;
+`formatted_details` adds path/category labels explicitly. Journal reads never
+reattach labels to raw text or strip genuine evidence prefixes. Legacy text edits
+retain positional metadata, supplied legacy fields override their corresponding
+structured projection, and explicit empty details clear issues. Missing metadata
+for new positions uses the existing null/default rules. Metadata-only replacement
+preserves issues; typed replacement uses the supplied complete issues without
+borrowing previous evidence.
 A nullable `operation` in publication summaries distinguishes phases such as
 `staging_sync`, `directory_sync`, `link`, and `lock_release`; renderers combine
 that phase with linked-candidate state. A failure before linking is unavailable,
@@ -382,16 +389,29 @@ not an unconfirmed publication. Unknown legacy phases are described neutrally.
 issues, abort state, omitted count, recording time, nullable `dry_run`, and
 nullable `deleted_audit_count` / `deleted_staging_count`. New invocations record
 known counts, incremented only after successful deletion; dry runs record zero.
-Legacy missing values remain unknown. Cleanup records one summary even when clean;
-a failure after deletion preserves completed counts. The immutable diagnostic
-batch is captured once, recorded immediately, and reused in the command result. Informational
+Legacy missing values remain unknown. Nullable `eligible_audit_count` and
+`eligible_staging_count` count only unreferenced, unchanged candidates at final
+revalidation. Dry runs report these as “would delete” counts, separately from zero
+actual deletions; aborted runs expose verified progress only. Nullable
+`cleanup_completed` distinguishes a recorded completion from unknown legacy state.
+Default results emit no execution diagnostic; recorded unknown outcomes use
+`audit_cleanup_unverified`, never `audit_cleanup_complete`. Cleanup records one
+summary even when clean; a failure after deletion preserves completed counts. The immutable diagnostic
+batch is captured once, recorded immediately, and reused in the command result.
+Compatibility-built `PruneResult` objects initialize a missing batch at their result
+boundary; the CLI never independently reconstructs it. Informational
 `retention_audit_cleanup` run components retain original bounded details and
 separate paths in the same invocation/stage row. Nullable `operation` records the
 failed phase, independently of its reason and underlying cause. Captured sample
 details are single-line and bounded to 400 characters; original cleanup failure
 details remain available internally, outside public rendering. Their exit code is zero; they
-change neither failed-run counters nor pruning exits. The existing tuple-returning
-cleanup adapter emits safe public notes. `skipped` and `protection_skipped` retain
+change neither failed-run counters nor pruning exits. Canonical cleanup entries own each bounded issue and its optional full original
+failure evidence, including nullable `error_type`. `issues` and `raw_failures` are
+readable compatibility views; the latter contains only known original failures.
+Legacy issue replacement cannot inherit a previous entry’s operation or cause;
+explicitly paired legacy issue/failure inputs must agree. Omitted typed context
+may use verified caller context; explicitly unknown paths remain null. The existing
+tuple-returning cleanup adapter emits safe public notes. `skipped` and `protection_skipped` retain
 their compatibility interfaces. Compatibility notices use structured path/category
 metadata; old unstructured strings receive informational wording and never imply
 a failed protection check.

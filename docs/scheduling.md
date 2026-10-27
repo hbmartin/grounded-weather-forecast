@@ -334,10 +334,14 @@ exit behavior, and later analysis commands.
   protection failure. Legacy note counts include all notes; only structured
   notices receive per-item sampling and omission counts. Every cleanup records
   one informational summary with nullable mode and completed audit/staging deletion
-  counts. Dry-run deletion counts are zero, and a later lock-release failure
-  preserves earlier completed deletions without implying rollback. Staging sync
+  counts. Eligible audit/staging counts are tracked separately after reference and
+  signature checks; dry runs preview these while actual deletion counts stay zero.
+  Aborts report eligibility verified so far, and a later lock-release failure
+  preserves earlier completed deletions without implying rollback. Unknown legacy
+  execution remains unverified; a default result cannot establish completion. Staging sync
   failures before linking report no publication; post-link failures preserve an
-  unconfirmed candidate. Legacy unknown phases remain neutral. Cleanup samples
+  unconfirmed candidate. Historical contention/link reasons prove no publication
+  when no linked candidate exists; unknown sync phases remain neutral. Cleanup samples
   are single-line and bounded to 400 characters, with full raw evidence retained
   internally and never rendered publicly.
 - `maintain` waits for `<dataset dir>/pipeline.lock` and holds it once across

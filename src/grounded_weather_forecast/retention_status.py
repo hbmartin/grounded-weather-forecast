@@ -1,7 +1,7 @@
 """Recorded protection checks and pruning attempts, without live archive reads."""
 
 import json
-from collections.abc import Callable, Iterator, Mapping
+from collections.abc import Callable, Iterator, Mapping, Sequence
 from dataclasses import dataclass, field, replace
 from datetime import datetime
 from typing import Any, Literal
@@ -11,7 +11,9 @@ import polars as pl
 from grounded_weather_forecast.run_health import assess_attempts, aware_moment
 from grounded_weather_forecast.status import EXIT_CONTENTION, ComponentDiagnostic
 from grounded_weather_forecast.verification_text import (
+    IssueSource,
     VerificationIssue,
+    canonical_issues,
     optional_code,
     public_explanation,
 )
@@ -20,12 +22,13 @@ VERIFICATION_SAMPLE_LIMIT = 20
 
 
 def _verification_issues(
-    issues: tuple[VerificationIssue, ...],
+    issues: Sequence[IssueSource],
     details: tuple[str, ...] | None,
     paths: tuple[str | None, ...] | None,
     categories: tuple[str, ...] | None,
     reasons: tuple[str | None, ...] | None,
 ) -> tuple[VerificationIssue, ...]:
+    issues = canonical_issues(issues)
     if all(value is None for value in (details, paths, categories, reasons)):
         return issues
     prefixed = details is not None
@@ -81,7 +84,7 @@ class RetentionVerification:
         audit_reason_code: str | None = None,
         audit_cause_code: str | None = None,
         *,
-        issues: tuple[VerificationIssue, ...] = (),
+        issues: Sequence[IssueSource] = (),
         audit_operation: str | None = None,
     ) -> None:
         # Only the legacy tuple adapter strips prefixes. Typed/journal evidence
@@ -105,6 +108,11 @@ class RetentionVerification:
 
     @property
     def details(self) -> tuple[str, ...]:
+        """Canonical raw evidence; formatting is an explicit separate projection."""
+        return tuple(issue.detail for issue in self.issues)
+
+    @property
+    def formatted_details(self) -> tuple[str, ...]:
         return tuple(issue.diagnostic() for issue in self.issues)
 
     @property

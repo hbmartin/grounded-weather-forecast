@@ -191,7 +191,8 @@ def test_legacy_adapter_normalizes_exact_prefixes_and_empty_paths(tmp_path):
         categories=("schema_invalid", "schema_invalid"),
     )
     result = retention_audit.publish_verification(config, check, dry_run=True)
-    assert result.details == (
+    assert result.details == ("bad /p: content", "empty path")
+    assert result.formatted_details == (
         "/p: schema_invalid: bad /p: content",
         "schema_invalid: empty path",
     )
