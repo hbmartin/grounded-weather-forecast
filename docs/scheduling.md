@@ -343,9 +343,14 @@ exit behavior, and later analysis commands.
   counts do not prove that the entire cleanup completed. Raw diagnostic text is
   literal at construction; labelled legacy input uses an explicit adapter. Bound
   cleanup records keep their source and check identity through copies, rebinding
-  only when either changes. Journaling replaces an earlier identified cleanup
-  batch with its later authoritative batch while preserving other checks and
-  captured progress through exceptions. Staging sync
+  only when either changes. A stable nullable `progress_id` survives copied check-ID
+  changes; new physical checks receive separate identities. Journaling and progress
+  capture replace earlier verification and cleanup batches per stage and logical
+  check, preserving independent checks and captured progress through exceptions.
+  Legacy IDs remain readable, and empty diagnostic tuples retain omitted-batch
+  compatibility. Compact failure-only replacement removes old tails; sparse
+  metadata annotation requires a unique association, with nullable aligned input
+  for duplicate issues. No execution or recovery policy changes. Staging sync
   failures before linking report no publication; post-link failures preserve an
   unconfirmed candidate. Historical contention/link reasons prove no publication
   when no linked candidate exists; unknown sync phases remain neutral. Cleanup samples

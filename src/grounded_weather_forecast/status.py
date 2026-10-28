@@ -50,6 +50,7 @@ class ComponentDiagnostic:
     eligible_staging_count: int | None = None
     cleanup_completed: bool | None = None
     error_type: str | None = None
+    progress_id: str | None = None
 
 
 _progress: ContextVar[list[ComponentDiagnostic] | None] = ContextVar(
@@ -70,43 +71,32 @@ def diagnostic_progress() -> Iterator[list[ComponentDiagnostic]]:
 
 def record_progress(diagnostics: tuple[ComponentDiagnostic, ...]) -> None:
     if (progress := _progress.get()) is not None:
-        progress[:] = _replace_cleanup_batches(tuple(progress), diagnostics)
+        progress[:] = _replace_identified_batches(tuple(progress), diagnostics)
 
 
-def _replace_cleanup_batches(
+def _batch_identity(item: ComponentDiagnostic) -> tuple[str, str] | None:
+    if item.stage not in {"retention_verification", "retention_audit_cleanup"}:
+        return None
+    identity = item.progress_id if item.progress_id is not None else item.check_id
+    return (item.stage, identity) if identity is not None else None
+
+
+def _replace_identified_batches(
     previous: tuple[ComponentDiagnostic, ...],
     incoming: tuple[ComponentDiagnostic, ...],
 ) -> tuple[ComponentDiagnostic, ...]:
     identities = {
-        item.check_id
-        for item in incoming
-        if item.stage == "retention_audit_cleanup" and item.check_id is not None
+        identity for item in incoming if (identity := _batch_identity(item)) is not None
     }
     return (
-        tuple(
-            item
-            for item in previous
-            if item.stage != "retention_audit_cleanup"
-            or item.check_id not in identities
-        )
+        tuple(item for item in previous if _batch_identity(item) not in identities)
         + incoming
     )
 
 
 def record_verification_progress(diagnostics: tuple[ComponentDiagnostic, ...]) -> None:
-    """Replace one identified check atomically, preserving other partial results."""
-    if (progress := _progress.get()) is None:
-        return
-    identities = {
-        item.check_id
-        for item in diagnostics
-        if item.stage == "retention_verification" and item.check_id is not None
-    }
-    progress[:] = [
-        item
-        for item in progress
-        if item.stage != "retention_verification" or item.check_id not in identities
-    ] + list(diagnostics)
+    """Compatibility entry point sharing atomic replacement with final merging."""
+    record_progress(diagnostics)
 
 
 def merge_diagnostics(
@@ -114,7 +104,7 @@ def merge_diagnostics(
 ) -> tuple[ComponentDiagnostic, ...]:
     merged: tuple[ComponentDiagnostic, ...] = ()
     for batch in batches:
-        merged = _replace_cleanup_batches(merged, batch)
+        merged = _replace_identified_batches(merged, batch)
     return tuple(dict.fromkeys(merged))
 
 
@@ -151,6 +141,7 @@ def failure_details_json(diagnostics: tuple[ComponentDiagnostic, ...]) -> str | 
                     "eligible_staging_count",
                     "cleanup_completed",
                     "error_type",
+                    "progress_id",
                 }
                 or value is not None
             }

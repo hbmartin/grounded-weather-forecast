@@ -962,7 +962,10 @@ class PruneResult:
     ) -> None:
         if verification is None:
             identity = cleanup_record.check_id if cleanup_record is not None else None
-            check = RetentionVerification(check_id=identity)
+            progress_id = (
+                cleanup_record.progress_id if cleanup_record is not None else None
+            )
+            check = RetentionVerification(check_id=identity, progress_id=progress_id)
         else:
             check = verification
         if audit_cleanup is not None:
@@ -972,12 +975,14 @@ class PruneResult:
         else:
             cleanup = AuditCleanupResult()
         bound = cleanup_record
-        if bound is None or bound.result != cleanup or bound.check_id != check.check_id:
-            bound = AuditCleanupRecord(cleanup, check.check_id)
         if (
-            audit_cleanup_diagnostics is not None
-            and audit_cleanup_diagnostics != bound.diagnostics
+            bound is None
+            or bound.result != cleanup
+            or bound.check_id != check.check_id
+            or bound.progress_id != check.progress_id
         ):
+            bound = AuditCleanupRecord(cleanup, check.check_id, check.progress_id)
+        if audit_cleanup_diagnostics and audit_cleanup_diagnostics != bound.diagnostics:
             raise ValueError(
                 "cleanup diagnostics do not match cleanup result and check"
             )
@@ -1321,7 +1326,9 @@ def prune_scores_files(
         config, verification, dry_run=dry_run, issues=tuple(issues)
     )
     audit_cleanup = cleanup_audits_result(config, now=moment, dry_run=dry_run)
-    cleanup_record = AuditCleanupRecord(audit_cleanup, verification.check_id)
+    cleanup_record = AuditCleanupRecord(
+        audit_cleanup, verification.check_id, verification.progress_id
+    )
     record_progress(cleanup_record.diagnostics)
     audit_notes = audit_cleanup.public_notes(config)
     if protected is None:

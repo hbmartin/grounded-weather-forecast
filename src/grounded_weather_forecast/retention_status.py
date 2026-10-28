@@ -27,6 +27,8 @@ def _verification_issues(
     paths: tuple[str | None, ...] | None,
     categories: tuple[str, ...] | None,
     reasons: tuple[str | None, ...] | None,
+    *,
+    normalize_prefix: bool = False,
 ) -> tuple[VerificationIssue, ...]:
     issues = canonical_issues(issues)
     if all(value is None for value in (details, paths, categories, reasons)):
@@ -45,7 +47,7 @@ def _verification_issues(
             path=sources[index] if index < len(sources) else None,
             category=kinds[index] if index < len(kinds) else None,
             reason_code=codes[index] if index < len(codes) else None,
-            normalize_prefix=False,
+            normalize_prefix=normalize_prefix and details is not None,
         )
         for index, detail in enumerate(raw)
     )
@@ -65,6 +67,7 @@ class RetentionVerification:
     audit_reason_code: str | None = None
     audit_cause_code: str | None = None
     audit_operation: str | None = None
+    progress_id: str | None = None
 
     def __init__(
         self,
@@ -85,6 +88,7 @@ class RetentionVerification:
         *,
         issues: Sequence[IssueSource] = (),
         audit_operation: str | None = None,
+        progress_id: str | None = None,
     ) -> None:
         # Constructor and replacement inputs are literal evidence. Prefix stripping
         # belongs exclusively to the explicit legacy adapter below.
@@ -96,6 +100,9 @@ class RetentionVerification:
             _verification_issues(issues, details, paths, categories, reason_codes),
         )
         object.__setattr__(self, "check_id", check_id)
+        object.__setattr__(
+            self, "progress_id", progress_id if progress_id is not None else check_id
+        )
         object.__setattr__(self, "audit_path", audit_path)
         object.__setattr__(self, "issue_count", issue_count)
         object.__setattr__(self, "audit_error", audit_error)
@@ -110,24 +117,47 @@ class RetentionVerification:
         cls,
         state: Literal["clear", "suspended", "not_recorded"] = "not_recorded",
         recorded_at: datetime | None = None,
-        details: tuple[str, ...] = (),
-        paths: tuple[str | None, ...] = (),
+        details: tuple[str, ...] | None = None,
+        paths: tuple[str | None, ...] | None = None,
+        check_id: str | None = None,
+        audit_path: str | None = None,
+        issue_count: int | None = None,
+        audit_error: str | None = None,
+        categories: tuple[str, ...] | None = None,
+        dry_run: bool | None = None,  # noqa: FBT001 -- constructor-compatible arguments
+        reason_codes: tuple[str | None, ...] | None = None,
+        audit_candidate_path: str | None = None,
+        audit_reason_code: str | None = None,
+        audit_cause_code: str | None = None,
         *,
-        categories: tuple[str, ...] = (),
-        reason_codes: tuple[str | None, ...] = (),
-        **metadata: Any,
+        issues: Sequence[IssueSource] = (),
+        audit_operation: str | None = None,
+        progress_id: str | None = None,
     ) -> "RetentionVerification":
         """Ingest labelled legacy strings, removing exact recorded prefixes once."""
-        issues = tuple(
-            VerificationIssue.from_legacy(
-                detail,
-                path=paths[index] if index < len(paths) else None,
-                category=categories[index] if index < len(categories) else None,
-                reason_code=reason_codes[index] if index < len(reason_codes) else None,
-            )
-            for index, detail in enumerate(details)
+        normalized = _verification_issues(
+            issues,
+            details,
+            paths,
+            categories,
+            reason_codes,
+            normalize_prefix=True,
         )
-        return cls(state, recorded_at, issues=issues, **metadata)
+        return cls(
+            state,
+            recorded_at,
+            check_id=check_id,
+            audit_path=audit_path,
+            issue_count=issue_count,
+            audit_error=audit_error,
+            dry_run=dry_run,
+            audit_candidate_path=audit_candidate_path,
+            audit_reason_code=audit_reason_code,
+            audit_cause_code=audit_cause_code,
+            issues=normalized,
+            audit_operation=audit_operation,
+            progress_id=progress_id,
+        )
 
     @property
     def details(self) -> tuple[str, ...]:
@@ -201,6 +231,7 @@ class RetentionVerification:
             failure_kind=f"retention_{self.state}",
             recorded_at=self.recorded_at.isoformat() if self.recorded_at else None,
             check_id=self.check_id,
+            progress_id=self.progress_id,
             dry_run=self.dry_run,
         )
         summary = (
@@ -416,6 +447,7 @@ def _check_batch(
         audit_reason_code=text("audit_reason_code"),
         audit_cause_code=text("audit_cause_code"),
         audit_operation=text("operation"),
+        progress_id=text("progress_id"),
     )
 
 

@@ -238,9 +238,11 @@ def publish_verification(
         if issues is not None
         else _legacy_issues(verification)
     )
+    identity = uuid4().hex
     identified = replace(
         verification,
-        check_id=uuid4().hex,
+        check_id=identity,
+        progress_id=identity,
         issue_count=len(problems),
         dry_run=dry_run,
         issues=problems[:VERIFICATION_SAMPLE_LIMIT],
@@ -440,38 +442,76 @@ class AuditCleanupEntry:
             raise ValueError("cleanup issue does not match its failure evidence")
 
 
+def _failure_positions(
+    issues: tuple[VerificationIssue, ...],
+    failures: tuple[AuditCleanupFailure, ...],
+    *,
+    reverse: bool,
+) -> tuple[int, ...]:
+    """Find the earliest/latest order-preserving compatible association."""
+    indexes = iter(range(len(issues) - 1, -1, -1) if reverse else range(len(issues)))
+    positions = []
+    for failure in reversed(failures) if reverse else failures:
+        for index in indexes:
+            issue = issues[index]
+            if issue == failure.issue(
+                aborted=issue.category == "audit_cleanup_aborted"
+            ):
+                positions.append(index)
+                break
+        else:
+            raise ValueError("cleanup failure evidence does not match supplied issues")
+    return tuple(reversed(positions)) if reverse else tuple(positions)
+
+
+def _annotated_entries(
+    issues: tuple[VerificationIssue, ...],
+    failures: tuple[AuditCleanupFailure, ...],
+) -> tuple[AuditCleanupEntry, ...]:
+    if len(failures) > len(issues):
+        raise ValueError("cleanup failure evidence must match supplied issues")
+    first = _failure_positions(issues, failures, reverse=False)
+    if first != _failure_positions(issues, failures, reverse=True):
+        raise ValueError("ambiguous cleanup failure evidence; use aligned_failures")
+    by_index = dict(zip(first, failures, strict=True))
+    return tuple(
+        AuditCleanupEntry(issue, by_index.get(index))
+        for index, issue in enumerate(issues)
+    )
+
+
 def _cleanup_entries(
     entries: Sequence[AuditCleanupEntry],
     issues: Sequence[IssueSource] | None,
     failures: Sequence[AuditCleanupFailure] | None,
     *,
+    aligned_failures: Sequence[AuditCleanupFailure | None] | None,
     aborted: bool,
 ) -> tuple[AuditCleanupEntry, ...]:
-    existing = tuple(entries) if issues is None else ()
-    if issues is None and existing and not failures:
-        return existing
     raw = tuple(failures or ())
+    if aligned_failures is not None:
+        if raw:
+            raise ValueError("compact and aligned failure evidence cannot be combined")
+        problems = (
+            canonical_issues(issues)
+            if issues is not None
+            else tuple(entry.issue for entry in entries)
+        )
+        if len(problems) != len(aligned_failures):
+            raise ValueError("aligned failure evidence must match the issue count")
+        return tuple(
+            AuditCleanupEntry(issue, failure)
+            for issue, failure in zip(problems, aligned_failures, strict=True)
+        )
     if issues is not None:
-        problems = canonical_issues(issues)
-    elif existing:
-        problems = tuple(entry.issue for entry in existing)
-    else:
-        problems = tuple(
-            failure.issue(aborted=aborted and index == 0)
+        return _annotated_entries(canonical_issues(issues), raw)
+    if raw:
+        # Failure-only compatibility input replaces its source, including on replace().
+        return tuple(
+            AuditCleanupEntry(failure.issue(aborted=aborted and index == 0), failure)
             for index, failure in enumerate(raw)
         )
-    if len(raw) > len(problems):
-        raise ValueError("cleanup failure evidence must match supplied issues")
-    # Legacy replacement issues never inherit evidence from older entries.
-    normalized = []
-    for index, issue in enumerate(problems):
-        if index < len(raw):
-            normalized.append(AuditCleanupEntry(issue, raw[index]))
-        elif existing:
-            normalized.append(existing[index])
-        else:
-            normalized.append(AuditCleanupEntry(issue))
-    return tuple(normalized)
+    return tuple(entries)
 
 
 class CleanupOutcome(StrEnum):
@@ -508,11 +548,18 @@ class AuditCleanupResult:
         eligible_audit_count: int | None = None,
         eligible_staging_count: int | None = None,
         completed: bool | None = None,
+        aligned_failures: Sequence[AuditCleanupFailure | None] | None = None,
     ) -> None:
         if aborted and completed is True:
             raise ValueError("an aborted cleanup cannot be completed")
         values = {
-            "entries": _cleanup_entries(entries, issues, raw_failures, aborted=aborted),
+            "entries": _cleanup_entries(
+                entries,
+                issues,
+                raw_failures,
+                aligned_failures=aligned_failures,
+                aborted=aborted,
+            ),
             "aborted": aborted,
             "omitted_count": omitted_count,
             "recorded_at": recorded_at,
@@ -535,6 +582,11 @@ class AuditCleanupResult:
         return tuple(
             entry.failure for entry in self.entries if entry.failure is not None
         )
+
+    @property
+    def aligned_failures(self) -> tuple[AuditCleanupFailure | None, ...]:
+        """Lossless positional view, including explicitly absent original evidence."""
+        return tuple(entry.failure for entry in self.entries)
 
     @property
     def outcome(self) -> CleanupOutcome:
@@ -590,7 +642,7 @@ class AuditCleanupResult:
         return notes
 
     def diagnostics(
-        self, *, check_id: str | None = None
+        self, *, check_id: str | None = None, progress_id: str | None = None
     ) -> tuple[ComponentDiagnostic, ...]:
         if self == AuditCleanupResult():
             return ()
@@ -599,6 +651,7 @@ class AuditCleanupResult:
             exit_code=0,
             recorded_at=self.recorded_at.isoformat() if self.recorded_at else None,
             check_id=check_id,
+            progress_id=progress_id if progress_id is not None else check_id,
             dry_run=self.dry_run,
         )
         match self.outcome:
@@ -652,11 +705,16 @@ class AuditCleanupRecord:
 
     result: AuditCleanupResult
     check_id: str | None = None
+    progress_id: str | None = None
     diagnostics: tuple[ComponentDiagnostic, ...] = field(init=False)
 
     def __post_init__(self) -> None:
+        identity = self.progress_id if self.progress_id is not None else self.check_id
+        object.__setattr__(self, "progress_id", identity)
         object.__setattr__(
-            self, "diagnostics", self.result.diagnostics(check_id=self.check_id)
+            self,
+            "diagnostics",
+            self.result.diagnostics(check_id=self.check_id, progress_id=identity),
         )
 
 

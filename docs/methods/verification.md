@@ -492,7 +492,8 @@ Evaluation failures take precedence over promotion-only failures while nullable
 *Implemented in: `reports/operations.py`, `retention_status.py`, `retention_audit.py`, `clocks.py`,
 `artifact_labels.py`, `verification_text.py`,
 `cli.py::_cmd_prune_scores`, `status.py::diagnostic_progress`,
-`status.py::record_verification_progress`, `run_health.py`,
+`status.py::record_verification_progress`, `status.py::record_progress`,
+`status.py::merge_diagnostics`, `run_health.py`,
 `dashboard/context.py`, `dashboard/zones/operations.py`.*
 
 Pruning freshly verifies release/event metadata, the active pointer and required
@@ -563,6 +564,9 @@ This retains the existing `fsync` policy without a stronger power-loss guarantee
 from `details`, `paths`, `categories`, and `reason_codes` is lossless. Labelled
 legacy strings use `from_legacy_details(...)`, which strips exact recorded prefixes
 once. Known prefixed callers use this adapter; format is never inferred from prose.
+Its typed arguments match the constructor's positional metadata and support null
+sequences and typed issues. Only supplied labelled text authorizes prefix removal;
+typed issues alone retain their raw evidence.
 Metadata-only replacements retain canonical issues, and journal reads stay raw.
 Accepted mutable sequences and compatible issue objects are frozen through the
 shared converter; already canonical immutable tuples are reused. Equal objects
@@ -601,9 +605,16 @@ Omitted typed context may use verified caller metadata; explicitly unknown paths
 stay null. Canonical cleanup entries own issue and optional original failure
 evidence together, so issue replacement cannot inherit unrelated operation/cause
 metadata. The `issues` and `raw_failures` compatibility views are derived, not
-independently indexed stores. Shorter legacy failure sequences populate only the
-supplied positional prefix; remaining issues retain no invented failure metadata.
-Every provided pair is validated, and excess or mismatched metadata is rejected.
+independently indexed stores. With explicit issues, compact failures require a
+unique order-preserving association by validated issue content. The earliest and
+latest compatible index sequences must agree; otherwise attribution is ambiguous
+and rejected. Unmatched issues retain no invented metadata. The nullable
+`aligned_failures` view and input preserve every position, including duplicate
+issues and absent evidence; length and each non-null pair are validated.
+Nonempty compact and aligned inputs cannot be combined. Without explicit issues,
+nonempty `raw_failures` replaces the failure-derived entries completely, truncates
+old tails and derives categories from the supplied outcome. Aligned input provides
+explicit annotation of canonical entries. Excess or mismatched metadata is rejected.
 Empty `raw_failures=()` does not erase canonical entries. Explicit `issues=()` still
 clears issues; replacing an issue collection does not borrow old failure metadata.
 `operation` also survives publication
@@ -632,12 +643,18 @@ batch. The producer records that exact batch immediately and reuses it in the
 command outcome, including through later output/deletion failures. Metadata-only
 prune-result copies reuse the record; cleanup or check-ID changes rebind once.
 Compatibility constructors and readable result views remain available; an explicitly
-supplied incompatible diagnostic batch is rejected. A standalone bound record keeps
+supplied incompatible nonempty diagnostic batch is rejected; an empty tuple retains
+the legacy omitted-batch meaning. A standalone bound record keeps
 its known identity unless verification explicitly changes it. Journal merging uses
-the later authoritative cleanup batch for an identified check, replacing earlier
-samples and summary together. Other checks and unrelated diagnostics survive;
+the later authoritative verification or cleanup batch, replacing earlier samples
+and summary together for that stage. A nullable `progress_id` starts from the
+first identified check and survives copies even when `check_id` changes. Both
+progress capture and final merging key batches by stage and this stable identity,
+falling back to check ID for older diagnostics. Each new physical verification
+gets its own identity; genuinely independent checks and unrelated diagnostics survive;
 without a returned outcome, captured progress remains authoritative. Legacy batches
-without check IDs retain exact-deduplication behavior. No CLI recomputation occurs.
+without either identity retain exact-deduplication behavior. This is additive JSON
+metadata, not a new ledger column or historical rewrite. No CLI recomputation occurs.
 Informational `retention_audit_cleanup` components preserve bounded details and
 separate full paths in the existing journal row; they cannot change command exits or failure
 counters. The 20-note cap still reserves abort and omission slots, and dry runs
