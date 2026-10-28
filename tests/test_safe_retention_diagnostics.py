@@ -49,7 +49,7 @@ def old_audit(config):
 
 
 def test_sample_projection_normalizes_uneven_legacy_metadata_and_bounds():
-    check = RetentionVerification(
+    check = RetentionVerification.from_legacy_details(
         "suspended",
         NOW,
         (

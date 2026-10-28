@@ -65,7 +65,7 @@ def test_specific_roots_outside_paths_and_symlinks(tmp_path):
 def test_legacy_prefix_normalization_is_idempotent(tmp_path):
     config, _, _ = setup(tmp_path)
     path = str(config.artifacts_dir / "releases/bad.json")
-    check = RetentionVerification(
+    check = RetentionVerification.from_legacy_details(
         "suspended", START, (f"{path}: invalid metadata",), (path,)
     )
     value = panel(config, check).table.rows[0][0]

@@ -94,7 +94,7 @@ def test_clean_cleanup_has_one_summary_with_known_mode_and_counts(tmp_path, dry_
     legacy = audit.AuditCleanupResult()
     assert legacy.diagnostics() == ()
     assert legacy.dry_run is legacy.deleted_audit_count is None
-    assert "outcome was not recorded" in legacy.summary()
+    assert "final status is unknown" in legacy.summary()
 
 
 @pytest.mark.parametrize(
@@ -211,7 +211,7 @@ def test_unrelated_file_failure_keeps_bounded_view_and_full_raw_evidence(
 
 def test_canonical_issues_equal_replace_and_reconstruct_without_flags():
     path = Path("/p")
-    legacy = RetentionVerification(
+    legacy = RetentionVerification.from_legacy_details(
         "suspended",
         NOW,
         ("/p: unreadable: evidence",),
@@ -227,7 +227,7 @@ def test_canonical_issues_equal_replace_and_reconstruct_without_flags():
     assert metadata.issues is typed.issues
     changed = replace(metadata, details=("/p: unreadable: replacement",))
     assert changed.sample_issues() == (
-        VerificationIssue(path, "unreadable", "replacement"),
+        VerificationIssue(path, "unreadable", "/p: unreadable: replacement"),
     )
     raw = "/p: unreadable: actual raw evidence"
     replacement = replace(typed, issues=(VerificationIssue(path, "unreadable", raw),))

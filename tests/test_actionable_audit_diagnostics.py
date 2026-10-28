@@ -183,7 +183,7 @@ def test_unknown_reference_path_stays_missing(tmp_path, monkeypatch):
 
 def test_legacy_adapter_normalizes_exact_prefixes_and_empty_paths(tmp_path):
     config, _, _ = setup(tmp_path)
-    check = RetentionVerification(
+    check = RetentionVerification.from_legacy_details(
         "suspended",
         NOW,
         ("/p: schema_invalid: bad /p: content", "schema_invalid: empty path"),

@@ -1167,9 +1167,22 @@ prints “Would delete” for these counts. An aborted check reports only verifi
 eligibility so far. Eligibility does not assert that an unlink succeeded.
 Missing legacy counts/mode remain unknown. The nullable `cleanup_completed` flag
 records whether cleanup finished; default results do not invent an execution, and
-recorded legacy evidence without a known outcome is `audit_cleanup_unverified`. A later lock-release failure
+recorded legacy evidence without a known outcome is `audit_cleanup_unverified`.
+The shared `CleanupOutcome` property drives wording, classification, and emitted
+completion flags. Contradictory abort/completion inputs are rejected. Known partial
+deletion counts remain independent of unknown final status. A later lock-release failure
 preserves completed counts and does not imply earlier deletions were undone.
 These diagnostics change neither the command exit nor failure counters.
+
+Library callers should pass literal text to `RetentionVerification(details=...)`;
+its `.details` view round-trips without changing genuine path/category-like prose.
+Use `from_legacy_details(...)` explicitly for labelled legacy strings. Formatted
+labels remain available through `.formatted_details`. Partial legacy cleanup
+failure metadata is supported, validated only where supplied; empty metadata must
+not erase canonical issues. Cleanup/check identity and its diagnostic batch remain
+bound across result copies. Later authoritative batches replace earlier ones for
+the same check during standalone or embedded journaling, with one summary per check.
+Explicitly supplied incompatible batches are rejected; no historical rows change.
 
 Publication explanations use the recorded link checkpoint and nullable `operation`
 metadata. A staging-file synchronization failure before linking means no audit

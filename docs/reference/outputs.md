@@ -369,13 +369,16 @@ absent reasons remain null. Unknown codes keep their original internal values
 and receive neutral public wording. Report explanation summaries are deduplicated
 in first-seen order; affected paths and complete audit rows are not collapsed.
 The legacy full-audit adapter streams every supplied issue, beyond the sample cap.
-Verification stores canonical immutable typed issues. Legacy prefixed tuple inputs
-are normalized once at construction; structured journal details stay raw and are
-never stripped again. Accepted lists and compatible issue objects are copied into immutable canonical
+Verification stores canonical immutable typed issues. Constructor `details=` and
+text-only replacements now mean literal raw text; round-tripping the raw tuple views
+does not strip genuine evidence. Labelled legacy input must use the explicit
+`RetentionVerification.from_legacy_details(...)` adapter. This replaces automatic
+prefix stripping at the constructor boundary; persisted journal details stay raw
+and historical artifacts are not rewritten. Accepted lists and compatible issue objects are copied into immutable canonical
 tuples; already canonical tuples are reused. `details` exposes canonical raw text;
 `formatted_details` adds path/category labels explicitly. Journal reads never
 reattach labels to raw text or strip genuine evidence prefixes. Legacy text edits
-retain positional metadata, supplied legacy fields override their corresponding
+retain positional metadata, supplied legacy metadata fields override their corresponding
 structured projection, and explicit empty details clear issues. Missing metadata
 for new positions uses the existing null/default rules. Metadata-only replacement
 preserves issues; typed replacement uses the supplied complete issues without
@@ -393,13 +396,24 @@ Legacy missing values remain unknown. Nullable `eligible_audit_count` and
 `eligible_staging_count` count only unreferenced, unchanged candidates at final
 revalidation. Dry runs report these as “would delete” counts, separately from zero
 actual deletions; aborted runs expose verified progress only. Nullable
-`cleanup_completed` distinguishes a recorded completion from unknown legacy state.
+`cleanup_completed` is derived from the shared typed `CleanupOutcome` classification
+(`unknown`, `completed`, `incomplete`). Contradictory legacy flags are rejected;
+recorded deletion counts do not establish overall completion. Unknown summaries
+state the final-status uncertainty separately from completed deletions.
 Default results emit no execution diagnostic; recorded unknown outcomes use
 `audit_cleanup_unverified`, never `audit_cleanup_complete`. Cleanup records one
 summary even when clean; a failure after deletion preserves completed counts. The immutable diagnostic
 batch is captured once, recorded immediately, and reused in the command result.
-Compatibility-built `PruneResult` objects initialize a missing batch at their result
-boundary; the CLI never independently reconstructs it. Informational
+`AuditCleanupRecord` atomically binds cleanup result, check ID, and diagnostic batch.
+`PruneResult.audit_cleanup` and `audit_cleanup_diagnostics` remain readable
+compatibility views, and constructor adapters remain available. Metadata-only
+copies reuse the record; changed cleanup or verification identity rebinds the batch
+once. Explicitly supplied stale batches are rejected. A standalone bound record
+retains its check identity when verification is omitted; explicit verification can
+change it. Later authoritative batches replace earlier cleanup diagnostics for the
+same identified check at journaling, preserving independent checks and unrelated
+components. Exceptions without returned outcomes retain captured progress. The CLI
+never independently reconstructs the batch. Informational
 `retention_audit_cleanup` run components retain original bounded details and
 separate paths in the same invocation/stage row. Nullable `operation` records the
 failed phase, independently of its reason and underlying cause. Captured sample
@@ -409,7 +423,10 @@ change neither failed-run counters nor pruning exits. Canonical cleanup entries 
 failure evidence, including nullable `error_type`. `issues` and `raw_failures` are
 readable compatibility views; the latter contains only known original failures.
 Legacy issue replacement cannot inherit a previous entry’s operation or cause;
-explicitly paired legacy issue/failure inputs must agree. Omitted typed context
+shorter legacy failure sequences are accepted and populate only their supplied
+positional prefix. Provided pairs must agree; excess or mismatched metadata fails.
+Empty failure metadata does not clear canonical entries; explicit empty issues
+still clear them. Omitted typed context
 may use verified caller context; explicitly unknown paths remain null. The existing
 tuple-returning cleanup adapter emits safe public notes. `skipped` and `protection_skipped` retain
 their compatibility interfaces. Compatibility notices use structured path/category

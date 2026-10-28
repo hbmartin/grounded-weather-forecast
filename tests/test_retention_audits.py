@@ -26,7 +26,7 @@ from grounded_weather_forecast.status import failure_details_json
 
 
 def verification(when=NOW, count=1):
-    return RetentionVerification(
+    return RetentionVerification.from_legacy_details(
         "suspended",
         when,
         tuple(f"source-{i}: invalid schema" for i in range(count)),
