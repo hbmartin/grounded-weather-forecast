@@ -1160,16 +1160,26 @@ notes, an overall abort summary takes precedence and omitted issues are counted.
 Dry runs perform the same reference verification but delete nothing.
 Every cleanup records one informational summary, including clean/no-op cleanup.
 Nullable `dry_run`, `deleted_audit_count`, and `deleted_staging_count` metadata
-report the actual mode and successfully completed unlinks. Dry-run counts are
-zero; missing legacy counts/mode remain unknown. A later lock-release failure
+report the actual mode and successfully completed unlinks. Dry-run deletion counts
+are zero. Nullable `eligible_audit_count` and `eligible_staging_count` separately
+count unreferenced files passing final signature revalidation; a completed dry run
+prints “Would delete” for these counts. An aborted check reports only verified
+eligibility so far. Eligibility does not assert that an unlink succeeded.
+Missing legacy counts/mode remain unknown. The nullable `cleanup_completed` flag
+records whether cleanup finished; default results do not invent an execution, and
+recorded legacy evidence without a known outcome is `audit_cleanup_unverified`. A later lock-release failure
 preserves completed counts and does not imply earlier deletions were undone.
 These diagnostics change neither the command exit nor failure counters.
 
 Publication explanations use the recorded link checkpoint and nullable `operation`
 metadata. A staging-file synchronization failure before linking means no audit
 was published; failures after linking keep the candidate explicitly unconfirmed.
-Legacy records without a known phase receive neutral wording. Raw error prose
-never supplies these explanations.
+Historical `audit_lock_contended` and `audit_link_failed` reasons also establish
+failure before linking, unless a linked candidate is recorded. Legacy sync failures
+without a known phase receive neutral wording. Cleanup abort wording refers to
+recorded progress rather than suggesting deletions before acquisition. Raw error
+prose never supplies these explanations; nullable `error_type` retains the original
+exception class separately in internal diagnostics.
 
 The latest attempt may be `contended` (exit 75) or `unknown` (unresolved malformed
 run evidence). Contention creates no protection-failure warning and clears none;

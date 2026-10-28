@@ -107,7 +107,9 @@ def test_dashboard_does_not_open_full_served_archive_but_pruning_does(
     monkeypatch.setattr(operations, "_active_reference_ids", original)
     result = operations.prune_scores_files(config, dry_run=True, now=NOW)
     assert result.verification.state == "suspended"
-    assert any("ancient.json" in detail for detail in result.verification.details)
+    assert any(
+        "ancient.json" in detail for detail in result.verification.formatted_details
+    )
 
 
 def test_legacy_missing_id_is_information_without_serving_authorization(tmp_path):

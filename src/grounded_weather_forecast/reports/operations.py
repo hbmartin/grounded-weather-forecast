@@ -942,6 +942,19 @@ class PruneResult:
     audit_cleanup: AuditCleanupResult = field(default_factory=AuditCleanupResult)
     audit_cleanup_diagnostics: tuple[ComponentDiagnostic, ...] = ()
 
+    def __post_init__(self) -> None:
+        # Compatibility callers may provide a cleanup result without its batch.
+        # Normal pruning supplies the batch already recorded as partial progress.
+        if (
+            not self.audit_cleanup_diagnostics
+            and self.audit_cleanup != AuditCleanupResult()
+        ):
+            object.__setattr__(
+                self,
+                "audit_cleanup_diagnostics",
+                self.audit_cleanup.diagnostics(check_id=self.verification.check_id),
+            )
+
 
 class _ReleaseReferenceError(ValueError):
     def __init__(self, reason_code: str, detail: str) -> None:

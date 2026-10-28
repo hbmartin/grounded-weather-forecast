@@ -562,8 +562,14 @@ This retains the existing `fsync` policy without a stronger power-loss guarantee
 parallel tuples normalize once during construction; structured/journal raw details
 use the typed path and are never stripped again. Metadata-only replacements retain
 the canonical issues, while replacement legacy details normalize the new inputs.
-Equal objects have identical issue projections; no hidden normalization mode is
-carried across replacements. The bounded `sample_issues()` projection shares these
+Accepted mutable sequences and compatible issue objects are frozen through the
+shared converter; already canonical immutable tuples are reused. Equal objects
+have identical issue projections; no hidden normalization mode is carried across
+replacements. `details` exposes canonical raw evidence and `formatted_details`
+explicitly composes labels. Legacy text edits retain positional metadata, explicit
+legacy fields override corresponding structured projections, and empty details
+clear issues. New code replaces complete typed issues; journal reads never strip
+genuine raw evidence prefixes. The bounded `sample_issues()` projection shares these
 canonical values. Input adapters normalize empty
 paths to null, empty/missing categories to `verification_invalid`, and absent
 reason codes to null. All renderers and run diagnostic serialization share it;
@@ -588,16 +594,32 @@ exception prose never supplies public cleanup text, including global aborts.
 Typed audit failures carry the operation, nullable path, reason and underlying
 cause at the failure site. Cleanup uses this context rather than a mutable location
 sentinel. Captured issue details use the shared single-line 400-character bound;
-original raw failure details remain internal. `operation` also survives publication
+original raw failure details and nullable exception `error_type` remain internal.
+Omitted typed context may use verified caller metadata; explicitly unknown paths
+stay null. Canonical cleanup entries own issue and optional original failure
+evidence together, so issue replacement cannot inherit unrelated operation/cause
+metadata. The `issues` and `raw_failures` compatibility views are derived, not
+independently indexed stores. `operation` also survives publication
 summary round-trips: pre-link failures report no audit publication, while post-link
-failures retain an unconfirmed candidate. Legacy unknown phases remain neutral.
+failures retain an unconfirmed candidate. Historical contention and link failures
+also prove pre-link failure when no candidate exists; legacy sync failures with
+unknown phases remain neutral.
 
 Every cleanup emits one informational summary with nullable `dry_run`,
 `deleted_audit_count`, and `deleted_staging_count`. New counts increase only after
 successful unlink, including before a later lock-release failure; dry runs record
-zero, and missing legacy values remain unknown. The same immutable cleanup
-component batch is built once, recorded immediately and reused by the command
-outcome, including through later output/deletion failures.
+zero, and missing legacy values remain unknown. Nullable `eligible_audit_count`
+and `eligible_staging_count` increase only for unreferenced candidates passing
+final signature revalidation. A completed dry run reports “Would delete” counts;
+aborts report verified eligibility so far. Eligibility is independent of unlink
+success. Nullable `cleanup_completed` records known completion; default results
+emit no execution diagnostic, and recorded unknown outcomes use
+`audit_cleanup_unverified` instead of claiming success. Cleanup abort wording uses
+recorded progress without suggesting deletion before acquisition. The same
+immutable cleanup component batch is built once, recorded immediately and reused
+by the command outcome, including through later output/deletion failures.
+Compatibility-built prune results initialize an omitted batch at the result
+boundary, without CLI recomputation.
 Informational `retention_audit_cleanup` components preserve bounded details and
 separate full paths in the existing journal row; they cannot change command exits or failure
 counters. The 20-note cap still reserves abort and omission slots, and dry runs

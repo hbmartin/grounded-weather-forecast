@@ -92,8 +92,9 @@ def test_clean_cleanup_has_one_summary_with_known_mode_and_counts(tmp_path, dry_
     assert summary.issue_count == 0 and summary.dry_run is dry_run
     assert summary.deleted_audit_count == summary.deleted_staging_count == 0
     legacy = audit.AuditCleanupResult()
-    assert legacy.diagnostics()[0].dry_run is None
-    assert legacy.diagnostics()[0].deleted_audit_count is None
+    assert legacy.diagnostics() == ()
+    assert legacy.dry_run is legacy.deleted_audit_count is None
+    assert "outcome was not recorded" in legacy.summary()
 
 
 @pytest.mark.parametrize(
