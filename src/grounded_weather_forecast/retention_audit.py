@@ -8,7 +8,7 @@ from collections.abc import Callable, Iterator, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timedelta
-from enum import Enum
+from enum import Enum, StrEnum
 from pathlib import Path
 from uuid import uuid4
 
@@ -447,24 +447,37 @@ def _cleanup_entries(
     *,
     aborted: bool,
 ) -> tuple[AuditCleanupEntry, ...]:
-    if issues is None and failures is None:
-        return tuple(entries)
+    existing = tuple(entries) if issues is None else ()
+    if issues is None and existing and not failures:
+        return existing
     raw = tuple(failures or ())
-    problems = (
-        canonical_issues(issues)
-        if issues is not None
-        else tuple(
+    if issues is not None:
+        problems = canonical_issues(issues)
+    elif existing:
+        problems = tuple(entry.issue for entry in existing)
+    else:
+        problems = tuple(
             failure.issue(aborted=aborted and index == 0)
             for index, failure in enumerate(raw)
         )
-    )
-    if raw and len(raw) != len(problems):
-        raise ValueError("cleanup issues and failure evidence must match")
+    if len(raw) > len(problems):
+        raise ValueError("cleanup failure evidence must match supplied issues")
     # Legacy replacement issues never inherit evidence from older entries.
-    return tuple(
-        AuditCleanupEntry(issue, raw[index] if raw else None)
-        for index, issue in enumerate(problems)
-    )
+    normalized = []
+    for index, issue in enumerate(problems):
+        if index < len(raw):
+            normalized.append(AuditCleanupEntry(issue, raw[index]))
+        elif existing:
+            normalized.append(existing[index])
+        else:
+            normalized.append(AuditCleanupEntry(issue))
+    return tuple(normalized)
+
+
+class CleanupOutcome(StrEnum):
+    UNKNOWN = "unknown"
+    COMPLETED = "completed"
+    INCOMPLETE = "incomplete"
 
 
 @dataclass(frozen=True, slots=True, init=False)
@@ -496,6 +509,8 @@ class AuditCleanupResult:
         eligible_staging_count: int | None = None,
         completed: bool | None = None,
     ) -> None:
+        if aborted and completed is True:
+            raise ValueError("an aborted cleanup cannot be completed")
         values = {
             "entries": _cleanup_entries(entries, issues, raw_failures, aborted=aborted),
             "aborted": aborted,
@@ -521,20 +536,29 @@ class AuditCleanupResult:
             entry.failure for entry in self.entries if entry.failure is not None
         )
 
-    def summary(self) -> str:
+    @property
+    def outcome(self) -> CleanupOutcome:
         if self.aborted or self.completed is False:
-            state = "did not complete"
-        elif self.completed is not True:
-            state = "outcome was not recorded"
-        else:
-            state = "completed with issues" if self.entries else "completed"
+            return CleanupOutcome.INCOMPLETE
+        if self.completed is True:
+            return CleanupOutcome.COMPLETED
+        return CleanupOutcome.UNKNOWN
+
+    def summary(self) -> str:
+        match self.outcome:
+            case CleanupOutcome.INCOMPLETE:
+                state = "did not complete"
+            case CleanupOutcome.UNKNOWN:
+                state = "final status is unknown"
+            case CleanupOutcome.COMPLETED:
+                state = "completed with issues" if self.entries else "completed"
         mode = " (dry run)" if self.dry_run is True else ""
         parts = [f"Audit cleanup {state}{mode}."]
         if (
             self.eligible_audit_count is not None
             and self.eligible_staging_count is not None
         ):
-            if self.aborted or self.completed is not True:
+            if self.outcome is not CleanupOutcome.COMPLETED:
                 prefix = "Verified eligible so far:"
             elif self.dry_run is True:
                 prefix = "Would delete"
@@ -547,8 +571,13 @@ class AuditCleanupResult:
             self.deleted_audit_count is not None
             and self.deleted_staging_count is not None
         ):
+            prefix = (
+                "Recorded deletions:"
+                if self.outcome is CleanupOutcome.UNKNOWN
+                else "Deleted"
+            )
             parts.append(
-                f"Deleted {self.deleted_audit_count} audits and {self.deleted_staging_count} staging files."
+                f"{prefix} {self.deleted_audit_count} audits and {self.deleted_staging_count} staging files."
             )
         else:
             parts.append("Completed deletion counts were not recorded.")
@@ -572,12 +601,15 @@ class AuditCleanupResult:
             check_id=check_id,
             dry_run=self.dry_run,
         )
-        if self.aborted or self.completed is False:
-            kind = "audit_cleanup_aborted"
-        elif self.completed is not True:
-            kind = "audit_cleanup_unverified"
-        else:
-            kind = "audit_cleanup_issues" if self.entries else "audit_cleanup_complete"
+        match self.outcome:
+            case CleanupOutcome.INCOMPLETE:
+                kind = "audit_cleanup_aborted"
+            case CleanupOutcome.UNKNOWN:
+                kind = "audit_cleanup_unverified"
+            case CleanupOutcome.COMPLETED:
+                kind = (
+                    "audit_cleanup_issues" if self.entries else "audit_cleanup_complete"
+                )
         summary = replace(
             common,
             failure_kind=kind,
@@ -588,7 +620,9 @@ class AuditCleanupResult:
             deleted_staging_count=self.deleted_staging_count,
             eligible_audit_count=self.eligible_audit_count,
             eligible_staging_count=self.eligible_staging_count,
-            cleanup_completed=self.completed,
+            cleanup_completed=None
+            if self.outcome is CleanupOutcome.UNKNOWN
+            else self.outcome is CleanupOutcome.COMPLETED,
         )
         samples = tuple(
             replace(
@@ -610,6 +644,20 @@ class AuditCleanupResult:
             for entry in self.entries
         )
         return (summary, *samples)
+
+
+@dataclass(frozen=True, slots=True)
+class AuditCleanupRecord:
+    """Bind one immutable source/check pair to the diagnostic batch it produced."""
+
+    result: AuditCleanupResult
+    check_id: str | None = None
+    diagnostics: tuple[ComponentDiagnostic, ...] = field(init=False)
+
+    def __post_init__(self) -> None:
+        object.__setattr__(
+            self, "diagnostics", self.result.diagnostics(check_id=self.check_id)
+        )
 
 
 @dataclass(slots=True)

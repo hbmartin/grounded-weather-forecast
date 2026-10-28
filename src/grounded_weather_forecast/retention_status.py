@@ -31,8 +31,7 @@ def _verification_issues(
     issues = canonical_issues(issues)
     if all(value is None for value in (details, paths, categories, reasons)):
         return issues
-    prefixed = details is not None
-    raw = details if prefixed else tuple(issue.detail for issue in issues)
+    raw = details if details is not None else tuple(issue.detail for issue in issues)
     sources = (
         paths
         if paths is not None
@@ -46,7 +45,7 @@ def _verification_issues(
             path=sources[index] if index < len(sources) else None,
             category=kinds[index] if index < len(kinds) else None,
             reason_code=codes[index] if index < len(codes) else None,
-            normalize_prefix=prefixed,
+            normalize_prefix=False,
         )
         for index, detail in enumerate(raw)
     )
@@ -87,8 +86,8 @@ class RetentionVerification:
         issues: Sequence[IssueSource] = (),
         audit_operation: str | None = None,
     ) -> None:
-        # Only the legacy tuple adapter strips prefixes. Typed/journal evidence
-        # goes straight into canonical immutable issues, including during replace.
+        # Constructor and replacement inputs are literal evidence. Prefix stripping
+        # belongs exclusively to the explicit legacy adapter below.
         object.__setattr__(self, "state", state)
         object.__setattr__(self, "recorded_at", recorded_at)
         object.__setattr__(
@@ -105,6 +104,30 @@ class RetentionVerification:
         object.__setattr__(self, "audit_reason_code", optional_code(audit_reason_code))
         object.__setattr__(self, "audit_cause_code", optional_code(audit_cause_code))
         object.__setattr__(self, "audit_operation", optional_code(audit_operation))
+
+    @classmethod
+    def from_legacy_details(
+        cls,
+        state: Literal["clear", "suspended", "not_recorded"] = "not_recorded",
+        recorded_at: datetime | None = None,
+        details: tuple[str, ...] = (),
+        paths: tuple[str | None, ...] = (),
+        *,
+        categories: tuple[str, ...] = (),
+        reason_codes: tuple[str | None, ...] = (),
+        **metadata: Any,
+    ) -> "RetentionVerification":
+        """Ingest labelled legacy strings, removing exact recorded prefixes once."""
+        issues = tuple(
+            VerificationIssue.from_legacy(
+                detail,
+                path=paths[index] if index < len(paths) else None,
+                category=categories[index] if index < len(categories) else None,
+                reason_code=reason_codes[index] if index < len(reason_codes) else None,
+            )
+            for index, detail in enumerate(details)
+        )
+        return cls(state, recorded_at, issues=issues, **metadata)
 
     @property
     def details(self) -> tuple[str, ...]:

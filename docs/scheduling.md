@@ -338,7 +338,14 @@ exit behavior, and later analysis commands.
   signature checks; dry runs preview these while actual deletion counts stay zero.
   Aborts report eligibility verified so far, and a later lock-release failure
   preserves earlier completed deletions without implying rollback. Unknown legacy
-  execution remains unverified; a default result cannot establish completion. Staging sync
+  execution remains unverified; a default result cannot establish completion.
+  One validated outcome drives all cleanup rendering and emitted completion flags;
+  counts do not prove that the entire cleanup completed. Raw diagnostic text is
+  literal at construction; labelled legacy input uses an explicit adapter. Bound
+  cleanup records keep their source and check identity through copies, rebinding
+  only when either changes. Journaling replaces an earlier identified cleanup
+  batch with its later authoritative batch while preserving other checks and
+  captured progress through exceptions. Staging sync
   failures before linking report no publication; post-link failures preserve an
   unconfirmed candidate. Historical contention/link reasons prove no publication
   when no linked candidate exists; unknown sync phases remain neutral. Cleanup samples

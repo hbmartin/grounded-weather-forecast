@@ -554,21 +554,23 @@ Public explanations use fixed category/reason templates, validated when reading
 run diagnostics; raw exception prose is never public text. Unknown codes and
 unstructured legacy details use a neutral diagnostic reference. Full original
 path/category/detail and nullable reason code remain in audit evidence. Unknown
-issue paths remain null. Exact legacy path/category prefixes are removed once;
-embedded prose is not rewritten. Audit-publication causes have separate templates.
+issue paths remain null. Exact legacy path/category prefixes are removed once only through explicit
+legacy ingestion; embedded prose and raw constructor inputs are not rewritten. Audit-publication causes have separate templates.
 This retains the existing `fsync` policy without a stronger power-loss guarantee.
 
-`RetentionVerification` stores canonical immutable typed issues. Legacy prefixed
-parallel tuples normalize once during construction; structured/journal raw details
-use the typed path and are never stripped again. Metadata-only replacements retain
-the canonical issues, while replacement legacy details normalize the new inputs.
+`RetentionVerification` stores canonical immutable typed issues. Constructor
+`details=` and text-only replacements preserve literal raw text, so reconstruction
+from `details`, `paths`, `categories`, and `reason_codes` is lossless. Labelled
+legacy strings use `from_legacy_details(...)`, which strips exact recorded prefixes
+once. Known prefixed callers use this adapter; format is never inferred from prose.
+Metadata-only replacements retain canonical issues, and journal reads stay raw.
 Accepted mutable sequences and compatible issue objects are frozen through the
 shared converter; already canonical immutable tuples are reused. Equal objects
 have identical issue projections; no hidden normalization mode is carried across
 replacements. `details` exposes canonical raw evidence and `formatted_details`
 explicitly composes labels. Legacy text edits retain positional metadata, explicit
-legacy fields override corresponding structured projections, and empty details
-clear issues. New code replaces complete typed issues; journal reads never strip
+legacy metadata fields override corresponding structured projections, and empty
+details clear issues. These metadata associations do not authorize prefix stripping. New code replaces complete typed issues; journal reads never strip
 genuine raw evidence prefixes. The bounded `sample_issues()` projection shares these
 canonical values. Input adapters normalize empty
 paths to null, empty/missing categories to `verification_invalid`, and absent
@@ -599,7 +601,12 @@ Omitted typed context may use verified caller metadata; explicitly unknown paths
 stay null. Canonical cleanup entries own issue and optional original failure
 evidence together, so issue replacement cannot inherit unrelated operation/cause
 metadata. The `issues` and `raw_failures` compatibility views are derived, not
-independently indexed stores. `operation` also survives publication
+independently indexed stores. Shorter legacy failure sequences populate only the
+supplied positional prefix; remaining issues retain no invented failure metadata.
+Every provided pair is validated, and excess or mismatched metadata is rejected.
+Empty `raw_failures=()` does not erase canonical entries. Explicit `issues=()` still
+clears issues; replacing an issue collection does not borrow old failure metadata.
+`operation` also survives publication
 summary round-trips: pre-link failures report no audit publication, while post-link
 failures retain an unconfirmed candidate. Historical contention and link failures
 also prove pre-link failure when no candidate exists; legacy sync failures with
@@ -612,14 +619,25 @@ zero, and missing legacy values remain unknown. Nullable `eligible_audit_count`
 and `eligible_staging_count` increase only for unreferenced candidates passing
 final signature revalidation. A completed dry run reports “Would delete” counts;
 aborts report verified eligibility so far. Eligibility is independent of unlink
-success. Nullable `cleanup_completed` records known completion; default results
+success. The typed `CleanupOutcome` property classifies `unknown`, `completed`, or
+`incomplete` once for all renderers. Contradictory legacy flags such as
+`aborted=True, completed=True` are rejected. Nullable `cleanup_completed` is derived
+from that outcome; known deletions never establish overall completion. Unknown
+summaries distinguish final status from recorded deletions. Default results
 emit no execution diagnostic, and recorded unknown outcomes use
 `audit_cleanup_unverified` instead of claiming success. Cleanup abort wording uses
 recorded progress without suggesting deletion before acquisition. The same
-immutable cleanup component batch is built once, recorded immediately and reused
-by the command outcome, including through later output/deletion failures.
-Compatibility-built prune results initialize an omitted batch at the result
-boundary, without CLI recomputation.
+`AuditCleanupRecord` binds the immutable cleanup source, check ID, and its diagnostic
+batch. The producer records that exact batch immediately and reuses it in the
+command outcome, including through later output/deletion failures. Metadata-only
+prune-result copies reuse the record; cleanup or check-ID changes rebind once.
+Compatibility constructors and readable result views remain available; an explicitly
+supplied incompatible diagnostic batch is rejected. A standalone bound record keeps
+its known identity unless verification explicitly changes it. Journal merging uses
+the later authoritative cleanup batch for an identified check, replacing earlier
+samples and summary together. Other checks and unrelated diagnostics survive;
+without a returned outcome, captured progress remains authoritative. Legacy batches
+without check IDs retain exact-deduplication behavior. No CLI recomputation occurs.
 Informational `retention_audit_cleanup` components preserve bounded details and
 separate full paths in the existing journal row; they cannot change command exits or failure
 counters. The 20-note cap still reserves abort and omission slots, and dry runs

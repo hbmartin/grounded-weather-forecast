@@ -70,7 +70,7 @@ def test_legacy_edits_have_explicit_precedence_and_clear_without_hidden_state():
         categories=("unreadable", ""),
     )
     assert edited.issues == (
-        VerificationIssue(Path("/a"), "unreadable", "changed"),
+        VerificationIssue(Path("/a"), "unreadable", "/a: unreadable: changed"),
         VerificationIssue(None, "verification_invalid", "new"),
     )
     assert replace(original, details=()).issues == ()
@@ -180,7 +180,7 @@ def test_entry_failure_metadata_is_local_to_its_own_issue():
 def test_unknown_cleanup_never_claims_success(tmp_path, monkeypatch, capsys, recorded):
     config, _, _ = setup(tmp_path)
     result = audit.AuditCleanupResult(recorded_at=NOW if recorded else None)
-    assert "outcome was not recorded" in result.summary()
+    assert "final status is unknown" in result.summary()
     assert "Audit cleanup completed" not in result.summary()
     if recorded:
         (summary,) = result.diagnostics()
@@ -192,7 +192,7 @@ def test_unknown_cleanup_never_claims_success(tmp_path, monkeypatch, capsys, rec
     wrapped = operations.PruneResult((), (), (), 0.0, audit_cleanup=result)
     monkeypatch.setattr(operations, "prune_scores_files", lambda *a, **k: wrapped)
     outcome = cli._cmd_prune_scores(config, argparse.Namespace(dry_run=True))
-    assert "outcome was not recorded" in capsys.readouterr().out
+    assert "final status is unknown" in capsys.readouterr().out
     assert not any(
         i.failure_kind == "audit_cleanup_complete" for i in outcome.diagnostics
     )
@@ -442,7 +442,7 @@ def test_preview_batch_is_recorded_once_through_late_failures(
 def test_explicit_incomplete_cleanup_is_distinct_from_unknown_legacy_outcome():
     result = audit.AuditCleanupResult(completed=False, recorded_at=NOW)
     assert "did not complete" in result.summary()
-    assert "outcome was not recorded" not in result.summary()
+    assert "final status is unknown" not in result.summary()
     assert result.diagnostics()[0].failure_kind == "audit_cleanup_aborted"
     assert result.diagnostics()[0].cleanup_completed is False
 

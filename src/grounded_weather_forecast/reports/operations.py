@@ -59,6 +59,7 @@ from grounded_weather_forecast.health_policy import (
 )
 from grounded_weather_forecast.reports import evidence
 from grounded_weather_forecast.retention_audit import (
+    AuditCleanupRecord,
     AuditCleanupResult,
     cleanup_audits_result,
     publish_verification,
@@ -926,9 +927,9 @@ _KEEP_NEWEST_PER_GROUP = 3
 _PROTECT_RELEASE_DAYS = 7
 
 
-@dataclass(frozen=True, slots=True)
+@dataclass(frozen=True, slots=True, init=False)
 class PruneResult:
-    """What prune-scores did (or would do, under --dry-run)."""
+    """What pruning did, with cleanup source and diagnostics bound atomically."""
 
     deleted: tuple[Path, ...]
     kept: tuple[Path, ...]
@@ -939,21 +940,69 @@ class PruneResult:
     coordination_release_failure: ScoreCoordinationFailure | None = None
     verification: RetentionVerification = field(default_factory=RetentionVerification)
     protection_skipped: tuple[str, ...] = ()
-    audit_cleanup: AuditCleanupResult = field(default_factory=AuditCleanupResult)
-    audit_cleanup_diagnostics: tuple[ComponentDiagnostic, ...] = ()
+    cleanup_record: AuditCleanupRecord = field(
+        default_factory=lambda: AuditCleanupRecord(AuditCleanupResult())
+    )
 
-    def __post_init__(self) -> None:
-        # Compatibility callers may provide a cleanup result without its batch.
-        # Normal pruning supplies the batch already recorded as partial progress.
+    def __init__(
+        self,
+        deleted: tuple[Path, ...],
+        kept: tuple[Path, ...],
+        skipped: tuple[str, ...],
+        freed_mb: float,
+        temporary_deleted: tuple[Path, ...] = (),
+        temporary_freed_mb: float = 0.0,
+        coordination_release_failure: ScoreCoordinationFailure | None = None,
+        verification: RetentionVerification | None = None,
+        protection_skipped: tuple[str, ...] = (),
+        audit_cleanup: AuditCleanupResult | None = None,
+        audit_cleanup_diagnostics: tuple[ComponentDiagnostic, ...] | None = None,
+        *,
+        cleanup_record: AuditCleanupRecord | None = None,
+    ) -> None:
+        if verification is None:
+            identity = cleanup_record.check_id if cleanup_record is not None else None
+            check = RetentionVerification(check_id=identity)
+        else:
+            check = verification
+        if audit_cleanup is not None:
+            cleanup = audit_cleanup
+        elif cleanup_record is not None:
+            cleanup = cleanup_record.result
+        else:
+            cleanup = AuditCleanupResult()
+        bound = cleanup_record
+        if bound is None or bound.result != cleanup or bound.check_id != check.check_id:
+            bound = AuditCleanupRecord(cleanup, check.check_id)
         if (
-            not self.audit_cleanup_diagnostics
-            and self.audit_cleanup != AuditCleanupResult()
+            audit_cleanup_diagnostics is not None
+            and audit_cleanup_diagnostics != bound.diagnostics
         ):
-            object.__setattr__(
-                self,
-                "audit_cleanup_diagnostics",
-                self.audit_cleanup.diagnostics(check_id=self.verification.check_id),
+            raise ValueError(
+                "cleanup diagnostics do not match cleanup result and check"
             )
+        values = {
+            "deleted": deleted,
+            "kept": kept,
+            "skipped": skipped,
+            "freed_mb": freed_mb,
+            "temporary_deleted": temporary_deleted,
+            "temporary_freed_mb": temporary_freed_mb,
+            "coordination_release_failure": coordination_release_failure,
+            "verification": check,
+            "protection_skipped": protection_skipped,
+            "cleanup_record": bound,
+        }
+        for name, value in values.items():
+            object.__setattr__(self, name, value)
+
+    @property
+    def audit_cleanup(self) -> AuditCleanupResult:
+        return self.cleanup_record.result
+
+    @property
+    def audit_cleanup_diagnostics(self) -> tuple[ComponentDiagnostic, ...]:
+        return self.cleanup_record.diagnostics
 
 
 class _ReleaseReferenceError(ValueError):
@@ -1272,8 +1321,8 @@ def prune_scores_files(
         config, verification, dry_run=dry_run, issues=tuple(issues)
     )
     audit_cleanup = cleanup_audits_result(config, now=moment, dry_run=dry_run)
-    cleanup_diagnostics = audit_cleanup.diagnostics(check_id=verification.check_id)
-    record_progress(cleanup_diagnostics)
+    cleanup_record = AuditCleanupRecord(audit_cleanup, verification.check_id)
+    record_progress(cleanup_record.diagnostics)
     audit_notes = audit_cleanup.public_notes(config)
     if protected is None:
         return PruneResult(
@@ -1286,8 +1335,7 @@ def prune_scores_files(
             temporary_freed_mb=temporary.freed_mb,
             coordination_release_failure=failure,
             verification=verification,
-            audit_cleanup=audit_cleanup,
-            audit_cleanup_diagnostics=cleanup_diagnostics,
+            cleanup_record=cleanup_record,
         )
     try:
         cataloged = set(
@@ -1329,6 +1377,5 @@ def prune_scores_files(
         temporary_freed_mb=temporary.freed_mb,
         coordination_release_failure=failure,
         verification=verification,
-        audit_cleanup=audit_cleanup,
-        audit_cleanup_diagnostics=cleanup_diagnostics,
+        cleanup_record=cleanup_record,
     )

@@ -70,7 +70,27 @@ def diagnostic_progress() -> Iterator[list[ComponentDiagnostic]]:
 
 def record_progress(diagnostics: tuple[ComponentDiagnostic, ...]) -> None:
     if (progress := _progress.get()) is not None:
-        progress.extend(diagnostics)
+        progress[:] = _replace_cleanup_batches(tuple(progress), diagnostics)
+
+
+def _replace_cleanup_batches(
+    previous: tuple[ComponentDiagnostic, ...],
+    incoming: tuple[ComponentDiagnostic, ...],
+) -> tuple[ComponentDiagnostic, ...]:
+    identities = {
+        item.check_id
+        for item in incoming
+        if item.stage == "retention_audit_cleanup" and item.check_id is not None
+    }
+    return (
+        tuple(
+            item
+            for item in previous
+            if item.stage != "retention_audit_cleanup"
+            or item.check_id not in identities
+        )
+        + incoming
+    )
 
 
 def record_verification_progress(diagnostics: tuple[ComponentDiagnostic, ...]) -> None:
@@ -92,7 +112,10 @@ def record_verification_progress(diagnostics: tuple[ComponentDiagnostic, ...]) -
 def merge_diagnostics(
     *batches: tuple[ComponentDiagnostic, ...],
 ) -> tuple[ComponentDiagnostic, ...]:
-    return tuple(dict.fromkeys(item for batch in batches for item in batch))
+    merged: tuple[ComponentDiagnostic, ...] = ()
+    for batch in batches:
+        merged = _replace_cleanup_batches(merged, batch)
+    return tuple(dict.fromkeys(merged))
 
 
 def failure_details_json(diagnostics: tuple[ComponentDiagnostic, ...]) -> str | None:
