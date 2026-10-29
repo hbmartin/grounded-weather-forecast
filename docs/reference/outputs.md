@@ -423,15 +423,32 @@ change neither failed-run counters nor pruning exits. Canonical cleanup entries 
 failure evidence, including nullable `error_type`. `issues` and `raw_failures` are
 readable compatibility views; the latter contains only known original failures.
 Legacy issue replacement cannot inherit a previous entry’s operation or cause;
-shorter legacy failure sequences are accepted and populate only their supplied
-positional prefix. Provided pairs must agree; excess or mismatched metadata fails.
-Empty failure metadata does not clear canonical entries; explicit empty issues
-still clear them. Omitted typed context
+explicit issues plus compact failure metadata require a unique order-preserving
+match by validated issue content. Sparse associations remain sparse; ambiguous,
+excess, or mismatched metadata fails instead of inventing attribution.
+The nullable positional `aligned_failures` view and constructor input permit
+lossless reconstruction even with duplicate issues. Aligned input requires equal
+length and validates every non-null pair; it cannot accompany nonempty compact
+metadata. Without explicit issues, nonempty `raw_failures` fully replaces
+failure-derived entries, truncating old tails and recomputing categories for the
+supplied outcome. Empty failure metadata does not clear canonical entries;
+explicit empty issues still clear them. Omitted typed context
 may use verified caller context; explicitly unknown paths remain null. The existing
 tuple-returning cleanup adapter emits safe public notes. `skipped` and `protection_skipped` retain
 their compatibility interfaces. Compatibility notices use structured path/category
 metadata; old unstructured strings receive informational wording and never imply
 a failed protection check.
+
+Verification and cleanup summaries/samples add nullable `progress_id` inside
+`failure_details_json`, without changing the run-ledger columns. It starts from
+the first identified check and survives copies that change `check_id`.
+Replacement uses `(stage, progress_id)` with legacy check-ID fallback, so final
+journal merging and partial-progress capture apply the same rule. A copied result
+supersedes its own verification and cleanup batches while independent checks
+remain visible. Each new physical verification receives its own progress identity.
+The explicit legacy detail adapter has typed constructor-compatible arguments,
+including nullable metadata, without stripping typed or journal evidence. Empty
+`audit_cleanup_diagnostics=()` means omitted; nonempty stale batches remain invalid.
 
 ## Daily report reader
 

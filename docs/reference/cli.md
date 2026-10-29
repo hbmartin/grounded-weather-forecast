@@ -1177,12 +1177,29 @@ These diagnostics change neither the command exit nor failure counters.
 Library callers should pass literal text to `RetentionVerification(details=...)`;
 its `.details` view round-trips without changing genuine path/category-like prose.
 Use `from_legacy_details(...)` explicitly for labelled legacy strings. Formatted
-labels remain available through `.formatted_details`. Partial legacy cleanup
-failure metadata is supported, validated only where supplied; empty metadata must
-not erase canonical issues. Cleanup/check identity and its diagnostic batch remain
-bound across result copies. Later authoritative batches replace earlier ones for
-the same check during standalone or embedded journaling, with one summary per check.
-Explicitly supplied incompatible batches are rejected; no historical rows change.
+labels remain available through `.formatted_details`. The typed adapter accepts
+the constructor's positional metadata, nullable sequences and typed issues; only
+explicitly supplied labelled text receives prefix normalization.
+
+Nonempty cleanup `raw_failures` without explicit issues replaces failure-derived
+entries, including during `dataclasses.replace`; shorter input removes the old
+tail and derives categories from the explicit outcome. Empty metadata preserves
+canonical entries. With explicit issues, compact failures require a unique,
+order-preserving association; unmatched issues retain no failure metadata.
+`aligned_failures` supplies and exposes exact positions, including null slots,
+for duplicate or otherwise ambiguous issues. Its length must match the issues,
+and nonempty compact and aligned input cannot be combined. Explicit empty issues
+still clear evidence. Changing a completed cleanup to aborted requires both
+`aborted=True` and `completed=False`.
+
+Cleanup/check identity and its diagnostic batch remain bound across result copies.
+Nullable `progress_id` identifies the logical check independently of a copied
+check's current ID. Later authoritative verification and cleanup batches replace
+their respective predecessors, with one summary per logical check and stage in
+standalone or embedded journaling. Independent checks remain separate. Legacy
+check IDs supply the fallback identity; unidentified batches retain exact
+deduplication. Empty `audit_cleanup_diagnostics=()` retains its old omitted-batch
+meaning; incompatible nonempty batches are rejected. No historical rows change.
 
 Publication explanations use the recorded link checkpoint and nullable `operation`
 metadata. A staging-file synchronization failure before linking means no audit

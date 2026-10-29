@@ -135,7 +135,7 @@ def test_canonical_entries_and_empty_legacy_metadata_are_not_clearing():
     assert result.entries is entries and result.raw_failures == raw
     assert replace(result, raw_failures=()).entries is entries
     overlay = audit.AuditCleanupResult(
-        entries=entries, raw_failures=raw[:1], completed=True
+        entries=entries, aligned_failures=raw, completed=True
     )
     assert overlay.entries == entries
     cleared = replace(result, issues=(), raw_failures=())
@@ -156,7 +156,7 @@ def test_mismatched_or_excess_metadata_still_fails():
         )
     with pytest.raises(ValueError, match="does not match"):
         audit.AuditCleanupResult(
-            entries=(audit.AuditCleanupEntry(raw[1].issue()),), raw_failures=raw[:1]
+            entries=(audit.AuditCleanupEntry(raw[1].issue()),), aligned_failures=raw[:1]
         )
 
 
@@ -293,10 +293,11 @@ def test_explicit_batch_must_match_bound_source_and_check():
             verification=replace(check, check_id="other"),
             audit_cleanup_diagnostics=record.diagnostics,
         )
-    with pytest.raises(ValueError, match="diagnostics do not match"):
-        operations.PruneResult(
-            (), (), (), 0.0, audit_cleanup=cleanup(True), audit_cleanup_diagnostics=()
-        )
+    omitted = operations.PruneResult(
+        (), (), (), 0.0, audit_cleanup=cleanup(True), audit_cleanup_diagnostics=()
+    )
+    assert omitted.audit_cleanup_diagnostics == omitted.cleanup_record.diagnostics
+    assert omitted.audit_cleanup_diagnostics[0].cleanup_completed is True
     rebound = replace(record, result=cleanup(False))
     assert rebound.diagnostics[0].cleanup_completed is False
 
