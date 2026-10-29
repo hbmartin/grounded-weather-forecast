@@ -1183,7 +1183,7 @@ explicitly supplied labelled text receives prefix normalization.
 
 Nonempty cleanup `raw_failures` without explicit issues replaces failure-derived
 entries, including during `dataclasses.replace`; shorter input removes the old
-tail and derives categories from the explicit outcome. Empty metadata preserves
+tail while preserving each failure's recorded role. Empty metadata preserves
 canonical entries. With explicit issues, compact failures require a unique,
 order-preserving association; unmatched issues retain no failure metadata.
 `aligned_failures` supplies and exposes exact positions, including null slots,
@@ -1192,13 +1192,29 @@ and nonempty compact and aligned input cannot be combined. Explicit empty issues
 still clear evidence. Changing a completed cleanup to aborted requires both
 `aborted=True` and `completed=False`.
 
+`AuditCleanupFailure.failure_role` is nullable: `abort_cause`, `file_local`, or
+unknown. Capture sites assign known roles; list position, overall outcome,
+operation names and raw prose do not establish them. Explicit legacy issue
+categories can supply recorded role evidence. Unclassified raw failures use a
+fixed neutral cleanup explanation. `issue(aborted=...)` remains an explicit
+compatibility adapter and rejects conflicts with a known role. An abort-cause
+entry requires `aborted=True`; changing a result to completed while retaining
+that evidence is rejected until it is explicitly corrected or replaced.
+Filtering out the cause never transfers its role to the next file failure.
+
 Cleanup/check identity and its diagnostic batch remain bound across result copies.
 Nullable `progress_id` identifies the logical check independently of a copied
 check's current ID. Later authoritative verification and cleanup batches replace
 their respective predecessors, with one summary per logical check and stage in
 standalone or embedded journaling. Independent checks remain separate. Legacy
 check IDs supply the fallback identity; unidentified batches retain exact
-deduplication. Empty `audit_cleanup_diagnostics=()` retains its old omitted-batch
+deduplication. Identified batches retain repeated issue occurrences, including
+identical samples; idempotence applies to batch delivery, not to evidence within
+one batch. Progress-only verifications emit summaries and remain distinct at
+equal timestamps. Older summary-less progress rows recover a consistent stored
+identity; conflicting or malformed identities cannot establish a clear check.
+JSON omits `progress_id` only when it equals that row's `check_id`; renamed or
+progress-only samples keep it. Empty `audit_cleanup_diagnostics=()` retains its old omitted-batch
 meaning; incompatible nonempty batches are rejected. No historical rows change.
 
 Publication explanations use the recorded link checkpoint and nullable `operation`

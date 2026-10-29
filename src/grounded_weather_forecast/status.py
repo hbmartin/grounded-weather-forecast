@@ -74,10 +74,20 @@ def record_progress(diagnostics: tuple[ComponentDiagnostic, ...]) -> None:
         progress[:] = _replace_identified_batches(tuple(progress), diagnostics)
 
 
+def effective_progress_id(progress_id: object, check_id: object) -> str | None:
+    """Resolve one owner consistently; malformed recorded identities are not legacy."""
+    for value in (progress_id, check_id):
+        if value is not None and (not isinstance(value, str) or not value.strip()):
+            raise ValueError("diagnostic identity must be a nonempty string or null")
+    if isinstance(progress_id, str):
+        return progress_id
+    return check_id if isinstance(check_id, str) else None
+
+
 def _batch_identity(item: ComponentDiagnostic) -> tuple[str, str] | None:
     if item.stage not in {"retention_verification", "retention_audit_cleanup"}:
         return None
-    identity = item.progress_id if item.progress_id is not None else item.check_id
+    identity = effective_progress_id(item.progress_id, item.check_id)
     return (item.stage, identity) if identity is not None else None
 
 
@@ -105,7 +115,13 @@ def merge_diagnostics(
     merged: tuple[ComponentDiagnostic, ...] = ()
     for batch in batches:
         merged = _replace_identified_batches(merged, batch)
-    return tuple(dict.fromkeys(merged))
+    seen: set[ComponentDiagnostic] = set()
+    result = []
+    for item in merged:
+        if _batch_identity(item) is not None or item not in seen:
+            result.append(item)
+        seen.add(item)
+    return tuple(result)
 
 
 def failure_details_json(diagnostics: tuple[ComponentDiagnostic, ...]) -> str | None:
@@ -144,6 +160,8 @@ def failure_details_json(diagnostics: tuple[ComponentDiagnostic, ...]) -> str | 
                     "progress_id",
                 }
                 or value is not None
+                if key != "progress_id"
+                or value != effective_progress_id(None, item.check_id)
             }
             | {"detail": normalize_error_detail(item.detail)}
             for item in diagnostics

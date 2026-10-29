@@ -43,15 +43,15 @@ def test_failure_only_replacement_rebuilds_and_truncates(replacement_indexes):
     assert result.raw_failures == raw
 
 
-def test_failure_reconstruction_uses_explicit_outcome():
-    raw = failures()
+def test_failure_reconstruction_preserves_roles_independently_of_outcome():
+    raw = tuple(replace(item, failure_role="file_local") for item in failures())
     result = audit.AuditCleanupResult(raw_failures=raw, aborted=True, completed=False)
     changed = replace(result, aborted=False, completed=True, raw_failures=raw[:1])
     assert changed.outcome is audit.CleanupOutcome.COMPLETED
     assert changed.issues[0].category == "audit_cleanup_file_failed"
     again = replace(changed, aborted=True, completed=False, raw_failures=raw[1:])
     assert again.outcome is audit.CleanupOutcome.INCOMPLETE
-    assert again.issues[0].category == "audit_cleanup_aborted"
+    assert again.issues[0].category == "audit_cleanup_file_failed"
     assert again.issues[1].category == "audit_cleanup_file_failed"
     with pytest.raises(ValueError, match="cannot be completed"):
         replace(changed, aborted=True)

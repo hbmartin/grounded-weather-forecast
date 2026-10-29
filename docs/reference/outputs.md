@@ -430,14 +430,25 @@ The nullable positional `aligned_failures` view and constructor input permit
 lossless reconstruction even with duplicate issues. Aligned input requires equal
 length and validates every non-null pair; it cannot accompany nonempty compact
 metadata. Without explicit issues, nonempty `raw_failures` fully replaces
-failure-derived entries, truncating old tails and recomputing categories for the
-supplied outcome. Empty failure metadata does not clear canonical entries;
+failure-derived entries, truncating old tails while preserving failure roles.
+Empty failure metadata does not clear canonical entries;
 explicit empty issues still clear them. Omitted typed context
 may use verified caller context; explicitly unknown paths remain null. The existing
 tuple-returning cleanup adapter emits safe public notes. `skipped` and `protection_skipped` retain
 their compatibility interfaces. Compatibility notices use structured path/category
 metadata; old unstructured strings receive informational wording and never imply
 a failed protection check.
+
+The internal/library failure record adds nullable `failure_role` with values
+`abort_cause` and `file_local`. Known roles come from capture sites or explicit
+legacy issue categories. Unknown raw failures remain unclassified and use
+`audit_cleanup_failure` with fixed neutral public wording. No role is inferred
+from an index, operation name or exception text. Canonical entries and compact/
+aligned projections preserve this metadata; journal categories encode the role
+without a new ledger column. Known abort-cause evidence requires `aborted=True`,
+including during copies. A completed result must explicitly remove or correct
+that evidence. Removing an abort-cause sample cannot relabel a remaining file
+failure. Existing raw details and paths are retained unchanged.
 
 Verification and cleanup summaries/samples add nullable `progress_id` inside
 `failure_details_json`, without changing the run-ledger columns. It starts from
@@ -446,6 +457,16 @@ Replacement uses `(stage, progress_id)` with legacy check-ID fallback, so final
 journal merging and partial-progress capture apply the same rule. A copied result
 supersedes its own verification and cleanup batches while independent checks
 remain visible. Each new physical verification receives its own progress identity.
+Identified batches preserve sample multiplicity; only repeated batch delivery is
+replaced. A summary is emitted for a known progress identity even without a check
+ID. Reading uses that effective identity before legacy clock grouping and recovers
+consistent identity from older summary-less samples; malformed or conflicting
+metadata cannot establish a clear check. Structured legacy samples retain their
+observed occurrence count without a summary. A shared resolver supplies the same
+progress/check fallback at binding, merge, read and serialization boundaries.
+`progress_id` is omitted from JSON only when equal to the row's `check_id`;
+different or progress-only sample identities remain explicit. The wire omission
+does not remove internal ownership or combine independent equal-clock checks.
 The explicit legacy detail adapter has typed constructor-compatible arguments,
 including nullable metadata, without stripping typed or journal evidence. Empty
 `audit_cleanup_diagnostics=()` means omitted; nonempty stale batches remain invalid.

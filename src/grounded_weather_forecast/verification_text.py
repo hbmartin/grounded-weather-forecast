@@ -39,6 +39,7 @@ _CATEGORIES = {
     "archived_document_invalid": "Archived served document could not be verified.",
     "release_reference_invalid": "Release evidence references could not be verified.",
     "audit_cleanup_file_failed": "Audit cleanup kept this file because verification or deletion failed.",
+    "audit_cleanup_failure": "An audit cleanup operation failed; see the stored diagnostic.",
     "audit_cleanup_aborted": "Audit cleanup did not complete; see the recorded cleanup progress.",
 }
 
