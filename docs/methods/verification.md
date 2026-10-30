@@ -491,7 +491,7 @@ Evaluation failures take precedence over promotion-only failures while nullable
 
 *Implemented in: `reports/operations.py`, `retention_status.py`, `retention_audit.py`, `clocks.py`,
 `artifact_labels.py`, `verification_text.py`,
-`cli.py::_cmd_prune_scores`, `status.py::diagnostic_progress`,
+`cli.py::_cmd_prune_scores`, `cli.py::_record_run`, `status.py::diagnostic_progress`,
 `status.py::record_verification_progress`, `status.py::record_progress`,
 `status.py::merge_diagnostics`, `run_health.py`,
 `status.py::effective_progress_id`, `status.py::assess_progress_identity`,
@@ -678,11 +678,19 @@ by binding, merge, reading and serialization. JSON omits only redundant progress
 IDs equal to that row's check ID; renamed and progress-only samples retain their
 owner. Summary-only identity storage is deliberately not used.
 Strict domain construction retains identity validation. Journal boundaries use
-non-raising identity assessment; malformed IDs have no trusted ownership and
-serialize as bounded invalid metadata rather than preventing a run record.
+non-raising identity assessment. Merging and serialization execute inside the
+recorder's protected boundary; progress capture independently contains ordinary
+telemetry failures. Malformed fields have no trusted ownership and serialize as
+bounded invalid metadata with `metadata_invalid`; `invalid_diagnostic_metadata`
+marks core-row fallback if optional processing fails. The original result,
+exception/cancellation and one invocation/stage row are preserved when ledger
+storage is available. Public warnings never render raw metadata prose. Safe exact
+deduplication contains only built-in keys; opaque/cyclic values use object identity,
+not bounded preview text. Different evidence is not collapsed by truncation.
 Identity assessment is reused once per object during a merge. Indexed batch
-replacement uses valid summary boundaries, including within concatenated inputs;
-summary-less legacy samples remain one batch per owner per input. Repeated sample
+replacement uses valid summary boundaries, including within concatenated inputs,
+without moving surviving interleaved items; summary-less legacy samples remain
+one batch per owner per input. Repeated sample
 values never establish a delivery boundary.
 
 Recorded groups are assessed independently. Invalid identity, clock or summary
@@ -692,11 +700,25 @@ without discarding unrelated valid checks. The additive report/status field
 check. Its uncertainty boundary is the damaged run's validated ending clock. Only
 a valid clear check strictly later than that boundary resolves it; a clear dry run
 can resolve check uncertainty independently of outstanding execution failure.
-Equal-clock or suspended checks cannot resolve damaged evidence. Valid equal-clock
-checks continue to use persisted order. Legacy verdict-only clear rows are excluded
-from samples; totals without a summary count actual occurrences before bounding,
-and invalid summaries or totals smaller than observed samples cannot prove clear
-protection. No failure counter or run-ledger column changes.
+Successful apply invocations with an independently valid selected clear check clear
+execution failure even when unrelated damage occurs in that row. Equal-clock or
+suspended checks cannot resolve damaged verification evidence. Malformed entries,
+missing/non-string stages and contradictory retention-stage data are uncertain;
+valid unrelated stages remain unrelated. Group assessment is repeatable and does
+not mutate ingestion state. Valid equal-clock checks continue to use persisted order.
+
+Legacy clear and suspended verdict-only rows are excluded from samples.
+Explicitly empty recorded category/path fields on suspended samples retain their
+canonical unknown-category/null-path normalization. A suspended
+verdict with no samples or recorded total carries `issue_count_known=False`, showing
+an unavailable count without fabricating an issue. Nullable diagnostic metadata
+preserves this knowledge through summary and sample round trips; integer library
+views retain zero recovered samples. Explicit totals and omitted counts remain
+validated. Ownerless groups retain raw recorded-clock boundaries, including absent
+versus explicit clocks and equivalent offset strings; parsed aware clocks control
+validation and stable chronological sorting. Invalid summaries or totals smaller
+than observed occurrences cannot prove clear protection. No failure counter or
+run-ledger column changes.
 
 Informational `retention_audit_cleanup` components preserve bounded details and
 separate full paths in the existing journal row; they cannot change command exits or failure

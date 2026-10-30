@@ -307,11 +307,20 @@ exit behavior, and later analysis commands.
   `verification_unknown` field. The last valid check remains visible, with amber
   uncertainty until a clear check is recorded strictly after the damaged run ends.
   A clear dry run may resolve this check uncertainty; execution recovery still
-  requires a successful clear apply run. Equal-clock valid checks continue to use
-  persisted order. Optional diagnostic damage cannot replace command outcomes or
-  prevent the run row from being recorded. Summary boundaries make concatenated
-  batch delivery idempotent without collapsing duplicate issue samples; legacy
-  verdict-only clear rows do not become issues.
+  requires a successful clear apply run. A successful apply with an independently
+  valid selected clear check clears an execution failure despite unrelated damaged
+  evidence; unresolved verification uncertainty independently keeps the panel amber.
+  Missing/non-string stages and unattributable malformed entries also create
+  uncertainty. Equal-clock valid checks continue to use persisted order; raw legacy
+  clock strings preserve old grouping boundaries.
+  Optional diagnostic merging/serialization stays inside the recorder's protected
+  boundary, and progress capture is independently safe. Invalid fields retain bounded
+  evidence; a fallback preserves the core row without replacing command outcomes or
+  original exceptions/cancellation, subject to existing best-effort ledger storage.
+  Summary boundaries make concatenated batch delivery idempotent while preserving
+  interleaved order and duplicate sample occurrences. Clear and suspended legacy
+  verdict-only rows do not become issues. A suspension without samples/counts shows
+  an unavailable count through nullable `issue_count_known` metadata.
   Each check records at most 20 issue samples with a full JSONL audit reference.
   Audits under `artifacts/history/pruning_verifications/` preserve every affected
   path, survive for 90 days and while referenced by retained run rows, and are
