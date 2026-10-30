@@ -351,8 +351,8 @@ neither audits nor scores. Dashboard rendering never opens the audit archive.
 The report adds nullable `check_age_minutes` from its reporting cutoff and shows
 `contended`/`unknown` attempt states. Contention alone is informational and clears
 no warning; unresolved malformed evidence is amber. Equal start/end clocks use
-the last persisted row. Multiple checks are grouped by check ID (legacy rows by
-recorded time), independently of their parent attempt. Only a later successful
+the last persisted row. Multiple checks are grouped by effective progress identity with check-ID fallback
+(legacy unidentified rows use recorded time), independently of their parent attempt. Only a later successful
 explicitly clear non-dry-run check clears an outstanding pruning execution failure.
 Dry runs can update verification independently. Check metadata precedes recorded
 arguments when determining mode; unknown legacy mode does not establish recovery.
@@ -507,3 +507,25 @@ If you back up only some of this:
 4. `config.toml`.
 
 Everything else is a function of those.
+
+
+### Damaged verification evidence
+
+The retention report adds boolean `verification_unknown`, independently of the
+last valid check and outstanding execution failure. Invalid identity, clock or
+count metadata quarantines its check group, preserving unrelated valid checks.
+The displayed last valid check may therefore be clear while the overall panel is
+amber with a fixed uncertainty explanation. Only a valid clear check recorded
+strictly after the damaged run's validated ending clock resolves this state;
+equal-clock and suspended checks do not. A clear dry run can resolve verification
+uncertainty, but cannot clear an execution failure.
+
+Legacy verdict-only clear records are not issue samples. Missing summaries use
+observed sample occurrences before the 20-item bound; malformed summaries and
+inconsistent totals remain uncertain. No historical evidence is rewritten.
+
+Optional invalid diagnostic identities retain bounded untrusted JSON evidence
+without blocking the command journal. The serializer compresses valid equal IDs
+without strict validation. Authoritative summary boundaries replace repeated
+batches, including concatenated deliveries, while duplicate sample occurrences
+and summary-less legacy samples remain intact.

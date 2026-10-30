@@ -12,6 +12,8 @@ from grounded_weather_forecast.run_health import assess_attempts, aware_moment
 from grounded_weather_forecast.status import (
     EXIT_CONTENTION,
     ComponentDiagnostic,
+    DiagnosticIdentity,
+    assess_progress_identity,
     effective_progress_id,
 )
 from grounded_weather_forecast.verification_text import (
@@ -329,11 +331,22 @@ class RetentionStatus:
     outstanding_failure: bool = False
     as_of: datetime | None = None
     attempt_dry_run: bool | None = None
+    verification_unknown: bool = False
+
+    @property
+    def verification_warning(self) -> str | None:
+        if not self.verification_unknown:
+            return None
+        return (
+            "Recorded verification evidence is damaged or inconsistent; the last valid check, if any, is retained. "
+            "A clear check recorded strictly after the damaged run ends is required to resolve this uncertainty."
+        )
 
     @property
     def severity(self) -> Literal["ok", "amber", "info"]:
         if (
             self.verification.state == "suspended"
+            or self.verification_unknown
             or self.outstanding_failure
             or self.attempt_state in {"failed", "unknown"}
         ):
@@ -356,15 +369,26 @@ class RetentionStatus:
         path_label: Callable[[str], str] | None = None,
         audit_path_label: Callable[[str], str] | None = None,
     ) -> pl.DataFrame:
-        return self.verification.frame(
+        frame = self.verification.frame(
             path_label=path_label, audit_path_label=audit_path_label
-        ).with_columns(
+        )
+        if self.verification_warning is not None:
+            frame = frame.with_columns(
+                pl.concat_str(
+                    pl.lit(self.verification_warning),
+                    pl.col("detail"),
+                    separator="; ",
+                    ignore_nulls=True,
+                ).alias("detail")
+            )
+        return frame.with_columns(
             pl.lit(self.attempt_at.isoformat() if self.attempt_at else None).alias(
                 "latest_attempt_at"
             ),
             pl.lit(self.attempt_state).alias("latest_attempt"),
             pl.lit(self.check_age_minutes, dtype=pl.Float64).alias("check_age_minutes"),
             pl.lit(self.outstanding_failure).alias("outstanding_failure"),
+            pl.lit(self.verification_unknown).alias("verification_unknown"),
             pl.lit(self.attempt_dry_run, dtype=pl.Boolean).alias(
                 "latest_attempt_dry_run"
             ),
@@ -402,6 +426,47 @@ def _check_identity(items: list[dict[str, Any]]) -> tuple[str | None, str | None
     return owners.pop(), next(iter(check_ids), None)
 
 
+def _has_issue_metadata(item: Mapping[str, Any]) -> bool:
+    # Malformed additive codes still describe a sample; the legacy issue adapter
+    # normalizes them safely instead of losing the recorded protection verdict.
+    return any(
+        item.get(key) is not None and item[key] != ""
+        for key in ("category", "path", "reason_code")
+    )
+
+
+def _check_parts(
+    items: list[dict[str, Any]],
+) -> tuple[dict[str, Any], list[dict[str, Any]], int]:
+    summaries: list[dict[str, Any]] = []
+    samples: list[dict[str, Any]] = []
+    for item in items:
+        metadata = _has_issue_metadata(item)
+        if "issue_count" in item:
+            if (
+                type(item["issue_count"]) is not int
+                or item["issue_count"] < 0
+                or metadata
+            ):
+                raise ValueError("invalid verification summary")
+            summaries.append(item)
+        elif item.get("failure_kind") != "retention_clear" or metadata:
+            samples.append(item)
+    if len(summaries) > 1:
+        raise ValueError("conflicting verification summaries")
+    summary = summaries[0] if summaries else {}
+    total = summary.get("issue_count", len(samples))
+    if total < len(samples):
+        raise ValueError("verification total is smaller than its samples")
+    omitted = summary.get("omitted_count")
+    if omitted is not None and (
+        type(omitted) is not int
+        or omitted != max(0, total - min(len(samples), VERIFICATION_SAMPLE_LIMIT))
+    ):
+        raise ValueError("invalid verification omitted count")
+    return summary, samples[:VERIFICATION_SAMPLE_LIMIT], total
+
+
 def _check_batch(
     items: list[dict[str, Any]],
     ended: datetime,
@@ -422,26 +487,8 @@ def _check_batch(
         or any(clock is None or clock > ended for clock in clocks)
         or len(set(clocks)) != 1
     ):
-        return RetentionVerification()
-    summary = next(
-        (
-            item
-            for item in items
-            if type(item.get("issue_count")) is int and item["issue_count"] >= 0
-        ),
-        {},
-    )
-    samples = [item for item in items if "issue_count" not in item][
-        :VERIFICATION_SAMPLE_LIMIT
-    ]
-    # Legacy clear verdict-only rows have no issue metadata. Structured samples
-    # still establish observed occurrences even when their summary is missing.
-    observed_count = (
-        len(items)
-        if kinds != {"retention_clear"}
-        or any(item.get("category") is not None for item in samples)
-        else 0
-    )
+        raise ValueError("invalid verification verdict or clock")
+    summary, samples, total = _check_parts(items)
 
     def text(key: str) -> str | None:
         value = summary.get(key)
@@ -452,7 +499,7 @@ def _check_batch(
         clocks[0],
         check_id=check_id,
         audit_path=text("audit_path"),
-        issue_count=summary.get("issue_count", observed_count),
+        issue_count=total,
         audit_error=text("audit_error"),
         dry_run=_check_mode(items, fallback=mode),
         issues=tuple(
@@ -473,46 +520,120 @@ def _check_batch(
     )
 
 
+@dataclass(frozen=True, slots=True)
+class InvalidCheckEvidence:
+    reason: str
+    progress_id: str | None = None
+    check_id: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class RecordedCheckAssessment:
+    checks: tuple[RetentionVerification, ...] = ()
+    invalid: tuple[InvalidCheckEvidence, ...] = ()
+
+
+@dataclass(slots=True)
+class _CheckGroups:
+    groups: dict[tuple[str, object], list[dict[str, Any]]] = field(default_factory=dict)
+    identities: dict[tuple[str, object], DiagnosticIdentity] = field(
+        default_factory=dict
+    )
+    check_owners: dict[str, set[str | None]] = field(default_factory=dict)
+    bad_owners: set[str] = field(default_factory=set)
+    bad_checks: set[str] = field(default_factory=set)
+    invalid: list[InvalidCheckEvidence] = field(default_factory=list)
+
+    def add(self, item: dict[str, Any], ended: datetime) -> None:
+        identity = assess_progress_identity(
+            item.get("progress_id"), item.get("check_id")
+        )
+        if (
+            not identity.valid
+            or type(item.get("exit_code")) is not int
+            or item["exit_code"] != 0
+        ):
+            self.invalid.append(
+                InvalidCheckEvidence(
+                    "invalid_identity_or_exit", identity.progress_id, identity.check_id
+                )
+            )
+            if identity.progress_id is not None:
+                self.bad_owners.add(identity.progress_id)
+            if identity.check_id is not None:
+                self.bad_checks.add(identity.check_id)
+            return
+        if identity.check_id is not None:
+            self.check_owners.setdefault(identity.check_id, set()).add(identity.owner)
+        key = (
+            ("owner", identity.owner)
+            if identity.owner is not None
+            else (
+                "clock",
+                aware_moment(item.get("recorded_at"))
+                if item.get("recorded_at") is not None
+                else ended,
+            )
+        )
+        self.groups.setdefault(key, []).append(item)
+        self.identities[key] = identity
+
+    def assess(self, ended: datetime, *, mode: bool | None) -> RecordedCheckAssessment:
+        self.bad_checks.update(
+            check for check, owners in self.check_owners.items() if len(owners) > 1
+        )
+        checks: list[RetentionVerification] = []
+        for key, items in self.groups.items():
+            identity = self.identities[key]
+            try:
+                if identity.owner in self.bad_owners or any(
+                    item.get("check_id") in self.bad_checks for item in items
+                ):
+                    raise ValueError("conflicting verification identities")
+                checks.append(_check_batch(items, ended, mode=mode))
+            except (ValueError, TypeError):
+                self.invalid.append(
+                    InvalidCheckEvidence(
+                        "invalid_check_group", identity.progress_id, identity.check_id
+                    )
+                )
+        return RecordedCheckAssessment(
+            tuple(sorted(checks, key=lambda check: check.recorded_at or ended)),
+            tuple(self.invalid),
+        )
+
+
+def _recorded_check_assessment(
+    row: Mapping[str, Any], ended: datetime
+) -> RecordedCheckAssessment:
+    try:
+        raw = json.loads(row.get("failure_details_json") or "null")
+    except (ValueError, TypeError):
+        return RecordedCheckAssessment(
+            invalid=(InvalidCheckEvidence("invalid_diagnostic_json"),)
+        )
+    if raw is None:
+        return RecordedCheckAssessment()
+    if not isinstance(raw, list):
+        return RecordedCheckAssessment(
+            invalid=(InvalidCheckEvidence("invalid_diagnostic_container"),)
+        )
+    groups = _CheckGroups()
+    for item in raw:
+        if isinstance(item, dict) and item.get("stage") == "retention_verification":
+            if type(item.get("exit_code")) is int and item["exit_code"] != 0:
+                # Non-completed diagnostics never asserted protection, including
+                # legacy contention records; their run outcome is assessed separately.
+                continue
+            groups.add(item, ended)
+    return groups.assess(ended, mode=_argument_mode(row))
+
+
 def _recorded_checks(
     row: Mapping[str, Any], ended: datetime
 ) -> tuple[RetentionVerification, ...]:
-    try:
-        raw = json.loads(row.get("failure_details_json") or "null")
-        if not isinstance(raw, list):
-            return ()
-        groups: dict[tuple[str, object], list[dict[str, Any]]] = {}
-        check_owners: dict[str, str | None] = {}
-        for item in raw:
-            if (
-                not isinstance(item, dict)
-                or item.get("stage") != "retention_verification"
-                or item.get("exit_code") != 0
-            ):
-                continue
-            owner = effective_progress_id(item.get("progress_id"), item.get("check_id"))
-            check_id = item.get("check_id")
-            if check_id is not None:
-                if check_id in check_owners and check_owners[check_id] != owner:
-                    raise ValueError("conflicting verification owner for check")
-                check_owners[check_id] = owner
-            identity = (
-                ("owner", owner)
-                if owner is not None
-                else ("clock", item.get("recorded_at"))
-            )
-            groups.setdefault(identity, []).append(item)
-        checks = [
-            _check_batch(items, ended, mode=_argument_mode(row))
-            for items in groups.values()
-        ]
-        return tuple(
-            sorted(
-                (check for check in checks if check.recorded_at is not None),
-                key=lambda check: check.recorded_at or ended,
-            )
-        )
-    except (ValueError, TypeError):
-        return ()
+    """Compatibility projection: preserve every independently valid check."""
+    return _recorded_check_assessment(row, ended).checks
 
 
 def retention_status(runs: pl.DataFrame, *, as_of: datetime) -> RetentionStatus:
@@ -522,9 +643,25 @@ def retention_status(runs: pl.DataFrame, *, as_of: datetime) -> RetentionStatus:
     latest = None
     outstanding = False
     mode = None
+    uncertainty_until: datetime | None = None
     for attempt in assessment.attempts:
         row, latest = attempt.row, attempt.ended_at
-        checks = _recorded_checks(row, latest)
+        recorded = _recorded_check_assessment(row, latest)
+        checks = recorded.checks
+        if recorded.invalid:
+            uncertainty_until = (
+                max(uncertainty_until, latest)
+                if uncertainty_until is not None
+                else latest
+            )
+        for check in checks:
+            if (
+                uncertainty_until is not None
+                and check.state == "clear"
+                and check.recorded_at is not None
+                and check.recorded_at > uncertainty_until
+            ):
+                uncertainty_until = None
         mode = checks[-1].dry_run if checks else _argument_mode(row)
         if checks:
             check = checks[-1]
@@ -539,7 +676,11 @@ def retention_status(runs: pl.DataFrame, *, as_of: datetime) -> RetentionStatus:
             state, outstanding = "failed", True
         elif checks:
             state = "completed"
-            if checks[-1].state == "clear" and mode is False:
+            if (
+                checks[-1].state == "clear"
+                and mode is False
+                and uncertainty_until is None
+            ):
                 outstanding = False
         else:
             state = "unverified"
@@ -548,7 +689,15 @@ def retention_status(runs: pl.DataFrame, *, as_of: datetime) -> RetentionStatus:
         mode = None
         clocks = assessment.invalid_ended
         latest = None if None in clocks else max(clocks) if clocks else latest
-    return RetentionStatus(verification, latest, state, outstanding, as_of, mode)
+    return RetentionStatus(
+        verification,
+        latest,
+        state,
+        outstanding,
+        as_of,
+        mode,
+        uncertainty_until is not None,
+    )
 
 
 def latest_retention_verification(

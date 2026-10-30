@@ -5,7 +5,7 @@ import os
 from collections.abc import Iterator
 from contextlib import contextmanager
 from contextvars import ContextVar
-from dataclasses import asdict, dataclass
+from dataclasses import dataclass, fields
 from pathlib import Path
 
 EXIT_NO_FOLDS = 3
@@ -71,37 +71,85 @@ def diagnostic_progress() -> Iterator[list[ComponentDiagnostic]]:
 
 def record_progress(diagnostics: tuple[ComponentDiagnostic, ...]) -> None:
     if (progress := _progress.get()) is not None:
-        progress[:] = _replace_identified_batches(tuple(progress), diagnostics)
+        progress[:] = merge_diagnostics(tuple(progress), diagnostics)
+
+
+@dataclass(frozen=True, slots=True)
+class DiagnosticIdentity:
+    """Validated ownership and independent hints for quarantining damaged data."""
+
+    owner: str | None
+    valid: bool
+    progress_id: str | None
+    check_id: str | None
+
+
+def _identity_hint(value: object) -> str | None:
+    return value if isinstance(value, str) and value.strip() else None
+
+
+def assess_progress_identity(
+    progress_id: object, check_id: object
+) -> DiagnosticIdentity:
+    """Inspect optional recorded metadata without giving malformed data ownership."""
+    progress, check = _identity_hint(progress_id), _identity_hint(check_id)
+    valid = (progress_id is None or progress is not None) and (
+        check_id is None or check is not None
+    )
+    return DiagnosticIdentity(
+        progress or check if valid else None, valid, progress, check
+    )
 
 
 def effective_progress_id(progress_id: object, check_id: object) -> str | None:
     """Resolve one owner consistently; malformed recorded identities are not legacy."""
-    for value in (progress_id, check_id):
-        if value is not None and (not isinstance(value, str) or not value.strip()):
-            raise ValueError("diagnostic identity must be a nonempty string or null")
-    if isinstance(progress_id, str):
-        return progress_id
-    return check_id if isinstance(check_id, str) else None
+    identity = assess_progress_identity(progress_id, check_id)
+    if not identity.valid:
+        raise ValueError("diagnostic identity must be a nonempty string or null")
+    return identity.owner
 
 
-def _batch_identity(item: ComponentDiagnostic) -> tuple[str, str] | None:
-    if item.stage not in {"retention_verification", "retention_audit_cleanup"}:
-        return None
-    identity = effective_progress_id(item.progress_id, item.check_id)
-    return (item.stage, identity) if identity is not None else None
+_RETENTION_STAGES = frozenset({"retention_verification", "retention_audit_cleanup"})
+type BatchKey = tuple[str, str]
 
 
-def _replace_identified_batches(
-    previous: tuple[ComponentDiagnostic, ...],
+@dataclass(slots=True)
+class _DiagnosticBatch:
+    key: BatchKey | None
+    identity_valid: bool
+    items: list[ComponentDiagnostic]
+
+
+def _diagnostic_batches(
     incoming: tuple[ComponentDiagnostic, ...],
-) -> tuple[ComponentDiagnostic, ...]:
-    identities = {
-        identity for item in incoming if (identity := _batch_identity(item)) is not None
-    }
-    return (
-        tuple(item for item in previous if _batch_identity(item) not in identities)
-        + incoming
-    )
+    identities: dict[int, DiagnosticIdentity],
+) -> list[_DiagnosticBatch]:
+    batches: list[_DiagnosticBatch] = []
+    active: dict[BatchKey, _DiagnosticBatch] = {}
+    for item in incoming:
+        if id(item) not in identities:
+            identities[id(item)] = assess_progress_identity(
+                item.progress_id, item.check_id
+            )
+        identity = identities[id(item)]
+        key = (
+            (item.stage, identity.owner)
+            if item.stage in _RETENTION_STAGES and identity.owner is not None
+            else None
+        )
+        summary = (
+            type(item.issue_count) is int
+            and item.issue_count >= 0
+            and item.category is None
+        )
+        if key is None:
+            batches.append(_DiagnosticBatch(None, identity.valid, [item]))
+        else:
+            if key not in active or summary:
+                active[key] = _DiagnosticBatch(key, identity_valid=True, items=[])
+                batches.append(active[key])
+            active[key].items.append(item)
+    return batches
 
 
 def record_verification_progress(diagnostics: tuple[ComponentDiagnostic, ...]) -> None:
@@ -112,61 +160,70 @@ def record_verification_progress(diagnostics: tuple[ComponentDiagnostic, ...]) -
 def merge_diagnostics(
     *batches: tuple[ComponentDiagnostic, ...],
 ) -> tuple[ComponentDiagnostic, ...]:
-    merged: tuple[ComponentDiagnostic, ...] = ()
+    identities: dict[int, DiagnosticIdentity] = {}
+    ordered: list[_DiagnosticBatch | None] = []
+    positions: dict[BatchKey, int] = {}
     for batch in batches:
-        merged = _replace_identified_batches(merged, batch)
+        for incoming in _diagnostic_batches(batch, identities):
+            if incoming.key is not None:
+                if incoming.key in positions:
+                    ordered[positions[incoming.key]] = None
+                positions[incoming.key] = len(ordered)
+            ordered.append(incoming)
     seen: set[ComponentDiagnostic] = set()
-    result = []
-    for item in merged:
-        if _batch_identity(item) is not None or item not in seen:
-            result.append(item)
-        seen.add(item)
+    result: list[ComponentDiagnostic] = []
+    for group in ordered:
+        if group is None:
+            continue
+        for item in group.items:
+            if group.key is not None or not group.identity_valid:
+                result.append(item)
+            elif item not in seen:
+                result.append(item)
+                seen.add(item)
     return tuple(result)
+
+
+def _serialized_identity(value: object) -> object:
+    """Bound invalid values, retaining an unmistakably invalid JSON object."""
+    if value is None or _identity_hint(value) is not None:
+        return value
+    from grounded_weather_forecast.runs import normalize_error_detail  # noqa: PLC0415
+
+    try:
+        detail = repr(value)
+    except (Exception,):  # noqa: B013 -- optional evidence must not erase a run
+        detail = "Identity value could not be represented."
+    return {
+        "invalid_identity_type": type(value).__name__,
+        "detail": normalize_error_detail(detail),
+    }
+
+
+def _diagnostic_payload(item: ComponentDiagnostic) -> dict[str, object]:
+    from grounded_weather_forecast.runs import normalize_error_detail  # noqa: PLC0415
+
+    identity = assess_progress_identity(item.progress_id, item.check_id)
+    payload: dict[str, object] = {
+        field.name: getattr(item, field.name)
+        for field in fields(item)
+        if getattr(item, field.name) is not None
+        or field.name in {"stage", "exit_code", "failure_kind", "detail"}
+    }
+    for key in ("progress_id", "check_id"):
+        if key in payload:
+            payload[key] = _serialized_identity(payload[key])
+    if identity.valid and identity.progress_id == identity.check_id:
+        payload.pop("progress_id", None)
+    payload["detail"] = normalize_error_detail(item.detail)
+    return payload
 
 
 def failure_details_json(diagnostics: tuple[ComponentDiagnostic, ...]) -> str | None:
     """Bound each component independently so a second error cannot disappear."""
     if not diagnostics:
         return None
-    from grounded_weather_forecast.runs import normalize_error_detail  # noqa: PLC0415
-
-    return json.dumps(
-        [
-            {
-                key: value
-                for key, value in asdict(item).items()
-                if key
-                not in {
-                    "path",
-                    "recorded_at",
-                    "check_id",
-                    "audit_path",
-                    "issue_count",
-                    "omitted_count",
-                    "audit_error",
-                    "dry_run",
-                    "category",
-                    "reason_code",
-                    "audit_candidate_path",
-                    "audit_reason_code",
-                    "audit_cause_code",
-                    "operation",
-                    "deleted_audit_count",
-                    "deleted_staging_count",
-                    "eligible_audit_count",
-                    "eligible_staging_count",
-                    "cleanup_completed",
-                    "error_type",
-                    "progress_id",
-                }
-                or value is not None
-                if key != "progress_id"
-                or value != effective_progress_id(None, item.check_id)
-            }
-            | {"detail": normalize_error_detail(item.detail)}
-            for item in diagnostics
-        ]
-    )
+    return json.dumps([_diagnostic_payload(item) for item in diagnostics])
 
 
 @dataclass(frozen=True, slots=True)

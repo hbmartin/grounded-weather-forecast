@@ -388,16 +388,15 @@ def _signature(path: Path) -> tuple[int, ...] | None:
 
 
 type CleanupFailureRole = Literal["abort_cause", "file_local"]
+_ROLE_CATEGORIES: dict[CleanupFailureRole, str] = {
+    "abort_cause": "audit_cleanup_aborted",
+    "file_local": "audit_cleanup_file_failed",
+}
+_CATEGORY_ROLES = {category: role for role, category in _ROLE_CATEGORIES.items()}
 
 
 def _cleanup_role(category: str) -> CleanupFailureRole | None:
-    match category:
-        case "audit_cleanup_aborted":
-            return "abort_cause"
-        case "audit_cleanup_file_failed":
-            return "file_local"
-        case _:
-            return None
+    return _CATEGORY_ROLES.get(category)
 
 
 @dataclass(frozen=True, slots=True)
@@ -411,7 +410,9 @@ class AuditCleanupFailure:
     failure_role: CleanupFailureRole | None = None
 
     def __post_init__(self) -> None:
-        if self.failure_role not in {None, "abort_cause", "file_local"}:
+        if self.failure_role is not None and self.failure_role not in tuple(
+            _ROLE_CATEGORIES
+        ):
             raise ValueError("unknown audit cleanup failure role")
 
     @classmethod
@@ -452,13 +453,9 @@ class AuditCleanupFailure:
                     "cleanup issue role conflicts with recorded failure role"
                 )
             role = supplied
-        match role:
-            case "abort_cause":
-                category = "audit_cleanup_aborted"
-            case "file_local":
-                category = "audit_cleanup_file_failed"
-            case _:
-                category = "audit_cleanup_failure"
+        category = (
+            _ROLE_CATEGORIES[role] if role is not None else "audit_cleanup_failure"
+        )
         return VerificationIssue(
             self.path,
             category,
@@ -479,26 +476,25 @@ class AuditCleanupEntry:
     def __post_init__(self) -> None:
         object.__setattr__(self, "issue", VerificationIssue.from_issue(self.issue))
         if self.failure is not None:
-            failure = self.failure
-            if failure.failure_role is None and (
-                role := _cleanup_role(self.issue.category)
-            ):
-                failure = replace(failure, failure_role=role)
-                object.__setattr__(self, "failure", failure)
+            failure = _recorded_role(self.issue, self.failure)
+            object.__setattr__(self, "failure", failure)
             if self.issue != failure.issue():
                 raise ValueError("cleanup issue does not match its failure evidence")
 
 
+def _recorded_role(
+    issue: VerificationIssue, failure: AuditCleanupFailure
+) -> AuditCleanupFailure:
+    if (
+        failure.failure_role is None
+        and (role := _cleanup_role(issue.category)) is not None
+    ):
+        return replace(failure, failure_role=role)
+    return failure
+
+
 def _failure_matches(issue: VerificationIssue, failure: AuditCleanupFailure) -> bool:
-    role = _cleanup_role(issue.category)
-    if failure.failure_role is not None and failure.failure_role != role:
-        return False
-    expected = (
-        failure.issue(aborted=role == "abort_cause")
-        if role is not None and failure.failure_role is None
-        else failure.issue()
-    )
-    return issue == expected
+    return issue == _recorded_role(issue, failure).issue()
 
 
 def _failure_positions(

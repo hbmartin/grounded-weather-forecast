@@ -303,6 +303,15 @@ exit behavior, and later analysis commands.
   Lock contention (75) is a distinct informational attempt, not a new protection
   failure, and clears no older warning. Relevant malformed newer run evidence
   is unknown/amber rather than exposing an old success as current.
+  Malformed verification groups preserve unrelated valid checks and set the report's
+  `verification_unknown` field. The last valid check remains visible, with amber
+  uncertainty until a clear check is recorded strictly after the damaged run ends.
+  A clear dry run may resolve this check uncertainty; execution recovery still
+  requires a successful clear apply run. Equal-clock valid checks continue to use
+  persisted order. Optional diagnostic damage cannot replace command outcomes or
+  prevent the run row from being recorded. Summary boundaries make concatenated
+  batch delivery idempotent without collapsing duplicate issue samples; legacy
+  verdict-only clear rows do not become issues.
   Each check records at most 20 issue samples with a full JSONL audit reference.
   Audits under `artifacts/history/pruning_verifications/` preserve every affected
   path, survive for 90 days and while referenced by retained run rows, and are

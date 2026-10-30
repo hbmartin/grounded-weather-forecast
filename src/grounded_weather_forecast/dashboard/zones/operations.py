@@ -425,6 +425,8 @@ def _retention_panel(ctx: DashboardContext) -> Panel:
         )
         omitted_notes = 0
     introduction = [audit_note] if audit_note else []
+    if recorded.verification_warning is not None:
+        introduction.append(recorded.verification_warning)
     if verification.audit_error:
         introduction.append(verification.audit_explanation())
     if compatibility:
@@ -455,6 +457,11 @@ def _retention_panel(ctx: DashboardContext) -> Panel:
                 "info",
             ),
             Stat("verification issues", str(verification.total), "info"),
+            Stat(
+                "verification uncertainty",
+                "yes" if recorded.verification_unknown else "no",
+                status,
+            ),
             Stat(
                 "audit state",
                 verification.audit_state.replace("_", " "),
