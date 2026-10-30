@@ -74,6 +74,7 @@ class RetentionVerification:
     audit_cause_code: str | None = None
     audit_operation: str | None = None
     progress_id: str | None = None
+    issue_count_known: bool | None = None
 
     def __init__(
         self,
@@ -95,6 +96,7 @@ class RetentionVerification:
         issues: Sequence[IssueSource] = (),
         audit_operation: str | None = None,
         progress_id: str | None = None,
+        issue_count_known: bool | None = None,
     ) -> None:
         # Constructor and replacement inputs are literal evidence. Prefix stripping
         # belongs exclusively to the explicit legacy adapter below.
@@ -111,6 +113,13 @@ class RetentionVerification:
         )
         object.__setattr__(self, "audit_path", audit_path)
         object.__setattr__(self, "issue_count", issue_count)
+        if issue_count_known is not None and type(issue_count_known) is not bool:
+            raise ValueError("issue count knowledge must be boolean or null")
+        if issue_count_known is False and (
+            state != "suspended" or self.issues or issue_count not in (None, 0)
+        ):
+            raise ValueError("unknown issue count requires a sample-free suspension")
+        object.__setattr__(self, "issue_count_known", issue_count_known)
         object.__setattr__(self, "audit_error", audit_error)
         object.__setattr__(self, "dry_run", dry_run)
         object.__setattr__(self, "audit_candidate_path", audit_candidate_path)
@@ -139,6 +148,7 @@ class RetentionVerification:
         issues: Sequence[IssueSource] = (),
         audit_operation: str | None = None,
         progress_id: str | None = None,
+        issue_count_known: bool | None = None,
     ) -> "RetentionVerification":
         """Ingest labelled legacy strings, removing exact recorded prefixes once."""
         normalized = _verification_issues(
@@ -163,6 +173,7 @@ class RetentionVerification:
             issues=normalized,
             audit_operation=audit_operation,
             progress_id=progress_id,
+            issue_count_known=issue_count_known,
         )
 
     @property
@@ -239,6 +250,7 @@ class RetentionVerification:
             check_id=self.check_id,
             progress_id=self.progress_id,
             dry_run=self.dry_run,
+            issue_count_known=self.issue_count_known,
         )
         summary = (
             (
@@ -299,7 +311,10 @@ class RetentionVerification:
                     )
                     or None
                 ],
-                "issue_count": [self.total],
+                "issue_count": pl.Series(
+                    [None if self.issue_count_known is False else self.total],
+                    dtype=pl.Int64,
+                ),
                 "omitted_count": [self.omitted],
                 "audit_state": [self.audit_state],
                 "audit_path": [
@@ -429,6 +444,13 @@ def _check_identity(items: list[dict[str, Any]]) -> tuple[str | None, str | None
 def _has_issue_metadata(item: Mapping[str, Any]) -> bool:
     # Malformed additive codes still describe a sample; the legacy issue adapter
     # normalizes them safely instead of losing the recorded protection verdict.
+    # An explicitly empty category/path on a suspension is recorded sample
+    # metadata, normalized to the existing unknown-category/null-path defaults.
+    # Verdict-only legacy records have no such sample metadata.
+    if item.get("failure_kind") == "retention_suspended" and any(
+        item.get(key) == "" for key in ("category", "path")
+    ):
+        return True
     return any(
         item.get(key) is not None and item[key] != ""
         for key in ("category", "path", "reason_code")
@@ -450,7 +472,7 @@ def _check_parts(
             ):
                 raise ValueError("invalid verification summary")
             summaries.append(item)
-        elif item.get("failure_kind") != "retention_clear" or metadata:
+        elif metadata:
             samples.append(item)
     if len(summaries) > 1:
         raise ValueError("conflicting verification summaries")
@@ -465,6 +487,25 @@ def _check_parts(
     ):
         raise ValueError("invalid verification omitted count")
     return summary, samples[:VERIFICATION_SAMPLE_LIMIT], total
+
+
+def _count_knowledge(items: list[dict[str, Any]], *, has_samples: bool) -> bool | None:
+    values = [
+        item["issue_count_known"]
+        for item in items
+        if item.get("issue_count_known") is not None
+    ]
+    if values:
+        if any(type(value) is not bool or value != values[0] for value in values):
+            raise ValueError("invalid issue count knowledge")
+        return values[0]
+    if (
+        not has_samples
+        and not any("issue_count" in item for item in items)
+        and any(item.get("failure_kind") == "retention_suspended" for item in items)
+    ):
+        return False
+    return None
 
 
 def _check_batch(
@@ -517,6 +558,7 @@ def _check_batch(
         audit_cause_code=text("audit_cause_code"),
         audit_operation=text("operation"),
         progress_id=progress_id,
+        issue_count_known=_count_knowledge(items, has_samples=bool(samples)),
     )
 
 
@@ -544,63 +586,84 @@ class _CheckGroups:
     bad_checks: set[str] = field(default_factory=set)
     invalid: list[InvalidCheckEvidence] = field(default_factory=list)
 
-    def add(self, item: dict[str, Any], ended: datetime) -> None:
+    def reject(self, item: object, reason: str) -> None:
+        identity = assess_progress_identity(
+            item.get("progress_id") if isinstance(item, dict) else None,
+            item.get("check_id") if isinstance(item, dict) else None,
+        )
+        self.invalid.append(
+            InvalidCheckEvidence(reason, identity.progress_id, identity.check_id)
+        )
+        if identity.progress_id is not None:
+            self.bad_owners.add(identity.progress_id)
+        if identity.check_id is not None:
+            self.bad_checks.add(identity.check_id)
+
+    def add(self, item: dict[str, Any]) -> None:
         identity = assess_progress_identity(
             item.get("progress_id"), item.get("check_id")
         )
-        if (
-            not identity.valid
-            or type(item.get("exit_code")) is not int
-            or item["exit_code"] != 0
-        ):
-            self.invalid.append(
-                InvalidCheckEvidence(
-                    "invalid_identity_or_exit", identity.progress_id, identity.check_id
-                )
-            )
-            if identity.progress_id is not None:
-                self.bad_owners.add(identity.progress_id)
-            if identity.check_id is not None:
-                self.bad_checks.add(identity.check_id)
+        if not identity.valid or type(item.get("exit_code")) is not int:
+            self.reject(item, "invalid_identity_or_exit")
             return
         if identity.check_id is not None:
             self.check_owners.setdefault(identity.check_id, set()).add(identity.owner)
+        clock = item.get("recorded_at")
+        if clock is not None and not isinstance(clock, str):
+            self.reject(item, "invalid_recorded_clock")
+            return
         key = (
             ("owner", identity.owner)
             if identity.owner is not None
             else (
                 "clock",
-                aware_moment(item.get("recorded_at"))
-                if item.get("recorded_at") is not None
-                else ended,
+                clock,
             )
         )
         self.groups.setdefault(key, []).append(item)
         self.identities[key] = identity
 
     def assess(self, ended: datetime, *, mode: bool | None) -> RecordedCheckAssessment:
-        self.bad_checks.update(
+        bad_checks = self.bad_checks | {
             check for check, owners in self.check_owners.items() if len(owners) > 1
-        )
+        }
+        invalid = list(self.invalid)
         checks: list[RetentionVerification] = []
         for key, items in self.groups.items():
             identity = self.identities[key]
             try:
                 if identity.owner in self.bad_owners or any(
-                    item.get("check_id") in self.bad_checks for item in items
+                    item.get("check_id") in bad_checks for item in items
                 ):
                     raise ValueError("conflicting verification identities")
                 checks.append(_check_batch(items, ended, mode=mode))
             except (ValueError, TypeError):
-                self.invalid.append(
+                invalid.append(
                     InvalidCheckEvidence(
                         "invalid_check_group", identity.progress_id, identity.check_id
                     )
                 )
         return RecordedCheckAssessment(
             tuple(sorted(checks, key=lambda check: check.recorded_at or ended)),
-            tuple(self.invalid),
+            tuple(invalid),
         )
+
+
+def _damaged_diagnostic(item: object) -> bool:
+    if not isinstance(item, dict):
+        return True
+    stage = item.get("stage")
+    if not isinstance(stage, str) or not stage.strip():
+        return True
+    metadata_invalid = item.get("metadata_invalid")
+    if metadata_invalid is not None and metadata_invalid is not False:
+        return True
+    if item.get("failure_kind") == "invalid_diagnostic_metadata":
+        return True
+    return stage != "retention_verification" and item.get("failure_kind") in (
+        "retention_clear",
+        "retention_suspended",
+    )
 
 
 def _recorded_check_assessment(
@@ -620,12 +683,14 @@ def _recorded_check_assessment(
         )
     groups = _CheckGroups()
     for item in raw:
-        if isinstance(item, dict) and item.get("stage") == "retention_verification":
+        if _damaged_diagnostic(item):
+            groups.reject(item, "invalid_diagnostic_metadata")
+        elif item.get("stage") == "retention_verification":
             if type(item.get("exit_code")) is int and item["exit_code"] != 0:
                 # Non-completed diagnostics never asserted protection, including
                 # legacy contention records; their run outcome is assessed separately.
                 continue
-            groups.add(item, ended)
+            groups.add(item)
     return groups.assess(ended, mode=_argument_mode(row))
 
 
@@ -634,6 +699,41 @@ def _recorded_checks(
 ) -> tuple[RetentionVerification, ...]:
     """Compatibility projection: preserve every independently valid check."""
     return _recorded_check_assessment(row, ended).checks
+
+
+def _verification_uncertainty(
+    recorded: RecordedCheckAssessment,
+    ended: datetime,
+    boundary: datetime | None,
+) -> datetime | None:
+    if recorded.invalid:
+        boundary = ended
+    if boundary is not None and any(
+        check.state == "clear"
+        and check.recorded_at is not None
+        and check.recorded_at > boundary
+        for check in recorded.checks
+    ):
+        return None
+    return boundary
+
+
+def _execution_recovery(
+    row: Mapping[str, Any],
+    checks: tuple[RetentionVerification, ...],
+    *,
+    mode: bool | None,
+    outstanding: bool,
+) -> tuple[AttemptState, bool]:
+    if row.get("exit_code") == EXIT_CONTENTION and not row.get("error"):
+        return "contended", outstanding
+    if row.get("error") or row.get("exit_code") != 0:
+        return "failed", True
+    if not checks:
+        return "unverified", outstanding
+    if checks[-1].state == "clear" and mode is False:
+        return "completed", False
+    return "completed", outstanding
 
 
 def retention_status(runs: pl.DataFrame, *, as_of: datetime) -> RetentionStatus:
@@ -648,20 +748,9 @@ def retention_status(runs: pl.DataFrame, *, as_of: datetime) -> RetentionStatus:
         row, latest = attempt.row, attempt.ended_at
         recorded = _recorded_check_assessment(row, latest)
         checks = recorded.checks
-        if recorded.invalid:
-            uncertainty_until = (
-                max(uncertainty_until, latest)
-                if uncertainty_until is not None
-                else latest
-            )
-        for check in checks:
-            if (
-                uncertainty_until is not None
-                and check.state == "clear"
-                and check.recorded_at is not None
-                and check.recorded_at > uncertainty_until
-            ):
-                uncertainty_until = None
+        uncertainty_until = _verification_uncertainty(
+            recorded, latest, uncertainty_until
+        )
         mode = checks[-1].dry_run if checks else _argument_mode(row)
         if checks:
             check = checks[-1]
@@ -670,20 +759,9 @@ def retention_status(runs: pl.DataFrame, *, as_of: datetime) -> RetentionStatus:
                 or check.recorded_at >= verification.recorded_at
             ):
                 verification = check
-        if row.get("exit_code") == EXIT_CONTENTION and not row.get("error"):
-            state = "contended"
-        elif row.get("error") or row.get("exit_code") != 0:
-            state, outstanding = "failed", True
-        elif checks:
-            state = "completed"
-            if (
-                checks[-1].state == "clear"
-                and mode is False
-                and uncertainty_until is None
-            ):
-                outstanding = False
-        else:
-            state = "unverified"
+        state, outstanding = _execution_recovery(
+            row, checks, mode=mode, outstanding=outstanding
+        )
     if assessment.unresolved:
         state = "unknown"
         mode = None

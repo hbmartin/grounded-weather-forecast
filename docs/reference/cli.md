@@ -1213,12 +1213,17 @@ identical samples; idempotence applies to batch delivery, not to evidence within
 one batch. Progress-only verifications emit summaries and remain distinct at
 equal timestamps. Older summary-less progress rows recover a consistent stored
 identity; conflicting or malformed identities cannot establish a clear check.
-Strict construction validates identities, while progress capture, merging and
-serialization assess recorded metadata without raising. Invalid optional IDs
-remain bounded untrusted evidence; they cannot mask a command return/exception or
-prevent its run row from being appended. A summary starts an authoritative batch;
+Strict construction validates identities. Progress capture independently contains
+ordinary diagnostic failures; merging and serialization run inside the recorder's
+protected boundary, never in the calling `finally` arguments. Malformed fields
+retain bounded JSON-safe evidence with a `metadata_invalid` marker and no trusted
+ownership. An `invalid_diagnostic_metadata` fallback preserves a core row if
+optional processing fails. Storage remains best effort. Neither path masks the
+command return or original exception/cancellation. Repeated untrusted delivery is
+safely deduplicated without hashing unchecked values or equating bounded previews. A summary starts an authoritative batch;
 a later summary for the same stage/owner replaces the preceding batch even within
-one concatenated input. Sample multiplicity remains intact. Without a summary,
+one concatenated input. Sample multiplicity and the relative order of surviving
+items remain intact, including interleaved check owners. Without a summary,
 legacy samples form one batch per owner per input; repeated values do not imply
 another delivery.
 
@@ -1227,10 +1232,22 @@ unrelated valid checks. Reports add `verification_unknown`: the last valid check
 stays visible, but unresolved damage is amber. A valid clear check must be recorded
 strictly after the damaged run's ending clock to resolve that uncertainty. Equal
 clocks and suspended checks do not resolve it. A later clear dry run can resolve
-verification damage, while execution-failure recovery still requires a successful
-clear apply run. Valid equal-clock checks retain persisted-order precedence.
-Legacy verdict-only clear rows create no sample; observed counts include only
-actual sample occurrences, and invalid/inconsistent counts cannot prove a clear check.
+verification damage. Execution recovery is independent: a successful apply run
+with an independently valid selected clear check clears an execution failure even
+when another group in its row is damaged. That damage still leaves the panel amber
+until a strictly later clear check. Valid equal-clock checks retain persisted-order
+precedence. Malformed entries, absent/non-string stages and contradictory retention
+stage metadata create uncertainty; valid unrelated components are ignored.
+
+Neither clear nor suspended legacy verdict-only rows create samples. A sample-free
+legacy suspension without a recorded count remains suspended with an unavailable
+count. Additive nullable `issue_count_known` diagnostic metadata preserves this
+state: false means unknown, shown as null in the report's `issue_count` and an em
+dash in the dashboard. Integer library compatibility views still return recovered
+sample counts. Explicit counts and actual sample multiplicity remain validated.
+Ownerless legacy checks retain raw clock grouping, including distinct missing and
+explicit clocks and different offset strings for the same instant. Parsed clocks
+still control validation and sorting; historical artifacts are not rewritten.
 
 JSON omits `progress_id` only when both identities are valid and equal; renamed or
 progress-only samples keep it. Empty `audit_cleanup_diagnostics=()` retains its old omitted-batch

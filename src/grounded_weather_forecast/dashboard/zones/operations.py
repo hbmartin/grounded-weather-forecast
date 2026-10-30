@@ -396,6 +396,10 @@ def _mode_label(*, dry_run: bool | None) -> str:
     return "dry run" if dry_run is True else "apply" if dry_run is False else "unknown"
 
 
+def _issue_count_label(value: int, *, known: bool | None) -> str:
+    return "—" if known is False else str(value)
+
+
 def _retention_panel(ctx: DashboardContext) -> Panel:
     recorded = retention_status(ctx.runs, as_of=ctx.now)
     verification = recorded.verification
@@ -456,7 +460,13 @@ def _retention_panel(ctx: DashboardContext) -> Panel:
                 recorded.attempt_at.isoformat() if recorded.attempt_at else "—",
                 "info",
             ),
-            Stat("verification issues", str(verification.total), "info"),
+            Stat(
+                "verification issues",
+                _issue_count_label(
+                    verification.total, known=verification.issue_count_known
+                ),
+                "info",
+            ),
             Stat(
                 "verification uncertainty",
                 "yes" if recorded.verification_unknown else "no",

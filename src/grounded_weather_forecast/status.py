@@ -7,6 +7,7 @@ from contextlib import contextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass, fields
 from pathlib import Path
+from typing import cast
 
 EXIT_NO_FOLDS = 3
 EXIT_CONTENTION = 75
@@ -51,6 +52,7 @@ class ComponentDiagnostic:
     cleanup_completed: bool | None = None
     error_type: str | None = None
     progress_id: str | None = None
+    issue_count_known: bool | None = None
 
 
 _progress: ContextVar[list[ComponentDiagnostic] | None] = ContextVar(
@@ -71,7 +73,10 @@ def diagnostic_progress() -> Iterator[list[ComponentDiagnostic]]:
 
 def record_progress(diagnostics: tuple[ComponentDiagnostic, ...]) -> None:
     if (progress := _progress.get()) is not None:
-        progress[:] = merge_diagnostics(tuple(progress), diagnostics)
+        try:
+            progress[:] = merge_diagnostics(tuple(progress), diagnostics)
+        except (Exception,):  # noqa: B013 -- optional telemetry cannot stop work
+            progress.extend((diagnostic_damage(),))
 
 
 @dataclass(frozen=True, slots=True)
@@ -113,20 +118,68 @@ _RETENTION_STAGES = frozenset({"retention_verification", "retention_audit_cleanu
 type BatchKey = tuple[str, str]
 
 
-@dataclass(slots=True)
-class _DiagnosticBatch:
-    key: BatchKey | None
-    identity_valid: bool
-    items: list[ComponentDiagnostic]
+def diagnostic_damage() -> ComponentDiagnostic:
+    return ComponentDiagnostic(
+        "diagnostic_metadata",
+        0,
+        "invalid_diagnostic_metadata",
+        "Optional diagnostic evidence could not be processed.",
+    )
+
+
+def _field_valid(name: str, value: object) -> bool:
+    if value is None:
+        return name not in {"stage", "exit_code"}
+    if name == "exit_code" or name.endswith("_count"):
+        return type(value) is int
+    if name in {"dry_run", "cleanup_completed", "issue_count_known"}:
+        return type(value) is bool
+    return type(value) is str and (name != "stage" or bool(value.strip()))
+
+
+def _valid_fields(item: ComponentDiagnostic) -> bool:
+    return all(
+        _field_valid(field.name, getattr(item, field.name)) for field in fields(item)
+    )
+
+
+def _exact_value(value: object, ancestors: tuple[int, ...] = ()) -> object:
+    """Hash only built-ins; opaque/cyclic data deduplicates by object, not preview."""
+    kind = type(value)
+    if kind in (str, int, bool, bytes, type(None)):
+        return (kind.__name__, value)
+    if kind is float:
+        return ("float", repr(value))
+    if id(value) in ancestors or len(ancestors) >= 20:
+        return ("object", id(value))
+    parents = (*ancestors, id(value))
+    if kind in (tuple, list):
+        return (
+            kind.__name__,
+            tuple(
+                _exact_value(part, parents)
+                for part in cast(list[object] | tuple[object, ...], value)
+            ),
+        )
+    if kind is dict:
+        return (
+            "dict",
+            tuple(
+                (_exact_value(key, parents), _exact_value(part, parents))
+                for key, part in cast(dict[object, object], value).items()
+            ),
+        )
+    return ("object", id(value))
 
 
 def _diagnostic_batches(
     incoming: tuple[ComponentDiagnostic, ...],
     identities: dict[int, DiagnosticIdentity],
-) -> list[_DiagnosticBatch]:
-    batches: list[_DiagnosticBatch] = []
-    active: dict[BatchKey, _DiagnosticBatch] = {}
+) -> Iterator[tuple[ComponentDiagnostic, BatchKey | None, bool]]:
     for item in incoming:
+        if not isinstance(item, ComponentDiagnostic):
+            yield diagnostic_damage(), None, False
+            continue
         if id(item) not in identities:
             identities[id(item)] = assess_progress_identity(
                 item.progress_id, item.check_id
@@ -134,7 +187,10 @@ def _diagnostic_batches(
         identity = identities[id(item)]
         key = (
             (item.stage, identity.owner)
-            if item.stage in _RETENTION_STAGES and identity.owner is not None
+            if isinstance(item.stage, str)
+            and item.stage in _RETENTION_STAGES
+            and identity.owner is not None
+            and _valid_fields(item)
             else None
         )
         summary = (
@@ -142,14 +198,7 @@ def _diagnostic_batches(
             and item.issue_count >= 0
             and item.category is None
         )
-        if key is None:
-            batches.append(_DiagnosticBatch(None, identity.valid, [item]))
-        else:
-            if key not in active or summary:
-                active[key] = _DiagnosticBatch(key, identity_valid=True, items=[])
-                batches.append(active[key])
-            active[key].items.append(item)
-    return batches
+        yield item, key, summary
 
 
 def record_verification_progress(diagnostics: tuple[ComponentDiagnostic, ...]) -> None:
@@ -161,27 +210,28 @@ def merge_diagnostics(
     *batches: tuple[ComponentDiagnostic, ...],
 ) -> tuple[ComponentDiagnostic, ...]:
     identities: dict[int, DiagnosticIdentity] = {}
-    ordered: list[_DiagnosticBatch | None] = []
-    positions: dict[BatchKey, int] = {}
+    ordered: list[ComponentDiagnostic | None] = []
+    positions: dict[BatchKey, list[int]] = {}
+    seen: set[object] = set()
     for batch in batches:
-        for incoming in _diagnostic_batches(batch, identities):
-            if incoming.key is not None:
-                if incoming.key in positions:
-                    ordered[positions[incoming.key]] = None
-                positions[incoming.key] = len(ordered)
-            ordered.append(incoming)
-    seen: set[ComponentDiagnostic] = set()
-    result: list[ComponentDiagnostic] = []
-    for group in ordered:
-        if group is None:
-            continue
-        for item in group.items:
-            if group.key is not None or not group.identity_valid:
-                result.append(item)
-            elif item not in seen:
-                result.append(item)
-                seen.add(item)
-    return tuple(result)
+        active: set[BatchKey] = set()
+        for item, key, summary in _diagnostic_batches(batch, identities):
+            if key is not None:
+                if key not in active or summary:
+                    for index in positions.get(key, ()):
+                        ordered[index] = None
+                    positions[key] = []
+                    active.add(key)
+                positions[key].append(len(ordered))
+            else:
+                exact = tuple(
+                    _exact_value(getattr(item, field.name)) for field in fields(item)
+                )
+                if exact in seen:
+                    continue
+                seen.add(exact)
+            ordered.append(item)
+    return tuple(item for item in ordered if item is not None)
 
 
 def _serialized_identity(value: object) -> object:
@@ -205,25 +255,48 @@ def _diagnostic_payload(item: ComponentDiagnostic) -> dict[str, object]:
 
     identity = assess_progress_identity(item.progress_id, item.check_id)
     payload: dict[str, object] = {
-        field.name: getattr(item, field.name)
+        field.name: (
+            getattr(item, field.name)
+            if _field_valid(field.name, getattr(item, field.name))
+            else _invalid_field(getattr(item, field.name))
+        )
         for field in fields(item)
         if getattr(item, field.name) is not None
         or field.name in {"stage", "exit_code", "failure_kind", "detail"}
     }
     for key in ("progress_id", "check_id"):
         if key in payload:
-            payload[key] = _serialized_identity(payload[key])
+            payload[key] = _serialized_identity(getattr(item, key))
     if identity.valid and identity.progress_id == identity.check_id:
         payload.pop("progress_id", None)
-    payload["detail"] = normalize_error_detail(item.detail)
+    if _field_valid("detail", item.detail):
+        payload["detail"] = normalize_error_detail(item.detail)
+    if not _valid_fields(item):
+        payload["metadata_invalid"] = True
     return payload
+
+
+def _invalid_field(value: object) -> dict[str, object]:
+    from grounded_weather_forecast.runs import normalize_error_detail  # noqa: PLC0415
+
+    try:
+        detail = normalize_error_detail(repr(value))
+    except (Exception,):  # noqa: B013 -- hostile optional values stay untrusted
+        detail = "Value could not be represented."
+    return {"invalid_field_type": type(value).__name__, "detail": detail}
 
 
 def failure_details_json(diagnostics: tuple[ComponentDiagnostic, ...]) -> str | None:
     """Bound each component independently so a second error cannot disappear."""
     if not diagnostics:
         return None
-    return json.dumps([_diagnostic_payload(item) for item in diagnostics])
+    payloads: list[dict[str, object]] = []
+    for item in diagnostics:
+        try:
+            payloads.append(_diagnostic_payload(item))
+        except (Exception,):  # noqa: B013 -- preserve other components and core row
+            payloads.append(_diagnostic_payload(diagnostic_damage()))
+    return json.dumps(payloads)
 
 
 @dataclass(frozen=True, slots=True)

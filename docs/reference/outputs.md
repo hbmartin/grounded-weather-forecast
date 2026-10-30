@@ -471,6 +471,51 @@ The explicit legacy detail adapter has typed constructor-compatible arguments,
 including nullable metadata, without stripping typed or journal evidence. Empty
 `audit_cleanup_diagnostics=()` means omitted; nonempty stale batches remain invalid.
 
+### Damaged verification evidence
+
+The retention report's boolean `verification_unknown` is independent of the last
+valid check and outstanding execution failure. Invalid identity, clock or count
+metadata quarantines its affected group; malformed entries and missing/non-string
+stages create uncertainty even when no verification owner can be recovered.
+Contradictory retention-stage metadata is also damaged evidence. Valid unrelated
+components remain unrelated, and independently valid checks stay visible.
+
+Only a valid clear check recorded strictly after the damaged run's validated
+ending clock resolves verification uncertainty. Equal-clock and suspended checks
+do not. A clear dry run can resolve that uncertainty. Separately, a successful
+apply invocation with an independently valid selected clear check clears an
+execution failure even if another group in the same row is damaged. The panel
+remains amber for the unresolved uncertainty until a strictly later clear check.
+A dry run never clears an execution failure itself.
+
+Both clear and suspended legacy verdict-only rows are verdicts, not issue samples.
+Explicitly empty recorded category/path fields on suspended samples retain their
+canonical unknown-category/null-path normalization.
+A suspended verdict without samples or an explicit count keeps its suspension
+and reports an unknown count. Additive nullable `issue_count_known` metadata
+preserves that distinction through diagnostic round trips; false means the count
+is unavailable. The report's nullable `issue_count` and dashboard em dash expose
+that uncertainty. Existing integer library views retain zero recovered samples.
+Explicit counts, duplicate sample occurrences and omitted counts remain validated.
+Ownerless legacy groups preserve their original recorded-clock strings: absent
+clocks and equivalent instants written with different offsets remain distinct.
+Parsed aware clocks still determine validity, chronological order and cutoffs.
+
+Diagnostic merging and serialization execute inside the recorder's protected
+boundary. Progress capture independently contains ordinary diagnostic errors.
+Malformed fields retain bounded JSON-safe evidence, with `metadata_invalid`
+marking invalid fields; an `invalid_diagnostic_metadata` fallback retains a core
+run row when optional processing fails. These are informational damage markers,
+not execution failures. They cannot replace the command's return or original
+exception/cancellation, and do not add ledger columns. Ledger storage remains best
+effort. Public warnings use fixed explanations rather than raw diagnostic prose.
+
+Authoritative summary boundaries replace repeated batch delivery while preserving
+the relative order of every surviving item, including interleaved owners, and
+all duplicate samples inside a surviving batch. Repeated untrusted deliveries
+are deduplicated without hashing raw values. Bounded previews never establish
+that distinct original evidence is equal. Historical artifacts are not rewritten.
+
 ## Daily report reader
 
 Daily-report schema 1 retains its envelope and adds nullable realized-evidence
@@ -507,25 +552,3 @@ If you back up only some of this:
 4. `config.toml`.
 
 Everything else is a function of those.
-
-
-### Damaged verification evidence
-
-The retention report adds boolean `verification_unknown`, independently of the
-last valid check and outstanding execution failure. Invalid identity, clock or
-count metadata quarantines its check group, preserving unrelated valid checks.
-The displayed last valid check may therefore be clear while the overall panel is
-amber with a fixed uncertainty explanation. Only a valid clear check recorded
-strictly after the damaged run's validated ending clock resolves this state;
-equal-clock and suspended checks do not. A clear dry run can resolve verification
-uncertainty, but cannot clear an execution failure.
-
-Legacy verdict-only clear records are not issue samples. Missing summaries use
-observed sample occurrences before the 20-item bound; malformed summaries and
-inconsistent totals remain uncertain. No historical evidence is rewritten.
-
-Optional invalid diagnostic identities retain bounded untrusted JSON evidence
-without blocking the command journal. The serializer compresses valid equal IDs
-without strict validation. Authoritative summary boundaries replace repeated
-batches, including concatenated deliveries, while duplicate sample occurrences
-and summary-less legacy samples remain intact.

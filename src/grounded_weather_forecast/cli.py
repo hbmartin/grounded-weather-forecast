@@ -1825,10 +1825,8 @@ def _run_pipeline_steps(
                     parent_run_id=_parent_run_id(args),
                     failure_kind=result.failure_kind if result is not None else None,
                     error_detail=result.error_detail if result is not None else None,
-                    diagnostics=merge_diagnostics(
-                        tuple(progress),
-                        result.diagnostics if result is not None else (),
-                    ),
+                    diagnostics=result.diagnostics if result is not None else (),
+                    captured_diagnostics=tuple(progress),
                 )
         if (
             tolerate_pending
@@ -2062,6 +2060,7 @@ def _record_run(
     failure_kind: str | None = None,
     error_detail: str | None = None,
     diagnostics: tuple[ComponentDiagnostic, ...] = (),
+    captured_diagnostics: tuple[ComponentDiagnostic, ...] = (),
 ) -> None:
     """Append this invocation to the run ledger; never raises."""
     try:
@@ -2074,6 +2073,16 @@ def _record_run(
         )
 
         error = sys.exc_info()[1]
+        try:
+            diagnostic_json = failure_details_json(
+                merge_diagnostics(captured_diagnostics, diagnostics)
+            )
+        except (Exception,):  # noqa: B013 -- optional evidence cannot erase a core row
+            diagnostic_json = (
+                '[{"stage":"diagnostic_metadata","exit_code":0,'
+                '"failure_kind":"invalid_diagnostic_metadata",'
+                '"detail":"Optional diagnostic evidence could not be processed."}]'
+            )
         try:
             dataset_print = dataset_fingerprint(config)
         except (OSError, ValueError):
@@ -2097,7 +2106,7 @@ def _record_run(
             parent_run_id=parent_run_id,
             failure_kind=failure_kind,
             error_detail=(str(error) if error is not None else error_detail),
-            failure_details_json=failure_details_json(diagnostics),
+            failure_details_json=diagnostic_json,
         )
         runs.append_run(record, runs.runs_path(config))
     except (Exception,):  # noqa: B013 - project style requires tuple clauses
@@ -2132,9 +2141,8 @@ def main(argv: Sequence[str] | None = None) -> int:
                 exit_code=outcome.exit_code if outcome is not None else None,
                 failure_kind=outcome.failure_kind if outcome is not None else None,
                 error_detail=outcome.error_detail if outcome is not None else None,
-                diagnostics=merge_diagnostics(
-                    tuple(progress), outcome.diagnostics if outcome is not None else ()
-                ),
+                diagnostics=outcome.diagnostics if outcome is not None else (),
+                captured_diagnostics=tuple(progress),
             )
 
 
