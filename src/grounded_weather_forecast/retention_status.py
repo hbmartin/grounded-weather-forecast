@@ -9,7 +9,11 @@ from typing import Any, Literal
 import polars as pl
 
 from grounded_weather_forecast.run_health import assess_attempts, aware_moment
-from grounded_weather_forecast.status import EXIT_CONTENTION, ComponentDiagnostic
+from grounded_weather_forecast.status import (
+    EXIT_CONTENTION,
+    ComponentDiagnostic,
+    effective_progress_id,
+)
 from grounded_weather_forecast.verification_text import (
     IssueSource,
     VerificationIssue,
@@ -101,7 +105,7 @@ class RetentionVerification:
         )
         object.__setattr__(self, "check_id", check_id)
         object.__setattr__(
-            self, "progress_id", progress_id if progress_id is not None else check_id
+            self, "progress_id", effective_progress_id(progress_id, check_id)
         )
         object.__setattr__(self, "audit_path", audit_path)
         object.__setattr__(self, "issue_count", issue_count)
@@ -249,7 +253,7 @@ class RetentionVerification:
                     operation=self.audit_operation,
                 ),
             )
-            if self.check_id is not None or self.omitted
+            if self.progress_id is not None or self.omitted
             else ()
         )
         samples = self.sample_issues()
@@ -387,12 +391,24 @@ def _check_mode(items: list[dict[str, Any]], *, fallback: bool | None) -> bool |
     )
 
 
+def _check_identity(items: list[dict[str, Any]]) -> tuple[str | None, str | None]:
+    owners = {
+        effective_progress_id(item.get("progress_id"), item.get("check_id"))
+        for item in items
+    }
+    check_ids = {item["check_id"] for item in items if item.get("check_id") is not None}
+    if len(owners) != 1 or len(check_ids) > 1:
+        raise ValueError("conflicting verification identities")
+    return owners.pop(), next(iter(check_ids), None)
+
+
 def _check_batch(
     items: list[dict[str, Any]],
     ended: datetime,
     *,
     mode: bool | None,
 ) -> RetentionVerification:
+    progress_id, check_id = _check_identity(items)
     kinds = {item.get("failure_kind") for item in items}
     clocks = [
         aware_moment(item["recorded_at"])
@@ -418,6 +434,14 @@ def _check_batch(
     samples = [item for item in items if "issue_count" not in item][
         :VERIFICATION_SAMPLE_LIMIT
     ]
+    # Legacy clear verdict-only rows have no issue metadata. Structured samples
+    # still establish observed occurrences even when their summary is missing.
+    observed_count = (
+        len(items)
+        if kinds != {"retention_clear"}
+        or any(item.get("category") is not None for item in samples)
+        else 0
+    )
 
     def text(key: str) -> str | None:
         value = summary.get(key)
@@ -426,11 +450,9 @@ def _check_batch(
     return RetentionVerification(
         "suspended" if "retention_suspended" in kinds else "clear",
         clocks[0],
-        check_id=items[0].get("check_id"),
+        check_id=check_id,
         audit_path=text("audit_path"),
-        issue_count=summary.get(
-            "issue_count", 0 if kinds == {"retention_clear"} else len(items)
-        ),
+        issue_count=summary.get("issue_count", observed_count),
         audit_error=text("audit_error"),
         dry_run=_check_mode(items, fallback=mode),
         issues=tuple(
@@ -447,7 +469,7 @@ def _check_batch(
         audit_reason_code=text("audit_reason_code"),
         audit_cause_code=text("audit_cause_code"),
         audit_operation=text("operation"),
-        progress_id=text("progress_id"),
+        progress_id=progress_id,
     )
 
 
@@ -459,6 +481,7 @@ def _recorded_checks(
         if not isinstance(raw, list):
             return ()
         groups: dict[tuple[str, object], list[dict[str, Any]]] = {}
+        check_owners: dict[str, str | None] = {}
         for item in raw:
             if (
                 not isinstance(item, dict)
@@ -466,9 +489,15 @@ def _recorded_checks(
                 or item.get("exit_code") != 0
             ):
                 continue
+            owner = effective_progress_id(item.get("progress_id"), item.get("check_id"))
+            check_id = item.get("check_id")
+            if check_id is not None:
+                if check_id in check_owners and check_owners[check_id] != owner:
+                    raise ValueError("conflicting verification owner for check")
+                check_owners[check_id] = owner
             identity = (
-                ("id", item["check_id"])
-                if isinstance(item.get("check_id"), str)
+                ("owner", owner)
+                if owner is not None
                 else ("clock", item.get("recorded_at"))
             )
             groups.setdefault(identity, []).append(item)

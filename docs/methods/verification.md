@@ -494,6 +494,7 @@ Evaluation failures take precedence over promotion-only failures while nullable
 `cli.py::_cmd_prune_scores`, `status.py::diagnostic_progress`,
 `status.py::record_verification_progress`, `status.py::record_progress`,
 `status.py::merge_diagnostics`, `run_health.py`,
+`status.py::effective_progress_id`,
 `dashboard/context.py`, `dashboard/zones/operations.py`.*
 
 Pruning freshly verifies release/event metadata, the active pointer and required
@@ -613,10 +614,20 @@ and rejected. Unmatched issues retain no invented metadata. The nullable
 issues and absent evidence; length and each non-null pair are validated.
 Nonempty compact and aligned inputs cannot be combined. Without explicit issues,
 nonempty `raw_failures` replaces the failure-derived entries completely, truncates
-old tails and derives categories from the supplied outcome. Aligned input provides
+old tails and retains recorded failure roles. Aligned input provides
 explicit annotation of canonical entries. Excess or mismatched metadata is rejected.
 Empty `raw_failures=()` does not erase canonical entries. Explicit `issues=()` still
 clears issues; replacing an issue collection does not borrow old failure metadata.
+Nullable `AuditCleanupFailure.failure_role` is `abort_cause`, `file_local`, or
+unknown. Producers set it at capture; neither position, result outcome, operation
+name nor raw prose establish a role. Explicit legacy categories are recorded role
+evidence and are preserved through canonical entries and compact/aligned views.
+Unclassified raw failures use the neutral `audit_cleanup_failure` category.
+The explicit `issue(aborted=...)` adapter cannot override a known role. Known
+abort-cause evidence requires `aborted=True`; inconsistent completed copies fail
+until their evidence is explicitly corrected or replaced. Filtering out an abort
+cause cannot transfer its role to another failure. No historical artifact is
+rewritten; raw details, paths and operation/cause data remain unchanged.
 `operation` also survives publication
 summary round-trips: pre-link failures report no audit publication, while post-link
 failures retain an unconfirmed candidate. Historical contention and link failures
@@ -655,6 +666,16 @@ gets its own identity; genuinely independent checks and unrelated diagnostics su
 without a returned outcome, captured progress remains authoritative. Legacy batches
 without either identity retain exact-deduplication behavior. This is additive JSON
 metadata, not a new ledger column or historical rewrite. No CLI recomputation occurs.
+Identified batches preserve identical sample occurrences and their order; repeated
+delivery replaces a whole batch rather than deduplicating its evidence. Counts,
+the 20-sample cap and omitted counts therefore remain consistent with full audits.
+Progress-only verifications emit summaries and group by effective identity before
+legacy clocks, preserving independent checks at equal timestamps. Older rows can
+recover consistent identity from samples without a summary. Invalid or conflicting
+identity metadata cannot establish a clear check. The same pure resolver is used
+by binding, merge, reading and serialization. JSON omits only redundant progress
+IDs equal to that row's check ID; renamed and progress-only samples retain their
+owner. Summary-only identity storage is deliberately not used.
 Informational `retention_audit_cleanup` components preserve bounded details and
 separate full paths in the existing journal row; they cannot change command exits or failure
 counters. The 20-note cap still reserves abort and omission slots, and dry runs

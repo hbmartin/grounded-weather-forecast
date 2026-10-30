@@ -10,6 +10,7 @@ from dataclasses import dataclass, field, replace
 from datetime import datetime, timedelta
 from enum import Enum, StrEnum
 from pathlib import Path
+from typing import Literal
 from uuid import uuid4
 
 import polars as pl
@@ -26,6 +27,7 @@ from grounded_weather_forecast.runs import normalize_error_detail, read_runs, ru
 from grounded_weather_forecast.serve.approvals import ApprovalIssue
 from grounded_weather_forecast.status import (
     ComponentDiagnostic,
+    effective_progress_id,
     record_verification_progress,
 )
 from grounded_weather_forecast.storage import temporary_sibling
@@ -385,6 +387,19 @@ def _signature(path: Path) -> tuple[int, ...] | None:
     )
 
 
+type CleanupFailureRole = Literal["abort_cause", "file_local"]
+
+
+def _cleanup_role(category: str) -> CleanupFailureRole | None:
+    match category:
+        case "audit_cleanup_aborted":
+            return "abort_cause"
+        case "audit_cleanup_file_failed":
+            return "file_local"
+        case _:
+            return None
+
+
 @dataclass(frozen=True, slots=True)
 class AuditCleanupFailure:
     operation: str | None
@@ -393,10 +408,20 @@ class AuditCleanupFailure:
     reason_code: str | None = None
     cause_code: str | None = None
     error_type: str | None = None
+    failure_role: CleanupFailureRole | None = None
+
+    def __post_init__(self) -> None:
+        if self.failure_role not in {None, "abort_cause", "file_local"}:
+            raise ValueError("unknown audit cleanup failure role")
 
     @classmethod
     def capture(
-        cls, error: Exception, *, operation: str, path: Path | None
+        cls,
+        error: Exception,
+        *,
+        operation: str,
+        path: Path | None,
+        failure_role: CleanupFailureRole | None = None,
     ) -> "AuditCleanupFailure":
         if isinstance(error, _AuditPublicationError):
             return cls(
@@ -406,6 +431,7 @@ class AuditCleanupFailure:
                 error.reason_code,
                 reason_for_error(error.cause),
                 type(error.cause).__name__,
+                failure_role,
             )
         return cls(
             operation,
@@ -414,12 +440,28 @@ class AuditCleanupFailure:
             None,
             reason_for_error(error),
             type(error).__name__,
+            failure_role,
         )
 
-    def issue(self, *, aborted: bool = False) -> VerificationIssue:
+    def issue(self, *, aborted: bool | None = None) -> VerificationIssue:
+        role = self.failure_role
+        if aborted is not None:
+            supplied: CleanupFailureRole = "abort_cause" if aborted else "file_local"
+            if role is not None and role != supplied:
+                raise ValueError(
+                    "cleanup issue role conflicts with recorded failure role"
+                )
+            role = supplied
+        match role:
+            case "abort_cause":
+                category = "audit_cleanup_aborted"
+            case "file_local":
+                category = "audit_cleanup_file_failed"
+            case _:
+                category = "audit_cleanup_failure"
         return VerificationIssue(
             self.path,
-            "audit_cleanup_aborted" if aborted else "audit_cleanup_file_failed",
+            category,
             normalize_error_detail(self.raw_detail) or "Audit operation failed.",
             self.cause_code
             if self.reason_code in {None, "audit_io_failed"}
@@ -436,10 +478,27 @@ class AuditCleanupEntry:
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "issue", VerificationIssue.from_issue(self.issue))
-        if self.failure is not None and self.issue != self.failure.issue(
-            aborted=self.issue.category == "audit_cleanup_aborted"
-        ):
-            raise ValueError("cleanup issue does not match its failure evidence")
+        if self.failure is not None:
+            failure = self.failure
+            if failure.failure_role is None and (
+                role := _cleanup_role(self.issue.category)
+            ):
+                failure = replace(failure, failure_role=role)
+                object.__setattr__(self, "failure", failure)
+            if self.issue != failure.issue():
+                raise ValueError("cleanup issue does not match its failure evidence")
+
+
+def _failure_matches(issue: VerificationIssue, failure: AuditCleanupFailure) -> bool:
+    role = _cleanup_role(issue.category)
+    if failure.failure_role is not None and failure.failure_role != role:
+        return False
+    expected = (
+        failure.issue(aborted=role == "abort_cause")
+        if role is not None and failure.failure_role is None
+        else failure.issue()
+    )
+    return issue == expected
 
 
 def _failure_positions(
@@ -454,9 +513,7 @@ def _failure_positions(
     for failure in reversed(failures) if reverse else failures:
         for index in indexes:
             issue = issues[index]
-            if issue == failure.issue(
-                aborted=issue.category == "audit_cleanup_aborted"
-            ):
+            if _failure_matches(issue, failure):
                 positions.append(index)
                 break
         else:
@@ -486,7 +543,6 @@ def _cleanup_entries(
     failures: Sequence[AuditCleanupFailure] | None,
     *,
     aligned_failures: Sequence[AuditCleanupFailure | None] | None,
-    aborted: bool,
 ) -> tuple[AuditCleanupEntry, ...]:
     raw = tuple(failures or ())
     if aligned_failures is not None:
@@ -507,10 +563,7 @@ def _cleanup_entries(
         return _annotated_entries(canonical_issues(issues), raw)
     if raw:
         # Failure-only compatibility input replaces its source, including on replace().
-        return tuple(
-            AuditCleanupEntry(failure.issue(aborted=aborted and index == 0), failure)
-            for index, failure in enumerate(raw)
-        )
+        return tuple(AuditCleanupEntry(failure.issue(), failure) for failure in raw)
     return tuple(entries)
 
 
@@ -552,14 +605,18 @@ class AuditCleanupResult:
     ) -> None:
         if aborted and completed is True:
             raise ValueError("an aborted cleanup cannot be completed")
+        normalized = _cleanup_entries(
+            entries,
+            issues,
+            raw_failures,
+            aligned_failures=aligned_failures,
+        )
+        if not aborted and any(
+            entry.issue.category == "audit_cleanup_aborted" for entry in normalized
+        ):
+            raise ValueError("abort-cause evidence requires aborted=True")
         values = {
-            "entries": _cleanup_entries(
-                entries,
-                issues,
-                raw_failures,
-                aligned_failures=aligned_failures,
-                aborted=aborted,
-            ),
+            "entries": normalized,
             "aborted": aborted,
             "omitted_count": omitted_count,
             "recorded_at": recorded_at,
@@ -651,7 +708,7 @@ class AuditCleanupResult:
             exit_code=0,
             recorded_at=self.recorded_at.isoformat() if self.recorded_at else None,
             check_id=check_id,
-            progress_id=progress_id if progress_id is not None else check_id,
+            progress_id=effective_progress_id(progress_id, check_id),
             dry_run=self.dry_run,
         )
         match self.outcome:
@@ -709,7 +766,7 @@ class AuditCleanupRecord:
     diagnostics: tuple[ComponentDiagnostic, ...] = field(init=False)
 
     def __post_init__(self) -> None:
-        identity = self.progress_id if self.progress_id is not None else self.check_id
+        identity = effective_progress_id(self.progress_id, self.check_id)
         object.__setattr__(self, "progress_id", identity)
         object.__setattr__(
             self,
@@ -734,7 +791,9 @@ class _CleanupNotes:
         self.count += 1
         if len(self.samples) < VERIFICATION_SAMPLE_LIMIT:
             self.samples.append(
-                AuditCleanupFailure.capture(error, operation=operation, path=path)
+                AuditCleanupFailure.capture(
+                    error, operation=operation, path=path, failure_role="file_local"
+                )
             )
 
     def finish(
@@ -749,10 +808,10 @@ class _CleanupNotes:
         return AuditCleanupResult(
             entries=tuple(
                 AuditCleanupEntry(
-                    failure.issue(aborted=self.abort is not None and index == 0),
+                    failure.issue(),
                     failure,
                 )
-                for index, failure in enumerate(failures)
+                for failure in failures
             ),
             aborted=self.abort is not None,
             omitted_count=self.count - shown,
@@ -842,7 +901,9 @@ def cleanup_audits_result(
                 except (OSError,) as error:  # noqa: B013 -- independent files still proceed
                     notes.add(path, error, operation="delete")
     except (*_AUDIT_ERRORS,) as error:
-        notes.abort = AuditCleanupFailure.capture(error, operation="cleanup", path=None)
+        notes.abort = AuditCleanupFailure.capture(
+            error, operation="cleanup", path=None, failure_role="abort_cause"
+        )
     return notes.finish(cutoff, dry_run=dry_run)
 
 

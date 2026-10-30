@@ -350,7 +350,14 @@ exit behavior, and later analysis commands.
   Legacy IDs remain readable, and empty diagnostic tuples retain omitted-batch
   compatibility. Compact failure-only replacement removes old tails; sparse
   metadata annotation requires a unique association, with nullable aligned input
-  for duplicate issues. No execution or recovery policy changes. Staging sync
+  for duplicate issues. Abort and file-local roles are recorded at capture;
+  filtering never relabels the next failure, and known abort evidence must be
+  corrected or replaced before a completed copy is accepted. Unknown legacy roles
+  remain neutral. Identical samples survive journal merging within each identified
+  batch; repeated delivery still replaces the batch. Progress-only checks retain
+  identity through reload and remain independent at equal clocks. JSON omits only
+  progress IDs equal to the row's check ID, preserving renamed sample ownership.
+  No execution or recovery policy changes. Staging sync
   failures before linking report no publication; post-link failures preserve an
   unconfirmed candidate. Historical contention/link reasons prove no publication
   when no linked candidate exists; unknown sync phases remain neutral. Cleanup samples
