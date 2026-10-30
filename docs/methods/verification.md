@@ -494,7 +494,8 @@ Evaluation failures take precedence over promotion-only failures while nullable
 `cli.py::_cmd_prune_scores`, `status.py::diagnostic_progress`,
 `status.py::record_verification_progress`, `status.py::record_progress`,
 `status.py::merge_diagnostics`, `run_health.py`,
-`status.py::effective_progress_id`,
+`status.py::effective_progress_id`, `status.py::assess_progress_identity`,
+`status.py::failure_details_json`,
 `dashboard/context.py`, `dashboard/zones/operations.py`.*
 
 Pruning freshly verifies release/event metadata, the active pointer and required
@@ -676,6 +677,27 @@ identity metadata cannot establish a clear check. The same pure resolver is used
 by binding, merge, reading and serialization. JSON omits only redundant progress
 IDs equal to that row's check ID; renamed and progress-only samples retain their
 owner. Summary-only identity storage is deliberately not used.
+Strict domain construction retains identity validation. Journal boundaries use
+non-raising identity assessment; malformed IDs have no trusted ownership and
+serialize as bounded invalid metadata rather than preventing a run record.
+Identity assessment is reused once per object during a merge. Indexed batch
+replacement uses valid summary boundaries, including within concatenated inputs;
+summary-less legacy samples remain one batch per owner per input. Repeated sample
+values never establish a delivery boundary.
+
+Recorded groups are assessed independently. Invalid identity, clock or summary
+metadata quarantines its affected group, including related known ownership hints,
+without discarding unrelated valid checks. The additive report/status field
+`verification_unknown` keeps damaged evidence amber while retaining the last valid
+check. Its uncertainty boundary is the damaged run's validated ending clock. Only
+a valid clear check strictly later than that boundary resolves it; a clear dry run
+can resolve check uncertainty independently of outstanding execution failure.
+Equal-clock or suspended checks cannot resolve damaged evidence. Valid equal-clock
+checks continue to use persisted order. Legacy verdict-only clear rows are excluded
+from samples; totals without a summary count actual occurrences before bounding,
+and invalid summaries or totals smaller than observed samples cannot prove clear
+protection. No failure counter or run-ledger column changes.
+
 Informational `retention_audit_cleanup` components preserve bounded details and
 separate full paths in the existing journal row; they cannot change command exits or failure
 counters. The 20-note cap still reserves abort and omission slots, and dry runs
