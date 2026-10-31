@@ -315,6 +315,12 @@ exit behavior, and later analysis commands.
   clock strings preserve old grouping boundaries.
   Known cleanup-stage damage does not quarantine verification sharing its identity;
   contradictory retention verdicts and unattributable damage remain uncertain.
+  Cleanup damage has a separate amber `cleanup_evidence_unknown` warning and keeps
+  the last valid cleanup outcome/time visible. It changes neither protection
+  verification, apply-run recovery, failed-run counts nor command exits. A valid
+  summary recorded strictly after the damaged run ends resolves it, including a
+  dry run or an incomplete cleanup; equal clocks do not. Absent legacy evidence
+  means cleanup was not recorded.
   Optional diagnostic merging/serialization stays inside the recorder's protected
   boundary, and progress capture is independently safe. Invalid fields retain bounded
   evidence; a fallback preserves the core row without replacing command outcomes or
@@ -322,6 +328,12 @@ exit behavior, and later analysis commands.
   Optional backtest hint validation/encoding/filesystem faults cannot prevent that
   recording attempt. Malformed optional classifications record null and bounded
   damage evidence, never a continuation exemption; cancellation still propagates.
+  Outcomes are normalized before continuation decisions, transport and journaling.
+  Invalid exits become failure 1 / `invalid_command_outcome` with bounded evidence
+  and stop dependent stages. Real integer subclasses and signed signal results
+  remain supported; booleans, strings, floats and out-of-range integers do not.
+  Explicit invocation/stage exception capture excludes callers' handled errors
+  from otherwise successful run records.
   A recognized stage and valid identity establish replacement lineage independently
   of payload validity, so valid final snapshots supersede damaged progress.
   Summary boundaries make concatenated batch delivery idempotent while preserving

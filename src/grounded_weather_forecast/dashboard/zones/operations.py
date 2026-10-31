@@ -429,8 +429,9 @@ def _retention_panel(ctx: DashboardContext) -> Panel:
         )
         omitted_notes = 0
     introduction = [audit_note] if audit_note else []
-    if recorded.verification_warning is not None:
-        introduction.append(recorded.verification_warning)
+    introduction.extend(
+        filter(None, (recorded.verification_warning, recorded.cleanup.warning))
+    )
     if verification.audit_error:
         introduction.append(verification.audit_explanation())
     if compatibility:
@@ -472,6 +473,9 @@ def _retention_panel(ctx: DashboardContext) -> Panel:
                 "yes" if recorded.verification_unknown else "no",
                 status,
             ),
+            Stat("cleanup evidence", recorded.cleanup_evidence_label, status),
+            Stat("cleanup recorded at", recorded.cleanup_recorded_label, "info"),
+            Stat("cleanup outcome", recorded.cleanup_outcome.replace("_", " "), "info"),
             Stat(
                 "audit state",
                 verification.audit_state.replace("_", " "),

@@ -482,6 +482,16 @@ components remain unrelated, and independently valid checks stay visible.
 Malformed `retention_audit_cleanup` evidence stays separate from verification,
 including when their identities match. Unattributable or contradictory stages
 retain conservative uncertainty.
+Cleanup evidence is assessed separately through additive report/status fields:
+`cleanup_evidence_unknown` (boolean), `cleanup_recorded_at` (nullable aware ISO
+clock), `cleanup_outcome` (`not_recorded`, `completed`, `incomplete`, or `unknown`),
+and nullable safe `cleanup_warning`. Damaged cleanup evidence is amber while valid
+verification and apply-run recovery remain intact. Its boundary is the damaged
+run's validated ending clock; only a valid cleanup summary recorded strictly
+later clears it. Dry runs and incomplete summaries may supply valid evidence.
+The last valid summary remains visible; legacy absence and unknown clocks never
+establish unrecorded success or fabricated timestamps. These are report fields,
+not new run-ledger columns or failed-run counters.
 
 Only a valid clear check recorded strictly after the damaged run's validated
 ending clock resolves verification uncertainty. Equal-clock and suspended checks
@@ -521,6 +531,17 @@ effort. Public warnings use fixed explanations rather than raw diagnostic prose.
 Field validation follows cached declared annotations, accepts supported primitive
 subclasses and enums, and normalizes them to JSON primitives while keeping bool
 distinct from int. Each field is assessed once per serialization snapshot.
+The schema follows the concrete diagnostic class and supports primitive/null
+unions (`str`, `int`, `bool`, `None`) and primitive extension fields. Unsupported
+annotations receive field-local damage without losing base stage/identity.
+Normalization accepts actual primitive subclasses, never objects merely spoofing
+their `__class__`. Strict identities and retention states raise `ValueError` for
+invalid inputs; journal boundaries remain tolerant.
+Authoritative command exits are validated before storage, so Polars never coerces
+invalid exits into plausible outcomes. Invalid exits become 1 with
+`invalid_command_outcome`; valid exits retain null classification and bounded
+damage when optional classification is invalid. Invocation-local explicit
+exception capture prevents ambient caller exceptions from contaminating records.
 Ordinary outcome-hint failures cannot prevent the recorder attempt; malformed
 optional classifications record null plus bounded damage evidence and confer no
 continuation exemption. Cancellation retains null-exit/error journaling.

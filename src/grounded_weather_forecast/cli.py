@@ -26,6 +26,7 @@ from grounded_weather_forecast.contracts import (
     TruthSemantics,
     VariableSpec,
 )
+from grounded_weather_forecast.diagnostic_values import actual_string
 from grounded_weather_forecast.serve.schema import Forecast
 from grounded_weather_forecast.status import (
     EXIT_CONTENTION as EXIT_CONTENTION,  # noqa: PLC0414 -- compatibility export
@@ -38,6 +39,7 @@ from grounded_weather_forecast.status import (
     diagnostic_damage,
     diagnostic_progress,
     failure_details_json,
+    invalid_metadata,
     merge_diagnostics,
     record_progress,
     write_outcome_hint,
@@ -1807,8 +1809,12 @@ def _run_pipeline_steps(
         started_at = datetime.now(tz=UTC)
         with diagnostic_progress() as progress:
             result: CommandOutcome | None = None
+            stage_error: BaseException | None = None
             try:
                 result = CommandOutcome.normalize(step())
+            except (BaseException,) as exc:  # noqa: B013 -- capture cancellation without handling it
+                stage_error = exc
+                raise
             finally:
                 stage = argparse.Namespace(
                     **{
@@ -1829,6 +1835,7 @@ def _run_pipeline_steps(
                     error_detail=result.error_detail if result is not None else None,
                     diagnostics=result.diagnostics if result is not None else (),
                     captured_diagnostics=tuple(progress),
+                    error=stage_error,
                 )
         if (
             tolerate_pending
@@ -1840,10 +1847,14 @@ def _run_pipeline_steps(
             print(f"pipeline pending: {name}; continuing diagnostics")
             continue
         if result.exit_code:
-            first_failure = first_failure or result
-            if name in continue_on_failure or (
-                isinstance(result.failure_kind, str)
-                and result.failure_kind in continue_on_failure_kinds
+            first_failure = (
+                result
+                if result.failure_kind == "invalid_command_outcome"
+                else first_failure or result
+            )
+            if result.failure_kind != "invalid_command_outcome" and (
+                name in continue_on_failure
+                or result.failure_kind in continue_on_failure_kinds
             ):
                 print(
                     f"pipeline continuing: {name} exited {result.exit_code}; remaining outputs will run, but the pipeline will return failure",
@@ -2063,6 +2074,7 @@ def _record_run(
     error_detail: str | None = None,
     diagnostics: tuple[ComponentDiagnostic, ...] = (),
     captured_diagnostics: tuple[ComponentDiagnostic, ...] = (),
+    error: BaseException | None = None,
 ) -> None:
     """Append this invocation to the run ledger; never raises."""
     try:
@@ -2074,20 +2086,23 @@ def _record_run(
             dataset_fingerprint,
         )
 
-        error = sys.exc_info()[1]
-        if failure_kind is not None and not isinstance(failure_kind, str):
-            diagnostics = (
-                *diagnostics,
-                ComponentDiagnostic(
-                    "diagnostic_metadata",
-                    0,
-                    "invalid_diagnostic_metadata",
-                    detail=failure_kind,
-                ),
+        outcome = CommandOutcome.normalize(
+            CommandOutcome(
+                exit_code if exit_code is not None else 0,
+                failure_kind,
+                error_detail,
+                diagnostics,
             )
-            failure_kind = None
-        elif isinstance(failure_kind, str):
-            failure_kind = str.__str__(failure_kind)
+        )
+        exit_code = outcome.exit_code if exit_code is not None else None
+        diagnostics = outcome.diagnostics
+        failure_kind, error_detail = outcome.failure_kind, outcome.error_detail
+        if error is not None:
+            try:
+                error_detail = actual_string(str(error))
+            except (Exception,):  # noqa: B013 -- retain the original exception type
+                diagnostics += (invalid_metadata("error_detail", error),)
+                error_detail = None
         try:
             diagnostic_json = failure_details_json(
                 merge_diagnostics(captured_diagnostics, diagnostics)
@@ -2120,7 +2135,7 @@ def _record_run(
             record_kind=record_kind,
             parent_run_id=parent_run_id,
             failure_kind=failure_kind,
-            error_detail=(str(error) if error is not None else error_detail),
+            error_detail=error_detail,
             failure_details_json=diagnostic_json,
         )
         runs.append_run(record, runs.runs_path(config))
@@ -2143,9 +2158,13 @@ def main(argv: Sequence[str] | None = None) -> int:
         return 2
     with diagnostic_progress() as progress:
         outcome: CommandOutcome | None = None
+        error: BaseException | None = None
         try:
             outcome = CommandOutcome.normalize(_dispatch(config, args, parser))
             return outcome.exit_code
+        except (BaseException,) as exc:  # noqa: B013 -- propagate this invocation's failure
+            error = exc
+            raise
         finally:
             try:
                 if args.command == "backtest" and outcome is not None:
@@ -2153,18 +2172,22 @@ def main(argv: Sequence[str] | None = None) -> int:
                         write_outcome_hint(outcome)
                     except (Exception,):  # noqa: B013 -- contain unexpected hint faults too
                         record_progress((diagnostic_damage(),))
+                    except (BaseException,) as exc:  # noqa: B013 -- cancellation remains visible
+                        error = exc
+                        raise
             finally:
                 _record_run(
                     config,
                     args,
                     started_at=started_at,
                     exit_code=outcome.exit_code
-                    if outcome is not None and sys.exc_info()[0] is None
+                    if outcome is not None and error is None
                     else None,
                     failure_kind=outcome.failure_kind if outcome is not None else None,
                     error_detail=outcome.error_detail if outcome is not None else None,
                     diagnostics=outcome.diagnostics if outcome is not None else (),
                     captured_diagnostics=tuple(progress),
+                    error=error,
                 )
 
 

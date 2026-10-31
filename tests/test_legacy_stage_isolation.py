@@ -171,7 +171,7 @@ def test_cleanup_damage_does_not_taint_shared_verification_or_recovery(field, va
         result.verification.state == "clear" and result.verification.check_id == "same"
     )
     assert not result.verification_unknown and not result.outstanding_failure
-    assert result.severity == "ok"
+    assert result.cleanup_evidence_unknown and result.severity == "amber"
     assert json.loads(current["failure_details_json"])[-1]["metadata_invalid"] is True
 
 
@@ -259,7 +259,7 @@ def test_hint_and_parent_optional_metadata_never_erase_the_run(
     ledger = runs.read_runs(runs.runs_path(config))
     assert ledger.height == 1 and ledger["exit_code"][0] == outcome.exit_code
     if outcome.failure_kind is not None:
-        assert not hint.exists()
+        assert json.loads(hint.read_text())["failure_kind"] is None
         assert ledger["failure_kind"][0] is None
         assert "invalid_diagnostic_metadata" in ledger["failure_details_json"][0]
         assert status.read_outcome_hint(hint, outcome.exit_code).failure_kind is None

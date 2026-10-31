@@ -8,13 +8,17 @@ from typing import Any, Literal
 
 import polars as pl
 
+from grounded_weather_forecast.cleanup_status import CleanupStatus
+from grounded_weather_forecast.diagnostic_values import actual_string
 from grounded_weather_forecast.run_health import assess_attempts, aware_moment
 from grounded_weather_forecast.status import (
     EXIT_CONTENTION,
+    VERIFICATION_VERDICT_DETAILS,
     ComponentDiagnostic,
     DiagnosticIdentity,
     assess_progress_identity,
     effective_progress_id,
+    is_verification_verdict,
 )
 from grounded_weather_forecast.verification_text import (
     IssueSource,
@@ -25,10 +29,7 @@ from grounded_weather_forecast.verification_text import (
 )
 
 VERIFICATION_SAMPLE_LIMIT = 20
-_VERDICT_DETAILS = {
-    "retention_clear": "published-score protection verified",
-    "retention_suspended": "published-score deletion suspended: protection could not be verified",
-}
+_VERDICT_DETAILS = VERIFICATION_VERDICT_DETAILS
 
 
 def _verification_issues(
@@ -104,7 +105,12 @@ class RetentionVerification:
     ) -> None:
         # Constructor and replacement inputs are literal evidence. Prefix stripping
         # belongs exclusively to the explicit legacy adapter below.
-        object.__setattr__(self, "state", state)
+        normalized_state = actual_string(state)
+        if normalized_state not in ("clear", "suspended", "not_recorded"):
+            raise ValueError(
+                "verification state must be clear, suspended, or not_recorded"
+            )
+        object.__setattr__(self, "state", normalized_state)
         object.__setattr__(self, "recorded_at", recorded_at)
         object.__setattr__(
             self,
@@ -120,7 +126,9 @@ class RetentionVerification:
         if issue_count_known is not None and type(issue_count_known) is not bool:
             raise ValueError("issue count knowledge must be boolean or null")
         if issue_count_known is False and (
-            state != "suspended" or self.issues or issue_count not in (None, 0)
+            normalized_state != "suspended"
+            or self.issues
+            or issue_count not in (None, 0)
         ):
             raise ValueError("unknown issue count requires a sample-free suspension")
         object.__setattr__(self, "issue_count_known", issue_count_known)
@@ -352,6 +360,33 @@ class RetentionStatus:
     as_of: datetime | None = None
     attempt_dry_run: bool | None = None
     verification_unknown: bool = False
+    cleanup: CleanupStatus = field(default_factory=CleanupStatus)
+
+    @property
+    def cleanup_evidence_unknown(self) -> bool:
+        return self.cleanup.uncertainty_until is not None
+
+    @property
+    def cleanup_recorded_at(self) -> datetime | None:
+        return self.cleanup.latest.recorded_at if self.cleanup.latest else None
+
+    @property
+    def cleanup_outcome(self) -> str:
+        return self.cleanup.latest.outcome if self.cleanup.latest else "not_recorded"
+
+    @property
+    def cleanup_recorded_label(self) -> str:
+        return self.cleanup_recorded_at.isoformat() if self.cleanup_recorded_at else "—"
+
+    @property
+    def cleanup_evidence_label(self) -> str:
+        return (
+            "damaged"
+            if self.cleanup_evidence_unknown
+            else "not recorded"
+            if self.cleanup.latest is None
+            else "recorded"
+        )
 
     @property
     def verification_warning(self) -> str | None:
@@ -367,6 +402,7 @@ class RetentionStatus:
         if (
             self.verification.state == "suspended"
             or self.verification_unknown
+            or self.cleanup_evidence_unknown
             or self.outstanding_failure
             or self.attempt_state in {"failed", "unknown"}
         ):
@@ -409,6 +445,15 @@ class RetentionStatus:
             pl.lit(self.check_age_minutes, dtype=pl.Float64).alias("check_age_minutes"),
             pl.lit(self.outstanding_failure).alias("outstanding_failure"),
             pl.lit(self.verification_unknown).alias("verification_unknown"),
+            pl.lit(self.cleanup_evidence_unknown).alias("cleanup_evidence_unknown"),
+            pl.lit(
+                self.cleanup_recorded_at.isoformat()
+                if self.cleanup_recorded_at
+                else None,
+                dtype=pl.String,
+            ).alias("cleanup_recorded_at"),
+            pl.lit(self.cleanup_outcome).alias("cleanup_outcome"),
+            pl.lit(self.cleanup.warning, dtype=pl.String).alias("cleanup_warning"),
             pl.lit(self.attempt_dry_run, dtype=pl.Boolean).alias(
                 "latest_attempt_dry_run"
             ),
@@ -564,7 +609,7 @@ def _check_batch(
     ]
     if (
         not kinds
-        or not kinds <= {"retention_clear", "retention_suspended"}
+        or not all(is_verification_verdict(kind) for kind in kinds)
         or any(clock is None or clock > ended for clock in clocks)
         or len(set(clocks)) != 1
     ):
@@ -700,9 +745,8 @@ def _damaged_diagnostic(item: object) -> bool:
         return True
     if item.get("failure_kind") == "invalid_diagnostic_metadata":
         return True
-    return stage != "retention_verification" and item.get("failure_kind") in (
-        "retention_clear",
-        "retention_suspended",
+    return stage != "retention_verification" and is_verification_verdict(
+        item.get("failure_kind")
     )
 
 
@@ -726,8 +770,7 @@ def _recorded_check_assessment(
         if (
             isinstance(item, dict)
             and item.get("stage") == "retention_audit_cleanup"
-            and item.get("failure_kind")
-            not in ("retention_clear", "retention_suspended")
+            and not is_verification_verdict(item.get("failure_kind"))
         ):
             # Cleanup shares lineage with verification, not its validity domain.
             continue
@@ -792,8 +835,10 @@ def retention_status(runs: pl.DataFrame, *, as_of: datetime) -> RetentionStatus:
     outstanding = False
     mode = None
     uncertainty_until: datetime | None = None
+    cleanup = CleanupStatus()
     for attempt in assessment.attempts:
         row, latest = attempt.row, attempt.ended_at
+        cleanup = cleanup.advance(row, latest)
         recorded = _recorded_check_assessment(row, latest)
         checks = recorded.checks
         uncertainty_until = _verification_uncertainty(
@@ -823,6 +868,7 @@ def retention_status(runs: pl.DataFrame, *, as_of: datetime) -> RetentionStatus:
         as_of,
         mode,
         uncertainty_until is not None,
+        cleanup,
     )
 
 
