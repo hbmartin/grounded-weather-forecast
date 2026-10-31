@@ -491,11 +491,11 @@ Evaluation failures take precedence over promotion-only failures while nullable
 
 *Implemented in: `reports/operations.py`, `retention_status.py`, `retention_audit.py`, `clocks.py`,
 `artifact_labels.py`, `verification_text.py`,
-`cli.py::_cmd_prune_scores`, `cli.py::_record_run`, `status.py::diagnostic_progress`,
+`cli.py::_cmd_prune_scores`, `cli.py::_record_run`, `cli.py::main`, `status.py::diagnostic_progress`,
 `status.py::record_verification_progress`, `status.py::record_progress`,
 `status.py::merge_diagnostics`, `run_health.py`,
 `status.py::effective_progress_id`, `status.py::assess_progress_identity`,
-`status.py::failure_details_json`,
+`status.py::failure_details_json`, `status.py::write_outcome_hint`,
 `dashboard/context.py`, `dashboard/zones/operations.py`.*
 
 Pruning freshly verifies release/event metadata, the active pointer and required
@@ -680,7 +680,10 @@ owner. Summary-only identity storage is deliberately not used.
 Strict domain construction retains identity validation. Journal boundaries use
 non-raising identity assessment. Merging and serialization execute inside the
 recorder's protected boundary; progress capture independently contains ordinary
-telemetry failures. Malformed fields have no trusted ownership and serialize as
+telemetry failures. A recognized retention stage and valid progress/check identity
+establish replacement ownership independently of other payload validity. Valid
+final snapshots supersede damaged progress; malformed ownership cannot replace
+another batch. Malformed payload fields serialize as
 bounded invalid metadata with `metadata_invalid`; `invalid_diagnostic_metadata`
 marks core-row fallback if optional processing fails. The original result,
 exception/cancellation and one invocation/stage row are preserved when ledger
@@ -692,6 +695,15 @@ replacement uses valid summary boundaries, including within concatenated inputs,
 without moving surviving interleaved items; summary-less legacy samples remain
 one batch per owner per input. Repeated sample
 values never establish a delivery boundary.
+Cached declared annotations govern field validation, including nullable values and
+supported string/integer subclasses or enums. Serialization projects primitives
+from one assessment per field; booleans do not satisfy integer annotations.
+Optional backtest outcome-hint validation, encoding and filesystem failures are
+contained before the recorder attempt. Malformed optional classifications are
+omitted from hints and stored as null with bounded damage evidence; they never
+grant continuation exemptions. Cancellation propagates with the existing
+null-exit/error journal convention. The last-resort core-row marker remains
+independent of the serializer it replaces.
 
 Recorded groups are assessed independently. Invalid identity, clock or summary
 metadata quarantines its affected group, including related known ownership hints,
@@ -706,13 +718,25 @@ suspended checks cannot resolve damaged verification evidence. Malformed entries
 missing/non-string stages and contradictory retention-stage data are uncertain;
 valid unrelated stages remain unrelated. Group assessment is repeatable and does
 not mutate ingestion state. Valid equal-clock checks continue to use persisted order.
+Known cleanup-stage damage remains separate even when it shares verification
+lineage. Cleanup data claiming a verification verdict is still contradictory and
+quarantines affected evidence.
 
+Historical detail-only samples are retained literally with duplicate occurrences.
+Only the exact fallback markers `published-score protection verified` and
+`published-score deletion suspended: protection could not be verified` may be
+sample-free verdicts. Summary and omitted-count metadata distinguish genuine
+samples whose text equals a marker; ambiguous subsets or inconsistent counts
+remain uncertain. Frozen `bd9f70c` and `35fc7e0` wire fixtures establish historical
+compatibility without requiring Git history in tests or rewriting evidence.
 Legacy clear and suspended verdict-only rows are excluded from samples.
 Explicitly empty recorded category/path fields on suspended samples retain their
 canonical unknown-category/null-path normalization. A suspended
 verdict with no samples or recorded total carries `issue_count_known=False`, showing
 an unavailable count without fabricating an issue. Nullable diagnostic metadata
-preserves this knowledge through summary and sample round trips; integer library
+preserves this knowledge through summary and sample round trips. Unknown totals
+and omissions render as null in reports and an em dash in the dashboard; older
+zero-valued omission placeholders remain readable. Integer library
 views retain zero recovered samples. Explicit totals and omitted counts remain
 validated. Ownerless groups retain raw recorded-clock boundaries, including absent
 versus explicit clocks and equivalent offset strings; parsed aware clocks control

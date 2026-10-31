@@ -1,0 +1,172 @@
+[
+  {
+    "writer_commit": "bd9f70c",
+    "identified": false,
+    "samples": false,
+    "diagnostics": [
+      {
+        "stage": "retention_verification",
+        "exit_code": 0,
+        "failure_kind": "retention_suspended",
+        "detail": "published-score deletion suspended: protection could not be verified",
+        "recorded_at": "2026-10-22T14:20:00+00:00"
+      }
+    ]
+  },
+  {
+    "writer_commit": "bd9f70c",
+    "identified": false,
+    "samples": true,
+    "diagnostics": [
+      {
+        "stage": "retention_verification",
+        "exit_code": 0,
+        "failure_kind": "retention_suspended",
+        "detail": "unreadable: genuine raw evidence",
+        "recorded_at": "2026-10-22T14:20:00+00:00"
+      },
+      {
+        "stage": "retention_verification",
+        "exit_code": 0,
+        "failure_kind": "retention_suspended",
+        "detail": "second genuine legacy detail",
+        "recorded_at": "2026-10-22T14:20:00+00:00"
+      }
+    ]
+  },
+  {
+    "writer_commit": "bd9f70c",
+    "identified": true,
+    "samples": false,
+    "diagnostics": [
+      {
+        "stage": "retention_verification",
+        "exit_code": 0,
+        "failure_kind": "retention_suspended",
+        "detail": "published-score deletion suspended: protection could not be verified",
+        "recorded_at": "2026-10-22T14:20:00+00:00",
+        "check_id": "old",
+        "issue_count": 0,
+        "omitted_count": 0
+      }
+    ]
+  },
+  {
+    "writer_commit": "bd9f70c",
+    "identified": true,
+    "samples": true,
+    "diagnostics": [
+      {
+        "stage": "retention_verification",
+        "exit_code": 0,
+        "failure_kind": "retention_suspended",
+        "detail": "published-score deletion suspended: protection could not be verified",
+        "recorded_at": "2026-10-22T14:20:00+00:00",
+        "check_id": "old",
+        "issue_count": 2,
+        "omitted_count": 0
+      },
+      {
+        "stage": "retention_verification",
+        "exit_code": 0,
+        "failure_kind": "retention_suspended",
+        "detail": "unreadable: genuine raw evidence",
+        "recorded_at": "2026-10-22T14:20:00+00:00",
+        "check_id": "old"
+      },
+      {
+        "stage": "retention_verification",
+        "exit_code": 0,
+        "failure_kind": "retention_suspended",
+        "detail": "second genuine legacy detail",
+        "recorded_at": "2026-10-22T14:20:00+00:00",
+        "check_id": "old"
+      }
+    ]
+  },
+  {
+    "writer_commit": "35fc7e0",
+    "identified": false,
+    "samples": false,
+    "diagnostics": [
+      {
+        "stage": "retention_verification",
+        "exit_code": 0,
+        "failure_kind": "retention_suspended",
+        "detail": "published-score deletion suspended: protection could not be verified",
+        "recorded_at": "2026-10-22T14:20:00+00:00"
+      }
+    ]
+  },
+  {
+    "writer_commit": "35fc7e0",
+    "identified": false,
+    "samples": true,
+    "diagnostics": [
+      {
+        "stage": "retention_verification",
+        "exit_code": 0,
+        "failure_kind": "retention_suspended",
+        "detail": "unreadable: genuine raw evidence",
+        "recorded_at": "2026-10-22T14:20:00+00:00"
+      },
+      {
+        "stage": "retention_verification",
+        "exit_code": 0,
+        "failure_kind": "retention_suspended",
+        "detail": "second genuine legacy detail",
+        "recorded_at": "2026-10-22T14:20:00+00:00"
+      }
+    ]
+  },
+  {
+    "writer_commit": "35fc7e0",
+    "identified": true,
+    "samples": false,
+    "diagnostics": [
+      {
+        "stage": "retention_verification",
+        "exit_code": 0,
+        "failure_kind": "retention_suspended",
+        "detail": "published-score deletion suspended: protection could not be verified",
+        "recorded_at": "2026-10-22T14:20:00+00:00",
+        "check_id": "old",
+        "issue_count": 0,
+        "omitted_count": 0
+      }
+    ]
+  },
+  {
+    "writer_commit": "35fc7e0",
+    "identified": true,
+    "samples": true,
+    "diagnostics": [
+      {
+        "stage": "retention_verification",
+        "exit_code": 0,
+        "failure_kind": "retention_suspended",
+        "detail": "published-score deletion suspended: protection could not be verified",
+        "recorded_at": "2026-10-22T14:20:00+00:00",
+        "check_id": "old",
+        "issue_count": 2,
+        "omitted_count": 0
+      },
+      {
+        "stage": "retention_verification",
+        "exit_code": 0,
+        "failure_kind": "retention_suspended",
+        "detail": "unreadable: genuine raw evidence",
+        "recorded_at": "2026-10-22T14:20:00+00:00",
+        "check_id": "old"
+      },
+      {
+        "stage": "retention_verification",
+        "exit_code": 0,
+        "failure_kind": "retention_suspended",
+        "detail": "second genuine legacy detail",
+        "recorded_at": "2026-10-22T14:20:00+00:00",
+        "check_id": "old"
+      }
+    ]
+  }
+]

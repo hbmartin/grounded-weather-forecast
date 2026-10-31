@@ -136,6 +136,13 @@ specific diagnostics. Explicit empty pointers retain degraded-output semantics;
 pruning exit codes remain unchanged. Repair the named source before expecting
 retention to resume.
 
+Historical pruning journals retain detail-only samples, including duplicates;
+only the documented fallback verdict markers may represent sample-free checks.
+Unknown aggregate totals and omissions display as unavailable. Valid final
+snapshots replace damaged progress using stage and identity, while cleanup damage
+stays separate from verification. Optional backtest hint failures cannot prevent
+the run-recording attempt or change the command result.
+
 Daily reads query rollback-mode SQLite bytes in memory and never pass source
 filenames to SQLite. WAL or journal-dependent sources fail closed: station reads
 use the published JSON fallback and provider health becomes explicitly unknown.

@@ -35,9 +35,11 @@ from grounded_weather_forecast.status import (
     PROMOTION_ONLY_FAILURE_KINDS,
     CommandOutcome,
     ComponentDiagnostic,
+    diagnostic_damage,
     diagnostic_progress,
     failure_details_json,
     merge_diagnostics,
+    record_progress,
     write_outcome_hint,
 )
 
@@ -1839,9 +1841,9 @@ def _run_pipeline_steps(
             continue
         if result.exit_code:
             first_failure = first_failure or result
-            if (
-                name in continue_on_failure
-                or result.failure_kind in continue_on_failure_kinds
+            if name in continue_on_failure or (
+                isinstance(result.failure_kind, str)
+                and result.failure_kind in continue_on_failure_kinds
             ):
                 print(
                     f"pipeline continuing: {name} exited {result.exit_code}; remaining outputs will run, but the pipeline will return failure",
@@ -2073,6 +2075,19 @@ def _record_run(
         )
 
         error = sys.exc_info()[1]
+        if failure_kind is not None and not isinstance(failure_kind, str):
+            diagnostics = (
+                *diagnostics,
+                ComponentDiagnostic(
+                    "diagnostic_metadata",
+                    0,
+                    "invalid_diagnostic_metadata",
+                    detail=failure_kind,
+                ),
+            )
+            failure_kind = None
+        elif isinstance(failure_kind, str):
+            failure_kind = str.__str__(failure_kind)
         try:
             diagnostic_json = failure_details_json(
                 merge_diagnostics(captured_diagnostics, diagnostics)
@@ -2132,18 +2147,25 @@ def main(argv: Sequence[str] | None = None) -> int:
             outcome = CommandOutcome.normalize(_dispatch(config, args, parser))
             return outcome.exit_code
         finally:
-            if args.command == "backtest" and outcome is not None:
-                write_outcome_hint(outcome)
-            _record_run(
-                config,
-                args,
-                started_at=started_at,
-                exit_code=outcome.exit_code if outcome is not None else None,
-                failure_kind=outcome.failure_kind if outcome is not None else None,
-                error_detail=outcome.error_detail if outcome is not None else None,
-                diagnostics=outcome.diagnostics if outcome is not None else (),
-                captured_diagnostics=tuple(progress),
-            )
+            try:
+                if args.command == "backtest" and outcome is not None:
+                    try:
+                        write_outcome_hint(outcome)
+                    except (Exception,):  # noqa: B013 -- contain unexpected hint faults too
+                        record_progress((diagnostic_damage(),))
+            finally:
+                _record_run(
+                    config,
+                    args,
+                    started_at=started_at,
+                    exit_code=outcome.exit_code
+                    if outcome is not None and sys.exc_info()[0] is None
+                    else None,
+                    failure_kind=outcome.failure_kind if outcome is not None else None,
+                    error_detail=outcome.error_detail if outcome is not None else None,
+                    diagnostics=outcome.diagnostics if outcome is not None else (),
+                    captured_diagnostics=tuple(progress),
+                )
 
 
 def _read_daily_error(limitation: str) -> int:
