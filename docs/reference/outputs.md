@@ -479,6 +479,9 @@ metadata quarantines its affected group; malformed entries and missing/non-strin
 stages create uncertainty even when no verification owner can be recovered.
 Contradictory retention-stage metadata is also damaged evidence. Valid unrelated
 components remain unrelated, and independently valid checks stay visible.
+Malformed `retention_audit_cleanup` evidence stays separate from verification,
+including when their identities match. Unattributable or contradictory stages
+retain conservative uncertainty.
 
 Only a valid clear check recorded strictly after the damaged run's validated
 ending clock resolves verification uncertainty. Equal-clock and suspended checks
@@ -489,13 +492,19 @@ remains amber for the unresolved uncertainty until a strictly later clear check.
 A dry run never clears an execution failure itself.
 
 Both clear and suspended legacy verdict-only rows are verdicts, not issue samples.
+Historical detail-only samples remain literal evidence with duplicate occurrences.
+Only exact documented fallback verdict strings are candidates for sample-free
+recognition; summary/count metadata resolves identical-text samples when possible.
+Ambiguous or inconsistent counts remain uncertain. Frozen fixtures from the
+`bd9f70c` and `35fc7e0` writers cover compatibility without rewriting artifacts.
 Explicitly empty recorded category/path fields on suspended samples retain their
 canonical unknown-category/null-path normalization.
 A suspended verdict without samples or an explicit count keeps its suspension
 and reports an unknown count. Additive nullable `issue_count_known` metadata
 preserves that distinction through diagnostic round trips; false means the count
-is unavailable. The report's nullable `issue_count` and dashboard em dash expose
+is unavailable. The report's nullable `issue_count`/`omitted_count` and dashboard em dash expose
 that uncertainty. Existing integer library views retain zero recovered samples.
+Older zero-valued omission placeholders remain readable.
 Explicit counts, duplicate sample occurrences and omitted counts remain validated.
 Ownerless legacy groups preserve their original recorded-clock strings: absent
 clocks and equivalent instants written with different offsets remain distinct.
@@ -509,12 +518,20 @@ run row when optional processing fails. These are informational damage markers,
 not execution failures. They cannot replace the command's return or original
 exception/cancellation, and do not add ledger columns. Ledger storage remains best
 effort. Public warnings use fixed explanations rather than raw diagnostic prose.
+Field validation follows cached declared annotations, accepts supported primitive
+subclasses and enums, and normalizes them to JSON primitives while keeping bool
+distinct from int. Each field is assessed once per serialization snapshot.
+Ordinary outcome-hint failures cannot prevent the recorder attempt; malformed
+optional classifications record null plus bounded damage evidence and confer no
+continuation exemption. Cancellation retains null-exit/error journaling.
 
 Authoritative summary boundaries replace repeated batch delivery while preserving
 the relative order of every surviving item, including interleaved owners, and
 all duplicate samples inside a surviving batch. Repeated untrusted deliveries
 are deduplicated without hashing raw values. Bounded previews never establish
 that distinct original evidence is equal. Historical artifacts are not rewritten.
+Valid stage/identity ownership controls replacement independently of payload
+validity, allowing final snapshots to supersede malformed progress safely.
 
 ## Daily report reader
 

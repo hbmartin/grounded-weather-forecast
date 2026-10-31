@@ -1227,6 +1227,20 @@ items remain intact, including interleaved check owners. Without a summary,
 legacy samples form one batch per owner per input; repeated values do not imply
 another delivery.
 
+Replacement ownership depends on a recognized retention stage and valid identity,
+independently of other payload fields. A valid final snapshot therefore replaces
+damaged progress for that stage/owner; malformed ownership cannot replace it.
+Serialization validates each field once against cached declared annotations,
+normalizes supported string/integer subclasses (including enums), and distinguishes
+booleans from integers.
+
+Backtest outcome hints are optional transport. Ordinary validation, encoding and
+filesystem failures cannot prevent the recorder attempt or change the return
+value. Invalid optional outcome classifications are omitted from hints, recorded
+as null with bounded damage evidence, and grant no maintenance continuation
+exemption. Cancellation still propagates and uses the existing null-exit/error
+journal convention.
+
 Malformed or conflicting check groups are quarantined separately, preserving
 unrelated valid checks. Reports add `verification_unknown`: the last valid check
 stays visible, but unresolved damage is amber. A valid clear check must be recorded
@@ -1238,12 +1252,20 @@ when another group in its row is damaged. That damage still leaves the panel amb
 until a strictly later clear check. Valid equal-clock checks retain persisted-order
 precedence. Malformed entries, absent/non-string stages and contradictory retention
 stage metadata create uncertainty; valid unrelated components are ignored.
+Known `retention_audit_cleanup` damage remains separate even when it shares a
+verification identity. A cleanup item claiming a verification verdict remains
+contradictory evidence and is quarantined.
 
-Neither clear nor suspended legacy verdict-only rows create samples. A sample-free
+Detail-only samples from historical writers remain literal evidence, including
+duplicates. Only the exact fallback strings `published-score protection verified`
+and `published-score deletion suspended: protection could not be verified` may
+represent verdict-only rows. Available summary/omission counts distinguish those
+verdicts from samples with identical text; inconsistent or ambiguous evidence
+remains uncertain. Neither clear nor suspended verdict-only rows create samples. A sample-free
 legacy suspension without a recorded count remains suspended with an unavailable
 count. Additive nullable `issue_count_known` diagnostic metadata preserves this
-state: false means unknown, shown as null in the report's `issue_count` and an em
-dash in the dashboard. Integer library compatibility views still return recovered
+state: false means unknown, shown as null in the report's `issue_count` and
+`omitted_count` and an em dash in the dashboard. Integer library compatibility views still return recovered
 sample counts. Explicit counts and actual sample multiplicity remain validated.
 Ownerless legacy checks retain raw clock grouping, including distinct missing and
 explicit clocks and different offset strings for the same instant. Parsed clocks

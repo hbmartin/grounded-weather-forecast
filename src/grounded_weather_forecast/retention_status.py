@@ -25,6 +25,10 @@ from grounded_weather_forecast.verification_text import (
 )
 
 VERIFICATION_SAMPLE_LIMIT = 20
+_VERDICT_DETAILS = {
+    "retention_clear": "published-score protection verified",
+    "retention_suspended": "published-score deletion suspended: protection could not be verified",
+}
 
 
 def _verification_issues(
@@ -237,11 +241,7 @@ class RetentionVerification:
     def diagnostics(self) -> tuple[ComponentDiagnostic, ...]:
         if self.state == "not_recorded":
             return ()
-        fallback = (
-            "published-score protection verified"
-            if self.state == "clear"
-            else "published-score deletion suspended: protection could not be verified"
-        )
+        fallback = _VERDICT_DETAILS[f"retention_{self.state}"]
         common = ComponentDiagnostic(
             stage="retention_verification",
             exit_code=0,
@@ -259,7 +259,9 @@ class RetentionVerification:
                     detail=fallback,
                     audit_path=self.audit_path,
                     issue_count=self.total,
-                    omitted_count=self.omitted,
+                    omitted_count=None
+                    if self.issue_count_known is False
+                    else self.omitted,
                     audit_error=self.audit_error,
                     audit_candidate_path=self.audit_candidate_path,
                     audit_reason_code=self.audit_reason_code,
@@ -315,7 +317,10 @@ class RetentionVerification:
                     [None if self.issue_count_known is False else self.total],
                     dtype=pl.Int64,
                 ),
-                "omitted_count": [self.omitted],
+                "omitted_count": pl.Series(
+                    [None if self.issue_count_known is False else self.omitted],
+                    dtype=pl.Int64,
+                ),
                 "audit_state": [self.audit_state],
                 "audit_path": [
                     (audit_path_label or str)(self.audit_path)
@@ -461,7 +466,7 @@ def _check_parts(
     items: list[dict[str, Any]],
 ) -> tuple[dict[str, Any], list[dict[str, Any]], int]:
     summaries: list[dict[str, Any]] = []
-    samples: list[dict[str, Any]] = []
+    rows: list[dict[str, Any]] = []
     for item in items:
         metadata = _has_issue_metadata(item)
         if "issue_count" in item:
@@ -472,11 +477,12 @@ def _check_parts(
             ):
                 raise ValueError("invalid verification summary")
             summaries.append(item)
-        elif metadata:
-            samples.append(item)
+        else:
+            rows.append(item)
     if len(summaries) > 1:
         raise ValueError("conflicting verification summaries")
     summary = summaries[0] if summaries else {}
+    samples = _legacy_samples(rows, summary)
     total = summary.get("issue_count", len(samples))
     if total < len(samples):
         raise ValueError("verification total is smaller than its samples")
@@ -487,6 +493,40 @@ def _check_parts(
     ):
         raise ValueError("invalid verification omitted count")
     return summary, samples[:VERIFICATION_SAMPLE_LIMIT], total
+
+
+def _legacy_samples(
+    rows: list[dict[str, Any]], summary: dict[str, Any]
+) -> list[dict[str, Any]]:
+    """Only exact wire verdict markers may stand in for absent legacy samples."""
+    verdicts: list[dict[str, Any]] = []
+    actual: list[dict[str, Any]] = []
+    for item in rows:
+        if not _has_issue_metadata(item) and item.get("detail") == _VERDICT_DETAILS.get(
+            item["failure_kind"]
+        ):
+            verdicts.append(item)
+        else:
+            actual.append(item)
+    if not verdicts:
+        return rows
+    if not summary or summary.get("issue_count_known") is False:
+        return actual
+    total = summary["issue_count"]
+    omitted = summary.get("omitted_count")
+    if omitted is not None and (type(omitted) is not int or not 0 <= omitted <= total):
+        raise ValueError("invalid verification omitted count")
+    expected = (
+        total - omitted
+        if omitted is not None
+        else min(total, VERIFICATION_SAMPLE_LIMIT)
+    )
+    needed = expected - len(actual)
+    if needed == 0:
+        return actual
+    if needed == len(verdicts):
+        return rows
+    raise ValueError("ambiguous legacy verification samples")
 
 
 def _count_knowledge(items: list[dict[str, Any]], *, has_samples: bool) -> bool | None:
@@ -683,6 +723,14 @@ def _recorded_check_assessment(
         )
     groups = _CheckGroups()
     for item in raw:
+        if (
+            isinstance(item, dict)
+            and item.get("stage") == "retention_audit_cleanup"
+            and item.get("failure_kind")
+            not in ("retention_clear", "retention_suspended")
+        ):
+            # Cleanup shares lineage with verification, not its validity domain.
+            continue
         if _damaged_diagnostic(item):
             groups.reject(item, "invalid_diagnostic_metadata")
         elif item.get("stage") == "retention_verification":

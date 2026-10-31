@@ -477,7 +477,13 @@ def _retention_panel(ctx: DashboardContext) -> Panel:
                 verification.audit_state.replace("_", " "),
                 "amber" if verification.audit_error else "info",
             ),
-            Stat("omitted from samples", str(verification.omitted), "info"),
+            Stat(
+                "omitted from samples",
+                _issue_count_label(
+                    verification.omitted, known=verification.issue_count_known
+                ),
+                "info",
+            ),
             Stat(
                 "full audit",
                 audit_label(verification.audit_path, ctx.config)

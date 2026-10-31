@@ -7,7 +7,7 @@ from contextlib import contextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass, fields
 from pathlib import Path
-from typing import cast
+from typing import cast, get_args, get_type_hints
 
 EXIT_NO_FOLDS = 3
 EXIT_CONTENTION = 75
@@ -55,6 +55,12 @@ class ComponentDiagnostic:
     issue_count_known: bool | None = None
 
 
+_FIELD_TYPES: dict[str, tuple[type, ...]] = {
+    name: get_args(annotation) or (annotation,)
+    for name, annotation in get_type_hints(ComponentDiagnostic).items()
+}
+
+
 _progress: ContextVar[list[ComponentDiagnostic] | None] = ContextVar(
     "command_progress", default=None
 )
@@ -90,7 +96,10 @@ class DiagnosticIdentity:
 
 
 def _identity_hint(value: object) -> str | None:
-    return value if isinstance(value, str) and value.strip() else None
+    if not isinstance(value, str):
+        return None
+    text = str.__str__(value)
+    return text if text.strip() else None
 
 
 def assess_progress_identity(
@@ -128,19 +137,20 @@ def diagnostic_damage() -> ComponentDiagnostic:
 
 
 def _field_valid(name: str, value: object) -> bool:
-    if value is None:
-        return name not in {"stage", "exit_code"}
-    if name == "exit_code" or name.endswith("_count"):
-        return type(value) is int
-    if name in {"dry_run", "cleanup_completed", "issue_count_known"}:
-        return type(value) is bool
-    return type(value) is str and (name != "stage" or bool(value.strip()))
+    allowed = _FIELD_TYPES[name]
+    if isinstance(value, bool):
+        return bool in allowed
+    if not isinstance(value, allowed):
+        return False
+    return name != "stage" or bool(str.__str__(cast(str, value)).strip())
 
 
-def _valid_fields(item: ComponentDiagnostic) -> bool:
-    return all(
-        _field_valid(field.name, getattr(item, field.name)) for field in fields(item)
-    )
+def _primitive(value: object) -> object:
+    if isinstance(value, str):
+        return str.__str__(value)
+    if isinstance(value, int) and not isinstance(value, bool):
+        return int.__int__(value)
+    return value
 
 
 def _exact_value(value: object, ancestors: tuple[int, ...] = ()) -> object:
@@ -185,19 +195,16 @@ def _diagnostic_batches(
                 item.progress_id, item.check_id
             )
         identity = identities[id(item)]
+        stage = str.__str__(item.stage) if isinstance(item.stage, str) else None
         key = (
-            (item.stage, identity.owner)
-            if isinstance(item.stage, str)
-            and item.stage in _RETENTION_STAGES
+            (stage, identity.owner)
+            if stage is not None
+            and stage in _RETENTION_STAGES
             and identity.owner is not None
-            and _valid_fields(item)
             else None
         )
-        summary = (
-            type(item.issue_count) is int
-            and item.issue_count >= 0
-            and item.category is None
-        )
+        count = _primitive(item.issue_count)
+        summary = type(count) is int and count >= 0 and item.category is None
         yield item, key, summary
 
 
@@ -236,8 +243,10 @@ def merge_diagnostics(
 
 def _serialized_identity(value: object) -> object:
     """Bound invalid values, retaining an unmistakably invalid JSON object."""
-    if value is None or _identity_hint(value) is not None:
-        return value
+    if value is None:
+        return None
+    if (text := _identity_hint(value)) is not None:
+        return text
     from grounded_weather_forecast.runs import normalize_error_detail  # noqa: PLC0415
 
     try:
@@ -253,25 +262,31 @@ def _serialized_identity(value: object) -> object:
 def _diagnostic_payload(item: ComponentDiagnostic) -> dict[str, object]:
     from grounded_weather_forecast.runs import normalize_error_detail  # noqa: PLC0415
 
-    identity = assess_progress_identity(item.progress_id, item.check_id)
-    payload: dict[str, object] = {
-        field.name: (
-            getattr(item, field.name)
-            if _field_valid(field.name, getattr(item, field.name))
-            else _invalid_field(getattr(item, field.name))
-        )
-        for field in fields(item)
-        if getattr(item, field.name) is not None
-        or field.name in {"stage", "exit_code", "failure_kind", "detail"}
-    }
+    assessed: dict[str, tuple[object, bool]] = {}
+    for field in fields(item):
+        value = getattr(item, field.name)
+        assessed[field.name] = (value, _field_valid(field.name, value))
+    identity = assess_progress_identity(
+        assessed["progress_id"][0], assessed["check_id"][0]
+    )
+    payload: dict[str, object] = {}
+    for name, (value, valid) in assessed.items():
+        if value is not None or name in {
+            "stage",
+            "exit_code",
+            "failure_kind",
+            "detail",
+        }:
+            payload[name] = _primitive(value) if valid else _invalid_field(value)
     for key in ("progress_id", "check_id"):
         if key in payload:
-            payload[key] = _serialized_identity(getattr(item, key))
+            payload[key] = _serialized_identity(assessed[key][0])
     if identity.valid and identity.progress_id == identity.check_id:
         payload.pop("progress_id", None)
-    if _field_valid("detail", item.detail):
-        payload["detail"] = normalize_error_detail(item.detail)
-    if not _valid_fields(item):
+    detail, valid_detail = assessed["detail"]
+    if valid_detail:
+        payload["detail"] = normalize_error_detail(_primitive(detail))
+    if not all(valid for _, valid in assessed.values()):
         payload["metadata_invalid"] = True
     return payload
 
@@ -317,16 +332,21 @@ def write_outcome_hint(outcome: CommandOutcome) -> None:
     """Best-effort child classification; the process exit remains authoritative."""
     if path := os.environ.get(COMMAND_OUTCOME_PATH):
         try:
+            if not _field_valid("exit_code", outcome.exit_code) or not _field_valid(
+                "failure_kind", outcome.failure_kind
+            ):
+                return
             Path(path).write_text(
                 json.dumps(
                     {
-                        "exit_code": outcome.exit_code,
-                        "failure_kind": outcome.failure_kind,
+                        "exit_code": _primitive(outcome.exit_code),
+                        "failure_kind": _primitive(outcome.failure_kind),
                     }
                 ),
                 encoding="utf-8",
             )
-        except (OSError,):  # noqa: B013 -- hints never change the command result
+        except (Exception,):  # noqa: B013 -- optional hints never change command results
+            record_progress((diagnostic_damage(),))
             return
 
 

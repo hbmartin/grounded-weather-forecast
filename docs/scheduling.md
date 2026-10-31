@@ -313,14 +313,23 @@ exit behavior, and later analysis commands.
   Missing/non-string stages and unattributable malformed entries also create
   uncertainty. Equal-clock valid checks continue to use persisted order; raw legacy
   clock strings preserve old grouping boundaries.
+  Known cleanup-stage damage does not quarantine verification sharing its identity;
+  contradictory retention verdicts and unattributable damage remain uncertain.
   Optional diagnostic merging/serialization stays inside the recorder's protected
   boundary, and progress capture is independently safe. Invalid fields retain bounded
   evidence; a fallback preserves the core row without replacing command outcomes or
   original exceptions/cancellation, subject to existing best-effort ledger storage.
+  Optional backtest hint validation/encoding/filesystem faults cannot prevent that
+  recording attempt. Malformed optional classifications record null and bounded
+  damage evidence, never a continuation exemption; cancellation still propagates.
+  A recognized stage and valid identity establish replacement lineage independently
+  of payload validity, so valid final snapshots supersede damaged progress.
   Summary boundaries make concatenated batch delivery idempotent while preserving
   interleaved order and duplicate sample occurrences. Clear and suspended legacy
   verdict-only rows do not become issues. A suspension without samples/counts shows
-  an unavailable count through nullable `issue_count_known` metadata.
+  unavailable total and omitted counts through nullable `issue_count_known`
+  metadata. Historical detail-only samples remain evidence; only exact fallback
+  verdict markers, interpreted with available counts, can identify sample-free rows.
   Each check records at most 20 issue samples with a full JSONL audit reference.
   Audits under `artifacts/history/pruning_verifications/` preserve every affected
   path, survive for 90 days and while referenced by retained run rows, and are

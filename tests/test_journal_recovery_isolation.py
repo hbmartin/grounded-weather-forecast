@@ -264,7 +264,7 @@ def test_legacy_suspended_verdict_has_unknown_count_and_no_invented_samples(tmp_
         "exit_code": 0,
         "failure_kind": "retention_suspended",
         "recorded_at": NOW.isoformat(),
-        "detail": "legacy verdict",
+        "detail": "published-score deletion suspended: protection could not be verified",
     }
     value = _recorded_check_assessment(row([item]), NOW).checks[0]
     for _ in range(3):
