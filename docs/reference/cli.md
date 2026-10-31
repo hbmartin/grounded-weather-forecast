@@ -1233,13 +1233,31 @@ damaged progress for that stage/owner; malformed ownership cannot replace it.
 Serialization validates each field once against cached declared annotations,
 normalizes supported string/integer subclasses (including enums), and distinguishes
 booleans from integers.
+The cache follows each concrete diagnostic class. Primitive extension fields are
+supported; unsupported annotations damage only their fields, preserving base
+stage/identity evidence. Checks use actual primitive classes rather than a
+spoofable `__class__`; strict domain identities and retention states reject invalid
+inputs with `ValueError`.
+
+`CommandOutcome.normalize` establishes trusted values before any pipeline policy,
+hint transport, or recorder projection. Real integer subclasses/enums are
+normalized, retaining signed signal-derived values. Booleans, floats, strings,
+and integers outside signed 64-bit ledger range become exit 1 with
+`invalid_command_outcome` and bounded original-value evidence. Such outcomes stop
+dependent stages even when a stage normally permits continuation. Valid exits with
+invalid optional classifications retain the exit and record null classification
+plus damage; every pending/promotion exemption uses normalized values. Repeated
+normalization does not duplicate damage.
 
 Backtest outcome hints are optional transport. Ordinary validation, encoding and
 filesystem failures cannot prevent the recorder attempt or change the return
-value. Invalid optional outcome classifications are omitted from hints, recorded
+value. Invalid optional outcome classifications are null in hints and recorded
 as null with bounded damage evidence, and grant no maintenance continuation
 exemption. Cancellation still propagates and uses the existing null-exit/error
 journal convention.
+Invocation and embedded-stage exceptions are captured explicitly, including hint
+cancellation; the recorder never infers them from a caller's handled exception.
+Success inside an outer `except` records its numeric exit and no unrelated error.
 
 Malformed or conflicting check groups are quarantined separately, preserving
 unrelated valid checks. Reports add `verification_unknown`: the last valid check
@@ -1255,6 +1273,15 @@ stage metadata create uncertainty; valid unrelated components are ignored.
 Known `retention_audit_cleanup` damage remains separate even when it shares a
 verification identity. A cleanup item claiming a verification verdict remains
 contradictory evidence and is quarantined.
+Cleanup has an independent assessment. Reports add `cleanup_evidence_unknown`,
+`cleanup_recorded_at`, `cleanup_outcome`, and a fixed safe `cleanup_warning`.
+Malformed cleanup metadata raises a separate amber warning without changing
+verification, execution recovery, failed-run counts, or exits. The last valid
+summary remains visible; absent legacy evidence means `not_recorded`.
+A valid cleanup summary with a clock strictly after the damaged run ends clears
+cleanup uncertainty, including dry runs and summaries reporting incomplete cleanup.
+Equal clocks cannot clear it. Known cleanup outcomes remain informational, and
+missing legacy recording clocks are displayed as unavailable rather than invented.
 
 Detail-only samples from historical writers remain literal evidence, including
 duplicates. Only the exact fallback strings `published-score protection verified`

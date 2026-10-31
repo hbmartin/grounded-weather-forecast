@@ -140,8 +140,19 @@ Historical pruning journals retain detail-only samples, including duplicates;
 only the documented fallback verdict markers may represent sample-free checks.
 Unknown aggregate totals and omissions display as unavailable. Valid final
 snapshots replace damaged progress using stage and identity, while cleanup damage
-stays separate from verification. Optional backtest hint failures cannot prevent
-the run-recording attempt or change the command result.
+stays separate from verification. Damaged cleanup evidence has its own amber
+warning, cleared by a valid cleanup summary recorded strictly after the damaged
+run ends; dry runs and incomplete cleanup outcomes can supply valid evidence.
+Legacy absence means cleanup was not recorded. Verification and apply-run
+execution recovery remain independent of this warning.
+
+Command outcomes are normalized before policy, hint transport, and journaling.
+An invalid exit (including a float, string, boolean, or integer outside the ledger
+range) returns 1 with `invalid_command_outcome`, never a coerced success or pending
+exemption. Invalid optional classifications retain valid exits and bounded damage
+evidence. Explicit invocation exceptions keep callers' handled exceptions out of
+the run journal. Optional hint failures cannot prevent the recording attempt;
+original exceptions and cancellation still propagate.
 
 Daily reads query rollback-mode SQLite bytes in memory and never pass source
 filenames to SQLite. WAL or journal-dependent sources fail closed: station reads

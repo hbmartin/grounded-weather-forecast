@@ -104,7 +104,7 @@ def test_recorder_uses_explicit_metadata_and_active_exception_precedence(
         with pytest.raises(RuntimeError, match="active exception detail"):
             try:
                 raise RuntimeError("active exception detail")
-            finally:
+            except (RuntimeError,) as exc:
                 cli_module._record_run(
                     config,
                     args,
@@ -112,7 +112,9 @@ def test_recorder_uses_explicit_metadata_and_active_exception_precedence(
                     exit_code=None,
                     failure_kind="explicit-kind",
                     error_detail="handled detail",
+                    error=exc,
                 )
+                raise
     else:
         cli_module._record_run(config, args, started_at=started, exit_code=1)
     record = load_runs(runs.runs_path(config)).row(0, named=True)

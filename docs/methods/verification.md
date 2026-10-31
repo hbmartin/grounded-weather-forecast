@@ -490,12 +490,12 @@ Evaluation failures take precedence over promotion-only failures while nullable
 ### Published-score protection verification
 
 *Implemented in: `reports/operations.py`, `retention_status.py`, `retention_audit.py`, `clocks.py`,
-`artifact_labels.py`, `verification_text.py`,
+`artifact_labels.py`, `verification_text.py`, `diagnostic_values.py`, `cleanup_status.py`,
 `cli.py::_cmd_prune_scores`, `cli.py::_record_run`, `cli.py::main`, `status.py::diagnostic_progress`,
 `status.py::record_verification_progress`, `status.py::record_progress`,
 `status.py::merge_diagnostics`, `run_health.py`,
 `status.py::effective_progress_id`, `status.py::assess_progress_identity`,
-`status.py::failure_details_json`, `status.py::write_outcome_hint`,
+`status.py::failure_details_json`, `status.py::write_outcome_hint`, `status.py::CommandOutcome.normalize`,
 `dashboard/context.py`, `dashboard/zones/operations.py`.*
 
 Pruning freshly verifies release/event metadata, the active pointer and required
@@ -698,9 +698,24 @@ values never establish a delivery boundary.
 Cached declared annotations govern field validation, including nullable values and
 supported string/integer subclasses or enums. Serialization projects primitives
 from one assessment per field; booleans do not satisfy integer annotations.
+The cached schema follows the concrete diagnostic class. Supported declarations
+are primitive/null unions of `str`, `int`, `bool`, and `None`; supported extension
+fields retain their values, while unsupported annotations damage only their own
+fields without losing base stage/identity. Primitive checks use actual classes,
+rejecting spoofed `__class__` objects without invoking built-in descriptors on
+them. Invalid strict identities and retention states raise deliberate `ValueError`.
+Command outcomes normalize before policy, hint transport and storage. Actual
+integer subclasses/enums retain their integer values, including signed signal
+results; booleans, floats, strings and integers outside signed 64-bit ledger range
+become exit 1 / `invalid_command_outcome` with bounded original evidence. They stop
+dependent stages without pending/promotion exemptions. Invalid optional
+classifications retain valid exits and become null plus damage evidence.
+Normalization is idempotent. Explicit invocation/stage exception capture replaces
+ambient exception inspection, so caller-handled errors do not taint successful
+records; original invocation exceptions/cancellation still propagate and journal.
 Optional backtest outcome-hint validation, encoding and filesystem failures are
 contained before the recorder attempt. Malformed optional classifications are
-omitted from hints and stored as null with bounded damage evidence; they never
+null in hints and stored as null with bounded damage evidence; they never
 grant continuation exemptions. Cancellation propagates with the existing
 null-exit/error journal convention. The last-resort core-row marker remains
 independent of the serializer it replaces.
@@ -721,6 +736,16 @@ not mutate ingestion state. Valid equal-clock checks continue to use persisted o
 Known cleanup-stage damage remains separate even when it shares verification
 lineage. Cleanup data claiming a verification verdict is still contradictory and
 quarantines affected evidence.
+An independent typed cleanup assessment retains valid cleanup summaries and tracks
+damaged cleanup evidence with `cleanup_evidence_unknown`. Reports expose the last
+valid `cleanup_recorded_at`, `cleanup_outcome`, and a fixed safe warning; dashboard
+amber presentation remains separate from verification and execution recovery.
+Only a valid cleanup summary recorded strictly after the damaged run's validated
+ending time resolves cleanup uncertainty; dry runs and incomplete summaries can
+establish valid evidence, while equal clocks cannot. Known cleanup outcomes remain
+informational. Missing legacy evidence is `not_recorded`, and missing clocks are
+unavailable. No counts are inferred from damaged fields, no failed-run counter or
+exit changes, and no archive rescan is introduced.
 
 Historical detail-only samples are retained literally with duplicate occurrences.
 Only the exact fallback markers `published-score protection verified` and

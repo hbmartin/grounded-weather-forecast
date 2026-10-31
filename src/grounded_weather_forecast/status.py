@@ -5,9 +5,17 @@ import os
 from collections.abc import Iterator
 from contextlib import contextmanager
 from contextvars import ContextVar
-from dataclasses import dataclass, fields
+from dataclasses import dataclass, fields, replace
 from pathlib import Path
-from typing import cast, get_args, get_type_hints
+from typing import cast
+
+from grounded_weather_forecast.diagnostic_values import (
+    actual_integer,
+    actual_string,
+    declared_types,
+    field_valid,
+    primitive,
+)
 
 EXIT_NO_FOLDS = 3
 EXIT_CONTENTION = 75
@@ -23,6 +31,15 @@ PROMOTION_ONLY_FAILURE_KINDS = frozenset(
 PENDING_EXIT_CODES = (0, 1, EXIT_NO_FOLDS)
 # Private, invocation-local transport for the standalone maintenance wrapper.
 COMMAND_OUTCOME_PATH = "_GWF_COMMAND_OUTCOME_PATH"
+VERIFICATION_VERDICT_DETAILS = {
+    "retention_clear": "published-score protection verified",
+    "retention_suspended": "published-score deletion suspended: protection could not be verified",
+}
+
+
+def is_verification_verdict(value: object) -> bool:
+    kind = actual_string(value)
+    return kind is not None and kind in VERIFICATION_VERDICT_DETAILS
 
 
 @dataclass(frozen=True, slots=True)
@@ -55,10 +72,7 @@ class ComponentDiagnostic:
     issue_count_known: bool | None = None
 
 
-_FIELD_TYPES: dict[str, tuple[type, ...]] = {
-    name: get_args(annotation) or (annotation,)
-    for name, annotation in get_type_hints(ComponentDiagnostic).items()
-}
+_FIELD_TYPES = declared_types(ComponentDiagnostic)
 
 
 _progress: ContextVar[list[ComponentDiagnostic] | None] = ContextVar(
@@ -96,10 +110,8 @@ class DiagnosticIdentity:
 
 
 def _identity_hint(value: object) -> str | None:
-    if not isinstance(value, str):
-        return None
-    text = str.__str__(value)
-    return text if text.strip() else None
+    text = actual_string(value)
+    return text if text is not None and text.strip() else None
 
 
 def assess_progress_identity(
@@ -137,20 +149,12 @@ def diagnostic_damage() -> ComponentDiagnostic:
 
 
 def _field_valid(name: str, value: object) -> bool:
-    allowed = _FIELD_TYPES[name]
-    if isinstance(value, bool):
-        return bool in allowed
-    if not isinstance(value, allowed):
-        return False
-    return name != "stage" or bool(str.__str__(cast(str, value)).strip())
+    return field_valid(name, value, _FIELD_TYPES)
 
 
 def _primitive(value: object) -> object:
-    if isinstance(value, str):
-        return str.__str__(value)
-    if isinstance(value, int) and not isinstance(value, bool):
-        return int.__int__(value)
-    return value
+    """Compatibility projection using the same real-subclass rules as validation."""
+    return primitive(value)
 
 
 def _exact_value(value: object, ancestors: tuple[int, ...] = ()) -> object:
@@ -187,7 +191,7 @@ def _diagnostic_batches(
     identities: dict[int, DiagnosticIdentity],
 ) -> Iterator[tuple[ComponentDiagnostic, BatchKey | None, bool]]:
     for item in incoming:
-        if not isinstance(item, ComponentDiagnostic):
+        if not issubclass(type(item), ComponentDiagnostic):
             yield diagnostic_damage(), None, False
             continue
         if id(item) not in identities:
@@ -195,7 +199,7 @@ def _diagnostic_batches(
                 item.progress_id, item.check_id
             )
         identity = identities[id(item)]
-        stage = str.__str__(item.stage) if isinstance(item.stage, str) else None
+        stage = actual_string(item.stage)
         key = (
             (stage, identity.owner)
             if stage is not None
@@ -263,9 +267,15 @@ def _diagnostic_payload(item: ComponentDiagnostic) -> dict[str, object]:
     from grounded_weather_forecast.runs import normalize_error_detail  # noqa: PLC0415
 
     assessed: dict[str, tuple[object, bool]] = {}
+    schema = declared_types(type(item))
     for field in fields(item):
         value = getattr(item, field.name)
-        assessed[field.name] = (value, _field_valid(field.name, value))
+        valid = (
+            _field_valid(field.name, value)
+            if type(item) is ComponentDiagnostic
+            else field_valid(field.name, value, schema)
+        )
+        assessed[field.name] = (value, valid)
     identity = assess_progress_identity(
         assessed["progress_id"][0], assessed["check_id"][0]
     )
@@ -325,29 +335,75 @@ class CommandOutcome:
 
     @classmethod
     def normalize(cls, value: "CommandOutcome | int") -> "CommandOutcome":
-        return value if isinstance(value, CommandOutcome) else cls(value)
+        outcome = (
+            cast(CommandOutcome, value)
+            if issubclass(type(value), cls)
+            else cls(cast(int, value))
+        )
+        code = actual_integer(outcome.exit_code)
+        damage: tuple[ComponentDiagnostic, ...] = ()
+        kind = actual_string(outcome.failure_kind)
+        detail = actual_string(outcome.error_detail)
+        if outcome.failure_kind is not None and kind is None:
+            damage += (invalid_metadata("failure_kind", outcome.failure_kind),)
+        if code is None or not -(2**63) <= code < 2**63:
+            damage += (invalid_metadata("exit_code", outcome.exit_code),)
+            code, kind = 1, "invalid_command_outcome"
+        if outcome.error_detail is not None and detail is None:
+            damage += (invalid_metadata("error_detail", outcome.error_detail),)
+        if (
+            type(outcome.exit_code) is int
+            and code == outcome.exit_code
+            and (outcome.failure_kind is None or type(outcome.failure_kind) is str)
+            and (outcome.error_detail is None or type(outcome.error_detail) is str)
+            and not damage
+        ):
+            return outcome
+        return cls(code, kind, detail, _with_damage(outcome.diagnostics, damage))
+
+
+def _with_damage(
+    diagnostics: tuple[ComponentDiagnostic, ...],
+    damage: tuple[ComponentDiagnostic, ...],
+) -> tuple[ComponentDiagnostic, ...]:
+    try:
+        return (*diagnostics, *damage)
+    except (Exception,):  # noqa: B013 -- optional evidence cannot replace an outcome
+        return (*damage, diagnostic_damage())
+
+
+def invalid_metadata(field: str, value: object) -> ComponentDiagnostic:
+    """Share the safe damage identity while keeping bounded offending evidence."""
+    from grounded_weather_forecast.runs import normalize_error_detail  # noqa: PLC0415
+
+    detail = _invalid_field(value)
+    return replace(
+        diagnostic_damage(),
+        detail=normalize_error_detail(
+            f"{field}: {detail['invalid_field_type']}: {detail['detail']}"
+        ),
+    )
 
 
 def write_outcome_hint(outcome: CommandOutcome) -> None:
     """Best-effort child classification; the process exit remains authoritative."""
-    if path := os.environ.get(COMMAND_OUTCOME_PATH):
-        try:
-            if not _field_valid("exit_code", outcome.exit_code) or not _field_valid(
-                "failure_kind", outcome.failure_kind
-            ):
-                return
+    try:
+        if path := os.environ.get(COMMAND_OUTCOME_PATH):
+            normalized = CommandOutcome.normalize(outcome)
+            if normalized is not outcome:
+                record_progress(normalized.diagnostics)
             Path(path).write_text(
                 json.dumps(
                     {
-                        "exit_code": _primitive(outcome.exit_code),
-                        "failure_kind": _primitive(outcome.failure_kind),
+                        "exit_code": normalized.exit_code,
+                        "failure_kind": normalized.failure_kind,
                     }
                 ),
                 encoding="utf-8",
             )
-        except (Exception,):  # noqa: B013 -- optional hints never change command results
-            record_progress((diagnostic_damage(),))
-            return
+    except (Exception,):  # noqa: B013 -- optional hints never change command results
+        record_progress((diagnostic_damage(),))
+        return
 
 
 def read_outcome_hint(path: Path, exit_code: int) -> CommandOutcome:
