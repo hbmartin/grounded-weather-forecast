@@ -34,6 +34,9 @@ uv run --no-sync python docs/launchd/daily-maintenance.py
 Do not install dependencies on a production host without the operator's
 permission. Deploy source and wrapper paths deliberately; an environment that
 still pins an older `PYTHONPATH` will continue importing that older code.
+Install publisher 2.3+ with `run_with_receipt()` before enabling v2 shadow flags
+([publisher follow-up #48](https://github.com/hbmartin/open-sun/pull/48)).
+Preserve old enrollments; the new runner requires a fresh v2 enrollment.
 Verify one complete maintenance cycle, truthful gate explanations, a ready
 forecast and successful public publication before enrolling the shadow.
 Check station freshness and hourly-mean coverage. An available instantaneous
@@ -59,8 +62,9 @@ uv run --no-sync python docs/launchd/hourly-predict-publish.py \
 ```
 
 The wrapper exports the existing serving snapshot once. After the normal
-publisher succeeds, it fetches the exact public Git commit into a temporary
-object store and seals the receipt. It does not call a weather provider to
+publisher succeeds, it seals the exact commit and forecast bytes returned by
+that successful explicit-commit push. It never reconstructs a receipt from a
+later branch tip. Unchanged publication requires verified original evidence. It does not call a weather provider to
 reconstruct inputs or refit a production selection. A held forecast retains
 its original capsule and issuance. If that original capsule is unavailable,
 the issue cannot enter the prospective comparison. No duplicate hourly task is
@@ -76,9 +80,13 @@ receipt or commit timestamp. No independent station commit ledger is invented.
 Evaluate once after the last 96-hour outcomes and two-hour truth lag:
 
 ```sh
+uv run --no-sync python scripts/temperature_shadow.py freeze-truth \
+  --truth REVIEWED_QC_HOURLY_TRUTH --protocol PRIVATE_ENROLLMENT/protocol.json \
+  --out SEALED_TRUTH
 uv run --no-sync python scripts/temperature_shadow.py evaluate \
-  --input PRIVATE_SHADOW/records --truth FROZEN_QC_HOURLY_TRUTH \
-  --out NEW_EVALUATION --protocol PRIVATE_ENROLLMENT/protocol.json --mode prospective
+  --input PRIVATE_SHADOW/records --capsules PRIVATE_SHADOW/capsules \
+  --truth-lock SEALED_TRUTH --out NEW_EVALUATION \
+  --protocol PRIVATE_ENROLLMENT/protocol.json --mode prospective
 ```
 
 The protocol requires sufficient independent-day coverage and paired 3-/7-day

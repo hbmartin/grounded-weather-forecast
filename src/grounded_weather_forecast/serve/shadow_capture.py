@@ -80,6 +80,7 @@ def capture_issue(
             "station_receipt_clock": "not separately recorded; observation_at is the collected observation clock, not a certified receipt/commit timestamp",
         }
         manifest = {
+            "artifact_version": 2,
             "input_as_of": document.issued_at,
             "capture_kind": "historical_reconstruction"
             if historical

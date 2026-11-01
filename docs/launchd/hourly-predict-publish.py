@@ -244,21 +244,37 @@ def publish(
     # cycle finishes) hold the last ready document for up to 6h instead of swapping
     # the public forecast's character for the integration window.
     source = publish_forecast.choose_source(paths.forecast)
-    exit_code = publish_forecast.run(source=source, include_dir=staged_dir())
+    receipt = None
+    missing_receipt_api = shadow is not None and not hasattr(
+        publish_forecast, "run_with_receipt"
+    )
+    if shadow is not None and not missing_receipt_api:
+        result = publish_forecast.run_with_receipt(
+            source=source, include_dir=staged_dir()
+        )
+        exit_code = result.exit_code
+        receipt = result.receipt.to_dict() if result.receipt is not None else None
+    else:
+        exit_code = publish_forecast.run(source=source, include_dir=staged_dir())
     print(
         f"{timestamp()} == publish exited {exit_code} "
         f"duration_s={time.monotonic() - publish_started:.1f} ==",
         flush=True,
     )
     if exit_code == 0 and shadow is not None:
+        if missing_receipt_api:
+            print(
+                "forecast published; shadow requires publisher run_with_receipt API (2.3+)",
+                flush=True,
+            )
+            return 1
         root, protocol = shadow
         return finalize_shadow(
             paths,
             source,
             root,
             protocol,
-            remote=publish_forecast.DEFAULT_REMOTE,
-            branch=publish_forecast.DEFAULT_BRANCH,
+            publication_receipt=receipt,
         )
     return exit_code
 
@@ -269,13 +285,12 @@ def finalize_shadow(
     root: Path,
     protocol: Path,
     *,
-    remote: str,
-    branch: str,
+    publication_receipt: dict | None = None,
 ) -> int:
     """After successful publication, join its exact commit to captured inputs."""
     try:
         return _finalize_shadow(
-            paths, source, root, protocol, remote=remote, branch=branch
+            paths, source, root, protocol, publication_receipt=publication_receipt
         )
     except (OSError, ValueError, KeyError, subprocess.SubprocessError) as error:
         print(f"forecast published; shadow receipt/record failed: {error}", flush=True)
@@ -288,12 +303,39 @@ def _finalize_shadow(
     root: Path,
     protocol: Path,
     *,
-    remote: str,
-    branch: str,
+    publication_receipt: dict | None = None,
 ) -> int:
     document = json.loads(source.read_text(encoding="utf-8"))
     issued_at = datetime.fromisoformat(document["issued_at"]).astimezone(UTC)
     name = issued_at.strftime("%Y%m%dT%H%M%SZ")
+    # Keep the small transport file outside immutable capsules. The runner seals
+    # exact bytes and the original publisher receipt before fitting.
+    import tempfile  # noqa: PLC0415 -- only opt-in shadow uses receipt transport
+
+    with tempfile.NamedTemporaryFile(
+        mode="w", encoding="utf-8", suffix=".json"
+    ) as transport:
+        if publication_receipt is not None:
+            json.dump(publication_receipt, transport)
+            transport.flush()
+        return _shadow_child(
+            paths,
+            source,
+            root,
+            protocol,
+            name,
+            transport.name if publication_receipt is not None else None,
+        )
+
+
+def _shadow_child(
+    paths: RuntimePaths,
+    source: Path,
+    root: Path,
+    protocol: Path,
+    name: str,
+    receipt_file: str | None,
+) -> int:
     result = subprocess.run(  # noqa: S603 -- reviewed local shadow script, no shell
         [
             *paths.command("python"),
@@ -305,10 +347,7 @@ def _finalize_shadow(
             str(root / "records"),
             "--protocol",
             str(protocol),
-            "--remote",
-            remote,
-            "--branch",
-            f"refs/heads/{branch}",
+            *(["--publication-receipt", receipt_file] if receipt_file else []),
             "--source",
             str(source),
             "--mode",
