@@ -873,7 +873,7 @@ def _elect_slices(
 def _winner_reason(row: Mapping[str, object]) -> str:
     """Preserve the decision gate when a reference replaces the board leader."""
     reason = "lowest backtest MAE among promotable common-case methods"
-    match row.get("gate"):
+    match row.get("decision_gate") or row.get("gate"):
         case None:
             return reason
         case "pooled_D3-10":
@@ -881,7 +881,10 @@ def _winner_reason(row: Mapping[str, object]) -> str:
         case "eligibility":
             return f"{reason}; board minimum excluded by eligibility requirements"
         case gate:
-            return f"reference fallback: {gate}"
+            reason = f"reference fallback: {gate}"
+            if row.get("gate") == "eligibility":
+                reason += "; board minimum excluded by eligibility requirements"
+            return reason
 
 
 def _evaluated_context(

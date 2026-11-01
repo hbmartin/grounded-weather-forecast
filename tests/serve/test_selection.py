@@ -253,6 +253,8 @@ class TestSelectMethods:
             json.loads(p.read_text())
             for p in (config.artifacts_dir / "releases").glob("*.json")
         ]
+        assert releases
+        assert all(r["selections"] for r in releases)
         assert all(
             choice["reason"] == f"reference fallback: {gate}"
             for r in releases

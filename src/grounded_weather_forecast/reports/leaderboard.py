@@ -823,6 +823,7 @@ def slice_winners(
         "mae_gap",
         "gap_ratio",
         "gate",
+        "decision_gate",
     )
     for slice_key, group in board.partition_by(keys, as_dict=True).items():
         parts = dict(zip(keys, (str(part) for part in slice_key), strict=True))
@@ -868,6 +869,7 @@ def slice_winners(
         pl.DataFrame(winners, infer_schema_length=None)
         .with_columns(
             pl.col("gate").cast(pl.String),
+            pl.col("decision_gate").cast(pl.String),
             pl.col("best_mae").cast(pl.Float64),
             pl.col("mae_gap").cast(pl.Float64),
             pl.col("gap_ratio").cast(pl.Float64),
@@ -889,7 +891,10 @@ def _annotate_winner(
 
     ``infer_gate=False`` preserves a caller-supplied label (the pooled daily
     gate), which the best-vs-eligible inference would otherwise overwrite.
+    ``decision_gate`` retains that original decision independently of the
+    legacy gap annotation, which is also used by incumbent retention.
     """
+    decision_gate = gate
     best_id = str(best["method_id"])
     if not infer_gate:
         pass
@@ -920,6 +925,7 @@ def _annotate_winner(
         "mae_gap": mae_gap,
         "gap_ratio": gap_ratio,
         "gate": gate,
+        "decision_gate": decision_gate,
     }
 
 
@@ -937,6 +943,7 @@ def _empty_winners(keys: list[str]) -> pl.DataFrame:
             "mae_gap": pl.Float64,
             "gap_ratio": pl.Float64,
             "gate": pl.String,
+            "decision_gate": pl.String,
         }
     )
 
