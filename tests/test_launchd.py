@@ -1,4 +1,5 @@
 import fcntl
+import hashlib
 import importlib.util
 import json
 import os
@@ -16,6 +17,116 @@ import pytest
 from grounded_weather_forecast.status import EXIT_NO_FOLDS
 
 SCRIPT = Path(__file__).parents[1] / "docs/launchd/daily-maintenance.py"
+
+
+def test_shadow_options_require_explicit_pair(monkeypatch, tmp_path):
+    module = load_script(SCRIPT.with_name("hourly-predict-publish.py"))
+    monkeypatch.setattr(
+        module, "run_predict", lambda *_a: pytest.fail("must not predict")
+    )
+    assert module.main(["--shadow-root", str(tmp_path / "shadow")]) == 2
+
+
+def test_predict_exports_inputs_only_when_explicitly_requested(monkeypatch, tmp_path):
+    module = load_script(SCRIPT.with_name("hourly-predict-publish.py"))
+    paths = module.RuntimePaths(tmp_path, "uv")
+    commands = []
+
+    def child(command, **_kwargs):
+        commands.append(command)
+        return subprocess.CompletedProcess(command, 0)
+
+    monkeypatch.setattr(subprocess, "run", child)
+    assert module.run_predict(paths) == 0
+    assert "--shadow-capture" not in commands[-1]
+    assert module.run_predict(paths, tmp_path / "capsules") == 0
+    assert commands[-1][-2:] == ["--shadow-capture", str(tmp_path / "capsules")]
+
+
+def test_held_shadow_issue_keeps_original_clock(monkeypatch, tmp_path, capsys):
+    module = load_script(SCRIPT.with_name("hourly-predict-publish.py"))
+    source = tmp_path / "held.json"
+    source.write_text('{"issued_at":"2026-10-01T12:00:00+00:00"}')
+    protocol = tmp_path / "protocol.json"
+    protocol.write_text("{}")
+    record = tmp_path / "shadow/records/20261001T120000Z/record.json"
+    record.parent.mkdir(parents=True)
+    record.write_text(
+        json.dumps(
+            {
+                "issued_at": "2026-10-01T12:00:00+00:00",
+                "protocol_sha256": hashlib.sha256(protocol.read_bytes()).hexdigest(),
+            }
+        )
+    )
+    monkeypatch.setattr(
+        subprocess,
+        "run",
+        lambda *_a, **_k: pytest.fail("held issue must not be re-recorded"),
+    )
+    assert (
+        module.finalize_shadow(
+            module.RuntimePaths(tmp_path, "uv"),
+            source,
+            tmp_path / "shadow",
+            protocol,
+            remote="fixture",
+            branch="data",
+        )
+        == 0
+    )
+    assert "original time" in capsys.readouterr().out
+
+
+def test_successful_publication_passes_exact_source_to_shadow(monkeypatch, tmp_path):
+    module = load_script(SCRIPT.with_name("hourly-predict-publish.py"))
+    source = tmp_path / "source.json"
+    source.write_text('{"issued_at":"2026-10-01T12:00:00+00:00"}')
+    commands = []
+
+    def child(command, **_kwargs):
+        commands.append(command)
+        return subprocess.CompletedProcess(command, 0)
+
+    monkeypatch.setattr(subprocess, "run", child)
+    root = tmp_path / "shadow"
+    protocol = tmp_path / "protocol.json"
+    assert (
+        module.finalize_shadow(
+            module.RuntimePaths(tmp_path, "uv"),
+            source,
+            root,
+            protocol,
+            remote="fixture",
+            branch="data",
+        )
+        == 0
+    )
+    command = commands[-1]
+    assert command[command.index("--input") + 1] == str(
+        root / "capsules/20261001T120000Z"
+    )
+    assert command[command.index("--source") + 1] == str(source)
+    assert command[-2:] == ["--mode", "prospective"]
+
+
+def test_failed_publication_never_finalizes_shadow(monkeypatch, tmp_path):
+    module = load_script(SCRIPT.with_name("hourly-predict-publish.py"))
+    monkeypatch.setattr(module, "resolve_publishing", lambda *_a, **_k: None)
+    monkeypatch.setattr(module, "render_station", lambda *_a: 0)
+    monkeypatch.setattr(module, "staged_dir", lambda: tmp_path)
+    monkeypatch.setattr(
+        module, "finalize_shadow", lambda *_a, **_k: pytest.fail("publication failed")
+    )
+    fake = types.SimpleNamespace(choose_source=lambda path: path, run=lambda **_k: 1)
+    monkeypatch.setitem(sys.modules, "publish_forecast", fake)
+    assert (
+        module.publish(
+            module.RuntimePaths(tmp_path, "uv"),
+            shadow=(tmp_path / "shadow", tmp_path / "protocol.json"),
+        )
+        == 1
+    )
 
 
 @pytest.fixture(autouse=True)
@@ -999,3 +1110,29 @@ def test_publication_oserror_is_runtime_failure(monkeypatch, capsys):
     monkeypatch.setattr(module, "publish", fail_publish)
     assert module.main([]) == 1
     assert "runtime failure: publisher write denied" in capsys.readouterr().out
+
+
+def test_shadow_receipt_timeout_reports_publication_already_succeeded(
+    monkeypatch, tmp_path, capsys
+):
+    module = load_script(SCRIPT.with_name("hourly-predict-publish.py"))
+    paths = module.resolve_runtime()
+    source = tmp_path / "source.json"
+    source.write_text('{"issued_at":"2026-11-02T08:00:00+00:00"}')
+
+    def timeout(*_a, **_k):
+        raise subprocess.TimeoutExpired("fixture receipt", timeout=120)
+
+    monkeypatch.setattr(subprocess, "run", timeout)
+    assert (
+        module.finalize_shadow(
+            paths,
+            source,
+            tmp_path / "shadow",
+            tmp_path / "protocol.json",
+            remote="fixture",
+            branch="data",
+        )
+        == 1
+    )
+    assert "forecast published; shadow receipt/record failed" in capsys.readouterr().out

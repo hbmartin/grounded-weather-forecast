@@ -24,6 +24,7 @@ strip files the branch is already serving.
 """
 
 import argparse
+import hashlib
 import json
 import os
 import socket
@@ -77,7 +78,7 @@ def timestamp() -> str:
 # --config is a global flag: passing it after the subcommand is an argparse
 # error, which is exactly how every scheduled run between 2026-07-27 and
 # 2026-08-03 died silently.
-def run_predict(paths: RuntimePaths) -> int:
+def run_predict(paths: RuntimePaths, shadow_capture: Path | None = None) -> int:
     predict_started = time.monotonic()
     print(f"{timestamp()} == predict ==", flush=True)
     try:
@@ -91,6 +92,7 @@ def run_predict(paths: RuntimePaths) -> int:
                 "predict",
                 "--out",
                 str(paths.forecast),
+                *(["--shadow-capture", str(shadow_capture)] if shadow_capture else []),
             ],
             check=False,
         ).returncode
@@ -201,7 +203,11 @@ def render_station(paths: PublishingPaths) -> int:
     return result.returncode
 
 
-def publish(paths: RuntimePaths, station_project: Path | None = None) -> int:
+def publish(
+    paths: RuntimePaths,
+    station_project: Path | None = None,
+    shadow: tuple[Path, Path] | None = None,
+) -> int:
     station_started = time.monotonic()
     print(f"{timestamp()} == station ==", flush=True)
     try:
@@ -245,7 +251,94 @@ def publish(paths: RuntimePaths, station_project: Path | None = None) -> int:
         f"duration_s={time.monotonic() - publish_started:.1f} ==",
         flush=True,
     )
+    if exit_code == 0 and shadow is not None:
+        root, protocol = shadow
+        return finalize_shadow(
+            paths,
+            source,
+            root,
+            protocol,
+            remote=publish_forecast.DEFAULT_REMOTE,
+            branch=publish_forecast.DEFAULT_BRANCH,
+        )
     return exit_code
+
+
+def finalize_shadow(
+    paths: RuntimePaths,
+    source: Path,
+    root: Path,
+    protocol: Path,
+    *,
+    remote: str,
+    branch: str,
+) -> int:
+    """After successful publication, join its exact commit to captured inputs."""
+    try:
+        return _finalize_shadow(
+            paths, source, root, protocol, remote=remote, branch=branch
+        )
+    except (OSError, ValueError, KeyError, subprocess.SubprocessError) as error:
+        print(f"forecast published; shadow receipt/record failed: {error}", flush=True)
+        return 1
+
+
+def _finalize_shadow(
+    paths: RuntimePaths,
+    source: Path,
+    root: Path,
+    protocol: Path,
+    *,
+    remote: str,
+    branch: str,
+) -> int:
+    document = json.loads(source.read_text(encoding="utf-8"))
+    issued_at = datetime.fromisoformat(document["issued_at"])
+    name = issued_at.strftime("%Y%m%dT%H%M%SZ")
+    existing = root / "records" / name / "record.json"
+    if existing.exists():
+        saved = json.loads(existing.read_text(encoding="utf-8"))
+        if (
+            saved.get("issued_at") != document["issued_at"]
+            or saved.get("protocol_sha256")
+            != hashlib.sha256(protocol.read_bytes()).hexdigest()
+        ):
+            print(
+                "forecast published; shadow record conflicts with this enrollment",
+                flush=True,
+            )
+            return 1
+        print(
+            "shadow already recorded this issuance; held forecasts retain their original time",
+            flush=True,
+        )
+        return 0
+    result = subprocess.run(  # noqa: S603 -- reviewed local shadow script, no shell
+        [
+            *paths.command("python"),
+            str(paths.project / "scripts/temperature_shadow.py"),
+            "finalize",
+            "--input",
+            str(root / "capsules" / name),
+            "--out",
+            str(root / "records"),
+            "--protocol",
+            str(protocol),
+            "--remote",
+            remote,
+            "--branch",
+            f"refs/heads/{branch}",
+            "--source",
+            str(source),
+            "--mode",
+            "prospective",
+        ],
+        check=False,
+        timeout=120,
+    )
+    if result.returncode:
+        print("forecast published; shadow receipt/record failed", flush=True)
+    return result.returncode
 
 
 def main(argv: Sequence[str] | None = None) -> int:
@@ -266,7 +359,17 @@ def main(argv: Sequence[str] | None = None) -> int:
             type=Path,
             help="collector project (default: sibling ambientweather2sqlite)",
         )
+        parser.add_argument(
+            "--shadow-root", type=Path, help="opt-in private capsule/record directory"
+        )
+        parser.add_argument(
+            "--shadow-protocol", type=Path, help="reviewed frozen enrollment protocol"
+        )
         args = parser.parse_args(argv)
+        if (args.shadow_root is None) != (args.shadow_protocol is None):
+            parser.error(
+                "--shadow-root and --shadow-protocol must be provided together"
+            )
         # History paths must resolve from the project before invoking the CLI.
         paths = resolve_runtime()
         os.chdir(paths.project)
@@ -275,7 +378,12 @@ def main(argv: Sequence[str] | None = None) -> int:
             flush=True,
         )
         sys.path.insert(0, str(support_dir()))
-        if run_predict(paths) != 0:
+        predicted = (
+            run_predict(paths, args.shadow_root / "capsules")
+            if args.shadow_root is not None
+            else run_predict(paths)
+        )
+        if predicted != 0:
             return 1
         restore_failed = False
         try:
@@ -285,7 +393,13 @@ def main(argv: Sequence[str] | None = None) -> int:
             print(
                 f"auto-restore launch failed: {exc}; continuing publication", flush=True
             )
-        code = publish(paths, args.station_project)
+        code = (
+            publish(
+                paths, args.station_project, (args.shadow_root, args.shadow_protocol)
+            )
+            if args.shadow_root is not None
+            else publish(paths, args.station_project)
+        )
         if code == 0 and restore_failed:
             code = 1
         return code

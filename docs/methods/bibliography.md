@@ -153,3 +153,10 @@ The daily read contract uses SQLite's documented
 validated rollback snapshots and refuses WAL/journal dependencies. It does not use
 immutable live reads or write sidecars/private disk snapshots. See
 [daily reporting](daily-report.md) for evidence compatibility and isolation policy.
+
+The [inactive temperature shadow](shadow-temperature.md) includes a self-contained
+fixed experiment definition, implemented in `scripts/shadow_candidate_v1.py` and
+`scripts/temperature_shadow.py`. Its calendar half-life, shrinkage, optimization
+penalty and review margins are local experimental choices. The module records
+the original fixed implementation digest; it registers no production method and
+makes no claim of measured production skill.

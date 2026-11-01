@@ -1,0 +1,28 @@
+{
+  "protocol_id": "temperature-shadow-v1-20261031",
+  "status": "frozen proposal; inactive; activation and schedule require review",
+  "window_start": "2026-11-02T08:00:00+00:00",
+  "window_end": "2026-12-14T08:00:00+00:00",
+  "time_basis": "42 complete UTC days, beginning Monday midnight PST; truth may arrive after the window",
+  "product": "hourly temperature interval mean, Celsius, 0 <= lead_hours <= 96",
+  "horizons": ["0-6h", "6-24h", "24-72h", "72-96h"],
+  "candidate": "simplex_decay21 fixed in the reviewed October 26 experiment; no re-selection",
+  "candidate_definition": {
+    "source": "scripts/shadow_candidate_v1.py; fixed temperature candidate definitions and source digest are included with the implementation",
+    "bias": "forecast-minus-truth; calendar-age exponential weights with 21-day half-life; global valid-hour multiplicity correction; local lead-group bias shrunk by unique UTC date count n/(n+7)",
+    "training": "all finite truth known by issuance (valid hour plus two hours), with issue_time <= issuance; keep latest issue per valid hour and broad lead group",
+    "fit_groups_hours": [[0,6],[6,24],[24,72],[72,168],[168,360]],
+    "weights": "single nonnegative vector per issuance, corrected training MSE divided by training target variance with sd floor 0.1 plus 2*sum((w-equal)^2); SLSQP bounds [0.0001,1], maxiter 100, ftol 1e-8; 50% shrinkage toward equal; equal on failed solve or fewer than 20 usable rows",
+    "availability": "finite providers only; identical weight renormalization at fit and predict",
+    "decay21_reference": "same correction, equal weights; no optimization"
+  },
+  "comparators": ["actual published production", "decay21", "training-ranked best available provider per original narrow lead bucket", "latest issue-time observed temperature, finite and at most 30 minutes old", "30-day station climatology, median per local 3-hour bin with >=3 dates else global median; all fully known hourly observations"],
+  "publication": "prospective requires exact committed published payload bytes, full commit hash and receipt; input matrix must be the same issuance snapshot used by serving. Hold-last-good has its original issued_at and cannot be relabeled. Prediction history alone is never proof of publication.",
+  "availability": "capture genuine provider completion/receipt and station collection/commit timestamps where available. Preserve raw clocks. If receipt/commit ledgers are absent, explicitly label truth-known-at +2h and archive fetched_at as assumptions. Captured inputs make prospective reconstruction auditable but do not invent a historical ledger.",
+  "quality": {"minimum_matched_utc_dates_per_horizon": 28, "minimum_matched_valid_hours_per_horizon": 300, "minimum_common_coverage": 0.8, "minimum_weeks_with_data": 4, "minimum_training_unique_valid_hours": 48},
+  "analysis": "Use identical issued_at/valid_time cases across all six methods and finite QC truth. Report attrition and pairwise coverage separately. Average absolute errors across repeated issuances within valid hour, then across valid hours within UTC day. Preserve missing calendar dates in circular-block resampling. Report hour-weighted MAE and bias as descriptive secondary metrics.",
+  "uncertainty": {"bootstrap_samples": 10000, "seed": 20261031, "primary_block_days": 3, "sensitivity_block_days": 7, "family_comparisons": 12, "two_sided_family_alpha": 0.05},
+  "decision": "Once at six weeks, per horizon: sufficient quality; candidate daily mean MAE improves production by >=0.1 C and >=5%; family-adjusted interval upper bound <0 versus production, and <=0.1 C versus decay21 and best available provider, under both 3- and 7-calendar-day blocks. Otherwise retain production; insufficient quality means inconclusive and a separately predeclared extension, without candidate tuning. Persistence and climatology are descriptive checks. No automatic promotion.",
+  "excluded": "all replay/smoke rows; non-published candidates; receipt mismatch; non-mean truth; forecasts produced after outcomes; horizons outside 0-96h; daily high/low, wind, gust and rain skill claims",
+  "activation": "This file and the runner activate no jobs, services or publication. Window dates may be amended only before the first prospective record and before examining outcomes. Schedule and production rollout remain review steps."
+}

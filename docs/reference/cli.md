@@ -952,11 +952,64 @@ apparent diversity without adding information.
 
 ## `predict`
 
+`--shadow-capture DIR` exports the exact serving feature/provider snapshot,
+temperature training rows, all-observation hourly temperature truth, source
+document, and genuine available archive completion clocks into a private,
+exclusive issuance capsule. It is off by default. It performs no additional
+collection or fit and does not enroll or publish a shadow. Capture errors are
+reported as warnings while the forecast continues. `--now` captures are marked
+historical; cached archived documents cannot manufacture original input capsules.
+No truth columns enter the exported future input matrix. Collection timestamps,
+database read/export times and absent receipt/commit ledgers remain distinct.
+
+The optional hourly wrapper flags `--shadow-root DIR --shadow-protocol FILE`
+must be supplied together. They enable input export and, only after successful
+publication, use the exact chosen source to finalize a shadow receipt. A held
+forecast keeps its original issuance. Already recorded held issuances are not
+counted again. A failed receipt does not undo publication; the wrapper reports
+that the forecast was published and returns a failure for the shadow step.
+
+### Standalone temperature shadow
+
+`scripts/temperature_shadow.py freeze --protocol PROPOSAL --out ENROLLMENT`
+copies and seals a reviewed six-week protocol before its window starts. It
+creates no job. The example window is a dated proposal, not a rolling default;
+an elapsed start is rejected and requires an explicitly reviewed new window.
+Candidate and evaluation rules are fixed. Protocol, runner, candidate and
+package digests are locked; changed implementations cannot be pooled.
+
+`record --input CAPSULE --out STORE --protocol ENROLLMENT/protocol.json
+--mode replay|prospective` computes the fixed predictions from supplied files.
+Replay is the default and is excluded from prospective analysis. Prospective
+records require contemporaneous inputs, interval-mean temperature semantics,
+the frozen window, actual committed public payload bytes and a full commit
+receipt. Public Fahrenheit rounding is included in the production comparator.
+Input hashes, code/config/data provenance and availability assumptions are
+retained. Source weights, bias corrections and per-row provider masks are logged.
+
+`finalize --input CAPSULE --out STORE --protocol ENROLLMENT/protocol.json
+--remote REMOTE --branch refs/heads/data --source SOURCE --mode prospective`
+reads the public Git branch into an isolated temporary object store, captures
+the full commit and exact `forecast.json` bytes, verifies issuance/source/data/
+release/grid identity, and records the original issue. Git requests are bounded
+to 30 seconds per operation. A racing public issuance, different held source,
+late outcome, modified input or conflicting immutable record is rejected.
+This command reads Git; it never pushes, publishes, promotes or collects weather.
+
+`evaluate --input STORE --truth FROZEN_TRUTH --out NEW_DIRECTORY --protocol
+ENROLLMENT/protocol.json --mode replay|prospective` joins QC hourly means and
+reports identical-case counts, pairwise attrition, daily losses and calendar-block
+uncertainty. It does not correct truth or select a new family. Replay and
+prospective stores remain distinct. The source producer and wrappers are
+inactive unless explicitly configured; see the [rollout review](../shadow-rollout.md)
+and [fixed candidate/evaluation definition](../methods/shadow-temperature.md).
+
 > emit the current blended forecast as JSON
 
 | Flag | Type | Default | Meaning |
 |---|---|---|---|
 | `--out` | path or `-` | `-` (stdout) | output destination |
+| `--shadow-capture` | path | off | export the exact serving inputs into an exclusive private issuance capsule |
 | `--method` | method id or `auto` | `auto` | force one method for every slice, or use the leaderboard |
 | `--no-history` | flag | off | do not append to the self-verification history |
 | `--semantics` | `auto` \| `inst` \| `mean` | `auto` | hourly truth semantics used when fitting |
