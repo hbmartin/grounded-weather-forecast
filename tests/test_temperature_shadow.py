@@ -98,9 +98,12 @@ def make_capsule(shadow, frames, tmp_path):
     train.write_parquet(capsule / "training.parquet")
     issue.write_parquet(capsule / "issue.parquet")
     truth.write_parquet(capsule / "truth_hourly.parquet")
+    pl.DataFrame({"completed_at": [origin]}).write_parquet(
+        capsule / "provider_completions.parquet"
+    )
     document = {
         "issued_at": origin.isoformat(),
-        "observation_at": None,
+        "observation_at": (origin - timedelta(minutes=31)).isoformat(),
         "dataset_fingerprint": "fixture",
         "release_ids": ["fixture"],
         "hourly": [
@@ -165,17 +168,25 @@ def test_history_candidate_is_not_publication_evidence(shadow, frames, tmp_path)
         shadow.production_rows(capsule, {}, prospective=True)
 
 
+@pytest.mark.parametrize("temperature", [15.0, 15.123, 15.00277])
 def test_committed_payload_validation_uses_public_rounded_temperature(
-    shadow, frames, tmp_path
+    shadow, frames, tmp_path, temperature
 ):
     capsule, _ = make_capsule(shadow, frames, tmp_path)
     document = json.loads((capsule / "production.json").read_text())
+    for row in document["hourly"]:
+        row["values"]["temp_c"] = temperature
+    (capsule / "production.json").write_text(json.dumps(document))
     published = {
         **document,
         "published_at": document["issued_at"],
         "units": {"temp_f": "F"},
         "hourly": [
-            {"valid_time": row["valid_time"], "values": {"temp_f": 59.0}}
+            {
+                "valid_time": row["valid_time"],
+                "values": {"temp_f": round(temperature * 9.0 / 5.0 + 32.0, 2)},
+                "methods": {"temp_f": "fixture"},
+            }
             for row in document["hourly"]
         ],
     }
@@ -200,10 +211,15 @@ def test_committed_payload_validation_uses_public_rounded_temperature(
     }
     meta = {"publication": receipt, "provenance": provenance}
     _, rows = shadow.production_rows(capsule, meta, prospective=True)
-    assert all(row["values"]["temp_c"] == 15 for row in rows.values())
+    assert all(
+        row["values"]["temp_c"]
+        == pytest.approx((round(temperature * 9.0 / 5.0 + 32.0, 2) - 32) / 1.8)
+        for row in rows.values()
+    )
     published["hourly"][0]["values"]["temp_f"] = 100.0
     (capsule / "published.json").write_text(json.dumps(published))
-    with pytest.raises(ValueError, match="payload mismatch"):
+    receipt["published_sha256"] = shadow.digest(capsule / "published.json")
+    with pytest.raises(ValueError, match="temperature differs"):
         shadow.production_rows(capsule, meta, prospective=True)
 
 
@@ -262,6 +278,8 @@ def test_secondary_hour_metrics_do_not_count_repeated_issuances_as_new_hours(sha
         "uncertainty": {
             "seed": 1,
             "bootstrap_samples": 100,
+            "primary_block_days": 3,
+            "sensitivity_block_days": 7,
             "family_comparisons": 12,
             "two_sided_family_alpha": 0.05,
         },
@@ -327,6 +345,70 @@ def test_input_hashes_reject_modified_packets(shadow, frames, tmp_path):
         shadow.capsule_metadata(capsule)
 
 
+@pytest.mark.parametrize(
+    "name",
+    [
+        "../outside",
+        "nested/../outside",
+        "/outside",
+        r"C:\outside",
+        "D:outside",
+        "issue.parquet:stream",
+        "missing.parquet",
+        r"..\outside",
+        ".",
+        "..",
+        "",
+    ],
+)
+def test_capsule_manifest_rejects_nonlocal_names_before_hashing(
+    shadow, frames, tmp_path, monkeypatch, name
+):
+    capsule, _ = make_capsule(shadow, frames, tmp_path)
+    metadata = json.loads((capsule / "capsule.json").read_text())
+    metadata["input_sha256"] = {name: "fixture"}
+    (capsule / "capsule.json").write_text(json.dumps(metadata))
+    monkeypatch.setattr(shadow, "digest", lambda *_a: pytest.fail("unsafe hash read"))
+    with pytest.raises(ValueError, match="capsule filename"):
+        shadow.capsule_metadata(capsule)
+
+
+@pytest.mark.parametrize(
+    "name", ["capsule.json", "publication.json", "issue.parquet", "unlisted.parquet"]
+)
+def test_capsule_rejects_declared_and_undeclared_symlinks(
+    shadow, frames, tmp_path, name
+):
+    capsule, _ = make_capsule(shadow, frames, tmp_path)
+    outside = tmp_path / "outside.json"
+    outside.write_text("{}")
+    target = capsule / name
+    target.unlink(missing_ok=True)
+    target.symlink_to(outside)
+    with pytest.raises(ValueError, match="capsule symlink"):
+        shadow.capsule_metadata(capsule)
+
+
+def test_operator_can_choose_a_capsule_root_alias(shadow, frames, tmp_path):
+    capsule, _ = make_capsule(shadow, frames, tmp_path)
+    alias = tmp_path / "operator-selected-alias"
+    alias.symlink_to(capsule, target_is_directory=True)
+    assert shadow.capsule_metadata(alias) == shadow.capsule_metadata(capsule)
+
+
+@pytest.mark.parametrize("name", ["issue.parquet", "unlisted"])
+def test_capsule_rejects_directories_before_parquet_reads(
+    shadow, frames, tmp_path, name
+):
+    capsule, _ = make_capsule(shadow, frames, tmp_path)
+    target = capsule / name
+    target.unlink(missing_ok=True)
+    target.mkdir()
+    (target / "nested.parquet").symlink_to(tmp_path / "outside.parquet")
+    with pytest.raises(ValueError, match="capsule child must be a regular file"):
+        shadow.capsule_metadata(capsule)
+
+
 def test_publication_fetch_reads_real_local_git_commit(shadow, tmp_path):
     git = shutil.which("git")
     assert git is not None
@@ -385,7 +467,12 @@ def test_finalize_rejects_a_racing_public_issuance(
     monkeypatch.setattr(
         shadow,
         "fetch_publication",
-        lambda *_a: ("a" * 40, b'{"issued_at":"different"}'),
+        lambda *_a: (
+            "a" * 40,
+            json.dumps(
+                {"issued_at": (frames[0] + timedelta(hours=1)).isoformat()}
+            ).encode(),
+        ),
     )
     with pytest.raises(ValueError, match="different issuance"):
         shadow.finalize(
@@ -400,9 +487,7 @@ def test_finalize_rejects_a_racing_public_issuance(
     assert not (capsule / "published.json").exists()
 
 
-def test_prospective_publication_receipt_seals_original_inputs(
-    shadow, frames, tmp_path, monkeypatch
-):
+def make_prospective_record(shadow, frames, tmp_path, monkeypatch):
     capsule, _ = make_capsule(shadow, frames, tmp_path)
     origin, *_ = frames
 
@@ -452,7 +537,11 @@ def test_prospective_publication_receipt_seals_original_inputs(
         "published_at": (origin + timedelta(minutes=4)).isoformat(),
         "units": {"temp_f": "F"},
         "hourly": [
-            {"valid_time": r["valid_time"], "values": {"temp_f": 59.0}}
+            {
+                "valid_time": r["valid_time"],
+                "values": {"temp_f": 59.0},
+                "methods": {"temp_f": "fixture"},
+            }
             for r in document["hourly"]
         ],
     }
@@ -473,3 +562,153 @@ def test_prospective_publication_receipt_seals_original_inputs(
     assert record["capsule"]["publication"]["commit"] == "a" * 40
     assert len(record["predictions"]) == 2
     assert all(r["production"] == 15.0 for r in record["predictions"])
+    return capsule, enrolled, target, Clock
+
+
+def test_prospective_publication_receipt_seals_original_inputs(
+    shadow, frames, tmp_path, monkeypatch
+):
+    make_prospective_record(shadow, frames, tmp_path, monkeypatch)
+
+
+@pytest.mark.parametrize(
+    "missing", [None, "training.parquet", "provider_completions.parquet"]
+)
+def test_prospective_requires_a_complete_input_manifest(
+    shadow, frames, tmp_path, missing
+):
+    capsule, _ = make_capsule(shadow, frames, tmp_path)
+    metadata = json.loads((capsule / "capsule.json").read_text())
+    if missing is not None:
+        metadata["input_sha256"] = {
+            name: shadow.digest(capsule / name)
+            for name in shadow.INPUT_FILES
+            if name != missing
+        }
+    (capsule / "capsule.json").write_text(json.dumps(metadata))
+    with pytest.raises(ValueError, match="complete captured input manifest"):
+        shadow.capsule_metadata(capsule, prospective=True)
+
+
+@pytest.mark.parametrize(
+    "stage", ["published_only", "receipt_complete", "empty_record_dir"]
+)
+def test_finalize_recovers_partial_state(shadow, frames, tmp_path, monkeypatch, stage):
+    capsule, protocol, target, _clock = make_prospective_record(
+        shadow, frames, tmp_path, monkeypatch
+    )
+    (target / "record.json").unlink()
+    if stage != "empty_record_dir":
+        target.rmdir()
+    if stage == "published_only":
+        (capsule / "publication.json").unlink()
+        payload = (capsule / "published.json").read_bytes()
+        monkeypatch.setattr(
+            shadow, "fetch_publication", lambda *_a: ("a" * 40, payload)
+        )
+    else:
+        monkeypatch.setattr(
+            shadow,
+            "fetch_publication",
+            lambda *_a: pytest.fail("reuse the sealed receipt"),
+        )
+    assert (
+        shadow.finalize(
+            capsule,
+            target.parent,
+            protocol,
+            remote="fixture",
+            branch="refs/heads/data",
+            source=capsule / "production.json",
+            mode="prospective",
+        )
+        == target
+    )
+    assert json.loads((target / "record.json").read_text())["mode"] == "prospective"
+
+
+def test_held_record_is_validated_without_retiming_or_refitting(
+    shadow, frames, tmp_path, monkeypatch
+):
+    capsule, protocol, target, clock = make_prospective_record(
+        shadow, frames, tmp_path, monkeypatch
+    )
+    before = (target / "record.json").read_bytes()
+    clock.instant += timedelta(hours=2)
+    monkeypatch.setattr(
+        shadow, "fetch_publication", lambda *_a: pytest.fail("receipt already sealed")
+    )
+    monkeypatch.setattr(
+        shadow, "record", lambda *_a, **_k: pytest.fail("do not refit held issues")
+    )
+    assert (
+        shadow.finalize(
+            capsule,
+            target.parent,
+            protocol,
+            remote="fixture",
+            branch="refs/heads/data",
+            source=capsule / "production.json",
+            mode="prospective",
+        )
+        == target
+    )
+    assert (target / "record.json").read_bytes() == before
+    invalid = json.loads(before)
+    invalid["mode"] = "replay"
+    (target / "record.json").write_text(json.dumps(invalid))
+    with pytest.raises(ValueError, match="conflicts with this enrollment"):
+        shadow.finalize(
+            capsule,
+            target.parent,
+            protocol,
+            remote="fixture",
+            branch="refs/heads/data",
+            source=capsule / "production.json",
+            mode="prospective",
+        )
+
+
+@pytest.mark.parametrize("change", ["duplicate", "method", "release", "rounding"])
+def test_publication_projection_rejects_grid_and_attribution_changes(
+    shadow, frames, tmp_path, monkeypatch, change
+):
+    capsule, _protocol, _target, _clock = make_prospective_record(
+        shadow, frames, tmp_path, monkeypatch
+    )
+    published = json.loads((capsule / "published.json").read_text())
+    if change == "duplicate":
+        published["hourly"].append(published["hourly"][0])
+    elif change == "method":
+        published["hourly"][0]["methods"]["temp_f"] = "wrong"
+    elif change == "release":
+        published["hourly"][0]["release_ids"] = {"temp_f": "wrong"}
+    else:
+        published["hourly"][0]["values"]["temp_f"] += 0.01
+    (capsule / "published.json").write_text(json.dumps(published))
+    receipt = json.loads((capsule / "publication.json").read_text())
+    receipt["published_sha256"] = shadow.digest(capsule / "published.json")
+    (capsule / "publication.json").write_text(json.dumps(receipt))
+    with pytest.raises(
+        ValueError, match=r"grid differs|attribution differs|temperature differs"
+    ):
+        shadow.production_rows(
+            capsule,
+            shadow.capsule_metadata(capsule, prospective=True),
+            prospective=True,
+        )
+
+
+def test_freeze_rejects_changed_candidate_bytes(shadow, tmp_path, monkeypatch):
+    protocol = tmp_path / "protocol.json"
+    protocol.write_text(json.dumps(template_protocol(shadow)))
+    digest = shadow.digest
+    monkeypatch.setattr(
+        shadow,
+        "digest",
+        lambda path: (
+            "0" * 64 if path.name == "shadow_candidate_v1.py" else digest(path)
+        ),
+    )
+    with pytest.raises(ValueError, match="reviewed protocol digest"):
+        shadow.freeze(protocol, tmp_path / "enrollment")

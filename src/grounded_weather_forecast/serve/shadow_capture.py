@@ -46,8 +46,14 @@ def capture_issue(
     historical: bool,
 ) -> Path:
     """Publish an exclusive local capsule, retaining only temperature inputs."""
+    if issue.is_empty() or not document.hourly:
+        raise ValueError("temperature shadow requires hourly inputs")
+    if any(point.truth_semantics.get("temp_c") != "mean" for point in document.hourly):
+        raise ValueError(
+            "temperature shadow requires production interval-mean semantics"
+        )
     root.mkdir(parents=True, exist_ok=True, mode=0o700)
-    issued_at = datetime.fromisoformat(document.issued_at)
+    issued_at = datetime.fromisoformat(document.issued_at).astimezone(UTC)
     target = root / issued_at.strftime("%Y%m%dT%H%M%SZ")
     if target.exists():
         raise FileExistsError(f"shadow inputs already captured: {target}")

@@ -11,7 +11,7 @@ For each source, estimate forecast-minus-truth bias using weights
 `2 ** (-age_days / 21)`. Train only on labels whose valid hour plus two hours
 is at or before issuance, with archive issue time at or before issuance.
 Retain the latest issue per valid hour and lead group. Groups are [0,6),
-[6,24), [24,72), [72,168), [168,360) hours. Divide each global residual's
+[6,24), [24,72), [72,168), [168,∞) hours. Divide each global residual's
 weight by that valid hour's lead-group multiplicity. Shrink each group bias
 toward the global bias by `n / (n + 7)`, with `n` the count of UTC dates with
 finite source values and positive weight. This is a count, not a decayed

@@ -1,12 +1,16 @@
 import importlib
 import json
+from dataclasses import replace
+from datetime import timedelta, timezone
 
 import polars as pl
 import pytest
 from conftest import utc
 from test_predict import build_fixture
 
+from grounded_weather_forecast.cli import main
 from grounded_weather_forecast.contracts import TruthSemantics
+from grounded_weather_forecast.serve.history import append_history
 from grounded_weather_forecast.serve.shadow_capture import capture_issue
 
 
@@ -61,7 +65,9 @@ def test_capture_is_exclusive(config, tmp_path):
     module = importlib.import_module("grounded_weather_forecast.serve.predict")
     now = utc(2026, 3, 22, 17)
     snapshot = module.build_snapshot(config, now)
-    document = module.predict(config, {}, now=now)
+    document = module.predict(
+        config, {}, now=now, semantics=TruthSemantics.INTERVAL_MEAN
+    )
     options = {
         "issue": snapshot.hourly,
         "training": snapshot.hourly,
@@ -74,3 +80,76 @@ def test_capture_is_exclusive(config, tmp_path):
     with pytest.raises(FileExistsError, match="already captured"):
         capture_issue(tmp_path / "capsules", config, document, **options)
     assert {p.name: p.read_bytes() for p in capsule.iterdir()} == before
+
+
+@pytest.mark.parametrize("kind", ["empty", "instantaneous"])
+def test_capture_abstains_on_incompatible_inputs(config, tmp_path, kind):
+    module = importlib.import_module("grounded_weather_forecast.serve.predict")
+    now = utc(2026, 3, 22, 17)
+    snapshot = module.build_snapshot(config, now)
+    document = module.predict(
+        config, {}, now=now, semantics=TruthSemantics.INTERVAL_MEAN
+    )
+    issue = snapshot.hourly
+    if kind == "empty":
+        issue = issue.head(0)
+    else:
+        document.hourly[0].truth_semantics["temp_c"] = "inst"
+    with pytest.raises(ValueError, match="temperature shadow requires"):
+        capture_issue(
+            tmp_path / "capsules",
+            config,
+            document,
+            issue=issue,
+            training=issue,
+            truth=snapshot.truth_hourly,
+            completions=snapshot.completions,
+            historical=True,
+        )
+    assert not (tmp_path / "capsules").exists()
+
+
+def test_capture_uses_utc_for_offset_aware_issuance(config, tmp_path):
+    module = importlib.import_module("grounded_weather_forecast.serve.predict")
+    now = utc(2026, 3, 22, 17)
+    snapshot = module.build_snapshot(config, now)
+    document = module.predict(
+        config, {}, now=now, semantics=TruthSemantics.INTERVAL_MEAN
+    )
+    document = replace(
+        document, issued_at=now.astimezone(timezone(timedelta(hours=-7))).isoformat()
+    )
+    capsule = capture_issue(
+        tmp_path / "capsules",
+        config,
+        document,
+        issue=snapshot.hourly,
+        training=snapshot.hourly,
+        truth=snapshot.truth_hourly,
+        completions=snapshot.completions,
+        historical=True,
+    )
+    assert capsule.name == "20260322T170000Z"
+
+
+def test_cached_capture_uses_normal_cli_error_path(config, tmp_path, capsys):
+    module = importlib.import_module("grounded_weather_forecast.serve.predict")
+    now = utc(2026, 3, 22, 17)
+    document = module.predict(config, {}, now=now)
+    append_history(document, config.predict.history_path)
+    assert (
+        main(
+            [
+                "--config",
+                str(tmp_path / "config.toml"),
+                "predict",
+                "--now",
+                now.isoformat(),
+                "--shadow-capture",
+                str(tmp_path / "capsules"),
+                "--no-history",
+            ]
+        )
+        == 1
+    )
+    assert "cannot export original inputs" in capsys.readouterr().out

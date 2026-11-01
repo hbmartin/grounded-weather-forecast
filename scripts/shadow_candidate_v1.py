@@ -1,6 +1,7 @@
 """Frozen October 26 candidate functions, copied verbatim; no registry changes.
 
-Source SHA256: 962d0a9c21d3e0e1d1babaf562635fd2e64a559ab27e6909fe0aba1caa327c28
+Original experiment source-file SHA256 (before extraction into this module):
+962d0a9c21d3e0e1d1babaf562635fd2e64a559ab27e6909fe0aba1caa327c28
 Only temperature simplex_decay21 / decay21 are enrolled by the shadow runner.
 """
 

@@ -1040,6 +1040,9 @@ exclusive issuance capsule. It is off by default. It performs no additional
 collection or fit and does not enroll or publish a shadow. Capture errors are
 reported as warnings while the forecast continues. `--now` captures are marked
 historical; cached archived documents cannot manufacture original input capsules.
+Enrollment requires already-served interval-mean temperature and hourly inputs.
+Incompatible captures abstain with a warning; enabling capture never changes
+production semantics, fitting or method selection.
 No truth columns enter the exported future input matrix. Collection timestamps,
 database read/export times and absent receipt/commit ledgers remain distinct.
 
@@ -1067,6 +1070,11 @@ the frozen window, actual committed public payload bytes and a full commit
 receipt. Public Fahrenheit rounding is included in the production comparator.
 Input hashes, code/config/data provenance and availability assumptions are
 retained. Source weights, bias corrections and per-row provider masks are logged.
+Capsules must be private, immutable directories of regular local files. Manifest
+keys must be plain filenames; traversal names and symlink children are rejected
+before reading capsule data. Explicit operator CLI paths remain configurable.
+Prospective input manifests must cover every consumed serving input and the
+provider-completion ledger. Replay may use partial synthetic manifests.
 
 `finalize --input CAPSULE --out STORE --protocol ENROLLMENT/protocol.json
 --remote REMOTE --branch refs/heads/data --source SOURCE --mode prospective`
@@ -1075,6 +1083,11 @@ the full commit and exact `forecast.json` bytes, verifies issuance/source/data/
 release/grid identity, and records the original issue. Git requests are bounded
 to 30 seconds per operation. A racing public issuance, different held source,
 late outcome, modified input or conflicting immutable record is rejected.
+The receipt identifies verified branch readback, rather than claiming an ID
+returned by the publisher's push. Temperature values must match the actual
+two-decimal Fahrenheit conversion, with identical per-row temperature attribution.
+Completed receipts and records are validated and reused on retry; conflicting
+partial state fails closed. The wrapper allows 300 seconds for Git and fitting.
 This command reads Git; it never pushes, publishes, promotes or collects weather.
 
 `evaluate --input STORE --truth FROZEN_TRUTH --out NEW_DIRECTORY --protocol
@@ -1084,6 +1097,10 @@ uncertainty. It does not correct truth or select a new family. Replay and
 prospective stores remain distinct. The source producer and wrappers are
 inactive unless explicitly configured; see the [rollout review](../shadow-rollout.md)
 and [fixed candidate/evaluation definition](../methods/shadow-temperature.md).
+Freeze and review the QC hourly-mean truth file after all outcomes mature;
+future observation bytes cannot be prehashed at enrollment. Evaluation records
+the exact truth and record-file hashes for audit. These private same-user
+artifacts are not authenticated against an operator rewriting every file.
 
 
 ---

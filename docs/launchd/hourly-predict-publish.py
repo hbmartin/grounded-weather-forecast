@@ -24,7 +24,6 @@ strip files the branch is already serving.
 """
 
 import argparse
-import hashlib
 import json
 import os
 import socket
@@ -293,26 +292,8 @@ def _finalize_shadow(
     branch: str,
 ) -> int:
     document = json.loads(source.read_text(encoding="utf-8"))
-    issued_at = datetime.fromisoformat(document["issued_at"])
+    issued_at = datetime.fromisoformat(document["issued_at"]).astimezone(UTC)
     name = issued_at.strftime("%Y%m%dT%H%M%SZ")
-    existing = root / "records" / name / "record.json"
-    if existing.exists():
-        saved = json.loads(existing.read_text(encoding="utf-8"))
-        if (
-            saved.get("issued_at") != document["issued_at"]
-            or saved.get("protocol_sha256")
-            != hashlib.sha256(protocol.read_bytes()).hexdigest()
-        ):
-            print(
-                "forecast published; shadow record conflicts with this enrollment",
-                flush=True,
-            )
-            return 1
-        print(
-            "shadow already recorded this issuance; held forecasts retain their original time",
-            flush=True,
-        )
-        return 0
     result = subprocess.run(  # noqa: S603 -- reviewed local shadow script, no shell
         [
             *paths.command("python"),
@@ -334,7 +315,7 @@ def _finalize_shadow(
             "prospective",
         ],
         check=False,
-        timeout=120,
+        timeout=300,
     )
     if result.returncode:
         print("forecast published; shadow receipt/record failed", flush=True)

@@ -1542,7 +1542,7 @@ def predict(
         )
         if archived is not None:
             if shadow_capture is not None:
-                raise ValueError(
+                raise NoForecastDataError(
                     "cannot export original inputs for an archived forecast"
                 )
             return archived

@@ -1,5 +1,4 @@
 import fcntl
-import hashlib
 import importlib.util
 import json
 import os
@@ -19,12 +18,13 @@ from grounded_weather_forecast.status import EXIT_NO_FOLDS
 SCRIPT = Path(__file__).parents[1] / "docs/launchd/daily-maintenance.py"
 
 
-def test_shadow_options_require_explicit_pair(monkeypatch, tmp_path):
+@pytest.mark.parametrize("flag", ["--shadow-root", "--shadow-protocol"])
+def test_shadow_options_require_explicit_pair(monkeypatch, tmp_path, flag):
     module = load_script(SCRIPT.with_name("hourly-predict-publish.py"))
     monkeypatch.setattr(
         module, "run_predict", lambda *_a: pytest.fail("must not predict")
     )
-    assert module.main(["--shadow-root", str(tmp_path / "shadow")]) == 2
+    assert module.main([flag, str(tmp_path / "shadow")]) == 2
 
 
 def test_predict_exports_inputs_only_when_explicitly_requested(monkeypatch, tmp_path):
@@ -43,7 +43,7 @@ def test_predict_exports_inputs_only_when_explicitly_requested(monkeypatch, tmp_
     assert commands[-1][-2:] == ["--shadow-capture", str(tmp_path / "capsules")]
 
 
-def test_held_shadow_issue_keeps_original_clock(monkeypatch, tmp_path, capsys):
+def test_held_shadow_issue_still_requires_validation(monkeypatch, tmp_path):
     module = load_script(SCRIPT.with_name("hourly-predict-publish.py"))
     source = tmp_path / "held.json"
     source.write_text('{"issued_at":"2026-10-01T12:00:00+00:00"}')
@@ -55,15 +55,17 @@ def test_held_shadow_issue_keeps_original_clock(monkeypatch, tmp_path, capsys):
         json.dumps(
             {
                 "issued_at": "2026-10-01T12:00:00+00:00",
-                "protocol_sha256": hashlib.sha256(protocol.read_bytes()).hexdigest(),
+                "mode": "replay",
             }
         )
     )
-    monkeypatch.setattr(
-        subprocess,
-        "run",
-        lambda *_a, **_k: pytest.fail("held issue must not be re-recorded"),
-    )
+    commands = []
+
+    def child(command, **_kwargs):
+        commands.append(command)
+        return subprocess.CompletedProcess(command, 1)
+
+    monkeypatch.setattr(subprocess, "run", child)
     assert (
         module.finalize_shadow(
             module.RuntimePaths(tmp_path, "uv"),
@@ -73,9 +75,10 @@ def test_held_shadow_issue_keeps_original_clock(monkeypatch, tmp_path, capsys):
             remote="fixture",
             branch="data",
         )
-        == 0
+        == 1
     )
-    assert "original time" in capsys.readouterr().out
+    command = commands[0]
+    assert command[command.index("--input") + 1].endswith("20261001T120000Z")
 
 
 def test_successful_publication_passes_exact_source_to_shadow(monkeypatch, tmp_path):
@@ -127,6 +130,35 @@ def test_failed_publication_never_finalizes_shadow(monkeypatch, tmp_path):
         )
         == 1
     )
+
+
+def test_publish_finalizes_the_source_chosen_by_hold_policy(monkeypatch, tmp_path):
+    module = load_script(SCRIPT.with_name("hourly-predict-publish.py"))
+    chosen = tmp_path / "held.json"
+    monkeypatch.setattr(module, "resolve_publishing", lambda *_a, **_k: None)
+    monkeypatch.setattr(module, "render_station", lambda *_a: 0)
+    monkeypatch.setattr(module, "staged_dir", lambda: tmp_path)
+    seen = []
+    fake = types.SimpleNamespace(
+        choose_source=lambda _path: chosen,
+        run=lambda **kwargs: seen.append(kwargs["source"]) or 0,
+        DEFAULT_REMOTE="fixture",
+        DEFAULT_BRANCH="data",
+    )
+    monkeypatch.setitem(sys.modules, "publish_forecast", fake)
+    monkeypatch.setattr(
+        module,
+        "finalize_shadow",
+        lambda _paths, source, *_a, **_k: seen.append(source) or 0,
+    )
+    assert (
+        module.publish(
+            module.RuntimePaths(tmp_path, "uv"),
+            shadow=(tmp_path / "shadow", tmp_path / "protocol"),
+        )
+        == 0
+    )
+    assert seen == [chosen, chosen]
 
 
 @pytest.fixture(autouse=True)
@@ -1120,8 +1152,9 @@ def test_shadow_receipt_timeout_reports_publication_already_succeeded(
     source = tmp_path / "source.json"
     source.write_text('{"issued_at":"2026-11-02T08:00:00+00:00"}')
 
-    def timeout(*_a, **_k):
-        raise subprocess.TimeoutExpired("fixture receipt", timeout=120)
+    def timeout(*_a, **kwargs):
+        assert kwargs["timeout"] == 300
+        raise subprocess.TimeoutExpired("fixture receipt", timeout=300)
 
     monkeypatch.setattr(subprocess, "run", timeout)
     assert (

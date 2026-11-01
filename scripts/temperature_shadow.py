@@ -10,9 +10,11 @@ import argparse
 import hashlib
 import json
 import math
+import os
 import shutil
 import subprocess
 import tempfile
+from contextlib import suppress
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any, cast
@@ -46,6 +48,15 @@ METHODS = (
 )
 HORIZONS = ("0-6h", "6-24h", "24-72h", "72-96h")
 TARGET = "t__temp_c__mean"
+INPUT_FILES = frozenset(
+    {
+        "issue.parquet",
+        "training.parquet",
+        "truth_hourly.parquet",
+        "production.json",
+        "provider_completions.parquet",
+    }
+)
 
 
 def digest(path: Path) -> str:
@@ -60,8 +71,23 @@ def timestamp(value: str) -> datetime:
 
 
 def write_new(path: Path, payload: Any) -> None:
-    with path.open("x", encoding="utf-8") as handle:
-        json.dump(payload, handle, indent=2, allow_nan=False, default=str)
+    write_bytes_new(
+        path, json.dumps(payload, indent=2, allow_nan=False, default=str).encode()
+    )
+
+
+def write_bytes_new(path: Path, payload: bytes) -> None:
+    """Publish complete bytes exclusively; a failed write never leaves partial JSON."""
+    temporary: Path | None = None
+    try:
+        with tempfile.NamedTemporaryFile(dir=path.parent, delete=False) as handle:
+            temporary = Path(handle.name)
+            handle.write(payload)
+        os.link(temporary, path)
+    finally:
+        if temporary is not None:
+            with suppress(OSError):
+                temporary.unlink()
 
 
 def number(value: float) -> float | None:
@@ -90,6 +116,10 @@ def freeze(protocol_path: Path, output: Path) -> Path:
         raise ValueError(
             "candidate and evaluation rules are fixed; review a new protocol version"
         )
+    if protocol["candidate_sha256"] != digest(
+        Path(__file__).with_name("shadow_candidate_v1.py")
+    ):
+        raise ValueError("candidate differs from the reviewed protocol digest")
     if timestamp(protocol["window_start"]) <= datetime.now(UTC):
         raise ValueError(
             "enrollment window has started; explicit review of a new window is required"
@@ -105,12 +135,27 @@ def freeze(protocol_path: Path, output: Path) -> Path:
     return target
 
 
-def capsule_metadata(capsule: Path) -> dict[str, Any]:
+def capsule_metadata(capsule: Path, *, prospective: bool = False) -> dict[str, Any]:
+    # A capsule is an immutable directory of local files, including files not
+    # listed in its manifest. Check before either JSON read or the later sweep.
+    if any(path.is_symlink() for path in capsule.iterdir()):
+        raise ValueError("capsule symlink is not a self-contained input")
+    if any(not path.is_file() for path in capsule.iterdir()):
+        raise ValueError("capsule child must be a regular file")
     meta = json.loads((capsule / "capsule.json").read_text())
+    hashes = meta.get("input_sha256", {})
+    if not isinstance(hashes, dict) or (
+        prospective and not hashes.keys() >= INPUT_FILES
+    ):
+        raise ValueError("prospective requires the complete captured input manifest")
     receipt = capsule / "publication.json"
     if receipt.exists():
         meta["publication"] = json.loads(receipt.read_text())
-    for name, expected in meta.get("input_sha256", {}).items():
+    for name, expected in hashes.items():
+        if not name or name in {".", ".."} or any(c in name for c in "/\\:"):
+            raise ValueError(f"invalid capsule filename: {name!r}")
+        if not (capsule / name).is_file():
+            raise ValueError(f"invalid capsule filename: {name!r} is not a regular file")
         if digest(capsule / name) != expected:
             raise ValueError(f"captured input changed: {name}")
     return meta
@@ -149,29 +194,57 @@ def finalize(
     mode: str,
 ) -> Path:
     """Seal a successful public commit and score the original captured issue."""
-    meta = capsule_metadata(capsule)
+    meta = capsule_metadata(capsule, prospective=mode == "prospective")
     if source is not None and digest(source) != digest(capsule / "production.json"):
         raise ValueError(
             "publisher chose a different source; do not relabel held forecasts"
         )
-    commit, payload = fetch_publication(remote, branch)
-    published = json.loads(payload)
-    if published["issued_at"] != meta["input_as_of"]:
-        raise ValueError("public commit belongs to a different issuance")
-    with (capsule / "published.json").open("xb") as stream:
-        stream.write(payload)
-    write_new(
-        capsule / "publication.json",
-        {
-            "commit": commit,
-            "issued_at": published["issued_at"],
-            "published_at": published["published_at"],
-            "source_sha256": digest(capsule / "production.json"),
-            "published_sha256": digest(capsule / "published.json"),
-            "remote": remote,
-            "branch": branch,
-        },
-    )
+    if "publication" not in meta:
+        commit, payload = fetch_publication(remote, branch)
+        published = json.loads(payload)
+        if timestamp(published["issued_at"]) != timestamp(meta["input_as_of"]):
+            raise ValueError("public commit belongs to a different issuance")
+        published_path = capsule / "published.json"
+        if published_path.exists():
+            if published_path.read_bytes() != payload:
+                raise ValueError(
+                    "partial publication conflicts with the public payload"
+                )
+        else:
+            write_bytes_new(published_path, payload)
+        write_new(
+            capsule / "publication.json",
+            {
+                "commit": commit,
+                "issued_at": published["issued_at"],
+                "published_at": published["published_at"],
+                "source_sha256": digest(capsule / "production.json"),
+                "published_sha256": digest(published_path),
+                "remote": remote,
+                "branch": branch,
+                "commit_binding": "verified branch readback; not a publisher-returned push operation id",
+            },
+        )
+        meta = capsule_metadata(capsule, prospective=mode == "prospective")
+    document, _ = production_rows(capsule, meta, prospective=mode == "prospective")
+    target = output / timestamp(document["issued_at"]).strftime("%Y%m%dT%H%M%SZ")
+    if (existing := target / "record.json").exists():
+        saved = json.loads(existing.read_text())
+        if json.loads(
+            protocol_path.with_suffix(".lock.json").read_text()
+        ) != implementation_lock(protocol_path):
+            raise ValueError("frozen protocol or implementation changed")
+        if (
+            saved.get("mode") != mode
+            or saved.get("issued_at") != timestamp(document["issued_at"]).isoformat()
+            or saved.get("protocol_sha256") != digest(protocol_path)
+            or not saved.get("predictions")
+            or saved.get("input_sha256")
+            != {p.name: digest(p) for p in capsule.iterdir()}
+            or saved.get("capsule", {}).get("publication") != meta["publication"]
+        ):
+            raise ValueError("existing shadow record conflicts with this enrollment")
+        return target
     return record(capsule, output, protocol_path, mode=mode)
 
 
@@ -200,6 +273,8 @@ def production_rows(
 ) -> tuple[dict[str, Any], dict[str, dict[str, Any]]]:
     document = json.loads((capsule / "production.json").read_text())
     rows = {row["valid_time"]: row for row in document["hourly"]}
+    if len(rows) != len(document["hourly"]):
+        raise ValueError("duplicated source forecast grid")
     if any(
         row.get("truth_semantics", {}).get("temp_c") != "mean" for row in rows.values()
     ):
@@ -214,6 +289,13 @@ def production_rows(
     receipt = meta["publication"]
     published_path = capsule / "published.json"
     published = json.loads(published_path.read_text())
+    published_times = [row["valid_time"] for row in published["hourly"]]
+    if (
+        len(published_times) != len(rows)
+        or len(set(published_times)) != len(published_times)
+        or set(published_times) != set(rows)
+    ):
+        raise ValueError("published timestamp grid differs")
     commit = receipt["commit"]
     if len(commit) != 40 or any(c not in "0123456789abcdef" for c in commit):
         raise ValueError("prospective publication needs full commit identity")
@@ -228,21 +310,34 @@ def production_rows(
         or timestamp(receipt["published_at"]) != timestamp(published["published_at"])
     ):
         raise ValueError("publication receipt/source/payload mismatch")
-    for row in published["hourly"]:
+    apply_published_temperature(rows, published["hourly"])
+    return document, rows
+
+
+def apply_published_temperature(
+    rows: dict[str, dict[str, Any]], published: list[dict[str, Any]]
+) -> None:
+    """Verify the exact temperature projection of the real public contract."""
+    for row in published:
         original = rows[row["valid_time"]]
+        for field in ("methods", "release_ids", "selection_reasons"):
+            if row.get(field, {}).get("temp_f") != original.get(field, {}).get(
+                "temp_c"
+            ):
+                raise ValueError(
+                    "published temperature attribution differs from source"
+                )
         original_value = original["values"].get("temp_c")
         value_f = row["values"].get("temp_f")
         if (original_value is None) != (value_f is None):
             raise ValueError("published temperature availability differs")
         if value_f is not None:
             value_c = (value_f - 32) / 1.8
-            if abs(value_c - original_value) > 0.004:
+            # The actual public publisher rounds Celsius * 9/5 +32 to 2 decimals.
+            if value_f != round(original_value * 9.0 / 5.0 + 32.0, 2):
                 raise ValueError("published temperature differs from source")
             # Evaluate the actual public, rounded value.
             original["values"]["temp_c"] = value_c
-    if {row["valid_time"] for row in published["hourly"]} != set(rows):
-        raise ValueError("published timestamp grid differs")
-    return document, rows
 
 
 def predictions(
@@ -298,7 +393,7 @@ def predictions(
 def record(capsule: Path, output: Path, protocol_path: Path, *, mode: str) -> Path:
     prospective = mode == "prospective"
     now = datetime.now(UTC)
-    meta = capsule_metadata(capsule)
+    meta = capsule_metadata(capsule, prospective=prospective)
     protocol = json.loads(protocol_path.read_text())
     lock = json.loads(protocol_path.with_suffix(".lock.json").read_text())
     if lock != implementation_lock(protocol_path):
@@ -382,7 +477,7 @@ def record(capsule: Path, output: Path, protocol_path: Path, *, mode: str) -> Pa
     # Exclusive directory creation makes an issue immutable, including after partial failure.
     output.mkdir(parents=True, exist_ok=True, mode=0o700)
     target = output / origin.strftime("%Y%m%dT%H%M%SZ")
-    target.mkdir(exist_ok=False, mode=0o700)
+    target.mkdir(exist_ok=True, mode=0o700)
     hashes = {p.name: digest(p) for p in capsule.iterdir() if p.is_file()}
     payload = {
         "mode": mode,
@@ -488,7 +583,10 @@ def score_horizon(
     intervals = {
         f"{c}_{block}d": interval(paired, c + "_diff", block=block, protocol=protocol)
         for c in ("production", "decay21", "best_provider")
-        for block in (3, 7)
+        for block in (
+            protocol["uncertainty"]["primary_block_days"],
+            protocol["uncertainty"]["sensitivity_block_days"],
+        )
     }
     quality = quality_pass(daily, common, eligible, issue_coverage, protocol)
     prod = float(cast(float, daily["production"].mean()))
@@ -596,6 +694,9 @@ def evaluate(
         {
             "protocol_sha256": digest(protocol_path),
             "truth_sha256": digest(truth_path),
+            "record_sha256": {
+                p.parent.name: digest(p) for p in sorted(store.glob("*/record.json"))
+            },
             "evaluated_at": datetime.now(UTC),
             "issuance_coverage": issue_coverage,
             "results": result,
