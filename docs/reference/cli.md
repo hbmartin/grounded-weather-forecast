@@ -1068,55 +1068,76 @@ that the forecast was published and returns a failure for the shadow step.
 
 ### Standalone temperature shadow
 
-`scripts/temperature_shadow.py freeze --protocol PROPOSAL --out ENROLLMENT`
-copies and seals a reviewed six-week protocol before its window starts. It
-creates no job. The example window is a dated proposal, not a rolling default;
-an elapsed start is rejected and requires an explicitly reviewed new window.
-Candidate and evaluation rules are fixed. Protocol, runner, candidate and
-package digests are locked; changed implementations cannot be pooled.
+The v2 runner requires a fresh enrollment; v1 prospective records and branch-readback
+receipts are preserved but cannot be upgraded or pooled into v2 evidence. Candidate
+mathematics, practical thresholds and the proposal dates are unchanged. Replay is
+still the default and is excluded from prospective analysis.
+
+`freeze --protocol PROPOSAL --out ENROLLMENT` copies a reviewed future six-week
+protocol and locks the protocol, runner, evidence helper, candidate and package
+identities. An elapsed start is rejected and requires an explicitly reviewed new
+window; freezing creates no job.
 
 `record --input CAPSULE --out STORE --protocol ENROLLMENT/protocol.json
---mode replay|prospective` computes the fixed predictions from supplied files.
-Replay is the default and is excluded from prospective analysis. Prospective
-records require contemporaneous inputs, interval-mean temperature semantics,
-the frozen window, actual committed public payload bytes and a full commit
-receipt. Public Fahrenheit rounding is included in the production comparator.
-Input hashes, code/config/data provenance and availability assumptions are
-retained. Source weights, bias corrections and per-row provider masks are logged.
-Capsules must be private, immutable directories of regular local files. Manifest
-keys must be plain filenames; traversal names and symlink children are rejected
-before reading capsule data. Explicit operator CLI paths remain configurable.
-Prospective input manifests must cover every consumed serving input and the
-provider-completion ledger. Replay may use partial synthetic manifests.
+--mode replay|prospective` computes fixed predictions from supplied files.
+Prospective records require contemporaneous v2 serving capsules, already-served
+interval-mean temperature, the frozen window and an original successful-push
+receipt. Capture never changes production semantics or method selection.
+Capsules are private immutable directories of regular files; manifest keys must
+be plain filenames and all consumed input hashes are checked before use.
+Symlink/directory aliases, traversal and Windows drive/stream names are rejected.
+Raw completion clocks and absent station-receipt assumptions remain explicit.
 
 `finalize --input CAPSULE --out STORE --protocol ENROLLMENT/protocol.json
---remote REMOTE --branch refs/heads/data --source SOURCE --mode prospective`
-reads the public Git branch into an isolated temporary object store, captures
-the full commit and exact `forecast.json` bytes, verifies issuance/source/data/
-release/grid identity, and records the original issue. Git requests are bounded
-to 30 seconds per operation. A racing public issuance, different held source,
-late outcome, modified input or conflicting immutable record is rejected.
-The receipt identifies verified branch readback, rather than claiming an ID
-returned by the publisher's push. Temperature values must match the actual
-two-decimal Fahrenheit conversion, with identical per-row temperature attribution.
-Completed receipts and records are validated and reused on retry; conflicting
-partial state fails closed. The wrapper allows 300 seconds for Git and fitting.
-This command reads Git; it never pushes, publishes, promotes or collects weather.
+--publication-receipt RECEIPT_JSON --source SOURCE --mode prospective` consumes
+publisher 2.3+ `run_with_receipt()` receipt schema 1. It seals the exact forecast
+bytes and full commit acknowledged by that publisher's explicit-commit push.
+It performs no Git fetch, collection or publication. The publisher's source
+SHA-256 must match the captured production document; issuance, data, unique grid,
+hoisted mean semantics, two-decimal Fahrenheit rounding and per-row temperature
+method/release/reason attribution are verified. Public schema remains 2.
+A missing original receipt cannot be reconstructed from a later branch tip.
 
-`evaluate --input STORE --truth FROZEN_TRUTH --out NEW_DIRECTORY --protocol
-ENROLLMENT/protocol.json --mode replay|prospective` joins QC hourly means and
-reports identical-case counts, pairwise attrition, daily losses and calendar-block
-uncertainty. It does not correct truth or select a new family. Replay and
-prospective stores remain distinct. The source producer and wrappers are
-inactive unless explicitly configured; see the [rollout review](../shadow-rollout.md)
-and [fixed candidate/evaluation definition](../methods/shadow-temperature.md).
-Freeze and review the QC hourly-mean truth file after all outcomes mature;
-future observation bytes cannot be prehashed at enrollment. Evaluation records
-the exact truth and record-file hashes for audit. These private same-user
-artifacts are not authenticated against an operator rewriting every file.
+The hourly wrapper transports the receipt privately and allows 300 seconds for
+validation/fitting. Failed publication never records a shadow. An unchanged
+publication may reuse only its verified original sealed receipt or record;
+conflicting partial state fails closed. Held records keep their original issuance
+and recording time. An older publisher remains usable for ordinary publishing;
+shadow-enabled publication succeeds normally but reports an unsupported-receipt
+API failure and creates no prospective evidence. Install compatible publisher
+and wrapper versions deliberately; merging does not deploy them.
 
+After `window_end +98 hours`, review the QC hourly-mean truth, then seal it:
 
----
+```sh
+uv run --no-sync python scripts/temperature_shadow.py freeze-truth \
+  --truth REVIEWED_QC_TRUTH --protocol ENROLLMENT/protocol.json --out SEALED_TRUTH
+```
+
+The exclusive private directory contains the exact Parquet bytes and a lock with
+protocol/enrollment identity, target, SHA-256, coverage and sealing time. Labels
+must be numeric finite-or-null interval means at unique timezone-aware exact
+hours. Sealing records the operator-reviewed input; it does not independently
+certify QC or prehash future observations at enrollment.
+
+`evaluate --input STORE --capsules CAPSULE_ROOT --truth-lock SEALED_TRUTH
+--out NEW_DIRECTORY --protocol ENROLLMENT/protocol.json --mode prospective`
+rejects execution before maturity. It validates the frozen implementation and
+canonical issuance directories, verifies every retained capsule/receipt digest,
+and reconstructs each prediction record from the original inputs and recording
+clock before admitting any row. Attribution, grid and identity fields must match;
+floating predictions use `rtol=1e-10`, `atol=1e-10`. Duplicate issuances and
+inconsistent evidence fail before publishing output. An optional `--truth FILE`
+must byte-match the sealed copy. Replay evaluation retains raw `--truth` support.
+
+Scoring retains identical-case counts, pairwise attrition, daily losses and the
+predeclared calendar-block uncertainty. Exact truth, truth-lock and selected
+record hashes are recorded. Results are staged privately and published only
+after validation and scoring succeed. A failed attempt leaves no accepted output;
+a crash can leave a `.NAME.publishing` lease requiring operator inspection before
+retry. There is no automatic promotion. These private same-user artifacts detect
+inconsistency; they are not authenticated against an operator rewriting every
+file. See the [rollout review](../shadow-rollout.md) before activation.
 
 ## `publish`
 

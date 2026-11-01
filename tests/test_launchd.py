@@ -72,8 +72,7 @@ def test_held_shadow_issue_still_requires_validation(monkeypatch, tmp_path):
             source,
             tmp_path / "shadow",
             protocol,
-            remote="fixture",
-            branch="data",
+            publication_receipt=None,
         )
         == 1
     )
@@ -100,8 +99,7 @@ def test_successful_publication_passes_exact_source_to_shadow(monkeypatch, tmp_p
             source,
             root,
             protocol,
-            remote="fixture",
-            branch="data",
+            publication_receipt=None,
         )
         == 0
     )
@@ -141,7 +139,10 @@ def test_publish_finalizes_the_source_chosen_by_hold_policy(monkeypatch, tmp_pat
     seen = []
     fake = types.SimpleNamespace(
         choose_source=lambda _path: chosen,
-        run=lambda **kwargs: seen.append(kwargs["source"]) or 0,
+        run_with_receipt=lambda **kwargs: (
+            seen.append(kwargs["source"])
+            or types.SimpleNamespace(exit_code=0, receipt=None)
+        ),
         DEFAULT_REMOTE="fixture",
         DEFAULT_BRANCH="data",
     )
@@ -159,6 +160,70 @@ def test_publish_finalizes_the_source_chosen_by_hold_policy(monkeypatch, tmp_pat
         == 0
     )
     assert seen == [chosen, chosen]
+
+
+def test_old_publisher_keeps_publication_but_declines_shadow(
+    monkeypatch, tmp_path, capsys
+):
+    module = load_script(SCRIPT.with_name("hourly-predict-publish.py"))
+    monkeypatch.setattr(module, "resolve_publishing", lambda *_a, **_k: None)
+    monkeypatch.setattr(module, "render_station", lambda *_a: 0)
+    monkeypatch.setattr(module, "staged_dir", lambda: tmp_path)
+    calls = []
+    monkeypatch.setitem(
+        sys.modules,
+        "publish_forecast",
+        types.SimpleNamespace(
+            choose_source=lambda path: path,
+            run=lambda **_kw: calls.append("published") or 0,
+        ),
+    )
+    monkeypatch.setattr(
+        module,
+        "finalize_shadow",
+        lambda *_a, **_k: pytest.fail("unsupported publisher"),
+    )
+    assert (
+        module.publish(
+            module.RuntimePaths(tmp_path, "uv"),
+            shadow=(tmp_path / "shadow", tmp_path / "protocol"),
+        )
+        == 1
+    )
+    assert calls == ["published"]
+    assert "run_with_receipt API" in capsys.readouterr().out
+
+
+def test_wrapper_transports_exact_receipt_and_removes_transport_file(
+    monkeypatch, tmp_path
+):
+    module = load_script(SCRIPT.with_name("hourly-predict-publish.py"))
+    source = tmp_path / "source.json"
+    source.write_text('{"issued_at":"2026-10-01T12:00:00+00:00"}')
+    receipt = {"commit": "a" * 40, "forecast_base64": "synthetic"}
+    files = []
+
+    def child(command, **kwargs):
+        assert kwargs["timeout"] == 300
+        transport = Path(command[command.index("--publication-receipt") + 1])
+        assert json.loads(transport.read_text()) == receipt
+        assert "--remote" not in command
+        assert "--branch" not in command
+        files.append(transport)
+        return subprocess.CompletedProcess(command, 0)
+
+    monkeypatch.setattr(subprocess, "run", child)
+    assert (
+        module.finalize_shadow(
+            module.RuntimePaths(tmp_path, "uv"),
+            source,
+            tmp_path / "shadow",
+            tmp_path / "protocol",
+            publication_receipt=receipt,
+        )
+        == 0
+    )
+    assert files and not files[0].exists()
 
 
 @pytest.fixture(autouse=True)
@@ -1226,8 +1291,7 @@ def test_shadow_receipt_timeout_reports_publication_already_succeeded(
             source,
             tmp_path / "shadow",
             tmp_path / "protocol.json",
-            remote="fixture",
-            branch="data",
+            publication_receipt=None,
         )
         == 1
     )

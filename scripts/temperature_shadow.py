@@ -11,8 +11,6 @@ import hashlib
 import json
 import math
 import os
-import shutil
-import subprocess
 import tempfile
 from contextlib import suppress
 from datetime import UTC, datetime, timedelta
@@ -28,6 +26,21 @@ from shadow_candidate_v1 import (
     independent_training,
     observed_climate,
     safe_blend,
+)
+from shadow_evidence import (
+    ARTIFACT_VERSION,
+    BINDING,
+    assert_equivalent,
+    capsule_for,
+    locked_truth,
+    mature,
+    publication,
+    regular,
+    staged_directory,
+    truth_frame,
+)
+from shadow_evidence import (
+    freeze_truth as seal_truth,
 )
 
 from grounded_weather_forecast.blenders.baselines import BestProvider
@@ -112,6 +125,7 @@ def implementation_lock(protocol_path: Path) -> dict[str, str]:
         "runner_sha256": digest(Path(__file__)),
         "candidate_sha256": digest(Path(__file__).with_name("shadow_candidate_v1.py")),
         "code_identity": code_identity(),
+        "evidence_sha256": digest(Path(__file__).with_name("shadow_evidence.py")),
     }
 
 
@@ -147,6 +161,19 @@ def freeze(protocol_path: Path, output: Path) -> Path:
     return target
 
 
+def freeze_truth(truth: Path, protocol_path: Path, output: Path, now: datetime) -> Path:
+    if (
+        json.loads(protocol_path.read_text()).get("artifact_version")
+        != ARTIFACT_VERSION
+    ):
+        raise ValueError("truth sealing requires a fresh v2 enrollment")
+    if json.loads(
+        protocol_path.with_suffix(".lock.json").read_text()
+    ) != implementation_lock(protocol_path):
+        raise ValueError("frozen protocol or implementation changed")
+    return seal_truth(truth, protocol_path, output, now)
+
+
 def capsule_metadata(capsule: Path, *, prospective: bool = False) -> dict[str, Any]:
     # A capsule is an immutable directory of local files, including files not
     # listed in its manifest. Check before either JSON read or the later sweep.
@@ -155,6 +182,8 @@ def capsule_metadata(capsule: Path, *, prospective: bool = False) -> dict[str, A
     if any(not path.is_file() for path in capsule.iterdir()):
         raise ValueError("capsule child must be a regular file")
     meta = json.loads((capsule / "capsule.json").read_text())
+    if prospective and meta.get("artifact_version") != ARTIFACT_VERSION:
+        raise ValueError("prospective capsules require a fresh v2 enrollment")
     hashes = meta.get("input_sha256", {})
     if not isinstance(hashes, dict) or (
         prospective and not hashes.keys() >= INPUT_FILES
@@ -175,35 +204,12 @@ def capsule_metadata(capsule: Path, *, prospective: bool = False) -> dict[str, A
     return meta
 
 
-def fetch_publication(remote: str, branch: str) -> tuple[str, bytes]:
-    """Read exact committed bytes into an isolated temporary Git object store."""
-    git = shutil.which("git")
-    if git is None or remote.startswith("-") or not branch.startswith("refs/heads/"):
-        raise ValueError("Git and an explicit remote/branch ref are required")
-    with tempfile.TemporaryDirectory(prefix="shadow-publication-") as folder:
-
-        def run(*args: str) -> bytes:
-            return subprocess.run(  # noqa: S603 -- explicit Git reads, no shell
-                [git, "-C", folder, *args],
-                check=True,
-                capture_output=True,
-                timeout=30,
-            ).stdout
-
-        run("init", "--bare", "--quiet")
-        run("fetch", "--quiet", "--depth=1", "--no-tags", remote, branch)
-        commit = run("rev-parse", "FETCH_HEAD").decode().strip()
-        payload = run("show", f"{commit}:forecast.json")
-    return commit, payload
-
-
 def finalize(
     capsule: Path,
     output: Path,
     protocol_path: Path,
     *,
-    remote: str,
-    branch: str,
+    publication_receipt: dict[str, Any] | None = None,
     source: Path | None,
     mode: str,
 ) -> Path:
@@ -213,9 +219,10 @@ def finalize(
         raise ValueError(
             "publisher chose a different source; do not relabel held forecasts"
         )
-    if "publication" not in meta:
-        commit, payload = fetch_publication(remote, branch)
-        published = json.loads(payload)
+    if publication_receipt is not None:
+        payload, published = publication(publication_receipt)
+        if publication_receipt["source_sha256"] != digest(capsule / "production.json"):
+            raise ValueError("publisher consumed a different source")
         if timestamp(published["issued_at"]) != timestamp(meta["input_as_of"]):
             raise ValueError("public commit belongs to a different issuance")
         published_path = capsule / "published.json"
@@ -226,40 +233,37 @@ def finalize(
                 )
         else:
             write_bytes_new(published_path, payload)
-        write_new(
-            capsule / "publication.json",
-            {
-                "commit": commit,
-                "issued_at": published["issued_at"],
-                "published_at": published["published_at"],
-                "source_sha256": digest(capsule / "production.json"),
-                "published_sha256": digest(published_path),
-                "remote": remote,
-                "branch": branch,
-                "commit_binding": "verified branch readback; not a publisher-returned push operation id",
-            },
-        )
+        receipt = {
+            "artifact_version": ARTIFACT_VERSION,
+            "commit": publication_receipt["commit"],
+            "issued_at": published["issued_at"],
+            "published_at": published["published_at"],
+            "source_sha256": digest(capsule / "production.json"),
+            "published_sha256": digest(published_path),
+            "remote": publication_receipt["remote"],
+            "branch": publication_receipt["branch"],
+            "commit_binding": BINDING,
+            "publisher_receipt": publication_receipt,
+        }
+        if "publication" in meta:
+            if meta["publication"] != receipt:
+                raise ValueError("publication receipt conflicts with sealed state")
+        else:
+            write_new(capsule / "publication.json", receipt)
         meta = capsule_metadata(capsule, prospective=mode == "prospective")
+    elif "publication" not in meta:
+        raise ValueError(
+            "missing original successful-push receipt; cannot reconstruct from a branch"
+        )
     document, _ = production_rows(capsule, meta, prospective=mode == "prospective")
     target = issue_record_target(output, timestamp(document["issued_at"]))
     if (existing := target / "record.json").exists():
         if existing.is_symlink() or not existing.is_file():
             raise ValueError("shadow record must be a regular local file")
         saved = json.loads(existing.read_text())
-        if json.loads(
-            protocol_path.with_suffix(".lock.json").read_text()
-        ) != implementation_lock(protocol_path):
-            raise ValueError("frozen protocol or implementation changed")
-        if (
-            saved.get("mode") != mode
-            or saved.get("issued_at") != timestamp(document["issued_at"]).isoformat()
-            or saved.get("protocol_sha256") != digest(protocol_path)
-            or not saved.get("predictions")
-            or saved.get("input_sha256")
-            != {p.name: digest(p) for p in capsule.iterdir()}
-            or saved.get("capsule", {}).get("publication") != meta["publication"]
-        ):
+        if saved.get("mode") != mode or not saved.get("predictions"):
             raise ValueError("existing shadow record conflicts with this enrollment")
+        validate_record(existing, saved, capsule, protocol_path)
         return target
     return record(capsule, output, protocol_path, mode=mode)
 
@@ -303,6 +307,11 @@ def production_rows(
         )
     validate_provenance(meta, document)
     receipt = meta["publication"]
+    if (
+        receipt.get("artifact_version") != ARTIFACT_VERSION
+        or receipt.get("commit_binding") != BINDING
+    ):
+        raise ValueError("prospective requires a v2 exact-push publication receipt")
     published_path = capsule / "published.json"
     published = json.loads(published_path.read_text())
     published_times = [row["valid_time"] for row in published["hourly"]]
@@ -327,6 +336,7 @@ def production_rows(
         or timestamp(receipt["published_at"]) != timestamp(published["published_at"])
     ):
         raise ValueError("publication receipt/source/payload mismatch")
+    validate_push_binding(receipt, capsule / "production.json", published_path)
     apply_published_temperature(rows, published["hourly"])
     return document, rows
 
@@ -407,32 +417,27 @@ def predictions(
     }
 
 
-def record(capsule: Path, output: Path, protocol_path: Path, *, mode: str) -> Path:
-    prospective = mode == "prospective"
-    now = datetime.now(UTC)
-    meta = capsule_metadata(capsule, prospective=prospective)
-    protocol = json.loads(protocol_path.read_text())
-    lock = json.loads(protocol_path.with_suffix(".lock.json").read_text())
-    if lock != implementation_lock(protocol_path):
-        raise ValueError(
-            "frozen protocol or implementation changed; review a new enrollment"
-        )
-    document, production = production_rows(capsule, meta, prospective=prospective)
-    origin = timestamp(document["issued_at"])
-    if timestamp(meta["input_as_of"]) != origin:
-        raise ValueError("features must have the production issuance time")
-    if prospective and (
-        meta["capture_kind"] != "serving_snapshot"
-        or not timestamp(protocol["window_start"])
-        <= origin
-        < timestamp(protocol["window_end"])
-        or not origin <= now <= origin + timedelta(minutes=30)
-        or not origin <= timestamp(meta["publication"]["published_at"]) <= now
-        or document.get("timezone") != "America/Los_Angeles"
+def validate_push_binding(
+    receipt: dict[str, Any], source: Path, published: Path
+) -> None:
+    payload, _ = publication(receipt["publisher_receipt"])
+    if (
+        payload != published.read_bytes()
+        or receipt["publisher_receipt"]["source_sha256"] != digest(source)
+        or receipt["publisher_receipt"]["commit"] != receipt["commit"]
     ):
-        raise ValueError(
-            "prospective requires a contemporaneous serving snapshot in the frozen window"
-        )
+        raise ValueError("publication receipt/source/payload mismatch")
+
+
+def checked_issue(
+    capsule: Path,
+    origin: datetime,
+    document: dict[str, Any],
+    production: dict[str, Any],
+    now: datetime,
+    *,
+    prospective: bool,
+) -> pl.DataFrame:
     issue = pl.read_parquet(capsule / "issue.parquet").sort("valid_time")
     if issue["issue_time"].n_unique() != 1 or issue["issue_time"][0] != origin:
         raise ValueError("issue matrix must contain exactly this issuance")
@@ -455,6 +460,42 @@ def record(capsule: Path, output: Path, protocol_path: Path, *, mode: str) -> Pa
         hours=1
     ):
         raise ValueError("refusing forecasts recorded after outcomes")
+    return issue
+
+
+def build_record(
+    capsule: Path, protocol_path: Path, *, mode: str, now: datetime
+) -> dict[str, Any]:
+    """Pure reconstruction from retained files and the original recording clock."""
+    prospective = mode == "prospective"
+    meta = capsule_metadata(capsule, prospective=prospective)
+    protocol = json.loads(protocol_path.read_text())
+    if prospective and protocol.get("artifact_version") != ARTIFACT_VERSION:
+        raise ValueError("prospective requires a fresh v2 enrollment")
+    lock = json.loads(protocol_path.with_suffix(".lock.json").read_text())
+    if lock != implementation_lock(protocol_path):
+        raise ValueError(
+            "frozen protocol or implementation changed; review a new enrollment"
+        )
+    document, production = production_rows(capsule, meta, prospective=prospective)
+    origin = timestamp(document["issued_at"])
+    if timestamp(meta["input_as_of"]) != origin:
+        raise ValueError("features must have the production issuance time")
+    if prospective and (
+        meta["capture_kind"] != "serving_snapshot"
+        or not timestamp(protocol["window_start"])
+        <= origin
+        < timestamp(protocol["window_end"])
+        or not origin <= now <= origin + timedelta(minutes=30)
+        or not origin <= timestamp(meta["publication"]["published_at"]) <= now
+        or document.get("timezone") != "America/Los_Angeles"
+    ):
+        raise ValueError(
+            "prospective requires a contemporaneous serving snapshot in the frozen window"
+        )
+    issue = checked_issue(
+        capsule, origin, document, production, now, prospective=prospective
+    )
     values, fitted = predictions(
         pl.read_parquet(capsule / "training.parquet"),
         issue,
@@ -491,12 +532,10 @@ def record(capsule: Path, output: Path, protocol_path: Path, *, mode: str) -> Pa
                 **{name: number(v[index]) for name, v in values.items()},
             )
         )
-    # Exclusive directory creation makes an issue immutable, including after partial failure.
-    output.mkdir(parents=True, exist_ok=True, mode=0o700)
-    target = issue_record_target(output, origin)
-    target.mkdir(exist_ok=True, mode=0o700)
     hashes = {p.name: digest(p) for p in capsule.iterdir() if p.is_file()}
-    payload = {
+    return {
+        "artifact_version": ARTIFACT_VERSION,
+        "evidence_sha256": implementation_lock(protocol_path)["evidence_sha256"],
         "mode": mode,
         "recorded_at": now.isoformat(),
         "issued_at": origin.isoformat(),
@@ -509,8 +548,32 @@ def record(capsule: Path, output: Path, protocol_path: Path, *, mode: str) -> Pa
         "fitted": fitted,
         "predictions": rows,
     }
+
+
+def record(capsule: Path, output: Path, protocol_path: Path, *, mode: str) -> Path:
+    payload = build_record(capsule, protocol_path, mode=mode, now=datetime.now(UTC))
+    output.mkdir(parents=True, exist_ok=True, mode=0o700)
+    target = issue_record_target(output, timestamp(payload["issued_at"]))
+    target.mkdir(exist_ok=True, mode=0o700)
     write_new(target / "record.json", payload)
     return target
+
+
+def validate_record(
+    path: Path, saved: dict[str, Any], capsule: Path, protocol: Path
+) -> None:
+    regular(path)
+    if saved.get("artifact_version") != ARTIFACT_VERSION:
+        raise ValueError("prospective records require a fresh v2 enrollment")
+    origin = timestamp(saved["issued_at"])
+    if path.parent.name != origin.strftime("%Y%m%dT%H%M%SZ"):
+        raise ValueError("record directory and issuance differ")
+    recorded = timestamp(saved["recorded_at"])
+    if recorded > datetime.now(UTC):
+        raise ValueError("record clock is in the future")
+    expected = build_record(capsule, protocol, mode=saved["mode"], now=recorded)
+    expected = json.loads(json.dumps(expected, default=str, allow_nan=False))
+    assert_equivalent(saved, expected)
 
 
 def interval(
@@ -655,13 +718,33 @@ def cohort_counts(eligible: pl.DataFrame) -> dict[str, Any]:
     }
 
 
+def load_records(store: Path) -> list[tuple[Path, dict[str, Any]]]:
+    """Reject child aliases before reading JSON outside the selected store."""
+    records = []
+    for directory in sorted(store.iterdir()):
+        if directory.is_symlink() or directory.is_junction():
+            raise ValueError("record directory must remain within the record store")
+        if not directory.is_dir():
+            continue
+        path = directory / "record.json"
+        if path.exists() or path.is_symlink():
+            regular(path)
+            records.append((path, json.loads(path.read_text())))
+    return records
+
+
 def evaluate(
-    store: Path, truth_path: Path, protocol_path: Path, output: Path, *, mode: str
+    store: Path,
+    truth_path: Path | None,
+    protocol_path: Path,
+    output: Path,
+    *,
+    mode: str,
+    capsules: Path | None = None,
+    truth_lock: Path | None = None,
 ) -> None:
     protocol = json.loads(protocol_path.read_text())
-    selected = [
-        (p, json.loads(p.read_text())) for p in sorted(store.glob("*/record.json"))
-    ]
+    selected = load_records(store)
     selected = [
         (p, r)
         for p, r in selected
@@ -672,6 +755,23 @@ def evaluate(
         raise ValueError(
             "no matching records; replay is excluded from prospective analysis"
         )
+    if mode == "prospective":
+        mature(protocol, datetime.now(UTC))
+        if capsules is None or truth_lock is None:
+            raise ValueError(
+                "prospective evaluation requires --capsules and --truth-lock"
+            )
+        truth_path = locked_truth(
+            truth_lock, protocol_path, truth_path, datetime.now(UTC)
+        )
+        origins = [timestamp(r["issued_at"]) for r in records]
+        if len(set(origins)) != len(origins):
+            raise ValueError("duplicated recorded issuance")
+        for (path, saved), origin in zip(selected, origins, strict=True):
+            issue_record_target(store, origin)
+            validate_record(path, saved, capsule_for(capsules, origin), protocol_path)
+    if truth_path is None:
+        raise ValueError("replay evaluation requires --truth")
     implementations = {
         (r["code_identity"], r["runner_sha256"], r["candidate_sha256"]) for r in records
     }
@@ -695,36 +795,44 @@ def evaluate(
         pl.col("valid_time").str.to_datetime(time_zone="UTC"),
         pl.col("issued_at").str.to_datetime(time_zone="UTC"),
     )
-    truth = pl.read_parquet(truth_path).select(
-        pl.col("valid_hour").alias("valid_time"), pl.col(TARGET).alias("truth")
-    )
+    truth = (
+        truth_frame(truth_path)
+        if mode == "prospective"
+        else pl.read_parquet(truth_path)
+    ).select(pl.col("valid_hour").alias("valid_time"), pl.col(TARGET).alias("truth"))
     if truth["valid_time"].n_unique() != truth.height:
         raise ValueError("truth must contain one QC label per valid hour")
     frame = frame.join(truth, on="valid_time", how="left").filter(
         pl.col("valid_time") + timedelta(hours=2) <= datetime.now(UTC)
     )
-    output.mkdir(parents=True, exist_ok=False, mode=0o700)
-    frame.write_parquet(output / "matched_rows.parquet")
-    result = [
-        score_horizon(frame, horizon, mode, issue_coverage, protocol)
-        for horizon in HORIZONS
-    ]
-    write_new(
-        output / "evaluation.json",
-        {
-            "protocol_sha256": digest(protocol_path),
-            "truth_sha256": digest(truth_path),
-            "record_sha256": {p.parent.name: digest(p) for p, _r in selected},
-            "evaluated_at": datetime.now(UTC),
-            "issuance_coverage": issue_coverage,
-            "results": result,
-        },
-    )
+    with staged_directory(output) as staged:
+        frame.write_parquet(staged / "matched_rows.parquet")
+        result = [
+            score_horizon(frame, horizon, mode, issue_coverage, protocol)
+            for horizon in HORIZONS
+        ]
+        write_new(
+            staged / "evaluation.json",
+            {
+                "artifact_version": ARTIFACT_VERSION,
+                "protocol_sha256": digest(protocol_path),
+                "truth_sha256": digest(truth_path),
+                "truth_lock_sha256": digest(truth_lock / "truth.lock.json")
+                if truth_lock is not None
+                else None,
+                "record_sha256": {p.parent.name: digest(p) for p, _r in selected},
+                "evaluated_at": datetime.now(UTC),
+                "issuance_coverage": issue_coverage,
+                "results": result,
+            },
+        )
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__.split("\n", 1)[0])
-    parser.add_argument("action", choices=("freeze", "record", "finalize", "evaluate"))
+    parser.add_argument(
+        "action", choices=("freeze", "freeze-truth", "record", "finalize", "evaluate")
+    )
     parser.add_argument(
         "--input",
         type=Path,
@@ -737,36 +845,56 @@ def main() -> None:
     parser.add_argument(
         "--truth", type=Path, help="frozen QC hourly truth for evaluate"
     )
-    parser.add_argument("--remote", help="public forecast Git remote for finalize")
-    parser.add_argument("--branch", default="refs/heads/data")
+    parser.add_argument(
+        "--publication-receipt", type=Path, help="exact successful-push receipt JSON"
+    )
+    parser.add_argument(
+        "--capsules", type=Path, help="retained capsule root for prospective evaluation"
+    )
+    parser.add_argument(
+        "--truth-lock", type=Path, help="sealed mature QC truth directory"
+    )
     parser.add_argument(
         "--source", type=Path, help="exact source chosen by the publisher"
     )
     args = parser.parse_args()
     if args.action == "freeze":
         print(freeze(args.protocol, args.out))
+    elif args.action == "freeze-truth":
+        if args.truth is None:
+            parser.error("freeze-truth requires --truth")
+        print(freeze_truth(args.truth, args.protocol, args.out, datetime.now(UTC)))
     elif args.input is None:
         parser.error("this action requires --input")
     elif args.action == "record":
         print(record(args.input, args.out, args.protocol, mode=args.mode))
     elif args.action == "finalize":
-        if not args.remote:
-            parser.error("finalize requires --remote")
         print(
             finalize(
                 args.input,
                 args.out,
                 args.protocol,
-                remote=args.remote,
-                branch=args.branch,
+                publication_receipt=(
+                    json.loads(args.publication_receipt.read_text())
+                    if args.publication_receipt
+                    else None
+                ),
                 source=args.source,
                 mode=args.mode,
             )
         )
-    elif args.truth is None:
+    elif args.truth is None and args.mode == "replay":
         parser.error("evaluate requires --truth")
     else:
-        evaluate(args.input, args.truth, args.protocol, args.out, mode=args.mode)
+        evaluate(
+            args.input,
+            args.truth,
+            args.protocol,
+            args.out,
+            mode=args.mode,
+            capsules=args.capsules,
+            truth_lock=args.truth_lock,
+        )
 
 
 if __name__ == "__main__":

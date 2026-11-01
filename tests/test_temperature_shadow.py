@@ -1,9 +1,9 @@
 """Offline-only checks for the inactive prospective shadow recorder."""
 
+import base64
 import importlib
 import json
 import shutil
-import subprocess
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
@@ -91,6 +91,36 @@ def test_missing_provider_weights_are_renormalized(shadow):
     )
 
 
+def publisher_receipt(shadow, capsule, public):
+    public.update(schema_version=2, publisher_version="2.3.0")
+    payload = json.dumps(public).encode()
+    return {
+        "schema_version": 1,
+        "commit_binding": shadow.BINDING,
+        "commit": "a" * 40,
+        "forecast_base64": base64.b64encode(payload).decode(),
+        "forecast_sha256": __import__("hashlib").sha256(payload).hexdigest(),
+        "source_sha256": shadow.digest(capsule / "production.json"),
+        "issued_at": public["issued_at"],
+        "published_at": public["published_at"],
+        "remote": "fixture",
+        "branch": "data",
+        "publisher_version": "2.3.0",
+        "public_schema_version": 2,
+    }
+
+
+def bind_public(shadow, capsule, public, receipt):
+    receipt.update(
+        artifact_version=2,
+        commit_binding=shadow.BINDING,
+        publisher_receipt=publisher_receipt(shadow, capsule, public),
+    )
+    (capsule / "published.json").write_text(json.dumps(public))
+    receipt["published_sha256"] = shadow.digest(capsule / "published.json")
+    return receipt
+
+
 def make_capsule(shadow, frames, tmp_path):
     origin, train, issue, truth = frames
     capsule = tmp_path / "capsule"
@@ -120,6 +150,7 @@ def make_capsule(shadow, frames, tmp_path):
     (capsule / "capsule.json").write_text(
         json.dumps(
             {
+                "artifact_version": 2,
                 "input_as_of": origin.isoformat(),
                 "capture_kind": "historical_reconstruction",
             }
@@ -130,16 +161,7 @@ def make_capsule(shadow, frames, tmp_path):
         '{"window_start":"2026-11-02T08:00:00+00:00","window_end":"2026-12-14T08:00:00+00:00"}'
     )
     protocol.with_suffix(".lock.json").write_text(
-        json.dumps(
-            {
-                "protocol_sha256": shadow.digest(protocol),
-                "runner_sha256": shadow.digest(Path(shadow.__file__)),
-                "candidate_sha256": shadow.digest(
-                    Path(shadow.__file__).with_name("shadow_candidate_v1.py")
-                ),
-                "code_identity": shadow.code_identity(),
-            }
-        )
+        json.dumps(shadow.implementation_lock(protocol))
     )
     return capsule, protocol
 
@@ -210,6 +232,7 @@ def test_committed_payload_validation_uses_public_rounded_temperature(
         "source_sha256": shadow.digest(capsule / "production.json"),
         "published_sha256": shadow.digest(capsule / "published.json"),
     }
+    bind_public(shadow, capsule, published, receipt)
     meta = {"publication": receipt, "provenance": provenance}
     _, rows = shadow.production_rows(capsule, meta, prospective=True)
     assert all(
@@ -219,7 +242,7 @@ def test_committed_payload_validation_uses_public_rounded_temperature(
     )
     published["hourly"][0]["values"]["temp_f"] = 100.0
     (capsule / "published.json").write_text(json.dumps(published))
-    receipt["published_sha256"] = shadow.digest(capsule / "published.json")
+    bind_public(shadow, capsule, published, receipt)
     with pytest.raises(ValueError, match="temperature differs"):
         shadow.production_rows(capsule, meta, prospective=True)
 
@@ -410,82 +433,22 @@ def test_capsule_rejects_directories_before_parquet_reads(
         shadow.capsule_metadata(capsule)
 
 
-def test_publication_fetch_reads_real_local_git_commit(shadow, tmp_path):
-    git = shutil.which("git")
-    assert git is not None
-    remote = tmp_path / "public"
-
-    def run(*args):
-        return subprocess.run([git, *args], check=True, capture_output=True).stdout  # noqa: S603 -- local fixture Git only
-
-    run("init", "--quiet", "--initial-branch=data", str(remote))
-    payload = b'{"issued_at":"fixture"}'
-    (remote / "forecast.json").write_bytes(payload)
-    run("-C", str(remote), "add", "forecast.json")
-    run(
-        "-C",
-        str(remote),
-        "-c",
-        "user.name=Fixture",
-        "-c",
-        "user.email=fixture@example.invalid",
-        "commit",
-        "--quiet",
-        "-m",
-        "fixture",
-    )
-    expected = run("-C", str(remote), "rev-parse", "HEAD").decode().strip()
-    commit, body = shadow.fetch_publication(str(remote), "refs/heads/data")
-    assert commit == expected
-    assert body == payload
+def test_finalize_cannot_reconstruct_a_missing_push_receipt(shadow, frames, tmp_path):
+    capsule, protocol = make_capsule(shadow, frames, tmp_path)
+    with pytest.raises(ValueError, match="missing original successful-push receipt"):
+        shadow.finalize(
+            capsule, tmp_path / "records", protocol, source=None, mode="replay"
+        )
 
 
-def test_finalize_refuses_relabelled_held_source_before_fetch(
-    shadow, frames, tmp_path, monkeypatch
-):
+def test_finalize_refuses_relabelled_held_source(shadow, frames, tmp_path):
     capsule, protocol = make_capsule(shadow, frames, tmp_path)
     other = tmp_path / "held.json"
     other.write_text("{}")
-    monkeypatch.setattr(
-        shadow, "fetch_publication", lambda *_a: pytest.fail("must not fetch")
-    )
     with pytest.raises(ValueError, match="different source"):
         shadow.finalize(
-            capsule,
-            tmp_path / "records",
-            protocol,
-            remote="fixture",
-            branch="refs/heads/data",
-            source=other,
-            mode="replay",
+            capsule, tmp_path / "records", protocol, source=other, mode="replay"
         )
-
-
-def test_finalize_rejects_a_racing_public_issuance(
-    shadow, frames, tmp_path, monkeypatch
-):
-    capsule, protocol = make_capsule(shadow, frames, tmp_path)
-    monkeypatch.setattr(
-        shadow,
-        "fetch_publication",
-        lambda *_a: (
-            "a" * 40,
-            json.dumps(
-                {"issued_at": (frames[0] + timedelta(hours=1)).isoformat()}
-            ).encode(),
-        ),
-    )
-    with pytest.raises(ValueError, match="different issuance"):
-        shadow.finalize(
-            capsule,
-            tmp_path / "records",
-            protocol,
-            remote="fixture",
-            branch="refs/heads/data",
-            source=None,
-            mode="replay",
-        )
-    assert not (capsule / "published.json").exists()
 
 
 def make_prospective_record(shadow, frames, tmp_path, monkeypatch):
@@ -547,15 +510,11 @@ def make_prospective_record(shadow, frames, tmp_path, monkeypatch):
             for r in document["hourly"]
         ],
     }
-    monkeypatch.setattr(
-        shadow, "fetch_publication", lambda *_a: ("a" * 40, json.dumps(public).encode())
-    )
     target = shadow.finalize(
         capsule,
         tmp_path / "records",
         enrolled,
-        remote="fixture",
-        branch="refs/heads/data",
+        publication_receipt=publisher_receipt(shadow, capsule, public),
         source=capsule / "production.json",
         mode="prospective",
     )
@@ -602,25 +561,17 @@ def test_finalize_recovers_partial_state(shadow, frames, tmp_path, monkeypatch, 
     (target / "record.json").unlink()
     if stage != "empty_record_dir":
         target.rmdir()
+    receipt = json.loads((capsule / "publication.json").read_text())[
+        "publisher_receipt"
+    ]
     if stage == "published_only":
         (capsule / "publication.json").unlink()
-        payload = (capsule / "published.json").read_bytes()
-        monkeypatch.setattr(
-            shadow, "fetch_publication", lambda *_a: ("a" * 40, payload)
-        )
-    else:
-        monkeypatch.setattr(
-            shadow,
-            "fetch_publication",
-            lambda *_a: pytest.fail("reuse the sealed receipt"),
-        )
     assert (
         shadow.finalize(
             capsule,
             target.parent,
             protocol,
-            remote="fixture",
-            branch="refs/heads/data",
+            publication_receipt=receipt if stage == "published_only" else None,
             source=capsule / "production.json",
             mode="prospective",
         )
@@ -638,9 +589,6 @@ def test_held_record_is_validated_without_retiming_or_refitting(
     before = (target / "record.json").read_bytes()
     clock.instant += timedelta(hours=2)
     monkeypatch.setattr(
-        shadow, "fetch_publication", lambda *_a: pytest.fail("receipt already sealed")
-    )
-    monkeypatch.setattr(
         shadow, "record", lambda *_a, **_k: pytest.fail("do not refit held issues")
     )
     assert (
@@ -648,8 +596,6 @@ def test_held_record_is_validated_without_retiming_or_refitting(
             capsule,
             target.parent,
             protocol,
-            remote="fixture",
-            branch="refs/heads/data",
             source=capsule / "production.json",
             mode="prospective",
         )
@@ -664,8 +610,6 @@ def test_held_record_is_validated_without_retiming_or_refitting(
             capsule,
             target.parent,
             protocol,
-            remote="fixture",
-            branch="refs/heads/data",
             source=capsule / "production.json",
             mode="prospective",
         )
@@ -693,7 +637,7 @@ def test_publication_projection_rejects_grid_and_attribution_changes(
         published["hourly"][0]["values"]["temp_f"] += 0.01
     (capsule / "published.json").write_text(json.dumps(published))
     receipt = json.loads((capsule / "publication.json").read_text())
-    receipt["published_sha256"] = shadow.digest(capsule / "published.json")
+    bind_public(shadow, capsule, published, receipt)
     (capsule / "publication.json").write_text(json.dumps(receipt))
     with pytest.raises(
         ValueError,
@@ -739,9 +683,21 @@ def test_record_store_rejects_an_issue_directory_alias(
 def test_evaluation_audit_hashes_only_the_scored_records(
     shadow, frames, tmp_path, monkeypatch
 ):
-    capsule, protocol, target, _clock = make_prospective_record(
+    capsule, protocol, target, clock = make_prospective_record(
         shadow, frames, tmp_path, monkeypatch
     )
+    clock.instant = shadow.timestamp(
+        json.loads(protocol.read_text())["window_end"]
+    ) + timedelta(hours=98)
+    truth_lock = shadow.freeze_truth(
+        capsule / "truth_hourly.parquet",
+        protocol,
+        tmp_path / "truth-lock",
+        clock.instant,
+    )
+    root = tmp_path / "capsules"
+    root.mkdir()
+    capsule.rename(root / target.name)
     original = json.loads((target / "record.json").read_text())
     for name, change in (
         ("replay", {"mode": "replay"}),
@@ -753,10 +709,12 @@ def test_evaluation_audit_hashes_only_the_scored_records(
     output = tmp_path / "evaluation"
     shadow.evaluate(
         target.parent,
-        capsule / "truth_hourly.parquet",
+        None,
         protocol,
         output,
         mode="prospective",
+        capsules=root,
+        truth_lock=truth_lock,
     )
     receipt = json.loads((output / "evaluation.json").read_text())
     assert receipt["record_sha256"] == {
