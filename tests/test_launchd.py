@@ -904,7 +904,7 @@ def test_fresh_support_directory_is_initialized(monkeypatch, tmp_path):
     assert (directory / "last-maintenance").exists()
 
 
-def test_long_success_does_not_skip_next_daily_refresh(monkeypatch, tmp_path):
+def test_long_success_measures_twenty_hours_from_start(monkeypatch, tmp_path):
     module = load_script(SCRIPT)
     monkeypatch.setattr(Path, "home", lambda: tmp_path)
     clock = [1_800_000_000.0]
@@ -927,7 +927,10 @@ def test_long_success_does_not_skip_next_daily_refresh(monkeypatch, tmp_path):
     # A same-day catch-up remains suppressed.
     assert module.main([]) == 0
     assert len(calls) == 1
-    clock[0] = 1_800_000_000.0 + 24 * 3600
+    clock[0] = 1_800_000_000.0 + 19 * 3600
+    assert module.main([]) == 0
+    assert len(calls) == 1
+    clock[0] = 1_800_000_000.0 + 20 * 3600
     assert module.main([]) == 0
     assert len(calls) == 2
 
@@ -948,6 +951,20 @@ def test_success_stamp_failure_preserves_old_freshness(monkeypatch, tmp_path, fa
         module.stamp_success(stamp, 1_800_000_000.0)
     assert stamp.stat().st_mtime_ns == 1_000_000_000
     assert {p.name for p in tmp_path.iterdir()} == before_names
+
+
+def test_success_stamp_needs_no_directory_cleanup_after_publication(
+    monkeypatch, tmp_path
+):
+    module = load_script(SCRIPT)
+    stamp = tmp_path / "last-maintenance"
+
+    def denied(*_args, **_kwargs):
+        raise PermissionError("directory cleanup denied")
+
+    monkeypatch.setattr(module.os, "rmdir", denied)
+    module.stamp_success(stamp, 1_800_000_000.0)
+    assert stamp.stat().st_mtime == 1_800_000_000.0
 
 
 @pytest.mark.parametrize("fault", ["mkdir", "open", "flock"])
@@ -989,10 +1006,10 @@ def test_stamp_runtime_failure_keeps_previous_stamp(monkeypatch, tmp_path, capsy
     os.utime(stamp, (1, 1))
     before = stamp.stat().st_mtime_ns
 
-    def fail_touch(*_a, **_k):
+    def fail_utime(*_a, **_k):
         raise PermissionError("stamp permission denied")
 
-    monkeypatch.setattr(Path, "touch", fail_touch)
+    monkeypatch.setattr(os, "utime", fail_utime)
     code, commands, _ = run_maintenance(monkeypatch, tmp_path)
     assert code == 1
     assert stamp.stat().st_mtime_ns == before

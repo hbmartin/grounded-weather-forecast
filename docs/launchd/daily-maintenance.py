@@ -25,10 +25,10 @@ import subprocess
 import sys
 import time
 from collections.abc import Iterator, Sequence
-from contextlib import contextmanager
+from contextlib import contextmanager, suppress
 from datetime import UTC, datetime
 from pathlib import Path
-from tempfile import TemporaryDirectory
+from tempfile import NamedTemporaryFile, TemporaryDirectory
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
@@ -50,11 +50,20 @@ def timestamp() -> str:
 
 def stamp_success(stamp: Path, started_at: float) -> None:
     """Publish start-based freshness only after the whole run succeeds."""
-    with TemporaryDirectory(prefix="maintenance-stamp-", dir=stamp.parent) as folder:
-        candidate = Path(folder) / "stamp"
-        candidate.touch()
+    candidate: Path | None = None
+    try:
+        with NamedTemporaryFile(
+            prefix="maintenance-stamp-", dir=stamp.parent, delete=False
+        ) as staged:
+            candidate = Path(staged.name)
         os.utime(candidate, (started_at, started_at))
+        # No fallible cleanup follows successful publication.
         os.replace(candidate, stamp)
+    except (OSError,):
+        if candidate is not None:
+            with suppress(OSError):
+                candidate.unlink(missing_ok=True)
+        raise
 
 
 def maintenance_steps(*, restore: bool) -> list[list[str]]:
@@ -280,8 +289,8 @@ def maintain(stamp: Path, *, restore: bool, paths: RuntimePaths) -> int:
             if restore:
                 return EXIT_NO_FOLDS
         elif not restore:
-            # Freshness measures successful run STARTS. A report taking >4h
-            # must not suppress tomorrow's daily dataset refresh.
+            # Freshness measures successful run STARTS; stage duration adds
+            # no extra delay to the twenty-hour interval.
             stamp_success(stamp, started_at)
         return 0
 
