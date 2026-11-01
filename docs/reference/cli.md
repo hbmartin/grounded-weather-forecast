@@ -958,7 +958,7 @@ not clear the sequential evidence threshold; it is not labelled the lowest-error
 challenger. Eligibility exclusions and successful pooled daily decisions have
 separate explanations. When an ineligible board minimum coexists with a
 statistical rejection of an eligible challenger, both explanations are retained.
-The winner row's `decision_gate` records the explicit statistical decision while
+The leaderboard winners table's `decision_gate` column records the explicit statistical decision while
 the existing `gate` gap annotation and incumbent-retention behavior are preserved.
 Incumbent retention and live quality guards may replace
 this reason with their own verdict. Forecast values, thresholds and weights
