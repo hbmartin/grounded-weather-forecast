@@ -11,6 +11,7 @@ import hashlib
 import json
 import math
 import os
+import sys
 import tempfile
 from contextlib import suppress
 from datetime import UTC, datetime, timedelta
@@ -818,7 +819,7 @@ def evaluate(
                 "protocol_sha256": digest(protocol_path),
                 "truth_sha256": digest(truth_path),
                 "truth_lock_sha256": digest(truth_lock / "truth.lock.json")
-                if truth_lock is not None
+                if mode == "prospective" and truth_lock is not None
                 else None,
                 "record_sha256": {p.parent.name: digest(p) for p, _r in selected},
                 "evaluated_at": datetime.now(UTC),
@@ -898,4 +899,8 @@ def main() -> None:
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except (OSError, ValueError, KeyError) as error:
+        print(f"shadow refused: {error}", file=sys.stderr)
+        raise SystemExit(2) from None

@@ -1097,6 +1097,8 @@ SHA-256 must match the captured production document; issuance, data, unique grid
 hoisted mean semantics, two-decimal Fahrenheit rounding and per-row temperature
 method/release/reason attribution are verified. Public schema remains 2.
 A missing original receipt cannot be reconstructed from a later branch tip.
+Malformed receipt objects and field types are refused with exit 2 and a concise
+`shadow refused` diagnostic.
 
 The hourly wrapper transports the receipt privately and allows 300 seconds for
 validation/fitting. Failed publication never records a shadow. An unchanged
@@ -1132,7 +1134,8 @@ must byte-match the sealed copy. Replay evaluation retains raw `--truth` support
 
 Scoring retains identical-case counts, pairwise attrition, daily losses and the
 predeclared calendar-block uncertainty. Exact truth, truth-lock and selected
-record hashes are recorded. Results are staged privately and published only
+record hashes are recorded. Replay output never claims an unused truth-lock
+digest. Results are staged privately and published only
 after validation and scoring succeed. A failed attempt leaves no accepted output;
 a crash can leave a `.NAME.publishing` lease requiring operator inspection before
 retry. There is no automatic promotion. These private same-user artifacts detect

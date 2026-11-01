@@ -1,16 +1,118 @@
 """Prospective scoring reconstructs retained evidence before admitting any row."""
 
-import json
 import base64
+import hashlib
+import json
+import subprocess
+import sys
 from datetime import timedelta
 from pathlib import Path
 
 import polars as pl
 import pytest
-from test_temperature_shadow import make_prospective_record
-
+from test_temperature_shadow import make_capsule, make_prospective_record
 
 pytest_plugins = ["test_temperature_shadow"]
+
+
+@pytest.mark.parametrize("value", [None, [], 42, "receipt"])
+def test_receipt_root_requires_an_object(shadow, value):
+    with pytest.raises(ValueError, match="expected an object"):
+        shadow.publication(value)
+
+
+@pytest.mark.parametrize(
+    "field",
+    [
+        "commit",
+        "forecast_base64",
+        "issued_at",
+        "published_at",
+        "remote",
+        "branch",
+        "publisher_version",
+        "source_sha256",
+        "forecast_sha256",
+    ],
+)
+@pytest.mark.parametrize("value", [None, 42, []])
+def test_malformed_receipt_fields_raise_domain_errors(shadow, field, value):
+    fixture = json.loads(
+        Path(__file__)
+        .with_name("fixtures")
+        .joinpath("publication-receipt-v1.json")
+        .read_text()
+    )
+    receipt = fixture["cases"][0]["receipt"]
+    receipt[field] = value
+    with pytest.raises(ValueError, match=r"commit identity|string fields"):
+        shadow.publication(receipt)
+
+
+@pytest.mark.parametrize("value", [None, [], 42, "forecast", True])
+def test_receipt_payload_requires_an_object(shadow, value):
+    fixture = json.loads(
+        Path(__file__)
+        .with_name("fixtures")
+        .joinpath("publication-receipt-v1.json")
+        .read_text()
+    )
+    receipt = fixture["cases"][0]["receipt"]
+    payload = json.dumps(value).encode()
+    receipt["forecast_base64"] = base64.b64encode(payload).decode()
+    receipt["forecast_sha256"] = hashlib.sha256(payload).hexdigest()
+    with pytest.raises(ValueError, match="expected an object"):
+        shadow.publication(receipt)
+
+
+def test_replay_does_not_claim_an_unused_truth_lock(shadow, frames, tmp_path):
+    capsule, protocol = make_capsule(shadow, frames, tmp_path)
+    target = shadow.record(capsule, tmp_path / "replay", protocol, mode="replay")
+    output = tmp_path / "result"
+    truth = capsule / "truth_hourly.parquet"
+    unused = tmp_path / "unused-lock"
+    unused.mkdir()
+    (unused / "truth.lock.json").write_text('{"truth_sha256":"unrelated"}')
+    shadow.evaluate(
+        target.parent,
+        truth,
+        protocol,
+        output,
+        mode="replay",
+        truth_lock=unused,
+    )
+    result = json.loads((output / "evaluation.json").read_text())
+    assert result["truth_lock_sha256"] is None
+    assert result["truth_sha256"] == shadow.digest(truth)
+
+
+def test_malformed_receipt_cli_has_clear_refusal(shadow, mature_record, tmp_path):
+    receipt = tmp_path / "bad-receipt.json"
+    receipt.write_text("[]")
+    capsule, protocol, target, *_ = mature_record
+    result = subprocess.run(  # noqa: S603 -- only the local standalone test CLI
+        [
+            sys.executable,
+            shadow.__file__,
+            "finalize",
+            "--input",
+            str(capsule),
+            "--protocol",
+            str(protocol),
+            "--out",
+            str(target.parent),
+            "--publication-receipt",
+            str(receipt),
+            "--mode",
+            "prospective",
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert result.returncode == 2
+    assert "shadow refused:" in result.stderr
+    assert "Traceback" not in result.stderr
 
 
 @pytest.fixture
@@ -122,7 +224,7 @@ def test_inconsistent_evidence_fails_before_output(
     path.write_text(json.dumps(saved))
     with pytest.raises(
         ValueError,
-        match="differs|changed|fresh|clock|contemporaneous|requires|must contain|include timezone|mismatch",
+        match=r"differs|changed|fresh|clock|contemporaneous|requires|must contain|include timezone|mismatch",
     ):
         evaluate(shadow, mature_record, tmp_path / "result")
     assert not (tmp_path / "result").exists()
@@ -184,7 +286,7 @@ def test_freeze_truth_rejects_invalid_qc_shapes(
     truth.write_parquet(source)
     with pytest.raises(
         ValueError,
-        match="differs|changed|fresh|clock|contemporaneous|requires|must contain|include timezone|mismatch",
+        match=r"differs|changed|fresh|clock|contemporaneous|requires|must contain|include timezone|mismatch",
     ):
         shadow.freeze_truth(
             source, mature_record[1], tmp_path / "bad-lock", mature_record[3].instant

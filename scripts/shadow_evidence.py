@@ -52,6 +52,8 @@ def capsule_for(root: Path, origin: datetime) -> Path:
 
 
 def publication(receipt: dict[str, Any]) -> tuple[bytes, dict[str, Any]]:
+    if not isinstance(receipt, dict):
+        raise ValueError("unsupported publisher receipt; expected an object")
     if (
         type(receipt.get("schema_version")) is not int
         or receipt.get("schema_version") != 1
@@ -63,19 +65,31 @@ def publication(receipt: dict[str, Any]) -> tuple[bytes, dict[str, Any]]:
             "unsupported publisher receipt; an exact-push receipt is required"
         )
     commit = receipt.get("commit", "")
-    if len(commit) != 40 or any(c not in "0123456789abcdef" for c in commit):
-        raise ValueError("publisher receipt requires a full commit identity")
     if (
-        not receipt.get("remote")
-        or not receipt.get("branch")
-        or not receipt.get("publisher_version")
+        not isinstance(commit, str)
+        or len(commit) != 40
+        or any(c not in "0123456789abcdef" for c in commit)
     ):
-        raise ValueError("publisher receipt requires destination and version")
+        raise ValueError("publisher receipt requires a full commit identity")
+    fields = (
+        "remote",
+        "branch",
+        "publisher_version",
+        "source_sha256",
+        "forecast_sha256",
+        "issued_at",
+        "published_at",
+        "forecast_base64",
+    )
+    if any(not isinstance(receipt.get(key), str) or not receipt[key] for key in fields):
+        raise ValueError("publisher receipt requires nonempty string fields")
     try:
         payload = base64.b64decode(receipt["forecast_base64"], validate=True)
         document = json.loads(payload)
-    except (KeyError, ValueError, binascii.Error, UnicodeError) as error:
+    except (KeyError, TypeError, ValueError, binascii.Error, UnicodeError) as error:
         raise ValueError("invalid publisher receipt payload") from error
+    if not isinstance(document, dict):
+        raise ValueError("invalid publisher receipt payload; expected an object")
     if (
         hashlib.sha256(payload).hexdigest() != receipt.get("forecast_sha256")
         or document.get("issued_at") != receipt.get("issued_at")
