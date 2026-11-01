@@ -94,6 +94,18 @@ def number(value: float) -> float | None:
     return float(value) if math.isfinite(value) else None
 
 
+def issue_record_target(output: Path, origin: datetime) -> Path:
+    target = output / origin.strftime("%Y%m%dT%H%M%SZ")
+    if (
+        target.is_symlink()
+        or target.is_junction()
+        or (target.exists() and not target.is_dir())
+        or target.resolve().parent != output.resolve()
+    ):
+        raise ValueError("shadow issue directory must remain within the record store")
+    return target
+
+
 def implementation_lock(protocol_path: Path) -> dict[str, str]:
     return {
         "protocol_sha256": digest(protocol_path),
@@ -155,7 +167,9 @@ def capsule_metadata(capsule: Path, *, prospective: bool = False) -> dict[str, A
         if not name or name in {".", ".."} or any(c in name for c in "/\\:"):
             raise ValueError(f"invalid capsule filename: {name!r}")
         if not (capsule / name).is_file():
-            raise ValueError(f"invalid capsule filename: {name!r} is not a regular file")
+            raise ValueError(
+                f"invalid capsule filename: {name!r} is not a regular file"
+            )
         if digest(capsule / name) != expected:
             raise ValueError(f"captured input changed: {name}")
     return meta
@@ -227,8 +241,10 @@ def finalize(
         )
         meta = capsule_metadata(capsule, prospective=mode == "prospective")
     document, _ = production_rows(capsule, meta, prospective=mode == "prospective")
-    target = output / timestamp(document["issued_at"]).strftime("%Y%m%dT%H%M%SZ")
+    target = issue_record_target(output, timestamp(document["issued_at"]))
     if (existing := target / "record.json").exists():
+        if existing.is_symlink() or not existing.is_file():
+            raise ValueError("shadow record must be a regular local file")
         saved = json.loads(existing.read_text())
         if json.loads(
             protocol_path.with_suffix(".lock.json").read_text()
@@ -307,6 +323,7 @@ def production_rows(
         or published["dataset_fingerprint"] != document["dataset_fingerprint"]
         or set(published["release_ids"]) != set(document["release_ids"])
         or published.get("units", {}).get("temp_f") != "F"
+        or published.get("truth_semantics", {}).get("temp_f") != "mean"
         or timestamp(receipt["published_at"]) != timestamp(published["published_at"])
     ):
         raise ValueError("publication receipt/source/payload mismatch")
@@ -476,7 +493,7 @@ def record(capsule: Path, output: Path, protocol_path: Path, *, mode: str) -> Pa
         )
     # Exclusive directory creation makes an issue immutable, including after partial failure.
     output.mkdir(parents=True, exist_ok=True, mode=0o700)
-    target = output / origin.strftime("%Y%m%dT%H%M%SZ")
+    target = issue_record_target(output, origin)
     target.mkdir(exist_ok=True, mode=0o700)
     hashes = {p.name: digest(p) for p in capsule.iterdir() if p.is_file()}
     payload = {
@@ -642,12 +659,15 @@ def evaluate(
     store: Path, truth_path: Path, protocol_path: Path, output: Path, *, mode: str
 ) -> None:
     protocol = json.loads(protocol_path.read_text())
-    records = [json.loads(p.read_text()) for p in sorted(store.glob("*/record.json"))]
-    records = [
-        r
-        for r in records
+    selected = [
+        (p, json.loads(p.read_text())) for p in sorted(store.glob("*/record.json"))
+    ]
+    selected = [
+        (p, r)
+        for p, r in selected
         if r["mode"] == mode and r["protocol_sha256"] == digest(protocol_path)
     ]
+    records = [r for _p, r in selected]
     if not records:
         raise ValueError(
             "no matching records; replay is excluded from prospective analysis"
@@ -694,9 +714,7 @@ def evaluate(
         {
             "protocol_sha256": digest(protocol_path),
             "truth_sha256": digest(truth_path),
-            "record_sha256": {
-                p.parent.name: digest(p) for p in sorted(store.glob("*/record.json"))
-            },
+            "record_sha256": {p.parent.name: digest(p) for p, _r in selected},
             "evaluated_at": datetime.now(UTC),
             "issuance_coverage": issue_coverage,
             "results": result,

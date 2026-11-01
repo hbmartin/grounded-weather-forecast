@@ -1040,7 +1040,8 @@ exclusive issuance capsule. It is off by default. It performs no additional
 collection or fit and does not enroll or publish a shadow. Capture errors are
 reported as warnings while the forecast continues. `--now` captures are marked
 historical; cached archived documents cannot manufacture original input capsules.
-Enrollment requires already-served interval-mean temperature and hourly inputs.
+Prospective records require already-served interval-mean temperature and hourly inputs;
+freezing a future enrollment requires no serving snapshot.
 Incompatible captures abstain with a warning; enabling capture never changes
 production semantics, fitting or method selection.
 No truth columns enter the exported future input matrix. Collection timestamps,

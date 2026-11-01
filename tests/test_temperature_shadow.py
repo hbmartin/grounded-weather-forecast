@@ -181,6 +181,7 @@ def test_committed_payload_validation_uses_public_rounded_temperature(
         **document,
         "published_at": document["issued_at"],
         "units": {"temp_f": "F"},
+        "truth_semantics": {"temp_f": "mean"},
         "hourly": [
             {
                 "valid_time": row["valid_time"],
@@ -536,6 +537,7 @@ def make_prospective_record(shadow, frames, tmp_path, monkeypatch):
         **document,
         "published_at": (origin + timedelta(minutes=4)).isoformat(),
         "units": {"temp_f": "F"},
+        "truth_semantics": {"temp_f": "mean"},
         "hourly": [
             {
                 "valid_time": r["valid_time"],
@@ -669,7 +671,9 @@ def test_held_record_is_validated_without_retiming_or_refitting(
         )
 
 
-@pytest.mark.parametrize("change", ["duplicate", "method", "release", "rounding"])
+@pytest.mark.parametrize(
+    "change", ["duplicate", "method", "release", "rounding", "semantics"]
+)
 def test_publication_projection_rejects_grid_and_attribution_changes(
     shadow, frames, tmp_path, monkeypatch, change
 ):
@@ -683,6 +687,8 @@ def test_publication_projection_rejects_grid_and_attribution_changes(
         published["hourly"][0]["methods"]["temp_f"] = "wrong"
     elif change == "release":
         published["hourly"][0]["release_ids"] = {"temp_f": "wrong"}
+    elif change == "semantics":
+        published["truth_semantics"]["temp_f"] = "inst"
     else:
         published["hourly"][0]["values"]["temp_f"] += 0.01
     (capsule / "published.json").write_text(json.dumps(published))
@@ -690,7 +696,8 @@ def test_publication_projection_rejects_grid_and_attribution_changes(
     receipt["published_sha256"] = shadow.digest(capsule / "published.json")
     (capsule / "publication.json").write_text(json.dumps(receipt))
     with pytest.raises(
-        ValueError, match=r"grid differs|attribution differs|temperature differs"
+        ValueError,
+        match=r"grid differs|attribution differs|temperature differs|payload mismatch",
     ):
         shadow.production_rows(
             capsule,
@@ -712,3 +719,46 @@ def test_freeze_rejects_changed_candidate_bytes(shadow, tmp_path, monkeypatch):
     )
     with pytest.raises(ValueError, match="reviewed protocol digest"):
         shadow.freeze(protocol, tmp_path / "enrollment")
+
+
+def test_record_store_rejects_an_issue_directory_alias(
+    shadow, frames, tmp_path, monkeypatch
+):
+    capsule, protocol, target, _clock = make_prospective_record(
+        shadow, frames, tmp_path, monkeypatch
+    )
+    shutil.rmtree(target)
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    target.symlink_to(outside, target_is_directory=True)
+    with pytest.raises(ValueError, match="remain within the record store"):
+        shadow.record(capsule, target.parent, protocol, mode="prospective")
+    assert not (outside / "record.json").exists()
+
+
+def test_evaluation_audit_hashes_only_the_scored_records(
+    shadow, frames, tmp_path, monkeypatch
+):
+    capsule, protocol, target, _clock = make_prospective_record(
+        shadow, frames, tmp_path, monkeypatch
+    )
+    original = json.loads((target / "record.json").read_text())
+    for name, change in (
+        ("replay", {"mode": "replay"}),
+        ("other-protocol", {"protocol_sha256": "other"}),
+    ):
+        directory = target.parent / name
+        directory.mkdir()
+        (directory / "record.json").write_text(json.dumps(original | change))
+    output = tmp_path / "evaluation"
+    shadow.evaluate(
+        target.parent,
+        capsule / "truth_hourly.parquet",
+        protocol,
+        output,
+        mode="prospective",
+    )
+    receipt = json.loads((output / "evaluation.json").read_text())
+    assert receipt["record_sha256"] == {
+        target.name: shadow.digest(target / "record.json")
+    }
