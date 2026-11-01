@@ -225,6 +225,53 @@ class TestEvaluationContexts:
 
 
 class TestSelectMethods:
+    @pytest.mark.parametrize(
+        "gate",
+        [
+            "seq_e_below_threshold",
+            "seq_no_matrix",
+            "missing_reference",
+            "mcs_not_separated",
+        ],
+    )
+    def test_reference_fallback_reason_survives_release_serialization(
+        self, tmp_path, monkeypatch, gate
+    ):
+        config = scored_config(tmp_path)
+        original = selection_module.slice_winners
+
+        def gated(*args, **kwargs):
+            return original(*args, **kwargs).with_columns(pl.lit(gate).alias("gate"))
+
+        monkeypatch.setattr(selection_module, "slice_winners", gated)
+        selections = select_methods(config, config.dataset.dir / "scores")
+        assert selections
+        assert all(
+            c.reason == f"reference fallback: {gate}" for c in selections.values()
+        )
+        releases = [
+            json.loads(p.read_text())
+            for p in (config.artifacts_dir / "releases").glob("*.json")
+        ]
+        assert all(
+            choice["reason"] == f"reference fallback: {gate}"
+            for r in releases
+            for choice in r["selections"].values()
+        )
+
+    @pytest.mark.parametrize(
+        "gate,fragment",
+        [
+            (None, "lowest backtest MAE"),
+            ("eligibility", "excluded by eligibility"),
+            ("pooled_D3-10", "gated on pooled D3-10"),
+        ],
+    )
+    def test_winner_reason_distinguishes_non_fallback_gates(self, gate, fragment):
+        reason = selection_module._winner_reason({"gate": gate})
+        assert fragment in reason
+        assert "reference fallback" not in reason
+
     def test_winner_per_slice(self, tmp_path):
         config = scored_config(tmp_path)
         selections = select_methods(config, config.dataset.dir / "scores")

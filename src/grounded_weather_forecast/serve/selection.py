@@ -856,9 +856,7 @@ def _elect_slices(
         if winners.is_empty():
             continue
         row = winners.row(0, named=True)
-        reason = "lowest backtest MAE among promotable common-case methods"
-        if row.get("gate") == "pooled_D3-10":
-            reason += " (gated on pooled D3-10 evidence)"
+        reason = _winner_reason(row)
         choice = _retained_incumbent(
             config,
             row,
@@ -870,6 +868,20 @@ def _elect_slices(
         ) or _selection_from_row(row, frame, dataset, reason)
         selected[key] = replace(choice, training_cutoff=cutoffs.get(key))
     return selected, candidates
+
+
+def _winner_reason(row: Mapping[str, object]) -> str:
+    """Preserve the decision gate when a reference replaces the board leader."""
+    reason = "lowest backtest MAE among promotable common-case methods"
+    match row.get("gate"):
+        case None:
+            return reason
+        case "pooled_D3-10":
+            return f"{reason} (gated on pooled D3-10 evidence)"
+        case "eligibility":
+            return f"{reason}; board minimum excluded by eligibility requirements"
+        case gate:
+            return f"reference fallback: {gate}"
 
 
 def _evaluated_context(
