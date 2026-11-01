@@ -904,6 +904,52 @@ def test_fresh_support_directory_is_initialized(monkeypatch, tmp_path):
     assert (directory / "last-maintenance").exists()
 
 
+def test_long_success_does_not_skip_next_daily_refresh(monkeypatch, tmp_path):
+    module = load_script(SCRIPT)
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    clock = [1_800_000_000.0]
+    monkeypatch.setattr(module.time, "time", lambda: clock[0])
+    monkeypatch.setattr(module, "maintenance_steps", lambda **_k: [["report"]])
+    calls = []
+
+    def long_stage(*_args):
+        calls.append(clock[0])
+        clock[0] += 4.5 * 3600
+        return 0
+
+    monkeypatch.setattr(module, "run_stage", long_stage)
+    assert module.main([]) == 0
+    stamp = (
+        tmp_path
+        / "Library/Application Support/grounded-weather-forecast/last-maintenance"
+    )
+    assert stamp.stat().st_mtime == 1_800_000_000.0
+    # A same-day catch-up remains suppressed.
+    assert module.main([]) == 0
+    assert len(calls) == 1
+    clock[0] = 1_800_000_000.0 + 24 * 3600
+    assert module.main([]) == 0
+    assert len(calls) == 2
+
+
+@pytest.mark.parametrize("fault", ["utime", "replace"])
+def test_success_stamp_failure_preserves_old_freshness(monkeypatch, tmp_path, fault):
+    module = load_script(SCRIPT)
+    stamp = tmp_path / "last-maintenance"
+    stamp.touch()
+    os.utime(stamp, (1, 1))
+    before_names = {p.name for p in tmp_path.iterdir()}
+
+    def denied(*_args, **_kwargs):
+        raise PermissionError("stamp operation denied")
+
+    monkeypatch.setattr(module.os, fault, denied)
+    with pytest.raises(PermissionError, match="stamp operation denied"):
+        module.stamp_success(stamp, 1_800_000_000.0)
+    assert stamp.stat().st_mtime_ns == 1_000_000_000
+    assert {p.name for p in tmp_path.iterdir()} == before_names
+
+
 @pytest.mark.parametrize("fault", ["mkdir", "open", "flock"])
 def test_support_lock_setup_faults_are_configuration_errors(
     monkeypatch, tmp_path, capsys, fault

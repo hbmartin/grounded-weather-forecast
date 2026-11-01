@@ -98,7 +98,9 @@ prediction. No volume or personal database defaults are embedded in the wrappers
 The daily wrapper holds `maintenance-job.lock` across its child stages using
 a context manager, releasing it on early returns and exceptions. Concurrent
 maintenance or restore jobs skip as duplicates. A successful daily run writes
-`last-maintenance`; a fresh stamp skips catch-up for **20 hours**. Restore runs
+`last-maintenance`; a fresh stamp skips catch-up for **20 hours**, measured from
+the start of the last successful run. Long reports therefore do not suppress
+the next daily refresh. Failed or pending runs do not advance the stamp. Restore runs
 leave that stamp untouched, and a failed report skips score pruning.
 
 CLI `maintain` also runs truth-QC before report. Build and ordinary backtest errors stop the

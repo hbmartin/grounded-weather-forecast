@@ -48,6 +48,15 @@ def timestamp() -> str:
     return datetime.now(UTC).isoformat()
 
 
+def stamp_success(stamp: Path, started_at: float) -> None:
+    """Publish start-based freshness only after the whole run succeeds."""
+    with TemporaryDirectory(prefix="maintenance-stamp-", dir=stamp.parent) as folder:
+        candidate = Path(folder) / "stamp"
+        candidate.touch()
+        os.utime(candidate, (started_at, started_at))
+        os.replace(candidate, stamp)
+
+
 def maintenance_steps(*, restore: bool) -> list[list[str]]:
     steps = [] if restore else [["ingest-ensembles"], ["build-dataset"], ["alignment"]]
     steps.append(["backtest", "--source", "live"])
@@ -207,10 +216,11 @@ def maintain(stamp: Path, *, restore: bool, paths: RuntimePaths) -> int:
             )
         except (ImportError, ValueError) as exc:
             raise RuntimePathError(f"invalid maintenance configuration: {exc}") from exc
+        started_at = time.time()
         if (
             not restore
             and stamp.exists()
-            and time.time() - stamp.stat().st_mtime < MIN_INTERVAL_S
+            and started_at - stamp.stat().st_mtime < MIN_INTERVAL_S
         ):
             print(
                 "last successful maintenance is fresh; skipping catch-up run",
@@ -270,7 +280,9 @@ def maintain(stamp: Path, *, restore: bool, paths: RuntimePaths) -> int:
             if restore:
                 return EXIT_NO_FOLDS
         elif not restore:
-            stamp.touch()
+            # Freshness measures successful run STARTS. A report taking >4h
+            # must not suppress tomorrow's daily dataset refresh.
+            stamp_success(stamp, started_at)
         return 0
 
 
