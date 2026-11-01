@@ -4,7 +4,9 @@ from datetime import timedelta
 
 import numpy as np
 import polars as pl
+import pytest
 
+from grounded_weather_forecast.backtest.scores import empty_scores
 from grounded_weather_forecast.config import PromotionConfig
 from grounded_weather_forecast.reports.eprocess import (
     EProcessEntry,
@@ -20,6 +22,7 @@ from grounded_weather_forecast.reports.leaderboard import (
     slice_winners,
     union_references,
 )
+from grounded_weather_forecast.serve.selection import _winner_reason
 from grounded_weather_forecast.timeutil import utc
 
 
@@ -69,6 +72,38 @@ def make_board(rows):
 
 
 class TestWinnerAnnotations:
+    @pytest.mark.parametrize(
+        ("rule", "rejection"),
+        [("legacy", "dm_not_significant"), ("seq_mcs", "seq_no_matrix")],
+    )
+    def test_ineligible_board_minimum_does_not_hide_statistical_rejection(
+        self, tmp_path, rule, rejection
+    ):
+        board = make_board(
+            [
+                board_row("too_sparse", 1.0, coverage=0.5),
+                board_row("persistence", 2.0, skill=0.3, p=0.4),
+                board_row("equal_weight", 3.0),
+                board_row("best_provider", 4.0),
+                board_row("damped_grounded_equal_weight", 5.0),
+            ]
+        )
+        row = slice_winners(
+            board,
+            scores=empty_scores(),
+            rule=rule,
+            eprocess_store=EProcessStore(
+                tmp_path / "unused.json", "fixture", "fixture"
+            ),
+        ).row(0, named=True)
+        assert row["method_id"] == "equal_weight"
+        # Keep the existing gap annotation used by incumbent retention.
+        assert row["gate"] == "eligibility"
+        assert row["decision_gate"] == rejection
+        assert _winner_reason(row) == (
+            f"reference fallback: {rejection}; board minimum excluded by eligibility requirements"
+        )
+
     def test_promoted_winner_has_zero_gap_and_no_gate(self):
         board = make_board(
             [
