@@ -5,8 +5,8 @@ wrapper, change a pinned runtime, start a job, or enroll an evaluation. No
 weather provider, billing, account or security setting is changed by this feature.
 
 Review the maintenance freshness fix independently. Its success stamp measures
-the start of a successful run; a long report must not suppress the next daily
-refresh. Preserve the previous stamp on failure, and retain restore semantics.
+the start of a successful run; the next refresh is eligible after 20 hours
+from that start. Preserve the previous stamp on failure, and retain restore semantics.
 Installing only that wrapper need not change the source implementation digest.
 
 For source changes, choose and record an immutable reviewed release commit.
