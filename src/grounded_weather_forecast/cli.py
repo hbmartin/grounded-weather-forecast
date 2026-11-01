@@ -251,6 +251,13 @@ def build_parser() -> argparse.ArgumentParser:
         "predict", help="emit the current blended forecast as JSON"
     )
     predict.add_argument(
+        "--shadow-capture",
+        type=Path,
+        default=None,
+        metavar="DIR",
+        help="export exact prediction inputs into a private shadow capsule (inactive by default)",
+    )
+    predict.add_argument(
         "--out",
         default="-",
         help="output path, or '-' for stdout (default)",
@@ -790,6 +797,7 @@ def _forecast_document(
     semantics_flag: str,
     now: datetime | None,
     lock_timeout: float | None = None,
+    shadow_capture: Path | None = None,
 ) -> Forecast:
     from grounded_weather_forecast.serve.dataset_snapshot import (  # noqa: PLC0415
         load_live_snapshot,
@@ -823,6 +831,7 @@ def _forecast_document(
         force_method=forced,
         dataset_snapshot=dataset,
         approved_release_loaded=bool(selections),
+        **({"shadow_capture": shadow_capture} if shadow_capture is not None else {}),
     )
 
 
@@ -848,6 +857,11 @@ def _cmd_predict(config: Config, args: argparse.Namespace) -> int:
             method=args.method,
             semantics_flag=args.semantics,
             now=args.now,
+            **(
+                {"shadow_capture": args.shadow_capture}
+                if getattr(args, "shadow_capture", None) is not None
+                else {}
+            ),
         )
     except (NoForecastDataError, UnsupportedMethodError) as exc:
         print(f"cannot predict: {exc}")

@@ -12,11 +12,13 @@ with lead. Providers' native minutely precipitation is blended separately,
 because it is the only genuinely minute-resolution signal they publish.
 """
 
+import logging
 import math
 from collections.abc import Mapping, Sequence
 from contextlib import suppress
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime, timedelta
+from pathlib import Path
 from typing import TYPE_CHECKING
 
 import numpy as np
@@ -106,6 +108,7 @@ from grounded_weather_forecast.serve.selection import (
     method_for,
     no_evidence_reason,
 )
+from grounded_weather_forecast.serve.shadow_capture import capture_issue
 
 MINUTELY_HORIZON_MINUTES = 60
 HOURLY_HORIZON_HOURS = 96
@@ -137,6 +140,8 @@ class Snapshot:
     minutely: pl.DataFrame
     observation: dict[str, float]
     observation_at: datetime | None
+    truth_hourly: pl.DataFrame = field(default_factory=pl.DataFrame)
+    completions: pl.DataFrame = field(default_factory=pl.DataFrame)
 
 
 @dataclass(frozen=True, slots=True)
@@ -227,6 +232,8 @@ def build_snapshot(config: Config, issue_time: datetime) -> Snapshot:
         minutely=minutely,
         observation=observation,
         observation_at=observation_at,
+        truth_hourly=hourly_truth,
+        completions=archive.completions,
     )
 
 
@@ -1525,6 +1532,7 @@ def predict(
     dataset_snapshot: LiveDatasetSnapshot | None = None,
     *,
     approved_release_loaded: bool = False,
+    shadow_capture: Path | None = None,
 ) -> Forecast:
     """Assemble the whole forecast document for one issue time."""
     issue_time = (now or datetime.now(tz=UTC)).replace(second=0, microsecond=0)
@@ -1533,6 +1541,10 @@ def predict(
             config.predict.history_path, issue_time.isoformat()
         )
         if archived is not None:
+            if shadow_capture is not None:
+                raise NoForecastDataError(
+                    "cannot export original inputs for an archived forecast"
+                )
             return archived
     snapshot = build_snapshot(config, issue_time)
     fit_diagnostics = FitDiagnostics()
@@ -1627,7 +1639,7 @@ def predict(
         else None
     )
     release_ids = _served_release_ids(hourly, daily, minutely)
-    return Forecast(
+    document = Forecast(
         schema_version=SCHEMA_VERSION,
         issued_at=issue_time.isoformat(),
         latitude=config.station.latitude,
@@ -1649,3 +1661,20 @@ def predict(
         status_reason=status_reason,
         release_ids=release_ids,
     )
+    if shadow_capture is not None:
+        try:
+            capture_issue(
+                shadow_capture,
+                config,
+                document,
+                issue=snapshot.hourly,
+                training=hourly_train,
+                truth=snapshot.truth_hourly,
+                completions=snapshot.completions,
+                historical=now is not None,
+            )
+        except (OSError, ValueError, pl.exceptions.PolarsError) as error:
+            logging.getLogger(__name__).warning(
+                "Shadow input capture failed: %s", error
+            )
+    return document
