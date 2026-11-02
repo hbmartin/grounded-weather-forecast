@@ -112,7 +112,9 @@ def publisher_receipt(shadow, capsule, public):
 
 def bind_public(shadow, capsule, public, receipt):
     receipt.update(
-        artifact_version=2,
+        remote="fixture",
+        branch="data",
+        artifact_version=3,
         commit_binding=shadow.BINDING,
         publisher_receipt=publisher_receipt(shadow, capsule, public),
     )
@@ -150,16 +152,14 @@ def make_capsule(shadow, frames, tmp_path):
     (capsule / "capsule.json").write_text(
         json.dumps(
             {
-                "artifact_version": 2,
+                "artifact_version": 3,
                 "input_as_of": origin.isoformat(),
                 "capture_kind": "historical_reconstruction",
             }
         )
     )
     protocol = tmp_path / "protocol.json"
-    protocol.write_text(
-        '{"window_start":"2026-11-02T08:00:00+00:00","window_end":"2026-12-14T08:00:00+00:00"}'
-    )
+    protocol.write_text(json.dumps(template_protocol(shadow)))
     protocol.with_suffix(".lock.json").write_text(
         json.dumps(shadow.implementation_lock(protocol))
     )
@@ -349,7 +349,7 @@ def test_freeze_requires_future_window_and_immutable_enrollment(shadow, tmp_path
 
 def test_freeze_rejects_changed_candidate_rules(shadow, tmp_path):
     protocol = template_protocol(shadow)
-    protocol["quality"]["minimum_common_coverage"] = 0
+    protocol["quality"]["minimum_common_coverage"] = 0.5
     source = tmp_path / "proposal.json"
     source.write_text(json.dumps(protocol))
     with pytest.raises(ValueError, match="rules are fixed"):
@@ -481,6 +481,7 @@ def make_prospective_record(shadow, frames, tmp_path, monkeypatch):
     (capsule / "production.json").write_text(json.dumps(document))
     metadata = json.loads((capsule / "capsule.json").read_text())
     metadata["capture_kind"] = "serving_snapshot"
+    metadata["capsule_exported_at"] = (origin + timedelta(minutes=1)).isoformat()
     metadata["provenance"] = dict.fromkeys(
         (
             "production_code_identity",
@@ -492,6 +493,7 @@ def make_prospective_record(shadow, frames, tmp_path, monkeypatch):
         "explicit fixture assumption",
     )
     metadata["provenance"]["dataset_fingerprint"] = "fixture"
+    metadata["provenance"]["production_code_identity"] = shadow.package_identity()
     metadata["input_sha256"] = {
         p.name: shadow.digest(p) for p in capsule.iterdir() if p.name != "capsule.json"
     }
@@ -559,12 +561,14 @@ def test_finalize_recovers_partial_state(shadow, frames, tmp_path, monkeypatch, 
         shadow, frames, tmp_path, monkeypatch
     )
     (target / "record.json").unlink()
+    (target / "record.lock.json").unlink()
     if stage != "empty_record_dir":
         target.rmdir()
     receipt = json.loads((capsule / "publication.json").read_text())[
         "publisher_receipt"
     ]
     if stage == "published_only":
+        (capsule / "evidence.lock.json").unlink()
         (capsule / "publication.json").unlink()
     assert (
         shadow.finalize(
@@ -641,7 +645,7 @@ def test_publication_projection_rejects_grid_and_attribution_changes(
     (capsule / "publication.json").write_text(json.dumps(receipt))
     with pytest.raises(
         ValueError,
-        match=r"grid differs|attribution differs|temperature differs|payload mismatch",
+        match=r"grid differs|duplicated published forecast grid|interval mean|attribution differs|temperature differs|payload mismatch",
     ):
         shadow.production_rows(
             capsule,

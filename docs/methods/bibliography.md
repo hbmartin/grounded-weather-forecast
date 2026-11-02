@@ -79,7 +79,7 @@ Three sections, kept deliberately separate:
 | Harvey, D., Leybourne, S. & Newbold, P. (1997). Testing the equality of prediction mean squared errors. *IJF* 13(2), 281–291. | `metrics/dm.py::_hln_factor` |
 | Tashman, L. J. (2000). Out-of-sample tests of forecasting accuracy: an analysis and review. *IJF* 16(4), 437–450. | `backtest/splits.py`; planner/producer outcome diagnostics in `backtest/outcomes.py`, `backtest/engine.py`, and `backtest/minutely.py` preserve this protocol. Observation-read snapshot clocks, eligible-slice pending classification, compatible approval retention in `serve/selection.py`, and typed evaluation/promotion failure aggregation are operational policies; scientific fold plans and promotion constants are unchanged. |
 | Hansen, P. R., Lunde, A. & Nason, J. M. (2011). The model confidence set. *Econometrica* 79(2), 453–497. | `reports/mcs.py::model_confidence_set` |
-| Künsch, H. R. (1989); Politis, D. N. & Romano, J. P. (1992). Moving/circular block bootstrap. | `reports/mcs.py::_block_indices` |
+| Künsch, H. R. (1989); Politis, D. N. & Romano, J. P. (1992). Moving/circular block bootstrap. | `reports/mcs.py::_block_indices`; `scripts/temperature_shadow.py::interval` uses random-start calendar circular blocks, with missing dates retained. |
 | Ville, J. (1939). *Étude critique de la notion de collectif.* | `reports/eprocess.py`; `leaderboard._seq_gate`; `product_eprocess_store` centralizes read-only loading while callers retain rule policy. |
 | Waudby-Smith, I. & Ramdas, A. Estimating means of bounded random variables by betting. *JRSS-B*. | `reports/eprocess.py::EProcessStore.update_pair` |
 | Cutkosky, A. & Orabona, F. — online Newton step lineage for the bet sizing. | `reports/eprocess.py` — `_ONS_RATE` |
@@ -91,6 +91,17 @@ Three sections, kept deliberately separate:
 | Sequential model confidence sets ([arXiv:2404.18678](https://arxiv.org/abs/2404.18678)). | `reports/eprocess.py` framing |
 | Anytime-valid inference read at fixed calendar times ([arXiv:2502.08539](https://arxiv.org/abs/2502.08539)). | `reports/leaderboard.py::ebh_adjusted` |
 | Météo-France expert aggregation ([arXiv:2506.15217](https://arxiv.org/pdf/2506.15217)). | Closest published analogue to the expert layer |
+
+Shadow optimization uses the [SciPy SLSQP implementation](https://docs.scipy.org/doc/scipy/reference/optimize.minimize-slsqp.html)
+(Kraft, 1988, DFVLR-FB 88-28), in `scripts/shadow_candidate_v1.py::fit_simplex`.
+The predeclared twelve-comparison interval adjustment follows the
+[Bonferroni inequality](https://www.itl.nist.gov/div898/handbook/prc/section4/prc473.htm),
+in `scripts/temperature_shadow.py::interval`; it does not turn approximate
+bootstrap intervals into exact finite-sample coverage. Calendar blocks follow
+the moving/circular-block references above. All tuning constants remain local
+experimental choices. V3 evidence/runtime sealing uses the Python annotation,
+aware-time and filesystem references in the operational analogues section; it adds operational
+consistency checks, not a new statistical estimator.
 
 ### Homogenization and station QC
 

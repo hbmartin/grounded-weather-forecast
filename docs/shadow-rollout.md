@@ -5,8 +5,8 @@ wrapper, change a pinned runtime, start a job, or enroll an evaluation. No
 weather provider, billing, account or security setting is changed by this feature.
 
 Review the maintenance freshness fix independently. Its success stamp measures
-the start of a successful run; the next refresh is eligible after 20 hours
-from that start. Preserve the previous stamp on failure, and retain restore semantics.
+the start of a successful run; each host-local daily slot (default 02:15)
+requires a successful start since that slot. Custom schedules use `--scheduled-at`. Preserve the previous stamp on failure, and retain restore semantics.
 Installing only that wrapper need not change the source implementation digest.
 
 For source changes, choose and record an immutable reviewed release commit.
@@ -34,16 +34,16 @@ uv run --no-sync python docs/launchd/daily-maintenance.py
 Do not install dependencies on a production host without the operator's
 permission. Deploy source and wrapper paths deliberately; an environment that
 still pins an older `PYTHONPATH` will continue importing that older code.
-Install publisher 2.3+ with `run_with_receipt()` before enabling v2 shadow flags
+Install publisher 2.3+ with `run_with_receipt()` before enabling v3 shadow flags
 ([publisher follow-up #48](https://github.com/hbmartin/open-sun/pull/48)).
-Preserve old enrollments; the new runner requires a fresh v2 enrollment.
+Preserve old enrollments; the new runner requires a fresh v3 enrollment.
 Verify one complete maintenance cycle, truthful gate explanations, a ready
 forecast and successful public publication before enrolling the shadow.
 Check station freshness and hourly-mean coverage. An available instantaneous
 sample does not substitute for a coverage-qualified hourly mean. Resolve any
 receiver reachability problem without inventing truth or guessing a new host.
 
-The supplied proposal begins November 2, 2026 at 08:00 UTC and ends December 14
+The supplied proposal's start has elapsed and it cannot be enrolled. It begins November 2, 2026 at 08:00 UTC and ends December 14
 at 08:00 UTC. Preserve these dates unless the operator explicitly approves a new
 predeclared window before outcomes. An elapsed start is rejected, not silently
 rolled forward. Amendments require a new enrollment directory and review trail.
@@ -102,3 +102,16 @@ Preserve immutable shadow records and their provenance; do not rewrite or pool
 them into a new enrollment. The rollout decision must specify maintenance
 catch-up timing, public hold behavior, the snapshot/receipt hook, and exact
 window. A successful merge alone authorizes none of those production actions.
+
+V3 freezes Python, numerical-library versions, backend/platform, effective
+thread controls (two threads) and dependency-lock digest. Preserve that runtime
+for evaluation. Receipts are durably spooled before finalization, then complete
+validated evidence is sealed within issuance +30 minutes and before outcomes.
+Only that seal permits delayed reconstruction; a surviving transport file alone
+does not. Held forecast pushes keep original evidence and completed record hashes.
+Before rollout, verify the v3 seal, record manifest, runtime and declared input
+hashes; incidental regular files do not change them. Review all six methods'
+availability because descriptive persistence/climatology still restrict matching.
+No old prospective evidence is migrated or relabeled. Legacy replay finalization
+requires its original compatible runner; raw-truth replay evaluation remains
+available without prospective-only flags.

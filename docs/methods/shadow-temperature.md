@@ -1,7 +1,8 @@
 # Inactive temperature shadow candidate
 
 Implemented in: `scripts/shadow_candidate_v1.py` and
-`scripts/temperature_shadow.py`. These standalone scripts register no new
+`scripts/temperature_shadow.py`, `scripts/shadow_evidence.py`,
+`scripts/shadow_environment.py` and `shadow_artifacts.py`. These standalone scripts register no new
 production method. They preserve the preselected October 26 experiment's
 `simplex_decay21` candidate and `decay21` reference. The definitions below are
 self-contained local experimental choices, not a reproduction of an operational
@@ -38,3 +39,32 @@ adjusted interval upper bound below zero against production and at most
 methods must be finite on common cases. Raw pairwise availability and
 attrition must also be inspected. Decisions occur once after six weeks plus
 the last 96-hour outcomes and two-hour truth lag. No automatic promotion.
+
+## V3 retained-evidence policy
+
+Complete input/publication evidence is validated and synchronized before
+`evidence.lock.json` is published. `evidence_sealed_at` must lie within issuance
++30 minutes and before the first outcome; only a complete timely seal authorizes
+late deterministic reconstruction. Actual `recorded_at` is retained separately.
+A completed `record.lock.json` binds record bytes to the evidence seal. Held
+pushes reuse the original issuance/receipt, and evaluation reconstructs each
+prediction with `rtol=1e-10`, `atol=1e-10`. Declared evidence files are hashed;
+incidental regular files are excluded while aliases remain invalid.
+
+The `.sealing` file carries an OS-managed lock, not persistent lease ownership.
+Process exit releases it; a live concurrent owner causes an operational refusal.
+Capture preflight validates a complete v3 enrollment in the selected runtime.
+
+Freeze Python patch, numerical-library/backend/platform identity, two-thread
+controls and dependency-lock digest. Truth matures at window end +98 hours and
+normalizes to UTC microseconds after exact-hour validation. Evaluation hashes
+and scores the same truth/protocol/lock/record byte snapshots. These are private
+operator consistency checks, not authentication against rewriting every artifact.
+The six-method cohort and all candidate/uncertainty constants above are unchanged;
+descriptive persistence and climatology still restrict case availability.
+V1/v2 prospective artifacts are preserved without migration; v3 needs fresh
+future enrollment. The original November 2–December 14 proposal is unchanged
+and its elapsed start blocks enrollment pending explicit future-window approval.
+
+Platform identity covers OS family and architecture, not kernel release.
+Unrelated kernel updates do not invalidate the frozen numerical environment.

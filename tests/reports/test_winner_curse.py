@@ -4,6 +4,7 @@ from datetime import timedelta
 
 import numpy as np
 import polars as pl
+import pytest
 
 from grounded_weather_forecast.config import PromotionConfig
 from grounded_weather_forecast.reports.leaderboard import (
@@ -166,6 +167,17 @@ class TestWinnerCurseAdjusted:
     def test_eligibility_gate_is_still_an_argmin_selection(self):
         adjusted = self.adjusted(gate="eligibility")
         assert adjusted.row(0, named=True)["winner_bias"] is not None
+
+    @pytest.mark.parametrize("decision", ["dm_not_significant", "seq_no_matrix"])
+    def test_legacy_dual_column_rejection_is_not_corrected(self, decision):
+        winners = pl.DataFrame([winners_row(gate="eligibility")]).with_columns(
+            pl.lit(decision).alias("decision_gate"),
+            pl.lit(True).alias("board_minimum_ineligible"),
+            pl.lit("slice").alias("evidence_scope"),
+        )
+        adjusted = winner_curse_adjusted(winners, curse_scores(), promotion=None)
+        assert adjusted["winner_bias"][0] is None
+        assert adjusted["mae_debiased"][0] is None
 
     def test_missing_scores_adds_typed_null_columns(self):
         winners = pl.DataFrame([winners_row()])

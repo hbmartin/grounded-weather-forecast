@@ -1,3 +1,4 @@
+import os
 import sqlite3
 import threading
 from collections.abc import Iterator
@@ -5,6 +6,13 @@ from contextlib import contextmanager
 from datetime import timedelta
 from pathlib import Path
 
+# isort: split
+from grounded_weather_forecast.shadow_artifacts import THREAD_CONTROLS
+
+for thread_control in THREAD_CONTROLS:
+    os.environ[thread_control] = "2"
+
+# isort: split
 import numpy as np
 import polars as pl
 import pytest

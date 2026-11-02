@@ -1,8 +1,9 @@
 """Non-raising primitive checks for untrusted optional journal metadata."""
 
-from functools import cache
+import sys
+from importlib import import_module
 from inspect import get_annotations
-from types import UnionType
+from types import SimpleNamespace, UnionType
 from typing import Union, cast, get_args, get_origin, get_type_hints
 
 _PRIMITIVES = (str, int, bool, type(None))
@@ -36,19 +37,45 @@ def _allowed_types(annotation: object) -> tuple[type, ...]:
     return parts if all(any(p is kind for kind in _PRIMITIVES) for p in parts) else ()
 
 
-@cache
+_SCHEMAS: dict[type, dict[str, tuple[type, ...]]] = {}
+
+
+def _annotations(base: type) -> dict[str, object]:
+    if sys.version_info >= (3, 14):
+        # This is a 3.14 standard-library module, not a 3.13 PyPI dependency.
+        annotations = import_module("annotationlib")
+        return annotations.get_annotations(base, format=annotations.Format.STRING)
+    return get_annotations(base, eval_str=False)
+
+
+def _resolve(base: type, name: str, annotation: object) -> object:
+    namespace = vars(sys.modules[base.__module__])
+    holder = SimpleNamespace(__annotations__={name: annotation})
+    return get_type_hints(holder, globalns=namespace, localns=dict(vars(base)))[name]
+
+
 def declared_types(cls: type) -> dict[str, tuple[type, ...]]:
     """Unsupported extensions do not erase the inherited diagnostic schema."""
+    if cls in _SCHEMAS:
+        return _SCHEMAS[cls]
     result: dict[str, tuple[type, ...]] = {}
+    complete = True
     for base in reversed(cls.__mro__):
-        # Python 3.14 can defer annotations; resolve through the public APIs.
         try:
-            resolved = get_type_hints(base)
-        except (NameError, TypeError, ValueError):
-            resolved = get_annotations(base, eval_str=False)
-        result.update(
-            (name, _allowed_types(annotation)) for name, annotation in resolved.items()
-        )
+            annotations = _annotations(base)
+        except (Exception,):  # noqa: B013 -- optional class metadata is untrusted
+            complete = False
+            continue
+        for name, annotation in annotations.items():
+            if result.get(name):
+                continue  # Narrowed annotations cannot erase inherited wire fields.
+            try:
+                result[name] = _allowed_types(_resolve(base, name, annotation))
+            except (Exception,):  # noqa: B013 -- contain resolution to one field
+                result[name] = ()
+                complete = False
+    if complete:
+        _SCHEMAS[cls] = result
     return result
 
 

@@ -15,6 +15,11 @@ import polars as pl
 from grounded_weather_forecast.config import Config, config_fingerprint
 from grounded_weather_forecast.evaluation import code_identity
 from grounded_weather_forecast.serve.schema import Forecast
+from grounded_weather_forecast.shadow_artifacts import (
+    ARTIFACT_VERSION,
+    issuance_name,
+    sync_directory,
+)
 
 
 def temperature_frame(frame: pl.DataFrame, *, training: bool) -> pl.DataFrame:
@@ -54,7 +59,7 @@ def capture_issue(
         )
     root.mkdir(parents=True, exist_ok=True, mode=0o700)
     issued_at = datetime.fromisoformat(document.issued_at).astimezone(UTC)
-    target = root / issued_at.strftime("%Y%m%dT%H%M%SZ")
+    target = root / issuance_name(issued_at)
     if target.exists():
         raise FileExistsError(f"shadow inputs already captured: {target}")
     inputs = temperature_frame(issue, training=False)
@@ -80,7 +85,7 @@ def capture_issue(
             "station_receipt_clock": "not separately recorded; observation_at is the collected observation clock, not a certified receipt/commit timestamp",
         }
         manifest = {
-            "artifact_version": 2,
+            "artifact_version": ARTIFACT_VERSION,
             "input_as_of": document.issued_at,
             "capture_kind": "historical_reconstruction"
             if historical
@@ -95,7 +100,12 @@ def capture_issue(
         (folder / "capsule.json").write_text(
             json.dumps(manifest, indent=2), encoding="utf-8"
         )
+        for path in folder.iterdir():
+            with path.open("rb") as handle:
+                __import__("os").fsync(handle.fileno())
+        sync_directory(folder)
         # The forecast pipeline serializes capture; reject existing issues and
         # never replace a non-empty capsule directory.
         folder.rename(target)
+        sync_directory(root)
     return target

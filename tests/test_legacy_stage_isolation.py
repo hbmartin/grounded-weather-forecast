@@ -208,29 +208,30 @@ def test_declared_primitive_subclasses_are_normalized_without_metadata_damage():
 
 def test_every_declared_field_uses_its_annotation_not_name():
     hints = get_type_hints(status.ComponentDiagnostic)
+    declared = status.declared_types(status.ComponentDiagnostic)
     for name, annotation in hints.items():
         allowed = get_args(annotation) or (annotation,)
-        assert status._field_valid(name, None) == (type(None) in allowed)
-        assert status._field_valid(name, True) == (bool in allowed)
-        assert status._field_valid(name, Code.ZERO) == (int in allowed)
-        assert status._field_valid(name, Stage.VERIFICATION) == (str in allowed)
+        assert status.field_valid(name, None, declared) == (type(None) in allowed)
+        assert status.field_valid(name, True, declared) == (bool in allowed)
+        assert status.field_valid(name, Code.ZERO, declared) == (int in allowed)
+        assert status.field_valid(name, Stage.VERIFICATION, declared) == (
+            str in allowed
+        )
     # A future annotated integer name need not follow the old suffix convention.
-    from unittest.mock import patch
-
-    with patch.dict(status._FIELD_TYPES, {"attempt_number": (int,)}):
-        assert status._field_valid("attempt_number", 7)
-        assert not status._field_valid("attempt_number", True)
+    schema = {"attempt_number": (int,)}
+    assert status.field_valid("attempt_number", 7, schema)
+    assert not status.field_valid("attempt_number", True, schema)
 
 
 def test_serialization_assesses_each_field_once(monkeypatch):
     seen = Counter()
-    original = status._field_valid
+    original = status.field_valid
 
-    def counted(name, value):
+    def counted(name, value, schema):
         seen[name] += 1
-        return original(name, value)
+        return original(name, value, schema)
 
-    monkeypatch.setattr(status, "_field_valid", counted)
+    monkeypatch.setattr(status, "field_valid", counted)
     value = status.ComponentDiagnostic("other", 0, detail=[])
     saved = json.loads(status.failure_details_json((value,)))[0]
     assert saved["metadata_invalid"] is True

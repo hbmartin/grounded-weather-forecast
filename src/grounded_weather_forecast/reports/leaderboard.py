@@ -18,6 +18,11 @@ import polars as pl
 from scipy import stats
 
 from grounded_weather_forecast.contracts import MINUTELY_REFERENCES, TruthSemantics
+from grounded_weather_forecast.selection_decisions import (
+    ELIGIBILITY,
+    POOLED_SCOPE,
+    SLICE_SCOPE,
+)
 
 if TYPE_CHECKING:
     from grounded_weather_forecast.config import PromotionConfig
@@ -509,7 +514,7 @@ _DAILY_GATE_POOL: Mapping[str, tuple[str, ...]] = {
     "D5-7": ("D3-4", "D5-7", "D8-10"),
     "D8-10": ("D3-4", "D5-7", "D8-10"),
 }
-_POOLED_GATE = "pooled_D3-10"
+_POOLED_GATE = POOLED_SCOPE
 _POOLABLE_REASONS = frozenset({"mcs_thin_matrix", "mcs_no_matrix", "seq_no_matrix"})
 
 
@@ -824,6 +829,8 @@ def slice_winners(
         "gap_ratio",
         "gate",
         "decision_gate",
+        "board_minimum_ineligible",
+        "evidence_scope",
     )
     for slice_key, group in board.partition_by(keys, as_dict=True).items():
         parts = dict(zip(keys, (str(part) for part in slice_key), strict=True))
@@ -892,17 +899,18 @@ def _annotate_winner(
     ``infer_gate=False`` preserves a caller-supplied label (the pooled daily
     gate), which the best-vs-eligible inference would otherwise overwrite.
     ``decision_gate`` retains that original decision independently of the
-    legacy gap annotation, which is also used by incumbent retention.
+    eligibility context. Statistical decisions always retain precedence.
     """
     decision_gate = gate
     best_id = str(best["method_id"])
+    minimum_ineligible = not (eligible["method_id"] == best_id).any()
     if not infer_gate:
         pass
-    elif str(candidate["method_id"]) == best_id:
+    elif gate is None and str(candidate["method_id"]) == best_id:
         gate = None
-    elif not (eligible["method_id"] == best_id).any():
+    elif gate is None and minimum_ineligible:
         # The board minimum never even reached the statistical gates.
-        gate = "eligibility"
+        gate = ELIGIBILITY
     best_mae = best["mae"] if isinstance(best["mae"], (int, float)) else None
     served_mae = (
         candidate["mae"] if isinstance(candidate["mae"], (int, float)) else None
@@ -926,6 +934,8 @@ def _annotate_winner(
         "gap_ratio": gap_ratio,
         "gate": gate,
         "decision_gate": decision_gate,
+        "board_minimum_ineligible": minimum_ineligible,
+        "evidence_scope": SLICE_SCOPE if infer_gate else POOLED_SCOPE,
     }
 
 
@@ -944,6 +954,8 @@ def _empty_winners(keys: list[str]) -> pl.DataFrame:
             "gap_ratio": pl.Float64,
             "gate": pl.String,
             "decision_gate": pl.String,
+            "board_minimum_ineligible": pl.Boolean,
+            "evidence_scope": pl.String,
         }
     )
 

@@ -36,6 +36,13 @@ from grounded_weather_forecast.reports.leaderboard import (
     union_references,
 )
 from grounded_weather_forecast.reports.winner_curse import should_retain_incumbent
+from grounded_weather_forecast.selection_decisions import (
+    ELIGIBILITY,
+    EXCLUSION_REASON,
+    POOLED_SCOPE,
+    argmin_selected,
+    decision_gate,
+)
 from grounded_weather_forecast.serve.approvals import (
     ApprovalDisposition,
     ApprovalSnapshot,
@@ -610,7 +617,6 @@ def _release_as_of(
 _RETAINED_REASON = "retained incumbent within one SE of best (winner-curse guard)"
 # Retention only ever overrides an argmin pick; a gate-forced reference or a
 # pooled winner was not selected on the minimum, so there is no curse to guard.
-_RETENTION_GATES = (None, "eligibility")
 
 
 def _incumbent_methods(
@@ -660,7 +666,7 @@ def _retained_incumbent(
     incumbent_method, incumbent_semantics = incumbent
     if (
         incumbent_method == str(winner_row["method_id"])
-        or winner_row.get("gate") not in _RETENTION_GATES
+        or not argmin_selected(winner_row)
         or incumbent_method == FALLBACK_METHOD
         # A demoted slice's persisted method is already the fallback;
         # retaining it by name would outlast the demotion's own re-hearing.
@@ -873,18 +879,18 @@ def _elect_slices(
 def _winner_reason(row: Mapping[str, object]) -> str:
     """Preserve the decision gate when a reference replaces the board leader."""
     reason = "lowest backtest MAE among promotable common-case methods"
-    match row.get("decision_gate") or row.get("gate"):
-        case None:
-            return reason
-        case "pooled_D3-10":
-            return f"{reason} (gated on pooled D3-10 evidence)"
-        case "eligibility":
-            return f"{reason}; board minimum excluded by eligibility requirements"
-        case gate:
-            reason = f"reference fallback: {gate}"
-            if row.get("gate") == "eligibility":
-                reason += "; board minimum excluded by eligibility requirements"
-            return reason
+    gate = decision_gate(row)
+    if gate not in (None, ELIGIBILITY, POOLED_SCOPE):
+        reason = f"reference fallback: {gate}"
+    if row.get("evidence_scope") == POOLED_SCOPE or gate == POOLED_SCOPE:
+        reason += " (gated on pooled D3-10 evidence)"
+    if (
+        row.get("board_minimum_ineligible")
+        or gate == ELIGIBILITY
+        or row.get("gate") == ELIGIBILITY
+    ):
+        reason += f"; {EXCLUSION_REASON}"
+    return reason
 
 
 def _evaluated_context(

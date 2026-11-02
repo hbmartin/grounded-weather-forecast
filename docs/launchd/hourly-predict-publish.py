@@ -305,27 +305,45 @@ def _finalize_shadow(
     *,
     publication_receipt: dict | None = None,
 ) -> int:
-    document = json.loads(source.read_text(encoding="utf-8"))
-    issued_at = datetime.fromisoformat(document["issued_at"]).astimezone(UTC)
-    name = issued_at.strftime("%Y%m%dT%H%M%SZ")
-    # Keep the small transport file outside immutable capsules. The runner seals
-    # exact bytes and the original publisher receipt before fitting.
-    import tempfile  # noqa: PLC0415 -- only opt-in shadow uses receipt transport
+    from grounded_weather_forecast.shadow_artifacts import (  # noqa: PLC0415
+        issuance_name,
+        json_object,
+        private_directory,
+        sha256,
+        write_bytes_new,
+    )
+    from grounded_weather_forecast.shadow_artifacts import (  # noqa: PLC0415
+        timestamp as evidence_timestamp,
+    )
 
-    with tempfile.NamedTemporaryFile(
-        mode="w", encoding="utf-8", suffix=".json"
-    ) as transport:
-        if publication_receipt is not None:
-            json.dump(publication_receipt, transport)
-            transport.flush()
-        return _shadow_child(
-            paths,
-            source,
-            root,
-            protocol,
-            name,
-            transport.name if publication_receipt is not None else None,
-        )
+    document = json_object(source.read_bytes(), "publisher source")
+    name = issuance_name(evidence_timestamp(document["issued_at"]))
+    receipt_file = None
+    if publication_receipt is not None:
+        raw = json.dumps(publication_receipt, allow_nan=False).encode()
+        folder = root / "receipts" / name
+        receipt_root = root / "receipts"
+        if receipt_root.is_symlink() or receipt_root.is_junction():
+            raise ValueError("receipt spool root must not be an alias")
+        private_directory(folder)
+        if (
+            folder.is_symlink()
+            or folder.is_junction()
+            or folder.resolve().parent != (root / "receipts").resolve()
+        ):
+            raise ValueError("receipt spool must remain within the selected root")
+        target = folder / (sha256(raw) + ".json")
+        if target.exists():
+            if (
+                target.is_symlink()
+                or not target.is_file()
+                or target.read_bytes() != raw
+            ):
+                raise ValueError("receipt spool conflicts with existing evidence")
+        else:
+            write_bytes_new(target, raw)
+        receipt_file = str(target)
+    return _shadow_child(paths, source, root, protocol, name, receipt_file)
 
 
 def _shadow_child(
@@ -358,7 +376,64 @@ def _shadow_child(
     )
     if result.returncode:
         print("forecast published; shadow receipt/record failed", flush=True)
-    return result.returncode
+    return 1 if result.returncode else 0
+
+
+def shadow_preflight(paths: RuntimePaths, protocol: Path) -> tuple[bool, str | None]:
+    """Shadow-specific faults cannot prevent ordinary production publication."""
+    try:
+        document = json.loads(protocol.read_text())
+        start, end = (
+            datetime.fromisoformat(document[key])
+            for key in ("window_start", "window_end")
+        )
+        if start.utcoffset() is None or end.utcoffset() is None or start >= end:
+            raise ValueError("shadow window requires ordered timezone-aware timestamps")
+        if not start <= datetime.now(UTC) < end:
+            print("shadow skipped: outside enrollment window", flush=True)
+            return False, None
+        check = subprocess.run(  # noqa: S603 -- local capability inspection, no providers
+            [
+                *paths.command("python"),
+                "-c",
+                (
+                    "import inspect, os, runpy, sys; from pathlib import Path; "
+                    "from grounded_weather_forecast.shadow_artifacts import THREAD_CONTROLS, current_artifact; "
+                    "os.environ.update({key: '2' for key in THREAD_CONTROLS}); "
+                    "from grounded_weather_forecast.serve.predict import predict; "
+                    "\nif 'shadow_capture' not in inspect.signature(predict).parameters:\n"
+                    " raise SystemExit('missing capture capability')\n"
+                    "script = Path(sys.argv[1]); sys.path.insert(0, str(script.parent)); "
+                    "runner = runpy.run_path(str(script)); "
+                    "enrolled = runner['enrollment'](Path(sys.argv[2])); "
+                    "\nif not current_artifact(enrolled.protocol.get('artifact_version')):\n"
+                    " raise SystemExit('fresh v3 enrollment required')"
+                ),
+                str(paths.project / "scripts/temperature_shadow.py"),
+                str(protocol),
+            ],
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=30,
+        )
+        if check.returncode:
+            detail = (getattr(check, "stderr", "") or "").strip().splitlines()
+            return (
+                False,
+                "shadow unavailable: selected prediction runtime lacks compatible v3 capture/enrollment"
+                + (f": {detail[-1][:400]}" if detail else ""),
+            )
+    except (
+        OSError,
+        ValueError,
+        TypeError,
+        KeyError,
+        RecursionError,
+        subprocess.SubprocessError,
+    ) as error:
+        return False, f"shadow preflight failed: {error}"
+    return True, None
 
 
 def main(argv: Sequence[str] | None = None) -> int:
@@ -398,9 +473,14 @@ def main(argv: Sequence[str] | None = None) -> int:
             flush=True,
         )
         sys.path.insert(0, str(support_dir()))
+        shadow_enabled, shadow_error = (
+            shadow_preflight(paths, args.shadow_protocol)
+            if args.shadow_root is not None
+            else (False, None)
+        )
         predicted = (
             run_predict(paths, args.shadow_root / "capsules")
-            if args.shadow_root is not None
+            if shadow_enabled
             else run_predict(paths)
         )
         if predicted != 0:
@@ -417,10 +497,12 @@ def main(argv: Sequence[str] | None = None) -> int:
             publish(
                 paths, args.station_project, (args.shadow_root, args.shadow_protocol)
             )
-            if args.shadow_root is not None
+            if shadow_enabled
             else publish(paths, args.station_project)
         )
-        if code == 0 and restore_failed:
+        if shadow_error:
+            print(f"ordinary publication exited {code}; {shadow_error}", flush=True)
+        if code == 0 and (restore_failed or shadow_error):
             code = 1
         return code
     except (RuntimePathError,) as exc:  # noqa: B013 -- project convention

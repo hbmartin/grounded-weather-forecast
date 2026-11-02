@@ -821,3 +821,23 @@ $$\text{mae\_gap} = \text{live\_mae} - \text{backtest\_mae}$$
 (n-weighted) beside it. A persistent positive gap is serving-path drift — a bug
 no backtest can find, because the backtest is not the thing that is broken.
 The gap also drives the [live demotion gate](model-selection.md#6-the-live-demotion-gate).
+
+## 9. Diagnostic integrity and daily freshness
+
+Implemented in: `diagnostic_values.py`, `diagnostic_groups.py`, `status.py`, `cli.py`,
+`cleanup_status.py`, `retention_status.py` and `docs/launchd/daily-maintenance.py`.
+
+Inherited primitive fields retain their wire schema; optional annotations resolve
+independently and incomplete resolutions are not cached. Journal rows decode once
+with shared identity/conflict grouping. Verification and cleanup have independent
+validity checks, recovery boundaries and dashboard status colors. Each requires
+valid evidence strictly later than its own damaged check to clear uncertainty. Contradictory cleanup
+verdicts and multiple owners sharing a check ID quarantine that cleanup lineage.
+
+Command exits are integers 0–255; recognized negative subprocess signals map to
+`128 + signal`. Invalid exits return 1 with a shared invalid-outcome classification
+and bounded original exit/failure-kind evidence. Such outcomes cannot receive
+pipeline continuation exemptions. Daily freshness covers a successful start
+since the latest host-local slot, default 02:15 (`--scheduled-at` for custom
+schedules). Fold times use the first occurrence; gaps use the first valid minute.
+Failed/pending/restore runs retain the old stamp, including its mode and symlink.

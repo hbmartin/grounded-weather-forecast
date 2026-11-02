@@ -7,7 +7,7 @@ import subprocess
 import sys
 import threading
 import types
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from unittest.mock import patch
 
@@ -194,9 +194,8 @@ def test_old_publisher_keeps_publication_but_declines_shadow(
     assert "run_with_receipt API" in capsys.readouterr().out
 
 
-def test_wrapper_transports_exact_receipt_and_removes_transport_file(
-    monkeypatch, tmp_path
-):
+@pytest.mark.parametrize("child_code", [0, 1, 2])
+def test_wrapper_spools_exact_receipt_durably(monkeypatch, tmp_path, child_code):
     module = load_script(SCRIPT.with_name("hourly-predict-publish.py"))
     source = tmp_path / "source.json"
     source.write_text('{"issued_at":"2026-10-01T12:00:00+00:00"}')
@@ -210,20 +209,18 @@ def test_wrapper_transports_exact_receipt_and_removes_transport_file(
         assert "--remote" not in command
         assert "--branch" not in command
         files.append(transport)
-        return subprocess.CompletedProcess(command, 0)
+        return subprocess.CompletedProcess(command, child_code)
 
     monkeypatch.setattr(subprocess, "run", child)
-    assert (
-        module.finalize_shadow(
-            module.RuntimePaths(tmp_path, "uv"),
-            source,
-            tmp_path / "shadow",
-            tmp_path / "protocol",
-            publication_receipt=receipt,
-        )
-        == 0
-    )
-    assert files and not files[0].exists()
+    assert module.finalize_shadow(
+        module.RuntimePaths(tmp_path, "uv"),
+        source,
+        tmp_path / "shadow",
+        tmp_path / "protocol",
+        publication_receipt=receipt,
+    ) == bool(child_code)
+    assert files and files[0].is_file()
+    assert json.loads(files[0].read_text()) == receipt
 
 
 @pytest.fixture(autouse=True)
@@ -299,7 +296,7 @@ def run_maintenance(
     with patch.dict(os.environ):
         module = load_script(SCRIPT)
 
-        class Clock:
+        class Clock(datetime):
             @staticmethod
             def now(_timezone):
                 return datetime(2026, 10, 18 if sunday else 19, tzinfo=UTC)
@@ -593,10 +590,10 @@ def test_backtest_failures_keep_previous_success_stamp(
 def test_maintenance_stage_order_and_restore_scope(monkeypatch, sunday):
     module = load_script(SCRIPT)
 
-    class Clock:
+    class Clock(datetime):
         @staticmethod
         def now(_timezone):
-            return Clock()
+            return Clock(2026, 10, 19, tzinfo=UTC)
 
         def weekday(self):
             return 6 if sunday else 0
@@ -1112,10 +1109,11 @@ def test_fresh_support_directory_is_initialized(monkeypatch, tmp_path):
     assert (directory / "last-maintenance").exists()
 
 
-def test_long_success_measures_twenty_hours_from_start(monkeypatch, tmp_path):
+def test_success_before_the_next_slot_does_not_skip_that_slot(monkeypatch, tmp_path):
     module = load_script(SCRIPT)
     monkeypatch.setattr(Path, "home", lambda: tmp_path)
-    clock = [1_800_000_000.0]
+    initial = module.time.mktime((2026, 10, 30, 8, 0, 0, -1, -1, -1))
+    clock = [initial]
     monkeypatch.setattr(module.time, "time", lambda: clock[0])
     monkeypatch.setattr(module, "maintenance_steps", lambda **_k: [["report"]])
     calls = []
@@ -1131,14 +1129,14 @@ def test_long_success_measures_twenty_hours_from_start(monkeypatch, tmp_path):
         tmp_path
         / "Library/Application Support/grounded-weather-forecast/last-maintenance"
     )
-    assert stamp.stat().st_mtime == 1_800_000_000.0
+    assert stamp.stat().st_mtime == initial
     # A same-day catch-up remains suppressed.
     assert module.main([]) == 0
     assert len(calls) == 1
-    clock[0] = 1_800_000_000.0 + 19 * 3600
+    clock[0] = module.latest_scheduled_slot(initial, (2, 15)) + 24 * 3600 - 1
     assert module.main([]) == 0
     assert len(calls) == 1
-    clock[0] = 1_800_000_000.0 + 20 * 3600
+    clock[0] += 1
     assert module.main([]) == 0
     assert len(calls) == 2
 
@@ -1161,16 +1159,14 @@ def test_success_stamp_failure_preserves_old_freshness(monkeypatch, tmp_path, fa
     assert {p.name for p in tmp_path.iterdir()} == before_names
 
 
-def test_success_stamp_needs_no_directory_cleanup_after_publication(
-    monkeypatch, tmp_path
-):
+def test_success_stamp_cleanup_failure_does_not_undo_publication(monkeypatch, tmp_path):
     module = load_script(SCRIPT)
     stamp = tmp_path / "last-maintenance"
 
     def denied(*_args, **_kwargs):
-        raise PermissionError("directory cleanup denied")
+        raise PermissionError("staging cleanup denied")
 
-    monkeypatch.setattr(module.os, "rmdir", denied)
+    monkeypatch.setattr(Path, "unlink", denied)
     module.stamp_success(stamp, 1_800_000_000.0)
     assert stamp.stat().st_mtime == 1_800_000_000.0
 
@@ -1221,9 +1217,11 @@ def test_stamp_runtime_failure_keeps_previous_stamp(monkeypatch, tmp_path, capsy
     code, commands, _ = run_maintenance(monkeypatch, tmp_path)
     assert code == 1
     assert stamp.stat().st_mtime_ns == before
+    assert not list(directory.glob(".last-maintenance.*.tmp"))
     assert any("prune-scores" in command for command in commands)
     output = capsys.readouterr().out
-    assert "maintenance failed: stamp permission denied" in output
+    assert "maintenance failed: cannot publish maintenance stamp" in output
+    assert "last-maintenance" in output and "stamp permission denied" in output
     assert "configuration error" not in output
     assert "exit=1" in output
 
@@ -1296,3 +1294,61 @@ def test_shadow_receipt_timeout_reports_publication_already_succeeded(
         == 1
     )
     assert "forecast published; shadow receipt/record failed" in capsys.readouterr().out
+
+
+@pytest.mark.parametrize("state", ["before", "after", "unsupported", "malformed"])
+def test_shadow_preflight_preserves_ordinary_publication(
+    monkeypatch, tmp_path, capsys, state
+):
+    module = load_script(SCRIPT.with_name("hourly-predict-publish.py"))
+    now = datetime.now(UTC)
+    start = now + timedelta(days=1) if state == "before" else now - timedelta(days=2)
+    end = now - timedelta(days=1) if state == "after" else now + timedelta(days=2)
+    protocol = tmp_path / "protocol.json"
+    protocol.write_text(
+        json.dumps({"window_start": start.isoformat(), "window_end": end.isoformat()})
+    )
+    if state == "malformed":
+        protocol.write_text("[" * 2000 + "0" + "]" * 2000)
+    events = []
+    monkeypatch.setattr(
+        module, "run_predict", lambda _paths: events.append("predict") or 0
+    )
+    monkeypatch.setattr(module, "maybe_spawn_restore", lambda _paths: None)
+    monkeypatch.setattr(
+        module, "publish", lambda _paths, _station: events.append("publish") or 0
+    )
+    monkeypatch.setattr(
+        subprocess,
+        "run",
+        lambda command, **_kw: subprocess.CompletedProcess(command, 2),
+    )
+    root = tmp_path / "shadow"
+    assert module.main(
+        ["--shadow-root", str(root), "--shadow-protocol", str(protocol)]
+    ) == (1 if state in {"unsupported", "malformed"} else 0)
+    assert events == ["predict", "publish"]
+    assert not root.exists()
+    output = capsys.readouterr().out
+    assert (
+        "shadow unavailable"
+        if state == "unsupported"
+        else "shadow preflight failed"
+        if state == "malformed"
+        else "outside enrollment window"
+    ) in output
+
+
+def test_future_stamp_never_suppresses_required_maintenance(monkeypatch, tmp_path):
+    module = load_script(SCRIPT)
+    stamp = (
+        tmp_path
+        / "Library/Application Support/grounded-weather-forecast/last-maintenance"
+    )
+    stamp.parent.mkdir(parents=True)
+    stamp.touch()
+    future = module.time.time() + 86400
+    os.utime(stamp, (future, future))
+    code, commands, _directory = run_maintenance(monkeypatch, tmp_path)
+    assert code == 0
+    assert commands

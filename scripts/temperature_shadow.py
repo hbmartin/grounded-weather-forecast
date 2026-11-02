@@ -7,16 +7,23 @@ opens SQLite, publishes, promotes, or installs a job. See docs/reference/cli.md.
 from __future__ import annotations
 
 import argparse
-import hashlib
 import json
 import math
 import os
 import sys
-import tempfile
-from contextlib import suppress
+from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
+from functools import cache
+from io import BytesIO
 from pathlib import Path
 from typing import Any, cast
+
+from filelock import FileLock, Timeout
+
+# isort: off
+import shadow_environment  # noqa: F401 -- limits must precede numerical imports
+# isort: on
+# isort: split
 
 import numpy as np
 import polars as pl
@@ -35,6 +42,8 @@ from shadow_evidence import (
     capsule_for,
     locked_truth,
     mature,
+    protocol_document,
+    protocol_rules,
     publication,
     regular,
     staged_directory,
@@ -51,6 +60,23 @@ from grounded_weather_forecast.dataset.matrix import (
     to_supervised_slice,
 )
 from grounded_weather_forecast.evaluation import code_identity
+from grounded_weather_forecast.shadow_artifacts import (
+    TARGET,
+    EvidenceError,
+    current_artifact,
+    digest,
+    forecast_rows,
+    hex_identity,
+    issuance_name,
+    json_object,
+    object_value,
+    required_string,
+    runtime_identity,
+    sha256,
+    sync_directory,
+    timestamp,
+    write_bytes_new,
+)
 
 METHODS = (
     "production",
@@ -61,7 +87,6 @@ METHODS = (
     "climatology",
 )
 HORIZONS = ("0-6h", "6-24h", "24-72h", "72-96h")
-TARGET = "t__temp_c__mean"
 INPUT_FILES = frozenset(
     {
         "issue.parquet",
@@ -73,35 +98,10 @@ INPUT_FILES = frozenset(
 )
 
 
-def digest(path: Path) -> str:
-    return hashlib.sha256(path.read_bytes()).hexdigest()
-
-
-def timestamp(value: str) -> datetime:
-    result = datetime.fromisoformat(value)
-    if result.tzinfo is None:
-        raise ValueError("timestamps must include timezone")
-    return result.astimezone(UTC)
-
-
 def write_new(path: Path, payload: Any) -> None:
     write_bytes_new(
         path, json.dumps(payload, indent=2, allow_nan=False, default=str).encode()
     )
-
-
-def write_bytes_new(path: Path, payload: bytes) -> None:
-    """Publish complete bytes exclusively; a failed write never leaves partial JSON."""
-    temporary: Path | None = None
-    try:
-        with tempfile.NamedTemporaryFile(dir=path.parent, delete=False) as handle:
-            temporary = Path(handle.name)
-            handle.write(payload)
-        os.link(temporary, path)
-    finally:
-        if temporary is not None:
-            with suppress(OSError):
-                temporary.unlink()
 
 
 def number(value: float) -> float | None:
@@ -109,100 +109,395 @@ def number(value: float) -> float | None:
 
 
 def issue_record_target(output: Path, origin: datetime) -> Path:
-    target = output / origin.strftime("%Y%m%dT%H%M%SZ")
+    target = output / issuance_name(origin)
     if (
         target.is_symlink()
         or target.is_junction()
         or (target.exists() and not target.is_dir())
         or target.resolve().parent != output.resolve()
     ):
-        raise ValueError("shadow issue directory must remain within the record store")
+        raise EvidenceError(
+            "shadow issue directory must remain within the record store"
+        )
     return target
 
 
-def implementation_lock(protocol_path: Path) -> dict[str, str]:
+@cache
+def package_identity() -> str:
+    return code_identity()
+
+
+def implementation_lock(
+    protocol_path: Path, protocol_bytes: bytes | None = None
+) -> dict[str, Any]:
     return {
-        "protocol_sha256": digest(protocol_path),
+        "protocol_sha256": sha256(protocol_bytes)
+        if protocol_bytes is not None
+        else digest(protocol_path),
         "runner_sha256": digest(Path(__file__)),
         "candidate_sha256": digest(Path(__file__).with_name("shadow_candidate_v1.py")),
-        "code_identity": code_identity(),
+        "code_identity": package_identity(),
         "evidence_sha256": digest(Path(__file__).with_name("shadow_evidence.py")),
+        "environment_sha256": digest(Path(__file__).with_name("shadow_environment.py")),
+        "runtime": runtime_identity(Path(__file__).parents[1] / "uv.lock"),
     }
+
+
+@dataclass(frozen=True)
+class Enrollment:
+    protocol_bytes: bytes
+    lock_bytes: bytes
+    protocol: dict[str, Any]
+    lock: dict[str, Any]
+
+
+def enrollment(
+    protocol_path: Path, *, protocol_bytes: bytes | None = None
+) -> Enrollment:
+    regular(protocol_path)
+    regular(protocol_path.with_suffix(".lock.json"))
+    raw = protocol_path.read_bytes() if protocol_bytes is None else protocol_bytes
+    locked = protocol_path.with_suffix(".lock.json").read_bytes()
+    protocol, lock = (
+        protocol_document(raw),
+        json_object(locked, "enrollment lock"),
+    )
+    if lock != implementation_lock(protocol_path, raw):
+        raise EvidenceError(
+            "frozen protocol or implementation changed, including numerical runtime"
+        )
+    return Enrollment(raw, locked, protocol, lock)
 
 
 def freeze(protocol_path: Path, output: Path) -> Path:
     """Seal a reviewed, future enrollment without scheduling any work."""
-    protocol = json.loads(protocol_path.read_text())
-    template = json.loads(
+    protocol_bytes = protocol_path.read_bytes()
+    protocol = protocol_document(protocol_bytes)
+    if not current_artifact(protocol.get("artifact_version")):
+        raise EvidenceError("freeze requires a fresh v3 protocol")
+    template = json_object(
         (
             Path(__file__).parents[1] / "examples/temperature-shadow/protocol.json"
-        ).read_text()
+        ).read_bytes(),
+        "protocol template",
     )
     fixed = template.keys() - {"window_start", "window_end", "status"}
     if any(protocol.get(key) != template[key] for key in fixed):
-        raise ValueError(
+        raise EvidenceError(
             "candidate and evaluation rules are fixed; review a new protocol version"
         )
     if protocol["candidate_sha256"] != digest(
         Path(__file__).with_name("shadow_candidate_v1.py")
     ):
-        raise ValueError("candidate differs from the reviewed protocol digest")
+        raise EvidenceError("candidate differs from the reviewed protocol digest")
     if timestamp(protocol["window_start"]) <= datetime.now(UTC):
-        raise ValueError(
+        raise EvidenceError(
             "enrollment window has started; explicit review of a new window is required"
         )
     if timestamp(protocol["window_end"]) - timestamp(
         protocol["window_start"]
     ) != timedelta(days=42):
-        raise ValueError("the predeclared initial window must be six weeks")
+        raise EvidenceError("the predeclared initial window must be six weeks")
     output.mkdir(parents=True, exist_ok=False, mode=0o700)
     target = output / "protocol.json"
-    target.write_bytes(protocol_path.read_bytes())
-    write_new(target.with_suffix(".lock.json"), implementation_lock(target))
+    target.write_bytes(protocol_bytes)
+    write_new(
+        target.with_suffix(".lock.json"), implementation_lock(target, protocol_bytes)
+    )
     return target
 
 
 def freeze_truth(truth: Path, protocol_path: Path, output: Path, now: datetime) -> Path:
-    if (
-        json.loads(protocol_path.read_text()).get("artifact_version")
-        != ARTIFACT_VERSION
-    ):
-        raise ValueError("truth sealing requires a fresh v2 enrollment")
-    if json.loads(
-        protocol_path.with_suffix(".lock.json").read_text()
-    ) != implementation_lock(protocol_path):
-        raise ValueError("frozen protocol or implementation changed")
-    return seal_truth(truth, protocol_path, output, now)
+    enrolled = enrollment(protocol_path)
+    if not current_artifact(enrolled.protocol.get("artifact_version")):
+        raise EvidenceError("truth sealing requires a fresh v3 enrollment")
+    return seal_truth(
+        truth,
+        protocol_path,
+        output,
+        now,
+        protocol_bytes=enrolled.protocol_bytes,
+        enrollment_bytes=enrolled.lock_bytes,
+    )
 
 
 def capsule_metadata(capsule: Path, *, prospective: bool = False) -> dict[str, Any]:
     # A capsule is an immutable directory of local files, including files not
     # listed in its manifest. Check before either JSON read or the later sweep.
     if any(path.is_symlink() for path in capsule.iterdir()):
-        raise ValueError("capsule symlink is not a self-contained input")
+        raise EvidenceError("capsule symlink is not a self-contained input")
     if any(not path.is_file() for path in capsule.iterdir()):
-        raise ValueError("capsule child must be a regular file")
-    meta = json.loads((capsule / "capsule.json").read_text())
-    if prospective and meta.get("artifact_version") != ARTIFACT_VERSION:
-        raise ValueError("prospective capsules require a fresh v2 enrollment")
+        raise EvidenceError("capsule child must be a regular file")
+    meta = json_object((capsule / "capsule.json").read_bytes(), "capsule manifest")
+    timestamp(required_string(meta.get("input_as_of"), "capsule.input_as_of"))
+    if prospective and not current_artifact(meta.get("artifact_version")):
+        raise EvidenceError("prospective capsules require a fresh v3 enrollment")
     hashes = meta.get("input_sha256", {})
     if not isinstance(hashes, dict) or (
         prospective and not hashes.keys() >= INPUT_FILES
     ):
-        raise ValueError("prospective requires the complete captured input manifest")
+        raise EvidenceError("prospective requires the complete captured input manifest")
     receipt = capsule / "publication.json"
     if receipt.exists():
-        meta["publication"] = json.loads(receipt.read_text())
+        meta["publication"] = json_object(
+            receipt.read_bytes(), "sealed publication receipt"
+        )
     for name, expected in hashes.items():
         if not name or name in {".", ".."} or any(c in name for c in "/\\:"):
-            raise ValueError(f"invalid capsule filename: {name!r}")
+            raise EvidenceError(f"invalid capsule filename: {name!r}")
         if not (capsule / name).is_file():
-            raise ValueError(
+            raise EvidenceError(
                 f"invalid capsule filename: {name!r} is not a regular file"
             )
         if digest(capsule / name) != expected:
-            raise ValueError(f"captured input changed: {name}")
+            raise EvidenceError(f"captured input changed: {name}")
     return meta
+
+
+def capsule_hashes(
+    capsule: Path,
+    meta: dict[str, Any],
+    *,
+    sealed: bool = True,
+    seal_bytes: bytes | None = None,
+) -> dict[str, str]:
+    names = set(meta.get("input_sha256", {})) | {"capsule.json"}
+    names |= {name for name in INPUT_FILES if (capsule / name).is_file()}
+    names |= {
+        name
+        for name in ("published.json", "publication.json")
+        if (capsule / name).is_file()
+    }
+    if sealed and (capsule / "evidence.lock.json").is_file():
+        names.add("evidence.lock.json")
+    return {
+        name: sha256(seal_bytes)
+        if name == "evidence.lock.json" and seal_bytes is not None
+        else digest(capsule / name)
+        for name in sorted(names)
+    }
+
+
+def publication_state(value: object) -> tuple[bytes, dict[str, Any], dict[str, Any]]:
+    payload, published = publication(value)
+    supplied = object_value(value, "publisher receipt")
+    names = (
+        "schema_version",
+        "public_schema_version",
+        "commit_binding",
+        "commit",
+        "forecast_base64",
+        "forecast_sha256",
+        "source_sha256",
+        "issued_at",
+        "published_at",
+        "remote",
+        "branch",
+        "publisher_version",
+    )
+    receipt = {name: supplied[name] for name in names}
+    state = {
+        "artifact_version": ARTIFACT_VERSION,
+        "commit": receipt["commit"],
+        "issued_at": receipt["issued_at"],
+        "published_at": receipt["published_at"],
+        "source_sha256": receipt["source_sha256"],
+        "published_sha256": sha256(payload),
+        "remote": receipt["remote"],
+        "branch": receipt["branch"],
+        "commit_binding": BINDING,
+        "publisher_receipt": receipt,
+    }
+    return payload, published, state
+
+
+def prospective_clock(
+    meta: dict[str, Any],
+    document: dict[str, Any],
+    protocol: dict[str, Any],
+    now: datetime,
+) -> None:
+    origin = timestamp(document["issued_at"])
+    if (
+        meta.get("capture_kind") != "serving_snapshot"
+        or not timestamp(protocol["window_start"])
+        <= origin
+        < timestamp(protocol["window_end"])
+        or not origin <= now <= origin + timedelta(minutes=30)
+        or not origin <= timestamp(meta["publication"]["published_at"]) <= now
+        or not origin <= timestamp(meta.get("capsule_exported_at", "")) <= now
+        or timestamp(meta["input_as_of"]) != origin
+        or document.get("timezone") != "America/Los_Angeles"
+    ):
+        raise EvidenceError(
+            "prospective requires a contemporaneous serving snapshot in the frozen window"
+        )
+
+
+def verified_seal(
+    capsule: Path, meta: dict[str, Any], enrolled: Enrollment
+) -> tuple[dict[str, Any], bytes]:
+    path = capsule / "evidence.lock.json"
+    if not path.exists():
+        raise EvidenceError(
+            "missing complete evidence seal: evidence.lock.json; late recovery requires a timely seal"
+        )
+    regular(path)
+    payload = path.read_bytes()
+    seal = json_object(payload, "evidence seal")
+    if (
+        not current_artifact(seal.get("artifact_version"))
+        or seal.get("protocol_sha256") != sha256(enrolled.protocol_bytes)
+        or seal.get("enrollment_sha256") != sha256(enrolled.lock_bytes)
+        or seal.get("input_sha256") != capsule_hashes(capsule, meta, sealed=False)
+    ):
+        raise EvidenceError("sealed evidence identity differs")
+    document, production = production_rows(capsule, meta, prospective=True)
+    sealed_at = timestamp(
+        required_string(seal.get("evidence_sealed_at"), "evidence.evidence_sealed_at")
+    )
+    if sealed_at > datetime.now(UTC):
+        raise EvidenceError("evidence seal clock is in the future")
+    prospective_clock(meta, document, enrolled.protocol, sealed_at)
+    checked_issue(
+        capsule,
+        timestamp(document["issued_at"]),
+        document,
+        production,
+        sealed_at,
+        prospective=True,
+    )
+    return seal, payload
+
+
+def ensure_bytes(path: Path, payload: bytes) -> None:
+    if path.exists() or path.is_symlink():
+        regular(path)
+        if path.read_bytes() != payload:
+            raise EvidenceError(
+                f"partial publication conflicts with sealed state: {path.name}"
+            )
+    else:
+        write_bytes_new(path, payload)
+
+
+def seal_publication(
+    capsule: Path, meta: dict[str, Any], value: object, enrolled: Enrollment
+) -> None:
+    payload, published, receipt = publication_state(value)
+    candidate = {**meta, "publication": receipt}
+    if (
+        object_value(meta.get("provenance"), "capsule.provenance").get(
+            "production_code_identity"
+        )
+        != enrolled.lock["code_identity"]
+    ):
+        raise EvidenceError("production implementation differs from frozen enrollment")
+    if timestamp(published["issued_at"]) != timestamp(meta["input_as_of"]):
+        raise EvidenceError("public commit belongs to a different issuance")
+    document, production = production_rows(
+        capsule, candidate, prospective=True, published_payload=payload
+    )
+    if (capsule / "evidence.lock.json").exists():
+        verified_seal(capsule, meta, enrolled)
+        original = meta["publication"]
+        if (receipt["remote"], receipt["branch"]) != (
+            original["remote"],
+            original["branch"],
+        ):
+            raise EvidenceError("held publication destination differs")
+        if (
+            not timestamp(original["published_at"])
+            <= timestamp(receipt["published_at"])
+            <= datetime.now(UTC)
+        ):
+            raise EvidenceError(
+                "held publisher receipt clock precedes original or is in the future"
+            )
+        return
+    now = datetime.now(UTC)
+    prospective_clock(candidate, document, enrolled.protocol, now)
+    checked_issue(
+        capsule,
+        timestamp(document["issued_at"]),
+        document,
+        production,
+        now,
+        prospective=True,
+    )
+    # Serialize before any exclusive write: malformed evidence cannot poison retries.
+    receipt_bytes = json.dumps(receipt, indent=2, allow_nan=False).encode()
+    ensure_bytes(capsule / "published.json", payload)
+    ensure_bytes(capsule / "publication.json", receipt_bytes)
+    meta = capsule_metadata(capsule, prospective=True)
+    hashes = capsule_hashes(capsule, meta, sealed=False)
+    for name in hashes:
+        with (capsule / name).open("rb") as handle:
+            os.fsync(handle.fileno())
+    sync_directory(capsule)
+    now = datetime.now(UTC)
+    prospective_clock(meta, document, enrolled.protocol, now)
+    write_new(
+        capsule / "evidence.lock.json",
+        {
+            "artifact_version": ARTIFACT_VERSION,
+            "evidence_sealed_at": now.isoformat(),
+            "protocol_sha256": sha256(enrolled.protocol_bytes),
+            "enrollment_sha256": sha256(enrolled.lock_bytes),
+            "input_sha256": hashes,
+        },
+    )
+
+
+def completed_record(
+    path: Path,
+    saved: dict[str, Any],
+    capsule: Path,
+    enrolled: Enrollment,
+    *,
+    record_bytes: bytes | None = None,
+    seal_snapshot: tuple[dict[str, Any], bytes] | None = None,
+) -> None:
+    regular(path)
+    version = saved.get("artifact_version")
+    if not current_artifact(version):
+        raise EvidenceError(
+            f"{saved.get('mode', 'unknown')} record version {version!r} is incompatible with v3 finalization; preserve it and use its original runner"
+        )
+    manifest_path = path.with_name("record.lock.json")
+    regular(manifest_path)
+    manifest = json_object(manifest_path.read_bytes(), "record manifest")
+    meta = capsule_metadata(capsule, prospective=saved["mode"] == "prospective")
+    seal_hash, seal_bytes = None, None
+    if saved["mode"] == "prospective":
+        seal_data, seal_bytes = (
+            seal_snapshot
+            if seal_snapshot is not None
+            else verified_seal(capsule, meta, enrolled)
+        )
+        if timestamp(
+            required_string(saved.get("recorded_at"), "record.recorded_at")
+        ) < timestamp(seal_data["evidence_sealed_at"]):
+            raise EvidenceError("record clock precedes complete evidence seal")
+        seal_hash = sha256(seal_bytes)
+    if (
+        type(manifest.get("artifact_version")) is not int
+        or manifest.get("artifact_version") != ARTIFACT_VERSION
+        or manifest.get("record_sha256")
+        != (sha256(record_bytes) if record_bytes is not None else digest(path))
+        or manifest.get("evidence_lock_sha256") != seal_hash
+        or saved.get("evidence_lock_sha256") != seal_hash
+        or saved.get("input_sha256")
+        != capsule_hashes(capsule, meta, seal_bytes=seal_bytes)
+        or saved.get("protocol_sha256") != sha256(enrolled.protocol_bytes)
+        or timestamp(required_string(saved.get("recorded_at"), "record.recorded_at"))
+        > datetime.now(UTC)
+        or path.parent.name
+        != issuance_name(
+            timestamp(required_string(saved.get("issued_at"), "record.issued_at"))
+        )
+    ):
+        raise EvidenceError("completed shadow record conflicts with sealed evidence")
 
 
 def finalize(
@@ -210,67 +505,50 @@ def finalize(
     output: Path,
     protocol_path: Path,
     *,
-    publication_receipt: dict[str, Any] | None = None,
+    publication_receipt: object = None,
     source: Path | None,
     mode: str,
 ) -> Path:
-    """Seal a successful public commit and score the original captured issue."""
+    """Seal original evidence before fitting; later held pushes retain that seal."""
     meta = capsule_metadata(capsule, prospective=mode == "prospective")
     if source is not None and digest(source) != digest(capsule / "production.json"):
-        raise ValueError(
+        raise EvidenceError(
             "publisher chose a different source; do not relabel held forecasts"
         )
-    if publication_receipt is not None:
-        payload, published = publication(publication_receipt)
-        if publication_receipt["source_sha256"] != digest(capsule / "production.json"):
-            raise ValueError("publisher consumed a different source")
-        if timestamp(published["issued_at"]) != timestamp(meta["input_as_of"]):
-            raise ValueError("public commit belongs to a different issuance")
-        published_path = capsule / "published.json"
-        if published_path.exists():
-            if published_path.read_bytes() != payload:
-                raise ValueError(
-                    "partial publication conflicts with the public payload"
+    enrolled = enrollment(protocol_path)
+    lease = capsule / ".sealing"
+    lock = FileLock(lease, timeout=0)
+    try:
+        lock.acquire()
+    except Timeout as error:
+        raise OSError(f"capsule finalization is already running: {capsule}") from error
+    try:
+        if publication_receipt is not None:
+            seal_publication(capsule, meta, publication_receipt, enrolled)
+            meta = capsule_metadata(capsule, prospective=mode == "prospective")
+        elif "publication" not in meta:
+            raise EvidenceError(
+                "missing original successful-push receipt; cannot reconstruct from a branch"
+            )
+        document, _ = production_rows(capsule, meta, prospective=mode == "prospective")
+        target = issue_record_target(output, timestamp(document["issued_at"]))
+        existing = target / "record.json"
+        if existing.exists() or existing.is_symlink():
+            regular(existing)
+            saved = json_object(existing.read_bytes(), "record")
+            if saved.get("mode") != mode or not saved.get("predictions"):
+                raise EvidenceError(
+                    "existing shadow record conflicts with this enrollment"
                 )
-        else:
-            write_bytes_new(published_path, payload)
-        receipt = {
-            "artifact_version": ARTIFACT_VERSION,
-            "commit": publication_receipt["commit"],
-            "issued_at": published["issued_at"],
-            "published_at": published["published_at"],
-            "source_sha256": digest(capsule / "production.json"),
-            "published_sha256": digest(published_path),
-            "remote": publication_receipt["remote"],
-            "branch": publication_receipt["branch"],
-            "commit_binding": BINDING,
-            "publisher_receipt": publication_receipt,
-        }
-        if "publication" in meta:
-            if meta["publication"] != receipt:
-                raise ValueError("publication receipt conflicts with sealed state")
-        else:
-            write_new(capsule / "publication.json", receipt)
-        meta = capsule_metadata(capsule, prospective=mode == "prospective")
-    elif "publication" not in meta:
-        raise ValueError(
-            "missing original successful-push receipt; cannot reconstruct from a branch"
-        )
-    document, _ = production_rows(capsule, meta, prospective=mode == "prospective")
-    target = issue_record_target(output, timestamp(document["issued_at"]))
-    if (existing := target / "record.json").exists():
-        if existing.is_symlink() or not existing.is_file():
-            raise ValueError("shadow record must be a regular local file")
-        saved = json.loads(existing.read_text())
-        if saved.get("mode") != mode or not saved.get("predictions"):
-            raise ValueError("existing shadow record conflicts with this enrollment")
-        validate_record(existing, saved, capsule, protocol_path)
-        return target
-    return record(capsule, output, protocol_path, mode=mode)
+            completed_record(existing, saved, capsule, enrolled)
+            return target
+        return record(capsule, output, protocol_path, mode=mode, enrolled=enrolled)
+    finally:
+        lock.release()
 
 
 def validate_provenance(meta: dict[str, Any], document: dict[str, Any]) -> None:
-    provenance = meta.get("provenance", {})
+    provenance = object_value(meta.get("provenance", {}), "capsule.provenance")
     required = (
         "production_code_identity",
         "config_fingerprint",
@@ -282,51 +560,60 @@ def validate_provenance(meta: dict[str, Any], document: dict[str, Any]) -> None:
     if any(
         not isinstance(provenance.get(k), str) or not provenance[k] for k in required
     ):
-        raise ValueError(
+        raise EvidenceError(
             "prospective requires explicit code/config/data and availability provenance"
         )
     if provenance["dataset_fingerprint"] != document["dataset_fingerprint"]:
-        raise ValueError("input data provenance differs from production")
+        raise EvidenceError("input data provenance differs from production")
 
 
 def production_rows(
-    capsule: Path, meta: dict[str, Any], *, prospective: bool
+    capsule: Path,
+    meta: dict[str, Any],
+    *,
+    prospective: bool,
+    published_payload: bytes | None = None,
 ) -> tuple[dict[str, Any], dict[str, dict[str, Any]]]:
-    document = json.loads((capsule / "production.json").read_text())
-    rows = {row["valid_time"]: row for row in document["hourly"]}
-    if len(rows) != len(document["hourly"]):
-        raise ValueError("duplicated source forecast grid")
-    if any(
-        row.get("truth_semantics", {}).get("temp_c") != "mean" for row in rows.values()
-    ):
-        raise ValueError("production temperature must target interval mean truth")
+    document = json_object(
+        (capsule / "production.json").read_bytes(), "source forecast"
+    )
+    rows = forecast_rows(document, public=False)
     if not prospective:
         return document, rows
-    if "publication" not in meta or not (capsule / "published.json").is_file():
-        raise ValueError(
+    if "publication" not in meta or (
+        published_payload is None and not (capsule / "published.json").is_file()
+    ):
+        raise EvidenceError(
             "prospective requires a committed payload and publication receipt"
         )
     validate_provenance(meta, document)
-    receipt = meta["publication"]
+    receipt = object_value(meta["publication"], "sealed publication receipt")
+    for name in ("issued_at", "published_at", "remote", "branch"):
+        required_string(receipt.get(name), "sealed publication." + name)
+    for name in ("source_sha256", "published_sha256"):
+        hex_identity(receipt.get(name), "sealed publication." + name, 64)
+    object_value(receipt.get("publisher_receipt"), "sealed publisher receipt")
     if (
-        receipt.get("artifact_version") != ARTIFACT_VERSION
+        not current_artifact(receipt.get("artifact_version"))
         or receipt.get("commit_binding") != BINDING
     ):
-        raise ValueError("prospective requires a v2 exact-push publication receipt")
+        raise EvidenceError("prospective requires a v3 exact-push publication receipt")
     published_path = capsule / "published.json"
-    published = json.loads(published_path.read_text())
+    payload = (
+        published_path.read_bytes() if published_payload is None else published_payload
+    )
+    published = json_object(payload, "published forecast")
+    forecast_rows(published, public=True)
     published_times = [row["valid_time"] for row in published["hourly"]]
     if (
         len(published_times) != len(rows)
         or len(set(published_times)) != len(published_times)
         or set(published_times) != set(rows)
     ):
-        raise ValueError("published timestamp grid differs")
-    commit = receipt["commit"]
-    if len(commit) != 40 or any(c not in "0123456789abcdef" for c in commit):
-        raise ValueError("prospective publication needs full commit identity")
+        raise EvidenceError("published timestamp grid differs")
+    hex_identity(receipt.get("commit"), "sealed publication.commit", 40)
     if (
-        receipt["published_sha256"] != digest(published_path)
+        receipt["published_sha256"] != sha256(payload)
         or receipt["source_sha256"] != digest(capsule / "production.json")
         or receipt["issued_at"] != document["issued_at"]
         or published["issued_at"] != document["issued_at"]
@@ -336,8 +623,8 @@ def production_rows(
         or published.get("truth_semantics", {}).get("temp_f") != "mean"
         or timestamp(receipt["published_at"]) != timestamp(published["published_at"])
     ):
-        raise ValueError("publication receipt/source/payload mismatch")
-    validate_push_binding(receipt, capsule / "production.json", published_path)
+        raise EvidenceError("publication receipt/source/payload mismatch")
+    validate_push_binding(receipt, capsule / "production.json", payload)
     apply_published_temperature(rows, published["hourly"])
     return document, rows
 
@@ -352,18 +639,18 @@ def apply_published_temperature(
             if row.get(field, {}).get("temp_f") != original.get(field, {}).get(
                 "temp_c"
             ):
-                raise ValueError(
+                raise EvidenceError(
                     "published temperature attribution differs from source"
                 )
         original_value = original["values"].get("temp_c")
         value_f = row["values"].get("temp_f")
         if (original_value is None) != (value_f is None):
-            raise ValueError("published temperature availability differs")
+            raise EvidenceError("published temperature availability differs")
         if value_f is not None:
             value_c = (value_f - 32) / 1.8
             # The actual public publisher rounds Celsius * 9/5 +32 to 2 decimals.
             if value_f != round(original_value * 9.0 / 5.0 + 32.0, 2):
-                raise ValueError("published temperature differs from source")
+                raise EvidenceError("published temperature differs from source")
             # Evaluate the actual public, rounded value.
             original["values"]["temp_c"] = value_c
 
@@ -379,7 +666,7 @@ def predictions(
         )
     )
     if train["valid_time"].n_unique() < 48:
-        raise ValueError("need at least 48 unique known training hours")
+        raise EvidenceError("need at least 48 unique known training hours")
     spec = hourly_variable("temp_c")
     supervised = to_supervised_slice(
         train, spec, semantics=TruthSemantics.INTERVAL_MEAN
@@ -419,15 +706,51 @@ def predictions(
 
 
 def validate_push_binding(
-    receipt: dict[str, Any], source: Path, published: Path
+    receipt: dict[str, Any], source: Path, published: Path | bytes
 ) -> None:
     payload, _ = publication(receipt["publisher_receipt"])
     if (
-        payload != published.read_bytes()
+        payload
+        != (published.read_bytes() if isinstance(published, Path) else published)
         or receipt["publisher_receipt"]["source_sha256"] != digest(source)
         or receipt["publisher_receipt"]["commit"] != receipt["commit"]
+        or receipt["publisher_receipt"]["remote"] != receipt.get("remote")
+        or receipt["publisher_receipt"]["branch"] != receipt.get("branch")
     ):
-        raise ValueError("publication receipt/source/payload mismatch")
+        raise EvidenceError("publication receipt/source/payload mismatch")
+
+
+def capsule_frame(capsule: Path, name: str, required: set[str]) -> pl.DataFrame:
+    path = capsule / name
+    regular(path)
+    try:
+        frame = pl.read_parquet(BytesIO(path.read_bytes()))
+    except pl.exceptions.PolarsError as error:
+        raise EvidenceError(f"{name}: invalid Parquet input") from error
+    if not required <= set(frame.columns):
+        raise EvidenceError(
+            f"{name}: missing required columns {sorted(required - set(frame.columns))}"
+        )
+    for column in required & {"issue_time", "valid_time", "valid_hour"}:
+        dtype = frame.schema[column]
+        if not isinstance(dtype, pl.Datetime) or dtype.time_zone is None:
+            raise EvidenceError(f"{name}.{column}: expected timezone-aware datetime")
+        if (
+            frame[column].null_count()
+            or frame.filter(pl.col(column).dt.epoch("ns") % 1000 != 0).height
+        ):
+            raise EvidenceError(
+                f"{name}.{column}: expected nonnull microsecond-precision clocks"
+            )
+        frame = frame.with_columns(
+            pl.col(column).dt.convert_time_zone("UTC").cast(pl.Datetime("us", "UTC"))
+        )
+    for column in frame.columns:
+        if (
+            column in {"lead_hours", TARGET, "obs__temp_c"} or column.startswith("fx__")
+        ) and not frame.schema[column].is_numeric():
+            raise EvidenceError(f"{name}.{column}: expected numeric input")
+    return frame
 
 
 def checked_issue(
@@ -439,14 +762,20 @@ def checked_issue(
     *,
     prospective: bool,
 ) -> pl.DataFrame:
-    issue = pl.read_parquet(capsule / "issue.parquet").sort("valid_time")
+    issue = capsule_frame(
+        capsule,
+        "issue.parquet",
+        {"issue_time", "valid_time", "lead_hours", "lead_bucket"},
+    ).sort("valid_time")
+    if issue["lead_hours"].null_count() or not issue["lead_hours"].is_finite().all():
+        raise EvidenceError("issue.lead_hours: expected finite values")
     if issue["issue_time"].n_unique() != 1 or issue["issue_time"][0] != origin:
-        raise ValueError("issue matrix must contain exactly this issuance")
+        raise EvidenceError("issue matrix must contain exactly this issuance")
     issue = issue.filter((pl.col("lead_hours") >= 0) & (pl.col("lead_hours") <= 96))
     if issue.is_empty() or issue["valid_time"].n_unique() != issue.height:
-        raise ValueError("empty or duplicated forecast grid")
+        raise EvidenceError("empty or duplicated forecast grid")
     if {v.isoformat() for v in issue["valid_time"]} != set(production):
-        raise ValueError("input matrix must cover exactly the published hourly grid")
+        raise EvidenceError("input matrix must cover exactly the published hourly grid")
     observation_at = document.get("observation_at")
     if (
         observation_at is None
@@ -456,51 +785,62 @@ def checked_issue(
     for row in issue.select("valid_time", "lead_hours").iter_rows(named=True):
         expected = (row["valid_time"] - origin).total_seconds() / 3600
         if abs(expected - row["lead_hours"]) > 0.001:
-            raise ValueError("lead hours must agree with issuance and valid time")
+            raise EvidenceError("lead hours must agree with issuance and valid time")
     if prospective and now >= cast(datetime, issue["valid_time"].min()) + timedelta(
         hours=1
     ):
-        raise ValueError("refusing forecasts recorded after outcomes")
+        raise EvidenceError("refusing forecasts recorded after outcomes")
     return issue
 
 
 def build_record(
-    capsule: Path, protocol_path: Path, *, mode: str, now: datetime
+    capsule: Path,
+    protocol_path: Path,
+    *,
+    mode: str,
+    now: datetime,
+    enrolled: Enrollment | None = None,
+    seal_snapshot: tuple[dict[str, Any], bytes] | None = None,
 ) -> dict[str, Any]:
     """Pure reconstruction from retained files and the original recording clock."""
     prospective = mode == "prospective"
     meta = capsule_metadata(capsule, prospective=prospective)
-    protocol = json.loads(protocol_path.read_text())
-    if prospective and protocol.get("artifact_version") != ARTIFACT_VERSION:
-        raise ValueError("prospective requires a fresh v2 enrollment")
-    lock = json.loads(protocol_path.with_suffix(".lock.json").read_text())
-    if lock != implementation_lock(protocol_path):
-        raise ValueError(
-            "frozen protocol or implementation changed; review a new enrollment"
-        )
+    enrolled = enrolled if enrolled is not None else enrollment(protocol_path)
+    protocol = enrolled.protocol
+    if prospective and not current_artifact(protocol.get("artifact_version")):
+        raise EvidenceError("prospective requires a fresh v3 enrollment")
     document, production = production_rows(capsule, meta, prospective=prospective)
     origin = timestamp(document["issued_at"])
     if timestamp(meta["input_as_of"]) != origin:
-        raise ValueError("features must have the production issuance time")
-    if prospective and (
-        meta["capture_kind"] != "serving_snapshot"
-        or not timestamp(protocol["window_start"])
-        <= origin
-        < timestamp(protocol["window_end"])
-        or not origin <= now <= origin + timedelta(minutes=30)
-        or not origin <= timestamp(meta["publication"]["published_at"]) <= now
-        or document.get("timezone") != "America/Los_Angeles"
-    ):
-        raise ValueError(
-            "prospective requires a contemporaneous serving snapshot in the frozen window"
+        raise EvidenceError("features must have the production issuance time")
+    evidence_at, seal_hash, seal_bytes = now, None, None
+    if prospective:
+        seal, seal_bytes = (
+            seal_snapshot
+            if seal_snapshot is not None
+            else verified_seal(capsule, meta, enrolled)
         )
+        evidence_at, seal_hash = (
+            timestamp(
+                required_string(
+                    seal.get("evidence_sealed_at"), "evidence.evidence_sealed_at"
+                )
+            ),
+            sha256(seal_bytes),
+        )
+        if now < evidence_at:
+            raise EvidenceError("record clock precedes complete evidence seal")
     issue = checked_issue(
-        capsule, origin, document, production, now, prospective=prospective
+        capsule, origin, document, production, evidence_at, prospective=prospective
     )
     values, fitted = predictions(
-        pl.read_parquet(capsule / "training.parquet"),
+        capsule_frame(
+            capsule,
+            "training.parquet",
+            {"issue_time", "valid_time", "lead_hours", "lead_bucket", TARGET},
+        ),
         issue,
-        pl.read_parquet(capsule / "truth_hourly.parquet"),
+        capsule_frame(capsule, "truth_hourly.parquet", {"valid_hour", TARGET}),
         origin,
     )
     rows = []
@@ -533,15 +873,17 @@ def build_record(
                 **{name: number(v[index]) for name, v in values.items()},
             )
         )
-    hashes = {p.name: digest(p) for p in capsule.iterdir() if p.is_file()}
+    hashes = capsule_hashes(capsule, meta, seal_bytes=seal_bytes)
     return {
         "artifact_version": ARTIFACT_VERSION,
-        "evidence_sha256": implementation_lock(protocol_path)["evidence_sha256"],
+        "evidence_sha256": enrolled.lock["evidence_sha256"],
+        "evidence_lock_sha256": seal_hash,
+        "evidence_sealed_at": evidence_at.isoformat() if prospective else None,
         "mode": mode,
         "recorded_at": now.isoformat(),
         "issued_at": origin.isoformat(),
-        "protocol_sha256": digest(protocol_path),
-        "code_identity": code_identity(),
+        "protocol_sha256": sha256(enrolled.protocol_bytes),
+        "code_identity": package_identity(),
         "runner_sha256": digest(Path(__file__)),
         "candidate_sha256": digest(Path(__file__).with_name("shadow_candidate_v1.py")),
         "capsule": meta,
@@ -551,28 +893,70 @@ def build_record(
     }
 
 
-def record(capsule: Path, output: Path, protocol_path: Path, *, mode: str) -> Path:
-    payload = build_record(capsule, protocol_path, mode=mode, now=datetime.now(UTC))
+def record(
+    capsule: Path,
+    output: Path,
+    protocol_path: Path,
+    *,
+    mode: str,
+    enrolled: Enrollment | None = None,
+) -> Path:
+    payload = build_record(
+        capsule, protocol_path, mode=mode, now=datetime.now(UTC), enrolled=enrolled
+    )
+    payload["recorded_at"] = datetime.now(UTC).isoformat()
     output.mkdir(parents=True, exist_ok=True, mode=0o700)
     target = issue_record_target(output, timestamp(payload["issued_at"]))
-    target.mkdir(exist_ok=True, mode=0o700)
-    write_new(target / "record.json", payload)
+    if target.exists() and not any(target.iterdir()):
+        target.rmdir()  # Recover an exclusively named empty pre-publication directory.
+    with staged_directory(target) as staged:
+        raw = json.dumps(payload, indent=2, allow_nan=False, default=str).encode()
+        write_bytes_new(staged / "record.json", raw)
+        write_new(
+            staged / "record.lock.json",
+            {
+                "artifact_version": ARTIFACT_VERSION,
+                "record_sha256": sha256(raw),
+                "evidence_lock_sha256": payload["evidence_lock_sha256"],
+            },
+        )
     return target
 
 
 def validate_record(
-    path: Path, saved: dict[str, Any], capsule: Path, protocol: Path
+    path: Path,
+    saved: dict[str, Any],
+    capsule: Path,
+    protocol: Path,
+    *,
+    enrolled: Enrollment | None = None,
+    record_bytes: bytes | None = None,
 ) -> None:
-    regular(path)
-    if saved.get("artifact_version") != ARTIFACT_VERSION:
-        raise ValueError("prospective records require a fresh v2 enrollment")
-    origin = timestamp(saved["issued_at"])
-    if path.parent.name != origin.strftime("%Y%m%dT%H%M%SZ"):
-        raise ValueError("record directory and issuance differ")
-    recorded = timestamp(saved["recorded_at"])
-    if recorded > datetime.now(UTC):
-        raise ValueError("record clock is in the future")
-    expected = build_record(capsule, protocol, mode=saved["mode"], now=recorded)
+    enrolled = enrolled if enrolled is not None else enrollment(protocol)
+    seal_snapshot = (
+        verified_seal(capsule, capsule_metadata(capsule, prospective=True), enrolled)
+        if saved.get("mode") == "prospective"
+        else None
+    )
+    completed_record(
+        path,
+        saved,
+        capsule,
+        enrolled,
+        record_bytes=record_bytes,
+        seal_snapshot=seal_snapshot,
+    )
+    recorded = timestamp(
+        required_string(saved.get("recorded_at"), "record.recorded_at")
+    )
+    expected = build_record(
+        capsule,
+        protocol,
+        mode=saved["mode"],
+        now=recorded,
+        enrolled=enrolled,
+        seal_snapshot=seal_snapshot,
+    )
     expected = json.loads(json.dumps(expected, default=str, allow_nan=False))
     assert_equivalent(saved, expected)
 
@@ -719,19 +1103,99 @@ def cohort_counts(eligible: pl.DataFrame) -> dict[str, Any]:
     }
 
 
-def load_records(store: Path) -> list[tuple[Path, dict[str, Any]]]:
+def load_records(store: Path) -> list[tuple[Path, dict[str, Any], bytes]]:
     """Reject child aliases before reading JSON outside the selected store."""
     records = []
     for directory in sorted(store.iterdir()):
         if directory.is_symlink() or directory.is_junction():
-            raise ValueError("record directory must remain within the record store")
+            raise EvidenceError("record directory must remain within the record store")
         if not directory.is_dir():
             continue
         path = directory / "record.json"
         if path.exists() or path.is_symlink():
             regular(path)
-            records.append((path, json.loads(path.read_text())))
+            raw = path.read_bytes()
+            records.append((path, json_object(raw, "record"), raw))
     return records
+
+
+@dataclass(frozen=True)
+class EvaluationInputs:
+    protocol_bytes: bytes
+    protocol: dict[str, Any]
+    selected: list[tuple[Path, dict[str, Any], bytes]]
+    truth_bytes: bytes
+    lock_bytes: bytes | None
+
+
+def evaluation_inputs(
+    store: Path,
+    truth_path: Path | None,
+    protocol_path: Path,
+    *,
+    mode: str,
+    capsules: Path | None = None,
+    truth_lock: Path | None = None,
+) -> EvaluationInputs:
+    protocol_bytes = protocol_path.read_bytes()
+    protocol = protocol_document(protocol_bytes)
+    enrolled = (
+        enrollment(protocol_path, protocol_bytes=protocol_bytes)
+        if mode == "prospective"
+        else None
+    )
+    selected = [
+        (p, r, raw)
+        for p, r, raw in load_records(store)
+        if r.get("mode") == mode and r.get("protocol_sha256") == sha256(protocol_bytes)
+    ]
+    records = [r for _p, r, _raw in selected]
+    if not records:
+        raise EvidenceError(
+            "no matching records; replay is excluded from prospective analysis"
+        )
+    protocol_rules(protocol)
+    lock_bytes = None
+    if mode == "prospective":
+        mature(protocol, datetime.now(UTC))
+        if capsules is None or truth_lock is None or enrolled is None:
+            raise EvidenceError(
+                "prospective evaluation requires --capsules and --truth-lock"
+            )
+        truth_bytes, lock_bytes = locked_truth(
+            truth_lock,
+            protocol_path,
+            truth_path,
+            datetime.now(UTC),
+            protocol_bytes=protocol_bytes,
+            enrollment_bytes=enrolled.lock_bytes,
+        )
+        origins = [
+            timestamp(required_string(r.get("issued_at"), "record.issued_at"))
+            for r in records
+        ]
+        if len(set(origins)) != len(origins):
+            raise EvidenceError("duplicated recorded issuance")
+        for (path, saved, raw), origin in zip(selected, origins, strict=True):
+            issue_record_target(store, origin)
+            validate_record(
+                path,
+                saved,
+                capsule_for(capsules, origin),
+                protocol_path,
+                enrolled=enrolled,
+                record_bytes=raw,
+            )
+    else:
+        if capsules is not None or truth_lock is not None:
+            raise EvidenceError(
+                "replay evaluation does not accept --capsules or --truth-lock"
+            )
+        if truth_path is None:
+            raise EvidenceError("replay evaluation requires --truth")
+        regular(truth_path)
+        truth_bytes = truth_path.read_bytes()
+    return EvaluationInputs(protocol_bytes, protocol, selected, truth_bytes, lock_bytes)
 
 
 def evaluate(
@@ -744,46 +1208,32 @@ def evaluate(
     capsules: Path | None = None,
     truth_lock: Path | None = None,
 ) -> None:
-    protocol = json.loads(protocol_path.read_text())
-    selected = load_records(store)
-    selected = [
-        (p, r)
-        for p, r in selected
-        if r["mode"] == mode and r["protocol_sha256"] == digest(protocol_path)
-    ]
-    records = [r for _p, r in selected]
-    if not records:
-        raise ValueError(
-            "no matching records; replay is excluded from prospective analysis"
-        )
-    if mode == "prospective":
-        mature(protocol, datetime.now(UTC))
-        if capsules is None or truth_lock is None:
-            raise ValueError(
-                "prospective evaluation requires --capsules and --truth-lock"
-            )
-        truth_path = locked_truth(
-            truth_lock, protocol_path, truth_path, datetime.now(UTC)
-        )
-        origins = [timestamp(r["issued_at"]) for r in records]
-        if len(set(origins)) != len(origins):
-            raise ValueError("duplicated recorded issuance")
-        for (path, saved), origin in zip(selected, origins, strict=True):
-            issue_record_target(store, origin)
-            validate_record(path, saved, capsule_for(capsules, origin), protocol_path)
-    if truth_path is None:
-        raise ValueError("replay evaluation requires --truth")
+    inputs = evaluation_inputs(
+        store,
+        truth_path,
+        protocol_path,
+        mode=mode,
+        capsules=capsules,
+        truth_lock=truth_lock,
+    )
+    protocol_bytes, protocol = inputs.protocol_bytes, inputs.protocol
+    selected, truth_bytes, lock_bytes = (
+        inputs.selected,
+        inputs.truth_bytes,
+        inputs.lock_bytes,
+    )
+    records = [record for _path, record, _raw in selected]
     implementations = {
         (r["code_identity"], r["runner_sha256"], r["candidate_sha256"]) for r in records
     }
     if len(implementations) != 1:
-        raise ValueError("cannot pool changed candidate implementations")
+        raise EvidenceError("cannot pool changed candidate implementations")
     production_codes = {
         r["capsule"].get("provenance", {}).get("production_code_identity")
         for r in records
     }
     if mode == "prospective" and len(production_codes) != 1:
-        raise ValueError(
+        raise EvidenceError(
             "production implementation changed; a new reviewed enrollment is required"
         )
     expected_issues = (
@@ -797,12 +1247,12 @@ def evaluate(
         pl.col("issued_at").str.to_datetime(time_zone="UTC"),
     )
     truth = (
-        truth_frame(truth_path)
+        truth_frame(truth_bytes)
         if mode == "prospective"
-        else pl.read_parquet(truth_path)
+        else pl.read_parquet(BytesIO(truth_bytes))
     ).select(pl.col("valid_hour").alias("valid_time"), pl.col(TARGET).alias("truth"))
     if truth["valid_time"].n_unique() != truth.height:
-        raise ValueError("truth must contain one QC label per valid hour")
+        raise EvidenceError("truth must contain one QC label per valid hour")
     frame = frame.join(truth, on="valid_time", how="left").filter(
         pl.col("valid_time") + timedelta(hours=2) <= datetime.now(UTC)
     )
@@ -816,12 +1266,14 @@ def evaluate(
             staged / "evaluation.json",
             {
                 "artifact_version": ARTIFACT_VERSION,
-                "protocol_sha256": digest(protocol_path),
-                "truth_sha256": digest(truth_path),
-                "truth_lock_sha256": digest(truth_lock / "truth.lock.json")
-                if mode == "prospective" and truth_lock is not None
+                "protocol_sha256": sha256(protocol_bytes),
+                "truth_sha256": sha256(truth_bytes),
+                "truth_lock_sha256": sha256(lock_bytes)
+                if lock_bytes is not None
                 else None,
-                "record_sha256": {p.parent.name: digest(p) for p, _r in selected},
+                "record_sha256": {
+                    p.parent.name: sha256(raw) for p, _r, raw in selected
+                },
                 "evaluated_at": datetime.now(UTC),
                 "issuance_coverage": issue_coverage,
                 "results": result,
@@ -876,7 +1328,9 @@ def main() -> None:
                 args.out,
                 args.protocol,
                 publication_receipt=(
-                    json.loads(args.publication_receipt.read_text())
+                    json_object(
+                        args.publication_receipt.read_bytes(), "publisher receipt"
+                    )
                     if args.publication_receipt
                     else None
                 ),
@@ -901,6 +1355,9 @@ def main() -> None:
 if __name__ == "__main__":
     try:
         main()
-    except (OSError, ValueError, KeyError) as error:
+    except EvidenceError as error:
         print(f"shadow refused: {error}", file=sys.stderr)
         raise SystemExit(2) from None
+    except OSError as error:
+        print(f"shadow runtime failure: {error}", file=sys.stderr)
+        raise SystemExit(1) from None

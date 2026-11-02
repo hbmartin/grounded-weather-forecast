@@ -176,7 +176,9 @@ def _latest_observation(
     return values, row["ts"]
 
 
-def build_snapshot(config: Config, issue_time: datetime) -> Snapshot:
+def build_snapshot(
+    config: Config, issue_time: datetime, *, capture: bool = False
+) -> Snapshot:
     """The as-of view of every source at ``issue_time``, plus current truth."""
     observations = read_observations(config.station)
     _, hourly_truth, daily_truth = build_truth(config, observations=observations)
@@ -232,8 +234,8 @@ def build_snapshot(config: Config, issue_time: datetime) -> Snapshot:
         minutely=minutely,
         observation=observation,
         observation_at=observation_at,
-        truth_hourly=hourly_truth,
-        completions=archive.completions,
+        truth_hourly=hourly_truth if capture else pl.DataFrame(),
+        completions=archive.completions if capture else pl.DataFrame(),
     )
 
 
@@ -1542,11 +1544,11 @@ def predict(
         )
         if archived is not None:
             if shadow_capture is not None:
-                raise NoForecastDataError(
-                    "cannot export original inputs for an archived forecast"
+                logging.getLogger(__name__).warning(
+                    "Shadow capture unavailable: cannot export original inputs for an archived forecast"
                 )
             return archived
-    snapshot = build_snapshot(config, issue_time)
+    snapshot = build_snapshot(config, issue_time, capture=shadow_capture is not None)
     fit_diagnostics = FitDiagnostics()
     rainfall_effects = RainfallEffects()
     raw_hourly = _raw_training_matrix(

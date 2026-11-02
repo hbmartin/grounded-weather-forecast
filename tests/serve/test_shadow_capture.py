@@ -64,7 +64,7 @@ def test_capture_failure_leaves_forecast_values_unchanged(
 def test_capture_is_exclusive(config, tmp_path):
     module = importlib.import_module("grounded_weather_forecast.serve.predict")
     now = utc(2026, 3, 22, 17)
-    snapshot = module.build_snapshot(config, now)
+    snapshot = module.build_snapshot(config, now, capture=True)
     document = module.predict(
         config, {}, now=now, semantics=TruthSemantics.INTERVAL_MEAN
     )
@@ -86,7 +86,7 @@ def test_capture_is_exclusive(config, tmp_path):
 def test_capture_abstains_on_incompatible_inputs(config, tmp_path, kind):
     module = importlib.import_module("grounded_weather_forecast.serve.predict")
     now = utc(2026, 3, 22, 17)
-    snapshot = module.build_snapshot(config, now)
+    snapshot = module.build_snapshot(config, now, capture=True)
     document = module.predict(
         config, {}, now=now, semantics=TruthSemantics.INTERVAL_MEAN
     )
@@ -112,7 +112,7 @@ def test_capture_abstains_on_incompatible_inputs(config, tmp_path, kind):
 def test_capture_uses_utc_for_offset_aware_issuance(config, tmp_path):
     module = importlib.import_module("grounded_weather_forecast.serve.predict")
     now = utc(2026, 3, 22, 17)
-    snapshot = module.build_snapshot(config, now)
+    snapshot = module.build_snapshot(config, now, capture=True)
     document = module.predict(
         config, {}, now=now, semantics=TruthSemantics.INTERVAL_MEAN
     )
@@ -132,7 +132,7 @@ def test_capture_uses_utc_for_offset_aware_issuance(config, tmp_path):
     assert capsule.name == "20260322T170000Z"
 
 
-def test_cached_capture_uses_normal_cli_error_path(config, tmp_path, capsys):
+def test_cached_capture_preserves_archived_forecast(config, tmp_path, capsys):
     module = importlib.import_module("grounded_weather_forecast.serve.predict")
     now = utc(2026, 3, 22, 17)
     document = module.predict(config, {}, now=now)
@@ -150,6 +150,7 @@ def test_cached_capture_uses_normal_cli_error_path(config, tmp_path, capsys):
                 "--no-history",
             ]
         )
-        == 1
+        == 0
     )
-    assert "cannot export original inputs" in capsys.readouterr().out
+    assert not (tmp_path / "capsules").exists()
+    assert capsys.readouterr().out.strip() == document.to_json()

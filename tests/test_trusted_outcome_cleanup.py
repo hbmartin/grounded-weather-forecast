@@ -134,9 +134,7 @@ def test_invalid_exits_fail_closed_in_cli_hint_and_ledger(tmp_path, monkeypatch,
     }
 
 
-@pytest.mark.parametrize(
-    "code", [0, 1, 2, 3, 75, -9, -(2**63), 2**63 - 1, Exit.PENDING, HostileInteger(3)]
-)
+@pytest.mark.parametrize("code", [0, 1, 2, 3, 75, 255, Exit.PENDING, HostileInteger(3)])
 def test_real_integer_outcomes_and_subclasses_remain_exact(code):
     value = status.CommandOutcome.normalize(status.CommandOutcome(code, Kind.PENDING))
     assert type(value.exit_code) is int and value.exit_code == code
@@ -483,6 +481,11 @@ def test_dashboard_exposes_cleanup_damage_without_raw_private_prose(tmp_path):
         and stats["cleanup evidence"] == "damaged"
     )
     assert stats["verification uncertainty"] == "no"
+    colors = {s.label: s.status for s in panel.stats}
+    assert colors["last recorded check"] == "ok"
+    assert colors["verification uncertainty"] == "ok"
+    assert colors["cleanup evidence"] == "amber"
+    assert colors["outstanding failure"] != "amber"
 
 
 def test_unresolved_extension_annotation_does_not_erase_base_fields():

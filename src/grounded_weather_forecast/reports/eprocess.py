@@ -43,6 +43,7 @@ import polars as pl
 
 from grounded_weather_forecast.contracts import FloatArray
 from grounded_weather_forecast.evaluation import code_identity, config_fingerprint
+from grounded_weather_forecast.selection_decisions import decision_gate
 from grounded_weather_forecast.storage import atomic_write_text, locked_path
 
 if TYPE_CHECKING:
@@ -236,21 +237,35 @@ def promotion_comparison(
                 **dict.fromkeys(keys or ["product"], pl.String),
                 "mcs_choice": pl.String,
                 "mcs_gate": pl.String,
+                "mcs_scope": pl.String,
+                "mcs_board_minimum_ineligible": pl.Boolean,
                 "seq_choice": pl.String,
                 "seq_gate": pl.String,
+                "seq_scope": pl.String,
+                "seq_board_minimum_ineligible": pl.Boolean,
                 "agree": pl.Boolean,
             }
         )
-    joined = mcs.select(
-        *keys,
-        pl.col("method_id").alias("mcs_choice"),
-        pl.col("gate").alias("mcs_gate"),
-    ).join(
-        seq.select(
+
+    def comparison(frame: pl.DataFrame, prefix: str) -> pl.DataFrame:
+        return frame.with_columns(
+            pl.Series(
+                "_decision",
+                [decision_gate(r) for r in frame.iter_rows(named=True)],
+                dtype=pl.String,
+            )
+        ).select(
             *keys,
-            pl.col("method_id").alias("seq_choice"),
-            pl.col("gate").alias("seq_gate"),
-        ),
+            pl.col("method_id").alias(prefix + "_choice"),
+            pl.col("_decision").alias(prefix + "_gate"),
+            pl.col("evidence_scope").alias(prefix + "_scope"),
+            pl.col("board_minimum_ineligible").alias(
+                prefix + "_board_minimum_ineligible"
+            ),
+        )
+
+    joined = comparison(mcs, "mcs").join(
+        comparison(seq, "seq"),
         on=keys,
         how="full",
         coalesce=True,

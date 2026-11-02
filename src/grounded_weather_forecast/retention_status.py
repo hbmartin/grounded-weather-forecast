@@ -9,6 +9,11 @@ from typing import Any, Literal
 import polars as pl
 
 from grounded_weather_forecast.cleanup_status import CleanupStatus
+from grounded_weather_forecast.diagnostic_groups import (
+    DiagnosticDocument,
+    DiagnosticGroups,
+    decode_diagnostics,
+)
 from grounded_weather_forecast.diagnostic_values import actual_string
 from grounded_weather_forecast.run_health import assess_attempts, aware_moment
 from grounded_weather_forecast.status import (
@@ -16,7 +21,6 @@ from grounded_weather_forecast.status import (
     VERIFICATION_VERDICT_DETAILS,
     ComponentDiagnostic,
     DiagnosticIdentity,
-    assess_progress_identity,
     effective_progress_id,
     is_verification_verdict,
 )
@@ -398,20 +402,27 @@ class RetentionStatus:
         )
 
     @property
-    def severity(self) -> Literal["ok", "amber", "info"]:
-        if (
-            self.verification.state == "suspended"
-            or self.verification_unknown
-            or self.cleanup_evidence_unknown
-            or self.outstanding_failure
-            or self.attempt_state in {"failed", "unknown"}
-        ):
+    def verification_severity(self) -> Literal["ok", "amber", "info"]:
+        if self.verification_unknown or self.verification.state == "suspended":
             return "amber"
-        return (
-            "ok"
-            if self.verification.state == "clear" and self.attempt_state == "completed"
-            else "info"
-        )
+        return "ok" if self.verification.state == "clear" else "info"
+
+    @property
+    def cleanup_severity(self) -> Literal["amber", "info"]:
+        return "amber" if self.cleanup_evidence_unknown else "info"
+
+    @property
+    def attempt_severity(self) -> Literal["ok", "amber", "info"]:
+        if self.outstanding_failure or self.attempt_state in {"failed", "unknown"}:
+            return "amber"
+        return "ok" if self.attempt_state == "completed" else "info"
+
+    @property
+    def severity(self) -> Literal["ok", "amber", "info"]:
+        verification, attempt = self.verification_severity, self.attempt_severity
+        if "amber" in (verification, self.cleanup_severity, attempt):
+            return "amber"
+        return "ok" if verification == attempt == "ok" else "info"
 
     @property
     def check_age_minutes(self) -> float | None:
@@ -480,11 +491,19 @@ def _check_mode(items: list[dict[str, Any]], *, fallback: bool | None) -> bool |
     )
 
 
-def _check_identity(items: list[dict[str, Any]]) -> tuple[str | None, str | None]:
-    owners = {
-        effective_progress_id(item.get("progress_id"), item.get("check_id"))
-        for item in items
-    }
+def _check_identity(
+    items: list[dict[str, Any]], *, identity: DiagnosticIdentity | None = None
+) -> tuple[str | None, str | None]:
+    # A shared group has already assessed each input and grouped by owner.
+    # Standalone callers still receive the full defensive assessment.
+    owners = (
+        {identity.owner}
+        if identity is not None
+        else {
+            effective_progress_id(item.get("progress_id"), item.get("check_id"))
+            for item in items
+        }
+    )
     check_ids = {item["check_id"] for item in items if item.get("check_id") is not None}
     if len(owners) != 1 or len(check_ids) > 1:
         raise ValueError("conflicting verification identities")
@@ -598,8 +617,9 @@ def _check_batch(
     ended: datetime,
     *,
     mode: bool | None,
+    identity: DiagnosticIdentity | None = None,
 ) -> RetentionVerification:
-    progress_id, check_id = _check_identity(items)
+    progress_id, check_id = _check_identity(items, identity=identity)
     kinds = {item.get("failure_kind") for item in items}
     clocks = [
         aware_moment(item["recorded_at"])
@@ -661,67 +681,34 @@ class RecordedCheckAssessment:
 
 
 @dataclass(slots=True)
-class _CheckGroups:
-    groups: dict[tuple[str, object], list[dict[str, Any]]] = field(default_factory=dict)
-    identities: dict[tuple[str, object], DiagnosticIdentity] = field(
-        default_factory=dict
-    )
-    check_owners: dict[str, set[str | None]] = field(default_factory=dict)
-    bad_owners: set[str] = field(default_factory=set)
-    bad_checks: set[str] = field(default_factory=set)
+class _CheckGroups(DiagnosticGroups):
     invalid: list[InvalidCheckEvidence] = field(default_factory=list)
 
-    def reject(self, item: object, reason: str) -> None:
-        identity = assess_progress_identity(
-            item.get("progress_id") if isinstance(item, dict) else None,
-            item.get("check_id") if isinstance(item, dict) else None,
-        )
+    def reject(self, identity: DiagnosticIdentity, reason: str) -> None:
         self.invalid.append(
             InvalidCheckEvidence(reason, identity.progress_id, identity.check_id)
         )
-        if identity.progress_id is not None:
-            self.bad_owners.add(identity.progress_id)
-        if identity.check_id is not None:
-            self.bad_checks.add(identity.check_id)
+        self.quarantine(identity)
 
-    def add(self, item: dict[str, Any]) -> None:
-        identity = assess_progress_identity(
-            item.get("progress_id"), item.get("check_id")
-        )
+    def add(self, item: dict[str, Any], identity: DiagnosticIdentity) -> None:
         if not identity.valid or type(item.get("exit_code")) is not int:
-            self.reject(item, "invalid_identity_or_exit")
+            self.reject(identity, "invalid_identity_or_exit")
             return
-        if identity.check_id is not None:
-            self.check_owners.setdefault(identity.check_id, set()).add(identity.owner)
         clock = item.get("recorded_at")
         if clock is not None and not isinstance(clock, str):
-            self.reject(item, "invalid_recorded_clock")
+            self.reject(identity, "invalid_recorded_clock")
             return
-        key = (
-            ("owner", identity.owner)
-            if identity.owner is not None
-            else (
-                "clock",
-                clock,
-            )
-        )
-        self.groups.setdefault(key, []).append(item)
-        self.identities[key] = identity
+        self.add_valid(item, identity)
 
     def assess(self, ended: datetime, *, mode: bool | None) -> RecordedCheckAssessment:
-        bad_checks = self.bad_checks | {
-            check for check, owners in self.check_owners.items() if len(owners) > 1
-        }
         invalid = list(self.invalid)
         checks: list[RetentionVerification] = []
         for key, items in self.groups.items():
             identity = self.identities[key]
             try:
-                if identity.owner in self.bad_owners or any(
-                    item.get("check_id") in bad_checks for item in items
-                ):
+                if self.conflicts(key):
                     raise ValueError("conflicting verification identities")
-                checks.append(_check_batch(items, ended, mode=mode))
+                checks.append(_check_batch(items, ended, mode=mode, identity=identity))
             except (ValueError, TypeError):
                 invalid.append(
                     InvalidCheckEvidence(
@@ -751,22 +738,17 @@ def _damaged_diagnostic(item: object) -> bool:
 
 
 def _recorded_check_assessment(
-    row: Mapping[str, Any], ended: datetime
+    row: Mapping[str, Any],
+    ended: datetime,
+    *,
+    document: DiagnosticDocument | None = None,
 ) -> RecordedCheckAssessment:
-    try:
-        raw = json.loads(row.get("failure_details_json") or "null")
-    except (ValueError, TypeError):
-        return RecordedCheckAssessment(
-            invalid=(InvalidCheckEvidence("invalid_diagnostic_json"),)
-        )
-    if raw is None:
-        return RecordedCheckAssessment()
-    if not isinstance(raw, list):
-        return RecordedCheckAssessment(
-            invalid=(InvalidCheckEvidence("invalid_diagnostic_container"),)
-        )
+    document = document if document is not None else decode_diagnostics(row)
+    if document.error:
+        return RecordedCheckAssessment(invalid=(InvalidCheckEvidence(document.error),))
     groups = _CheckGroups()
-    for item in raw:
+    for entry in document.entries:
+        item = entry.item
         if (
             isinstance(item, dict)
             and item.get("stage") == "retention_audit_cleanup"
@@ -775,13 +757,13 @@ def _recorded_check_assessment(
             # Cleanup shares lineage with verification, not its validity domain.
             continue
         if _damaged_diagnostic(item):
-            groups.reject(item, "invalid_diagnostic_metadata")
+            groups.reject(entry.identity, "invalid_diagnostic_metadata")
         elif item.get("stage") == "retention_verification":
             if type(item.get("exit_code")) is int and item["exit_code"] != 0:
                 # Non-completed diagnostics never asserted protection, including
                 # legacy contention records; their run outcome is assessed separately.
                 continue
-            groups.add(item)
+            groups.add(item, entry.identity)
     return groups.assess(ended, mode=_argument_mode(row))
 
 
@@ -838,8 +820,9 @@ def retention_status(runs: pl.DataFrame, *, as_of: datetime) -> RetentionStatus:
     cleanup = CleanupStatus()
     for attempt in assessment.attempts:
         row, latest = attempt.row, attempt.ended_at
-        cleanup = cleanup.advance(row, latest)
-        recorded = _recorded_check_assessment(row, latest)
+        document = decode_diagnostics(row)
+        cleanup = cleanup.advance(row, latest, document=document)
+        recorded = _recorded_check_assessment(row, latest, document=document)
         checks = recorded.checks
         uncertainty_until = _verification_uncertainty(
             recorded, latest, uncertainty_until

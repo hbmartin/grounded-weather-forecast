@@ -2,6 +2,7 @@
 
 import json
 import os
+import signal
 from collections.abc import Iterator
 from contextlib import contextmanager
 from contextvars import ContextVar
@@ -31,6 +32,7 @@ PROMOTION_ONLY_FAILURE_KINDS = frozenset(
 PENDING_EXIT_CODES = (0, 1, EXIT_NO_FOLDS)
 # Private, invocation-local transport for the standalone maintenance wrapper.
 COMMAND_OUTCOME_PATH = "_GWF_COMMAND_OUTCOME_PATH"
+INVALID_COMMAND_OUTCOME = "invalid_command_outcome"
 VERIFICATION_VERDICT_DETAILS = {
     "retention_clear": "published-score protection verified",
     "retention_suspended": "published-score deletion suspended: protection could not be verified",
@@ -70,9 +72,6 @@ class ComponentDiagnostic:
     error_type: str | None = None
     progress_id: str | None = None
     issue_count_known: bool | None = None
-
-
-_FIELD_TYPES = declared_types(ComponentDiagnostic)
 
 
 _progress: ContextVar[list[ComponentDiagnostic] | None] = ContextVar(
@@ -146,10 +145,6 @@ def diagnostic_damage() -> ComponentDiagnostic:
         "invalid_diagnostic_metadata",
         "Optional diagnostic evidence could not be processed.",
     )
-
-
-def _field_valid(name: str, value: object) -> bool:
-    return field_valid(name, value, _FIELD_TYPES)
 
 
 def _primitive(value: object) -> object:
@@ -270,11 +265,7 @@ def _diagnostic_payload(item: ComponentDiagnostic) -> dict[str, object]:
     schema = declared_types(type(item))
     for field in fields(item):
         value = getattr(item, field.name)
-        valid = (
-            _field_valid(field.name, value)
-            if type(item) is ComponentDiagnostic
-            else field_valid(field.name, value, schema)
-        )
+        valid = field_valid(field.name, value, schema)
         assessed[field.name] = (value, valid)
     identity = assess_progress_identity(
         assessed["progress_id"][0], assessed["check_id"][0]
@@ -333,6 +324,10 @@ class CommandOutcome:
     error_detail: str | None = None
     diagnostics: tuple[ComponentDiagnostic, ...] = ()
 
+    @property
+    def invalid(self) -> bool:
+        return self.failure_kind == INVALID_COMMAND_OUTCOME
+
     @classmethod
     def normalize(cls, value: "CommandOutcome | int") -> "CommandOutcome":
         outcome = (
@@ -346,9 +341,26 @@ class CommandOutcome:
         detail = actual_string(outcome.error_detail)
         if outcome.failure_kind is not None and kind is None:
             damage += (invalid_metadata("failure_kind", outcome.failure_kind),)
-        if code is None or not -(2**63) <= code < 2**63:
+        if code is not None and code < 0 and -code in signal.valid_signals():
+            code = 128 - code
+        if code is None or not 0 <= code <= 255:
             damage += (invalid_metadata("exit_code", outcome.exit_code),)
-            code, kind = 1, "invalid_command_outcome"
+            if kind is not None:
+                from grounded_weather_forecast.runs import (  # noqa: PLC0415 -- invalid evidence only
+                    normalize_error_detail,
+                )
+
+                damage += (
+                    ComponentDiagnostic(
+                        "diagnostic_metadata",
+                        0,
+                        INVALID_COMMAND_OUTCOME,
+                        detail=normalize_error_detail(
+                            f"original_failure_kind={kind!r}"
+                        ),
+                    ),
+                )
+            code, kind = 1, INVALID_COMMAND_OUTCOME
         if outcome.error_detail is not None and detail is None:
             damage += (invalid_metadata("error_detail", outcome.error_detail),)
         if (

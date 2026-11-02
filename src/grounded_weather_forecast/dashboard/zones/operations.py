@@ -404,6 +404,9 @@ def _retention_panel(ctx: DashboardContext) -> Panel:
     recorded = retention_status(ctx.runs, as_of=ctx.now)
     verification = recorded.verification
     status: PanelStatus = recorded.severity
+    verification_status = recorded.verification_severity
+    cleanup_status = recorded.cleanup_severity
+    attempt_status = recorded.attempt_severity
     details = [issue_label(issue, ctx.config) for issue in verification.sample_issues()]
     notices = ctx.compatibility_notices
     notes = ctx.compatibility_notes
@@ -446,7 +449,11 @@ def _retention_panel(ctx: DashboardContext) -> Panel:
         copy=PANEL_COPY["i7"],
         intro=" ".join(introduction) or None,
         stats=(
-            Stat("last recorded check", verification.state.replace("_", " "), status),
+            Stat(
+                "last recorded check",
+                verification.state.replace("_", " "),
+                verification_status,
+            ),
             Stat(
                 "check recorded at",
                 verification.recorded_at.isoformat()
@@ -455,7 +462,11 @@ def _retention_panel(ctx: DashboardContext) -> Panel:
                 "info",
             ),
             Stat("check age", f"{age:.0f}m" if age is not None else "—", "info"),
-            Stat("latest attempt", recorded.attempt_state.replace("_", " "), status),
+            Stat(
+                "latest attempt",
+                recorded.attempt_state.replace("_", " "),
+                attempt_status,
+            ),
             Stat(
                 "attempt recorded at",
                 recorded.attempt_at.isoformat() if recorded.attempt_at else "—",
@@ -471,9 +482,9 @@ def _retention_panel(ctx: DashboardContext) -> Panel:
             Stat(
                 "verification uncertainty",
                 "yes" if recorded.verification_unknown else "no",
-                status,
+                verification_status,
             ),
-            Stat("cleanup evidence", recorded.cleanup_evidence_label, status),
+            Stat("cleanup evidence", recorded.cleanup_evidence_label, cleanup_status),
             Stat("cleanup recorded at", recorded.cleanup_recorded_label, "info"),
             Stat("cleanup outcome", recorded.cleanup_outcome.replace("_", " "), "info"),
             Stat(
@@ -500,7 +511,7 @@ def _retention_panel(ctx: DashboardContext) -> Panel:
             Stat(
                 "outstanding failure",
                 "yes" if recorded.outstanding_failure else "no",
-                status,
+                attempt_status,
             ),
             Stat(
                 "check mode",

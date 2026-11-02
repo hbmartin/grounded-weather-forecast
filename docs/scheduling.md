@@ -98,11 +98,14 @@ prediction. No volume or personal database defaults are embedded in the wrappers
 The daily wrapper holds `maintenance-job.lock` across its child stages using
 a context manager, releasing it on early returns and exceptions. Concurrent
 maintenance or restore jobs skip as duplicates. A successful daily run writes
-`last-maintenance`; a fresh stamp skips catch-up for **20 hours**, measured from
-the start of the last successful run. The next daily refresh proceeds when at
-least 20 hours have elapsed since that start; a delayed start less than 20 hours
-before the next schedule can still suppress it. Failed or pending runs do not
-advance the stamp. Restore runs leave that stamp untouched, and a failed report
+`last-maintenance` with the successful run's start. Catch-up skips only when
+that start lies between the latest scheduled slot and now. The wrapper defaults
+to host-local **02:15**, matching the supplied plist; pass `--scheduled-at HH:MM`
+for another configured schedule. This does not alter a job. A late start cannot
+suppress the following day's slot. Ambiguous times use the first occurrence;
+nonexistent times advance to the first valid minute. Future stamps do not suppress
+maintenance. Stamp publication preserves symlink targets and existing modes and
+cleans staging on catchable exceptions and interruptions; SIGKILL or power loss can leave a temporary sibling. Failed or pending runs never advance the stamp. Restore runs leave that stamp untouched, and a failed report
 skips score pruning.
 
 CLI `maintain` also runs truth-QC before report. Build and ordinary backtest errors stop the

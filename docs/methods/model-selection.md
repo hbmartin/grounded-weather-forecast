@@ -179,7 +179,9 @@ the two families genuinely differ in size.
 
 The selected method's reported MAE is optimistically biased. Two mutually
 exclusive estimands are computed, both report-layer, and both applied only where
-the served row really was chosen by argmin (`gate ∈ {None, "eligibility"}`).
+the served row really was chosen by argmin: its canonical decision is null or
+`eligibility`, and its evidence scope is `slice`. Statistical rejections never
+become eligibility just because another board row is ineligible.
 
 ### Bootstrap bias
 
@@ -278,8 +280,9 @@ sampling noise trade the slice back and forth, and every trade re-realizes the
 argmin's optimism (§4). Selection therefore keeps the **previous release's
 method** when all of the following hold:
 
-1. today's winner was a true argmin pick (`gate` ∈ {∅, `eligibility`} — a
-   gate-forced reference or pooled winner is never overridden);
+1. today's winner was a true slice argmin pick (canonical decision ∈ {∅,
+   `eligibility`} and `evidence_scope="slice"`); a gate-forced reference or pooled
+   winner is never overridden;
 2. the incumbent is a *different* method, is **not** `equal_weight` or a
    configured safety-class reference (retaining a fallback by name would
    outlast the demotion's own 14-day re-hearing), and passes the
@@ -441,3 +444,17 @@ Deploying these source changes changes the code fingerprint and requires fresh
 compatible `backtest --source live` / `report` evidence. Existing artifacts
 remain intact. Attributed minutely live evidence accumulates from schema-6
 forecasts prospectively.
+
+### Decision metadata
+
+Implemented in: `selection_decisions.py`, `reports/leaderboard.py`,
+`serve/selection.py`, `reports/winner_curse.py`, `reports/eprocess.py`.
+
+`decision_gate` retains the statistical decision. The canonical accessor prefers
+its non-null value, otherwise uses `gate` for compatible rows. The producer never
+replaces a rejection with eligibility. `board_minimum_ineligible` is independent
+Boolean context, and `evidence_scope` is `slice` or `pooled_D3-10`. Pooled rejection
+retains both its scope and its rejection/exclusion explanation. Comparison gate
+columns use the canonical decision with corresponding scope and exclusion columns.
+This repairs decision propagation; tests, thresholds and candidate mathematics
+are unchanged. Selection-reason formatting remains shared through serialization.

@@ -86,10 +86,11 @@ That works on day one. Everything else needs an archive with some history — se
 | `truth-qc` | cross-check truth against lapse-adjusted neighbors and fit the radiation-shield error model | `--days` |
 | `ingest-ensembles` | poll the Open-Meteo Ensemble API for per-model spread features | `--models` |
 | `predict` | consume approved releases without electing methods; emit schema-6 JSON with rainfall guards and finite-value release attribution; `--method` bypasses automatic rain safeguards for experiments; opt-in `--shadow-capture` exports exact inputs | `--out` `--method` `--no-history` `--semantics` `--now` `--shadow-capture` |
-| `uv run python scripts/temperature_shadow.py` | freeze a reviewed enrollment and mature QC truth; verify retained capsules before evaluating the temperature shadow | `--input` `--out` `--protocol` `--mode` `--truth` `--truth-lock` `--capsules` `--publication-receipt` `--source` |
+| `uv run python scripts/temperature_shadow.py` | freeze a v3 enrollment/runtime and mature QC truth; reconstruct sealed evidence and hash exactly the snapshots scored | `--input` `--out` `--protocol` `--mode` `--truth` `--truth-lock` `--capsules` `--publication-receipt` `--source` |
 | `publish` | safely publish an automatic forecast, holding a matching ready document for up to six hours | `--out` `--semantics` `--recovery-methods` `--recovery-window` |
 | `recover` | recheck degradation, then rebuild live evidence and reports when recovery is still needed | `--semantics` `--methods` `--window` |
-| `hourly-predict-publish.py` (standalone launchd wrapper) | predict first, then render live station data through collector configuration; retain staged station files on render failure; paired shadow flags opt into input capture and publication receipts | `--station-project` `--shadow-root` `--shadow-protocol` |
+| `daily-maintenance.py` (standalone wrapper) | skip only after a successful start since the latest host-local daily slot; preserve stamp permissions/symlinks | `--restore` `--scheduled-at` |
+| `hourly-predict-publish.py` (standalone launchd wrapper) | predict first, then render live station data through collector configuration; retain staged station files on render failure; paired shadow flags opt into v3 input capture, durable publication seals and recoverable records | `--station-project` `--shadow-root` `--shadow-protocol` |
 | `prune-scores` | delete superseded scores and recover inactive leased stages one at a time; `--dry-run` updates verification but cannot clear execution failures; retain completed checks through audit interruptions and later failures, distinguish contention/unknown attempts, and display check age; unverifiable protection suspends score deletion; full JSONL audits retain all issues while samples stop at 20; safe category/reason explanations, including cleanup aborts, keep raw paths in diagnostics; audit failures preserve both operation and cause; compatible legacy notes remain informational; audit publication requires hard links and synchronization, and linked but unconfirmed audits remain separately referenced and protected; cleanup previews verified eligible audit/staging counts separately from completed deletions and mode, leaves unknown outcomes unverified, preserves literal raw evidence and uniquely attributable sparse metadata with aligned compatibility input, restores failure-only replacement, keeps copied verification/cleanup batches under one stable journal identity, preserves duplicate samples and progress-only checks, isolates malformed check evidence with an explicit `verification_unknown` warning until a strictly later clear check, contains malformed fields inside the recorder while retaining a core row, preserves interleaved sample order, separates apply-run execution recovery from unrelated verification uncertainty, and labels sample-free legacy suspensions with an unknown count, records abort/file roles without positional inference, rejects completed copies retaining abort causes, preserves bounded abort summaries, and continues after file-local failures; publication diagnostics distinguish pre-link failure from linked-but-unconfirmed content; recovery guard-release errors retain partial counts, finish published-score retention, then return 1 | `--dry-run` |
 | `uv run --group profiling python scripts/profile_memory.py -- <command>` | capture a command's memory allocations and write a peak-memory HTML report | `--output-dir` `--trace-python-allocators` `--no-native` `--no-report` |
 | `uv run python scripts/benchmark_selection_memory.py` | compare full selection runs against a Git baseline in fresh processes | `--baseline` `--runs` `--evaluations` `--cases` |
@@ -239,6 +240,23 @@ Steady state is four crons — poll, ingest ensembles, `publish`, and nightly
 `maintain`. Cadence rationale and
 launchd templates are in
 [Scheduling](https://hbmartin.github.io/grounded-weather-forecast/scheduling/).
+The daily wrapper defaults to the host-local 02:15 slot (`--scheduled-at HH:MM`
+for custom schedules). A successful run covers its start's latest slot, so a late
+wake or manual start cannot suppress the next daily slot. Invalid command exits
+fail closed; negative subprocess signals are converted to portable nonzero exits.
+
+Reports retain `decision_gate` and add `board_minimum_ineligible` and
+`evidence_scope`. Statistical rejection takes precedence over eligibility in
+selection, incumbent retention, winner-bias correction and rule comparisons.
+Forecast `selection_reasons` retain pooled scope and exclusion context.
+
+Shadow v3 requires fresh enrollment with a frozen numerical runtime. Complete
+contemporaneous evidence seals allow deterministic late recovery; held pushes
+reuse original evidence. Truth and record audit digests identify the bytes scored.
+All six methods still restrict the common cohort, including descriptive
+persistence/climatology. The November 2 proposal has started and remains inactive; a
+future window needs explicit approval. Existing artifacts are preserved.
+
 The daily wrapper treats backtest exit 3 as pending and continues diagnostics;
 it returns 0 if the remaining required work passes, but preserves its success
 stamp until every requested, applicable evaluation completes. All other nonzero
