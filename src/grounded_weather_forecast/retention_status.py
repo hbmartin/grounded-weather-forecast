@@ -419,19 +419,10 @@ class RetentionStatus:
 
     @property
     def severity(self) -> Literal["ok", "amber", "info"]:
-        if (
-            self.verification.state == "suspended"
-            or self.verification_unknown
-            or self.cleanup_evidence_unknown
-            or self.outstanding_failure
-            or self.attempt_state in {"failed", "unknown"}
-        ):
+        verification, attempt = self.verification_severity, self.attempt_severity
+        if "amber" in (verification, self.cleanup_severity, attempt):
             return "amber"
-        return (
-            "ok"
-            if self.verification.state == "clear" and self.attempt_state == "completed"
-            else "info"
-        )
+        return "ok" if verification == attempt == "ok" else "info"
 
     @property
     def check_age_minutes(self) -> float | None:

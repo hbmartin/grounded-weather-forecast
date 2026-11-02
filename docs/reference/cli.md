@@ -1083,6 +1083,10 @@ two-thread numerical controls and dependency-lock digest. Runtime drift is refus
 evaluate in the retained environment. An elapsed start is rejected and requires an explicitly reviewed new
 window; freezing creates no job.
 
+The OS family and architecture are part of that numerical identity; the kernel
+release is not, so an unrelated kernel security update alone does not invalidate
+enrollment. Any numerical-library/backend or effective-thread drift still refuses.
+
 `record --input CAPSULE --out STORE --protocol ENROLLMENT/protocol.json
 --mode replay|prospective` computes fixed predictions from supplied files.
 Prospective records require contemporaneous v3 serving capsules, already-served

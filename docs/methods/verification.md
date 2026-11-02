@@ -822,15 +822,16 @@ $$\text{mae\_gap} = \text{live\_mae} - \text{backtest\_mae}$$
 no backtest can find, because the backtest is not the thing that is broken.
 The gap also drives the [live demotion gate](model-selection.md#6-the-live-demotion-gate).
 
-## Diagnostic integrity and daily freshness
+## 9. Diagnostic integrity and daily freshness
 
-Implemented in: `diagnostic_values.py`, `diagnostic_groups.py`, `status.py`,
+Implemented in: `diagnostic_values.py`, `diagnostic_groups.py`, `status.py`, `cli.py`,
 `cleanup_status.py`, `retention_status.py` and `docs/launchd/daily-maintenance.py`.
 
 Inherited primitive fields retain their wire schema; optional annotations resolve
 independently and incomplete resolutions are not cached. Journal rows decode once
-with shared identity/conflict grouping, while verification and cleanup preserve
-separate validity, strictly later recovery and stat colors. Contradictory cleanup
+with shared identity/conflict grouping. Verification and cleanup have independent
+validity checks, recovery boundaries and dashboard status colors. Each requires
+valid evidence strictly later than its own damaged check to clear uncertainty. Contradictory cleanup
 verdicts and multiple owners sharing a check ID quarantine that cleanup lineage.
 
 Command exits are integers 0–255; recognized negative subprocess signals map to

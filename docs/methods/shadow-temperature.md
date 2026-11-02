@@ -65,3 +65,6 @@ descriptive persistence and climatology still restrict case availability.
 V1/v2 prospective artifacts are preserved without migration; v3 needs fresh
 future enrollment. The original November 2–December 14 proposal is unchanged
 and its elapsed start blocks enrollment pending explicit future-window approval.
+
+Platform identity covers OS family and architecture, not kernel release.
+Unrelated kernel updates do not invalidate the frozen numerical environment.

@@ -240,7 +240,6 @@ def runtime_identity(lockfile: Path) -> dict[str, Any]:
         "python": platform.python_version(),
         "implementation": sys.implementation.name,
         "platform": platform.system(),
-        "platform_release": platform.release(),
         "architecture": platform.machine(),
         "libraries": {
             name: version(name) for name in ("numpy", "scipy", "polars", "pyarrow")

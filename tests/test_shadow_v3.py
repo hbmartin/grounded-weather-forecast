@@ -263,6 +263,20 @@ def test_runtime_drift_is_refused_before_evaluation(
     assert not (tmp_path / "result").exists()
 
 
+def test_kernel_release_alone_does_not_invalidate_numerical_enrollment(
+    shadow, frames, tmp_path, monkeypatch
+):
+    _capsule, protocol, _target, _clock = make_prospective_record(
+        shadow, frames, tmp_path, monkeypatch
+    )
+    original = shadow.enrollment(protocol)
+    monkeypatch.setattr(
+        "grounded_weather_forecast.shadow_artifacts.platform.release",
+        lambda: "unrelated-kernel-security-update",
+    )
+    assert shadow.enrollment(protocol) == original
+
+
 def test_evaluation_reads_each_selected_lock_and_record_once(
     shadow, mature_record, tmp_path, monkeypatch
 ):

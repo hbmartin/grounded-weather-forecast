@@ -74,9 +74,6 @@ class ComponentDiagnostic:
     issue_count_known: bool | None = None
 
 
-_FIELD_TYPES = declared_types(ComponentDiagnostic)
-
-
 _progress: ContextVar[list[ComponentDiagnostic] | None] = ContextVar(
     "command_progress", default=None
 )
@@ -148,10 +145,6 @@ def diagnostic_damage() -> ComponentDiagnostic:
         "invalid_diagnostic_metadata",
         "Optional diagnostic evidence could not be processed.",
     )
-
-
-def _field_valid(name: str, value: object) -> bool:
-    return field_valid(name, value, _FIELD_TYPES)
 
 
 def _primitive(value: object) -> object:
