@@ -1296,7 +1296,7 @@ def test_shadow_receipt_timeout_reports_publication_already_succeeded(
     assert "forecast published; shadow receipt/record failed" in capsys.readouterr().out
 
 
-@pytest.mark.parametrize("state", ["before", "after", "unsupported"])
+@pytest.mark.parametrize("state", ["before", "after", "unsupported", "malformed"])
 def test_shadow_preflight_preserves_ordinary_publication(
     monkeypatch, tmp_path, capsys, state
 ):
@@ -1308,6 +1308,8 @@ def test_shadow_preflight_preserves_ordinary_publication(
     protocol.write_text(
         json.dumps({"window_start": start.isoformat(), "window_end": end.isoformat()})
     )
+    if state == "malformed":
+        protocol.write_text("[" * 2000 + "0" + "]" * 2000)
     events = []
     monkeypatch.setattr(
         module, "run_predict", lambda _paths: events.append("predict") or 0
@@ -1324,12 +1326,16 @@ def test_shadow_preflight_preserves_ordinary_publication(
     root = tmp_path / "shadow"
     assert module.main(
         ["--shadow-root", str(root), "--shadow-protocol", str(protocol)]
-    ) == (1 if state == "unsupported" else 0)
+    ) == (1 if state in {"unsupported", "malformed"} else 0)
     assert events == ["predict", "publish"]
     assert not root.exists()
     output = capsys.readouterr().out
     assert (
-        "shadow unavailable" if state == "unsupported" else "outside enrollment window"
+        "shadow unavailable"
+        if state == "unsupported"
+        else "shadow preflight failed"
+        if state == "malformed"
+        else "outside enrollment window"
     ) in output
 
 

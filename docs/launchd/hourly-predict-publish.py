@@ -429,6 +429,7 @@ def shadow_preflight(paths: RuntimePaths, protocol: Path) -> tuple[bool, str | N
         ValueError,
         TypeError,
         KeyError,
+        RecursionError,
         subprocess.SubprocessError,
     ) as error:
         return False, f"shadow preflight failed: {error}"
