@@ -485,6 +485,7 @@ def test_dashboard_exposes_cleanup_damage_without_raw_private_prose(tmp_path):
     assert colors["last recorded check"] == "ok"
     assert colors["verification uncertainty"] == "ok"
     assert colors["cleanup evidence"] == "amber"
+    assert colors["outstanding failure"] != "amber"
 
 
 def test_unresolved_extension_annotation_does_not_erase_base_fields():

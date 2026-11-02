@@ -153,3 +153,4 @@ def test_cached_capture_preserves_archived_forecast(config, tmp_path, capsys):
         == 0
     )
     assert not (tmp_path / "capsules").exists()
+    assert capsys.readouterr().out.strip() == document.to_json()

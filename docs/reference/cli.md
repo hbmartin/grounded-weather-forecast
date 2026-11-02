@@ -1132,6 +1132,11 @@ wrapper exit 1 after publication. The child retains its diagnostic and has a
 300-second timeout. Install compatible source and wrappers deliberately;
 merging does not deploy them.
 
+Preflight also validates the v3 enrollment and implementation/runtime lock in the
+selected runtime before capture. Finalization uses an operating-system file lock;
+process exit releases ownership, so a leftover `.sealing` sidecar does not block
+recovery. Concurrent finalization still fails immediately as an operational error.
+
 After `window_end +98 hours`, review the QC hourly-mean truth, then seal it:
 
 ```sh
@@ -1549,4 +1554,4 @@ signals become `128 + signal`. Invalid exits return 1 with
 evidence and never receive pipeline continuation exemptions. Annotation failures
 are isolated per extension field, with inherited primitive wire fields retained.
 Verification and cleanup share lineage grouping, not recovery policy; each has
-its own stat color and uncertainty boundary.
+its own dashboard status color and uncertainty boundary.

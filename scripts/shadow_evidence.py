@@ -26,6 +26,7 @@ from grounded_weather_forecast.shadow_artifacts import (
     EvidenceError,
     current_artifact,
     digest,
+    finite_number,
     forecast_rows,
     hex_identity,
     issuance_name,
@@ -36,6 +37,62 @@ from grounded_weather_forecast.shadow_artifacts import (
     sync_directory,
     timestamp,
 )
+
+
+def protocol_rules(protocol: dict[str, Any], *, complete: bool = True) -> None:
+    """Validate the numeric rules before scoring, without changing their values."""
+    counts = {
+        "quality": (
+            "minimum_matched_utc_dates_per_horizon",
+            "minimum_matched_valid_hours_per_horizon",
+            "minimum_weeks_with_data",
+            "minimum_training_unique_valid_hours",
+        ),
+        "uncertainty": (
+            "bootstrap_samples",
+            "primary_block_days",
+            "sensitivity_block_days",
+            "family_comparisons",
+        ),
+    }
+    fractions = {
+        "quality": "minimum_common_coverage",
+        "uncertainty": "two_sided_family_alpha",
+    }
+    for domain, fields in counts.items():
+        if not complete and domain not in protocol:
+            continue
+        rule = object_value(protocol.get(domain), f"protocol.{domain}")
+        for field in fields:
+            value = rule.get(field)
+            if type(value) is not int or value < 1:
+                raise EvidenceError(
+                    f"protocol.{domain}.{field}: expected positive integer"
+                )
+        field = fractions[domain]
+        value = rule.get(field)
+        if not finite_number(value) or not 0 < value <= 1:
+            raise EvidenceError(
+                f"protocol.{domain}.{field}: expected fraction in (0,1]"
+            )
+        if domain == "uncertainty":
+            value = rule.get("seed")
+            if type(value) is not int or value < 0:
+                raise EvidenceError(
+                    "protocol.uncertainty.seed: expected nonnegative integer"
+                )
+
+
+def protocol_document(payload: bytes) -> dict[str, Any]:
+    protocol = json_object(payload, "protocol")
+    start, end = (
+        timestamp(required_string(protocol.get(key), f"protocol.{key}"))
+        for key in ("window_start", "window_end")
+    )
+    if start >= end:
+        raise EvidenceError("protocol: window_start must precede window_end")
+    protocol_rules(protocol, complete=False)
+    return protocol
 
 
 def regular(path: Path) -> None:
@@ -222,7 +279,7 @@ def freeze_truth(
         if enrollment_bytes is None
         else enrollment_bytes
     )
-    protocol = json_object(protocol_bytes, "protocol")
+    protocol = protocol_document(protocol_bytes)
     mature(protocol, now)
     regular(truth)
     payload = truth.read_bytes()
@@ -271,7 +328,7 @@ def locked_truth(
         else enrollment_bytes
     )
     mature(
-        json_object(protocol_bytes, "protocol"),
+        protocol_document(protocol_bytes),
         timestamp(required_string(lock.get("sealed_at"), "truth lock.sealed_at")),
     )
     if (

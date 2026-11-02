@@ -9,10 +9,12 @@ EXCLUSION_REASON = "board minimum excluded by eligibility requirements"
 
 
 def decision_gate(row: Mapping[str, object]) -> str | None:
-    value = row.get("decision_gate") or row.get("gate")
+    value = row.get("decision_gate")
+    if value is None:
+        value = row.get("gate")
     return (
         value
-        if isinstance(value, str) or value is None
+        if (isinstance(value, str) and bool(value)) or value is None
         else "invalid_selection_decision"
     )
 

@@ -10,7 +10,7 @@ from pathlib import Path
 from grounded_weather_forecast.shadow_artifacts import THREAD_CONTROLS
 
 for thread_control in THREAD_CONTROLS:
-    os.environ.setdefault(thread_control, "2")
+    os.environ[thread_control] = "2"
 
 # isort: split
 import numpy as np

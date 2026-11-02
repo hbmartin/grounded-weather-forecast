@@ -352,9 +352,14 @@ class CommandOutcome:
             code = 128 - code
         if code is None or not 0 <= code <= 255:
             damage += (invalid_metadata("exit_code", outcome.exit_code),)
-            if outcome.failure_kind is not None:
+            if kind is not None:
                 damage += (
-                    invalid_metadata("original_failure_kind", outcome.failure_kind),
+                    ComponentDiagnostic(
+                        "diagnostic_metadata",
+                        0,
+                        INVALID_COMMAND_OUTCOME,
+                        detail=f"original_failure_kind={kind!r}"[:400],
+                    ),
                 )
             code, kind = 1, INVALID_COMMAND_OUTCOME
         if outcome.error_detail is not None and detail is None:

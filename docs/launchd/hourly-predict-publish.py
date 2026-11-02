@@ -397,10 +397,20 @@ def shadow_preflight(paths: RuntimePaths, protocol: Path) -> tuple[bool, str | N
                 *paths.command("python"),
                 "-c",
                 (
-                    "import inspect; from grounded_weather_forecast.serve.predict import predict; "
-                    "from grounded_weather_forecast.shadow_artifacts import ARTIFACT_VERSION; "
-                    "raise SystemExit(0 if ARTIFACT_VERSION == 3 and 'shadow_capture' in inspect.signature(predict).parameters else 1)"
+                    "import inspect, os, runpy, sys; from pathlib import Path; "
+                    "from grounded_weather_forecast.shadow_artifacts import THREAD_CONTROLS, current_artifact; "
+                    "os.environ.update({key: '2' for key in THREAD_CONTROLS}); "
+                    "from grounded_weather_forecast.serve.predict import predict; "
+                    "\nif 'shadow_capture' not in inspect.signature(predict).parameters:\n"
+                    " raise SystemExit('missing capture capability')\n"
+                    "script = Path(sys.argv[1]); sys.path.insert(0, str(script.parent)); "
+                    "runner = runpy.run_path(str(script)); "
+                    "enrolled = runner['enrollment'](Path(sys.argv[2])); "
+                    "\nif not current_artifact(enrolled.protocol.get('artifact_version')):\n"
+                    " raise SystemExit('fresh v3 enrollment required')"
                 ),
+                str(paths.project / "scripts/temperature_shadow.py"),
+                str(protocol),
             ],
             capture_output=True,
             text=True,
@@ -408,9 +418,11 @@ def shadow_preflight(paths: RuntimePaths, protocol: Path) -> tuple[bool, str | N
             timeout=30,
         )
         if check.returncode:
+            detail = (getattr(check, "stderr", "") or "").strip().splitlines()
             return (
                 False,
-                "shadow unavailable: selected prediction runtime lacks v3 capture capability",
+                "shadow unavailable: selected prediction runtime lacks compatible v3 capture/enrollment"
+                + (f": {detail[-1][:400]}" if detail else ""),
             )
     except (
         OSError,
@@ -488,7 +500,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             else publish(paths, args.station_project)
         )
         if shadow_error:
-            print(f"forecast publication completed; {shadow_error}", flush=True)
+            print(f"ordinary publication exited {code}; {shadow_error}", flush=True)
         if code == 0 and (restore_failed or shadow_error):
             code = 1
         return code

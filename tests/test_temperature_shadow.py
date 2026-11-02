@@ -159,9 +159,7 @@ def make_capsule(shadow, frames, tmp_path):
         )
     )
     protocol = tmp_path / "protocol.json"
-    protocol.write_text(
-        '{"window_start":"2026-11-02T08:00:00+00:00","window_end":"2026-12-14T08:00:00+00:00"}'
-    )
+    protocol.write_text(json.dumps(template_protocol(shadow)))
     protocol.with_suffix(".lock.json").write_text(
         json.dumps(shadow.implementation_lock(protocol))
     )
@@ -351,7 +349,7 @@ def test_freeze_requires_future_window_and_immutable_enrollment(shadow, tmp_path
 
 def test_freeze_rejects_changed_candidate_rules(shadow, tmp_path):
     protocol = template_protocol(shadow)
-    protocol["quality"]["minimum_common_coverage"] = 0
+    protocol["quality"]["minimum_common_coverage"] = 0.5
     source = tmp_path / "proposal.json"
     source.write_text(json.dumps(protocol))
     with pytest.raises(ValueError, match="rules are fixed"):

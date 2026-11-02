@@ -2,11 +2,16 @@
 
 import base64
 import json
+import subprocess
+import sys
 from datetime import timedelta
 from pathlib import Path
+from types import SimpleNamespace
 
 import polars as pl
 import pytest
+from filelock import FileLock
+from test_launchd import SCRIPT, load_script
 from test_shadow_evidence import (
     evaluate,
 )
@@ -354,6 +359,91 @@ def test_wrong_receipt_issuance_has_specific_refusal(
 def test_excessive_receipt_nesting_is_a_named_refusal():
     with pytest.raises(ValueError, match=r"excessive JSON nesting|invalid JSON"):
         json_value("[" * 2000 + "0" + "]" * 2000, "publisher receipt")
+
+
+def test_sealing_lock_survives_concurrency_and_recovers_after_process_exit(
+    shadow, frames, tmp_path, monkeypatch
+):
+    capsule, protocol, target, _clock = make_prospective_record(
+        shadow, frames, tmp_path, monkeypatch
+    )
+    remove_record(target)
+    lock = capsule / ".sealing"
+    with (
+        FileLock(lock),
+        pytest.raises(OSError, match="finalization is already running"),
+    ):
+        shadow.finalize(
+            capsule, target.parent, protocol, source=None, mode="prospective"
+        )
+    result = subprocess.run(  # noqa: S603 -- fixed local child holds a synthetic capsule lock
+        [
+            sys.executable,
+            "-c",
+            "import os,sys; from filelock import FileLock; lock=FileLock(sys.argv[1]); lock.acquire(); os._exit(7)",
+            str(lock),
+        ],
+        check=False,
+        timeout=10,
+    )
+    assert result.returncode == 7
+    assert (
+        shadow.finalize(
+            capsule, target.parent, protocol, source=None, mode="prospective"
+        )
+        == target
+    )
+
+
+def test_preflight_validates_the_selected_runtime_enrollment(
+    shadow, frames, tmp_path, monkeypatch
+):
+    _capsule, protocol, _target, clock = make_prospective_record(
+        shadow, frames, tmp_path, monkeypatch
+    )
+    wrapper = load_script(SCRIPT.with_name("hourly-predict-publish.py"))
+    monkeypatch.setattr(wrapper, "datetime", clock)
+    paths = SimpleNamespace(
+        project=Path(shadow.__file__).parents[1], command=lambda _name: [sys.executable]
+    )
+    assert wrapper.shadow_preflight(paths, protocol) == (True, None)
+    locked = protocol.with_suffix(".lock.json")
+    lock = json.loads(locked.read_text())
+    lock["runner_sha256"] = "changed"
+    locked.write_text(json.dumps(lock))
+    enabled, error = wrapper.shadow_preflight(paths, protocol)
+    assert not enabled
+    assert "frozen protocol or implementation changed" in error
+
+
+@pytest.mark.parametrize(
+    "value", [{}, {"window_start": None}, {"window_start": "bad", "window_end": "bad"}]
+)
+def test_malformed_protocol_cli_is_a_named_refusal(shadow, tmp_path, value):
+    protocol = tmp_path / "protocol.json"
+    protocol.write_text(json.dumps(value))
+    result = subprocess.run(  # noqa: S603 -- local runner and synthetic evidence only
+        [
+            sys.executable,
+            shadow.__file__,
+            "freeze",
+            "--protocol",
+            str(protocol),
+            "--out",
+            str(tmp_path / "out"),
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=30,
+    )
+    assert result.returncode == 2
+    assert "shadow refused:" in result.stderr
+    assert (
+        "protocol.window_start" in result.stderr
+        or "timestamp must include timezone" in result.stderr
+    )
+    assert "Traceback" not in result.stderr
 
 
 @pytest.mark.parametrize("value", [None, 42, []])

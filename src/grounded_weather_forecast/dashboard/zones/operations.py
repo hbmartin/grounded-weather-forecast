@@ -511,7 +511,7 @@ def _retention_panel(ctx: DashboardContext) -> Panel:
             Stat(
                 "outstanding failure",
                 "yes" if recorded.outstanding_failure else "no",
-                status,
+                attempt_status,
             ),
             Stat(
                 "check mode",

@@ -117,6 +117,32 @@ def test_statistical_rejection_is_never_an_argmin(decision):
     assert argmin_selected({"gate": "eligibility", "decision_gate": None})
 
 
+@pytest.mark.parametrize("value", [False, 0, "", [], {}])
+def test_falsy_invalid_decisions_never_receive_argmin_exemptions(value):
+    assert not argmin_selected({"decision_gate": value, "gate": None})
+
+
+@pytest.mark.parametrize(
+    "value", ["0001-01-01T00:00:00+01:00", "9999-12-31T23:59:59-01:00"]
+)
+def test_extreme_timestamp_offsets_are_named_refusals(value):
+    with pytest.raises(
+        shadow_artifacts.EvidenceError, match="timestamp must include timezone"
+    ):
+        shadow_artifacts.timestamp(value)
+
+
+def test_invalid_exit_retains_valid_original_kind_without_misclassifying_it():
+    result = status.CommandOutcome.normalize(
+        status.CommandOutcome(256, "promotion_evidence_invalid")
+    )
+    original = [
+        d for d in result.diagnostics if "original_failure_kind" in (d.detail or "")
+    ]
+    assert len(original) == 1
+    assert original[0].failure_kind == status.INVALID_COMMAND_OUTCOME
+
+
 def test_grouped_reader_reuses_input_identity_assessments(monkeypatch):
     items = [
         {

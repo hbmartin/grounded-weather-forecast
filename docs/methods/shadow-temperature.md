@@ -51,6 +51,10 @@ pushes reuse the original issuance/receipt, and evaluation reconstructs each
 prediction with `rtol=1e-10`, `atol=1e-10`. Declared evidence files are hashed;
 incidental regular files are excluded while aliases remain invalid.
 
+The `.sealing` file carries an OS-managed lock, not persistent lease ownership.
+Process exit releases it; a live concurrent owner causes an operational refusal.
+Capture preflight validates a complete v3 enrollment in the selected runtime.
+
 Freeze Python patch, numerical-library/backend/platform identity, two-thread
 controls and dependency-lock digest. Truth matures at window end +98 hours and
 normalizes to UTC microseconds after exact-hour validation. Evaluation hashes

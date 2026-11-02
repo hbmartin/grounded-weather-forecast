@@ -105,7 +105,7 @@ for another configured schedule. This does not alter a job. A late start cannot
 suppress the following day's slot. Ambiguous times use the first occurrence;
 nonexistent times advance to the first valid minute. Future stamps do not suppress
 maintenance. Stamp publication preserves symlink targets and existing modes and
-cleans interrupted staging. Failed or pending runs never advance the stamp. Restore runs leave that stamp untouched, and a failed report
+cleans staging on catchable exceptions and interruptions; SIGKILL or power loss can leave a temporary sibling. Failed or pending runs never advance the stamp. Restore runs leave that stamp untouched, and a failed report
 skips score pruning.
 
 CLI `maintain` also runs truth-QC before report. Build and ordinary backtest errors stop the

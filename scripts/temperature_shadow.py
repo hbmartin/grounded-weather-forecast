@@ -11,13 +11,14 @@ import json
 import math
 import os
 import sys
-from contextlib import suppress
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from functools import cache
 from io import BytesIO
 from pathlib import Path
 from typing import Any, cast
+
+from filelock import FileLock, Timeout
 
 # isort: off
 import shadow_environment  # noqa: F401 -- limits must precede numerical imports
@@ -41,6 +42,8 @@ from shadow_evidence import (
     capsule_for,
     locked_truth,
     mature,
+    protocol_document,
+    protocol_rules,
     publication,
     regular,
     staged_directory,
@@ -58,6 +61,7 @@ from grounded_weather_forecast.dataset.matrix import (
 )
 from grounded_weather_forecast.evaluation import code_identity
 from grounded_weather_forecast.shadow_artifacts import (
+    TARGET,
     EvidenceError,
     current_artifact,
     digest,
@@ -83,7 +87,6 @@ METHODS = (
     "climatology",
 )
 HORIZONS = ("0-6h", "6-24h", "24-72h", "72-96h")
-TARGET = "t__temp_c__mean"
 INPUT_FILES = frozenset(
     {
         "issue.parquet",
@@ -156,7 +159,7 @@ def enrollment(
     raw = protocol_path.read_bytes() if protocol_bytes is None else protocol_bytes
     locked = protocol_path.with_suffix(".lock.json").read_bytes()
     protocol, lock = (
-        json_object(raw, "protocol"),
+        protocol_document(raw),
         json_object(locked, "enrollment lock"),
     )
     if lock != implementation_lock(protocol_path, raw):
@@ -169,7 +172,7 @@ def enrollment(
 def freeze(protocol_path: Path, output: Path) -> Path:
     """Seal a reviewed, future enrollment without scheduling any work."""
     protocol_bytes = protocol_path.read_bytes()
-    protocol = json_object(protocol_bytes, "protocol")
+    protocol = protocol_document(protocol_bytes)
     if not current_artifact(protocol.get("artifact_version")):
         raise EvidenceError("freeze requires a fresh v3 protocol")
     template = json_object(
@@ -514,9 +517,12 @@ def finalize(
         )
     enrolled = enrollment(protocol_path)
     lease = capsule / ".sealing"
-    descriptor = os.open(lease, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+    lock = FileLock(lease, timeout=0)
     try:
-        os.close(descriptor)
+        lock.acquire()
+    except Timeout as error:
+        raise OSError(f"capsule finalization is already running: {capsule}") from error
+    try:
         if publication_receipt is not None:
             seal_publication(capsule, meta, publication_receipt, enrolled)
             meta = capsule_metadata(capsule, prospective=mode == "prospective")
@@ -538,8 +544,7 @@ def finalize(
             return target
         return record(capsule, output, protocol_path, mode=mode, enrolled=enrolled)
     finally:
-        with suppress(OSError):
-            lease.unlink(missing_ok=True)
+        lock.release()
 
 
 def validate_provenance(meta: dict[str, Any], document: dict[str, Any]) -> None:
@@ -1133,7 +1138,7 @@ def evaluation_inputs(
     truth_lock: Path | None = None,
 ) -> EvaluationInputs:
     protocol_bytes = protocol_path.read_bytes()
-    protocol = json_object(protocol_bytes, "protocol")
+    protocol = protocol_document(protocol_bytes)
     enrolled = (
         enrollment(protocol_path, protocol_bytes=protocol_bytes)
         if mode == "prospective"
@@ -1149,6 +1154,7 @@ def evaluation_inputs(
         raise EvidenceError(
             "no matching records; replay is excluded from prospective analysis"
         )
+    protocol_rules(protocol)
     lock_bytes = None
     if mode == "prospective":
         mature(protocol, datetime.now(UTC))

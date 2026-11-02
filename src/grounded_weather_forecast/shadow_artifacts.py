@@ -49,9 +49,9 @@ def timestamp(value: str) -> datetime:
         result = datetime.fromisoformat(value)
         if result.utcoffset() is None:
             raise ValueError("timezone missing")
-    except (TypeError, ValueError) as error:
+        return result.astimezone(UTC)
+    except (TypeError, ValueError, OverflowError) as error:
         raise EvidenceError(f"timestamp must include timezone: {value!r}") from error
-    return result.astimezone(UTC)
 
 
 def issuance_name(origin: datetime) -> str:
