@@ -241,14 +241,21 @@ class TestSelectMethods:
         original = selection_module.slice_winners
 
         def gated(*args, **kwargs):
-            return original(*args, **kwargs).with_columns(pl.lit(gate).alias("gate"))
+            return original(*args, **kwargs).with_columns(
+                pl.lit("eligibility").alias("gate"),
+                pl.lit(gate).alias("decision_gate"),
+                pl.lit(True).alias("board_minimum_ineligible"),
+                pl.lit("pooled_D3-10").alias("evidence_scope"),
+            )
 
         monkeypatch.setattr(selection_module, "slice_winners", gated)
         selections = select_methods(config, config.dataset.dir / "scores")
         assert selections
-        assert all(
-            c.reason == f"reference fallback: {gate}" for c in selections.values()
+        expected = (
+            f"reference fallback: {gate} (gated on pooled D3-10 evidence); "
+            "board minimum excluded by eligibility requirements"
         )
+        assert all(c.reason == expected for c in selections.values())
         releases = [
             json.loads(p.read_text())
             for p in (config.artifacts_dir / "releases").glob("*.json")
@@ -256,7 +263,7 @@ class TestSelectMethods:
         assert releases
         assert all(r["selections"] for r in releases)
         assert all(
-            choice["reason"] == f"reference fallback: {gate}"
+            choice["reason"] == expected
             for r in releases
             for choice in r["selections"].values()
         )
@@ -1179,7 +1186,10 @@ class TestIncumbentRetention:
         )
         assert kept is None
 
-    def test_gate_forced_winner_is_never_overridden(self, tmp_path, monkeypatch):
+    @pytest.mark.parametrize("legacy_gate", ["dm_not_significant", "eligibility"])
+    def test_gate_forced_winner_is_never_overridden(
+        self, tmp_path, monkeypatch, legacy_gate
+    ):
         config = write_config(tmp_path)
         self._pin_fingerprints(monkeypatch)
         frame = near_tie_scores(utc(2026, 8, 2), "evaltwo", "cluster_equal_weight")
@@ -1191,7 +1201,10 @@ class TestIncumbentRetention:
             "truth_semantics": "inst",
             "method_id": "equal_weight",
             "mae": 1.0,
-            "gate": "dm_not_significant",
+            "gate": legacy_gate,
+            "decision_gate": "dm_not_significant",
+            "board_minimum_ineligible": True,
+            "evidence_scope": "slice",
         }
         kept = selection_module._retained_incumbent(
             config, row, board, frame, ("inverse_mse", "inst"), "evaltwo"

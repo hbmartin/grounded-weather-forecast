@@ -307,7 +307,11 @@ def test_count_knowledge_requires_sample_free_suspension():
 
 def test_assessment_is_repeatable_and_does_not_mutate_group_state():
     groups = _CheckGroups()
-    groups.add(payload(check())[0] | {"recorded_at": "bad"})
+    item = payload(check())[0] | {"recorded_at": "bad"}
+    groups.add(
+        item,
+        status.assess_progress_identity(item.get("progress_id"), item.get("check_id")),
+    )
     before = (dict(groups.check_owners), set(groups.bad_checks), tuple(groups.invalid))
     first = groups.assess(NOW, mode=False)
     second = groups.assess(NOW, mode=False)

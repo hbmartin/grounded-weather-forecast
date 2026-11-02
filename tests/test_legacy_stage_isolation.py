@@ -224,13 +224,13 @@ def test_every_declared_field_uses_its_annotation_not_name():
 
 def test_serialization_assesses_each_field_once(monkeypatch):
     seen = Counter()
-    original = status._field_valid
+    original = status.field_valid
 
-    def counted(name, value):
+    def counted(name, value, schema):
         seen[name] += 1
-        return original(name, value)
+        return original(name, value, schema)
 
-    monkeypatch.setattr(status, "_field_valid", counted)
+    monkeypatch.setattr(status, "field_valid", counted)
     value = status.ComponentDiagnostic("other", 0, detail=[])
     saved = json.loads(status.failure_details_json((value,)))[0]
     assert saved["metadata_invalid"] is True

@@ -831,7 +831,7 @@ def _forecast_document(
         force_method=forced,
         dataset_snapshot=dataset,
         approved_release_loaded=bool(selections),
-        **({"shadow_capture": shadow_capture} if shadow_capture is not None else {}),
+        shadow_capture=shadow_capture,
     )
 
 
@@ -857,11 +857,7 @@ def _cmd_predict(config: Config, args: argparse.Namespace) -> int:
             method=args.method,
             semantics_flag=args.semantics,
             now=args.now,
-            **(
-                {"shadow_capture": args.shadow_capture}
-                if getattr(args, "shadow_capture", None) is not None
-                else {}
-            ),
+            shadow_capture=args.shadow_capture,
         )
     except (NoForecastDataError, UnsupportedMethodError) as exc:
         print(f"cannot predict: {exc}")
@@ -1861,12 +1857,8 @@ def _run_pipeline_steps(
             print(f"pipeline pending: {name}; continuing diagnostics")
             continue
         if result.exit_code:
-            first_failure = (
-                result
-                if result.failure_kind == "invalid_command_outcome"
-                else first_failure or result
-            )
-            if result.failure_kind != "invalid_command_outcome" and (
+            first_failure = result if result.invalid else first_failure or result
+            if not result.invalid and (
                 name in continue_on_failure
                 or result.failure_kind in continue_on_failure_kinds
             ):

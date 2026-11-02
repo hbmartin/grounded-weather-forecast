@@ -23,6 +23,7 @@ nav = [
   { "Operating" = [
     { "Advanced Usage" = "advanced-usage.md" },
     { "Scheduling" = "scheduling.md" },
+    { "Shadow rollout review" = "shadow-rollout.md" },
     { "Operator Dashboard" = "dashboard.md" },
     { "Releasing" = "releasing.md" },
   ] },
@@ -58,6 +59,7 @@ nav = [
     { "Precipitation" = "methods/precipitation.md" },
     { "Truth and QC" = "methods/truth-qc.md" },
     { "Daily read contract" = "methods/daily-report.md" },
+    { "Inactive temperature shadow" = "methods/shadow-temperature.md" },
     { "Bibliography" = "methods/bibliography.md" },
   ] },
   { "Project" = [

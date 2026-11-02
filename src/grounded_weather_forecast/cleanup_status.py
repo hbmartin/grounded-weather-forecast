@@ -1,16 +1,19 @@
 """Recorded cleanup evidence has its own validity and recovery boundary."""
 
-import json
 from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Any, Literal
 
+from grounded_weather_forecast.diagnostic_groups import (
+    DiagnosticDocument,
+    DiagnosticGroups,
+    decode_diagnostics,
+)
 from grounded_weather_forecast.diagnostic_values import declared_types, field_valid
 from grounded_weather_forecast.run_health import aware_moment
 from grounded_weather_forecast.status import (
     ComponentDiagnostic,
-    assess_progress_identity,
     is_verification_verdict,
 )
 
@@ -114,51 +117,32 @@ def _summary_clock(items: list[dict[str, Any]], ended: datetime) -> datetime | N
     return clocks[0]
 
 
-def assess_cleanup(row: Mapping[str, Any], ended: datetime) -> CleanupAssessment:
-    try:
-        raw = json.loads(row.get("failure_details_json") or "null")
-    except (ValueError, TypeError):
-        return CleanupAssessment()  # Unattributable damage belongs to verification.
-    if not isinstance(raw, list):
-        return CleanupAssessment()
-    groups: dict[tuple[str, object], list[dict[str, Any]]] = {}
-    bad_owners: set[str] = set()
-    bad_checks: set[str] = set()
+def assess_cleanup(
+    row: Mapping[str, Any],
+    ended: datetime,
+    *,
+    document: DiagnosticDocument | None = None,
+) -> CleanupAssessment:
+    document = document if document is not None else decode_diagnostics(row)
+    groups = DiagnosticGroups()
     damaged = False
-    for item in raw:
+    for entry in document.entries:
+        item, identity = entry.item, entry.identity
+        if not isinstance(item, dict) or item.get("stage") != "retention_audit_cleanup":
+            continue
         if (
-            not isinstance(item, dict)
-            or item.get("stage") != "retention_audit_cleanup"
+            not _valid_item(item)
+            or not identity.valid
             or is_verification_verdict(item.get("failure_kind"))
         ):
-            continue
-        identity = assess_progress_identity(
-            item.get("progress_id"), item.get("check_id")
-        )
-        if not _valid_item(item) or not identity.valid:
             damaged = True
-            if identity.progress_id is not None:
-                bad_owners.add(identity.progress_id)
-            if identity.check_id is not None:
-                bad_checks.add(identity.check_id)
+            groups.quarantine(identity)
             continue
-        key = (
-            ("owner", identity.owner)
-            if identity.owner
-            else ("clock", item.get("recorded_at"))
-        )
-        groups.setdefault(key, []).append(item)
+        groups.add_valid(item, identity)
     summaries: list[CleanupSummary] = []
-    for items in groups.values():
+    for key, items in groups.groups.items():
         try:
-            if any(
-                assess_progress_identity(
-                    item.get("progress_id"), item.get("check_id")
-                ).owner
-                in bad_owners
-                or item.get("check_id") in bad_checks
-                for item in items
-            ):
+            if groups.conflicts(key):
                 raise ValueError("damaged cleanup group")
             if (value := _summary(items, ended)) is not None:
                 summaries.append(value)
@@ -175,8 +159,14 @@ class CleanupStatus:
     uncertainty_until: datetime | None = None
     latest_order: datetime | None = None
 
-    def advance(self, row: Mapping[str, Any], ended: datetime) -> "CleanupStatus":
-        assessment = assess_cleanup(row, ended)
+    def advance(
+        self,
+        row: Mapping[str, Any],
+        ended: datetime,
+        *,
+        document: DiagnosticDocument | None = None,
+    ) -> "CleanupStatus":
+        assessment = assess_cleanup(row, ended, document=document)
         boundary = ended if assessment.damaged else self.uncertainty_until
         latest = self.latest
         order = self.latest_order

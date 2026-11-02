@@ -97,8 +97,9 @@ class TestWinnerAnnotations:
             ),
         ).row(0, named=True)
         assert row["method_id"] == "equal_weight"
-        # Keep the existing gap annotation used by incumbent retention.
-        assert row["gate"] == "eligibility"
+        # Statistical rejection wins; exclusion is independent metadata.
+        assert row["gate"] == rejection
+        assert row["board_minimum_ineligible"] is True
         assert row["decision_gate"] == rejection
         assert _winner_reason(row) == (
             f"reference fallback: {rejection}; board minimum excluded by eligibility requirements"

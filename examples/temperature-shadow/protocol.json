@@ -1,6 +1,6 @@
 {
-  "artifact_version": 2,
-  "protocol_id": "temperature-shadow-v2-20261101",
+  "artifact_version": 3,
+  "protocol_id": "temperature-shadow-v3-20261102",
   "status": "frozen proposal; inactive; activation and schedule require review",
   "window_start": "2026-11-02T08:00:00+00:00",
   "window_end": "2026-12-14T08:00:00+00:00",
@@ -19,7 +19,7 @@
     "decay21_reference": "same correction, equal weights; no optimization"
   },
   "comparators": ["actual published production", "decay21", "training-ranked best available provider per original narrow lead bucket", "latest issue-time observed temperature, finite and at most 30 minutes old", "30-day station climatology, median per local 3-hour bin with >=3 dates else global median; all fully known hourly observations"],
-  "publication": "v2 prospective requires exact published payload bytes and the original publisher successful explicit-commit push receipt; input matrix must be the same issuance snapshot used by serving. Hold-last-good has its original issued_at and cannot be relabeled. Prediction history alone is never proof of publication.",
+  "publication": "v3 prospective requires exact published payload bytes and the original publisher successful explicit-commit push receipt; input matrix must be the same issuance snapshot used by serving. Hold-last-good has its original issued_at and cannot be relabeled. Prediction history alone is never proof of publication.",
   "availability": "capture genuine provider completion/receipt and station collection/commit timestamps where available. Preserve raw clocks. If receipt/commit ledgers are absent, explicitly label truth-known-at +2h and archive fetched_at as assumptions. Captured inputs make prospective reconstruction auditable but do not invent a historical ledger.",
   "quality": {"minimum_matched_utc_dates_per_horizon": 28, "minimum_matched_valid_hours_per_horizon": 300, "minimum_common_coverage": 0.8, "minimum_weeks_with_data": 4, "minimum_training_unique_valid_hours": 48},
   "analysis": "Use identical issued_at/valid_time cases across all six methods and finite QC truth. Report attrition and pairwise coverage separately. Average absolute errors across repeated issuances within valid hour, then across valid hours within UTC day. Preserve missing calendar dates in circular-block resampling. Report hour-weighted MAE and bias as descriptive secondary metrics.",

@@ -43,6 +43,7 @@ from grounded_weather_forecast.reports.mcs import (
     _block_indices,
     collapsed_loss_matrix,
 )
+from grounded_weather_forecast.selection_decisions import argmin_selected
 
 if TYPE_CHECKING:
     from grounded_weather_forecast.config import PromotionConfig
@@ -54,7 +55,6 @@ _DEFAULT_ALPHA = 0.1
 _PROJECTION_DRAWS = 2000
 _BISECT_STEPS = 80
 _DENOMINATOR_FLOOR = 1e-12
-_CORRECTED_GATES = (None, "eligibility")
 
 CURSE_COLUMNS: tuple[tuple[str, pl.DataType], ...] = (
     ("winner_bias", pl.Float64()),
@@ -257,7 +257,7 @@ def winner_curse_adjusted(
         record: dict[str, object] = dict.fromkeys(
             (name for name, _ in CURSE_COLUMNS), None
         )
-        if row.get("gate") in _CORRECTED_GATES and row.get("mae") is not None:
+        if argmin_selected(row) and row.get("mae") is not None:
             slice_scores = normalized.filter(
                 (pl.col("product") == row["product"])
                 & (pl.col("variable") == row["variable"])

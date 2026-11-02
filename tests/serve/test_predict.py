@@ -1215,7 +1215,7 @@ def test_real_fitted_rain_guard_records_loss(
     )
     assert fitted is not None
     assert math.isfinite(fitted[0]["equal_weight"].point[0])
-    monkeypatch.setattr(module, "build_snapshot", lambda *_args: snapshot)
+    monkeypatch.setattr(module, "build_snapshot", lambda *_args, **_kwargs: snapshot)
     selections = {
         ("hourly", "precip_mm", "0-1h"): Selection(
             "equal_weight", "promoted", release_id="rain-only", truth_semantics="inst"

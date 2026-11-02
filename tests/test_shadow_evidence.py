@@ -15,6 +15,34 @@ from test_temperature_shadow import make_capsule, make_prospective_record
 pytest_plugins = ["test_temperature_shadow"]
 
 
+@pytest.fixture
+def publication_fixture():
+    # Function scope gives every mutation test its own complete parsed copy.
+    return json.loads(
+        (
+            Path(__file__).with_name("fixtures") / "publication-receipt-v1.json"
+        ).read_text()
+    )
+
+
+def test_copied_publication_fixture_git_object_chain(publication_fixture):
+    def git_hash(kind, payload):
+        return hashlib.sha1(
+            f"{kind} {len(payload)}\0".encode() + payload, usedforsecurity=False
+        ).hexdigest()
+
+    for case in publication_fixture["cases"]:
+        receipt = case["receipt"]
+        commit = base64.b64decode(case["commit_base64"])
+        tree = base64.b64decode(case["tree_base64"])
+        payload = base64.b64decode(receipt["forecast_base64"])
+        assert git_hash("commit", commit) == receipt["commit"]
+        assert commit.splitlines()[0] == f"tree {git_hash('tree', tree)}".encode()
+        assert tree == b"100644 forecast.json\0" + bytes.fromhex(
+            git_hash("blob", payload)
+        )
+
+
 @pytest.mark.parametrize("value", [None, [], 42, "receipt"])
 def test_receipt_root_requires_an_object(shadow, value):
     with pytest.raises(ValueError, match="expected an object"):
@@ -36,13 +64,10 @@ def test_receipt_root_requires_an_object(shadow, value):
     ],
 )
 @pytest.mark.parametrize("value", [None, 42, []])
-def test_malformed_receipt_fields_raise_domain_errors(shadow, field, value):
-    fixture = json.loads(
-        Path(__file__)
-        .with_name("fixtures")
-        .joinpath("publication-receipt-v1.json")
-        .read_text()
-    )
+def test_malformed_receipt_fields_raise_domain_errors(
+    shadow, field, value, publication_fixture
+):
+    fixture = publication_fixture
     receipt = fixture["cases"][0]["receipt"]
     receipt[field] = value
     with pytest.raises(ValueError, match=r"commit identity|string fields"):
@@ -50,13 +75,8 @@ def test_malformed_receipt_fields_raise_domain_errors(shadow, field, value):
 
 
 @pytest.mark.parametrize("value", [None, [], 42, "forecast", True])
-def test_receipt_payload_requires_an_object(shadow, value):
-    fixture = json.loads(
-        Path(__file__)
-        .with_name("fixtures")
-        .joinpath("publication-receipt-v1.json")
-        .read_text()
-    )
+def test_receipt_payload_requires_an_object(shadow, value, publication_fixture):
+    fixture = publication_fixture
     receipt = fixture["cases"][0]["receipt"]
     payload = json.dumps(value).encode()
     receipt["forecast_base64"] = base64.b64encode(payload).decode()
@@ -65,25 +85,28 @@ def test_receipt_payload_requires_an_object(shadow, value):
         shadow.publication(receipt)
 
 
-def test_replay_does_not_claim_an_unused_truth_lock(shadow, frames, tmp_path):
+def test_replay_rejects_prospective_only_truth_lock(shadow, frames, tmp_path):
     capsule, protocol = make_capsule(shadow, frames, tmp_path)
     target = shadow.record(capsule, tmp_path / "replay", protocol, mode="replay")
-    output = tmp_path / "result"
-    truth = capsule / "truth_hourly.parquet"
-    unused = tmp_path / "unused-lock"
-    unused.mkdir()
-    (unused / "truth.lock.json").write_text('{"truth_sha256":"unrelated"}')
+    with pytest.raises(ValueError, match="replay evaluation does not accept"):
+        shadow.evaluate(
+            target.parent,
+            capsule / "truth_hourly.parquet",
+            protocol,
+            tmp_path / "result",
+            mode="replay",
+            truth_lock=tmp_path / "unused",
+        )
     shadow.evaluate(
         target.parent,
-        truth,
+        capsule / "truth_hourly.parquet",
         protocol,
-        output,
+        tmp_path / "valid",
         mode="replay",
-        truth_lock=unused,
     )
-    result = json.loads((output / "evaluation.json").read_text())
+    result = json.loads((tmp_path / "valid/evaluation.json").read_text())
     assert result["truth_lock_sha256"] is None
-    assert result["truth_sha256"] == shadow.digest(truth)
+    assert result["truth_sha256"] == shadow.digest(capsule / "truth_hourly.parquet")
 
 
 def test_malformed_receipt_cli_has_clear_refusal(shadow, mature_record, tmp_path):
@@ -111,7 +134,7 @@ def test_malformed_receipt_cli_has_clear_refusal(shadow, mature_record, tmp_path
         check=False,
     )
     assert result.returncode == 2
-    assert "shadow refused:" in result.stderr
+    assert "expected an object" in result.stderr
     assert "Traceback" not in result.stderr
 
 
@@ -159,6 +182,9 @@ def test_mature_evaluation_reconstructs_and_scores_exact_record(
         mature_record[2].name: shadow.digest(mature_record[2] / "record.json")
     }
     assert result["truth_sha256"] == shadow.digest(mature_record[5] / "truth.parquet")
+    assert result["truth_lock_sha256"] == shadow.digest(
+        mature_record[5] / "truth.lock.json"
+    )
     matched = pl.read_parquet(tmp_path / "result/matched_rows.parquet")
     assert matched.height == 2
     assert matched["truth"].to_list() == [15.0, 15.0]
@@ -224,7 +250,7 @@ def test_inconsistent_evidence_fails_before_output(
     path.write_text(json.dumps(saved))
     with pytest.raises(
         ValueError,
-        match=r"differs|changed|fresh|clock|contemporaneous|requires|must contain|include timezone|mismatch",
+        match=r"differs|changed|fresh|clock|contemporaneous|requires|must contain|include timezone|mismatch|conflicts|incompatible",
     ):
         evaluate(shadow, mature_record, tmp_path / "result")
     assert not (tmp_path / "result").exists()
@@ -286,7 +312,7 @@ def test_freeze_truth_rejects_invalid_qc_shapes(
     truth.write_parquet(source)
     with pytest.raises(
         ValueError,
-        match=r"differs|changed|fresh|clock|contemporaneous|requires|must contain|include timezone|mismatch",
+        match=r"differs|changed|fresh|clock|contemporaneous|requires|must contain|include timezone|mismatch|conflicts|incompatible",
     ):
         shadow.freeze_truth(
             source, mature_record[1], tmp_path / "bad-lock", mature_record[3].instant
@@ -340,20 +366,16 @@ def test_scoring_failure_does_not_publish_partial_results(
 
 @pytest.mark.parametrize("index", [0, 1])
 def test_actual_publisher_schema_5_and_6_receipts_are_accepted(
-    shadow, frames, tmp_path, monkeypatch, index
+    shadow, frames, tmp_path, monkeypatch, index, publication_fixture
 ):
-    fixture = json.loads(
-        Path(__file__)
-        .with_name("fixtures")
-        .joinpath("publication-receipt-v1.json")
-        .read_text()
-    )
+    fixture = publication_fixture
     case = fixture["cases"][index]
     capsule, protocol, target, _clock = make_prospective_record(
         shadow, frames, tmp_path, monkeypatch
     )
     (target / "record.json").unlink()
-    for name in ("published.json", "publication.json"):
+    (target / "record.lock.json").unlink()
+    for name in ("published.json", "publication.json", "evidence.lock.json"):
         (capsule / name).unlink()
     (capsule / "production.json").write_bytes(base64.b64decode(case["source_base64"]))
     meta = json.loads((capsule / "capsule.json").read_text())

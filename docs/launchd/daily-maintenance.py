@@ -8,9 +8,10 @@ enough live history exists), re-runs the synthetic backtest on Sundays (so
 newly registered methods pick up backfill folds within a week), and
 regenerates the leaderboard reports.
 
-Runs daily at 06:30. Missed days require a manual launchctl kickstart. A stamp
-file prevents a manual catch-up from re-running within 20 hours of the last
-successful maintenance.
+The supplied launchd schedule runs daily at 02:15 in the host's local calendar.
+A success stamp retains the successful run's start. Catch-up skips only when
+that start is between the latest scheduled slot and now. Custom schedules must
+pass --scheduled-at HH:MM; this option does not install or alter a job.
 
 Insufficient-history backtests remain pending while diagnostics continue.
 Pending evaluations and failed runs never advance the success stamp.
@@ -19,6 +20,7 @@ Pending evaluations and failed runs never advance the success stamp.
 import argparse
 import fcntl
 import os
+import re
 import socket
 import stat
 import subprocess
@@ -26,9 +28,9 @@ import sys
 import time
 from collections.abc import Iterator, Sequence
 from contextlib import contextmanager, suppress
-from datetime import UTC, datetime
+from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
-from tempfile import NamedTemporaryFile, TemporaryDirectory
+from tempfile import TemporaryDirectory
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
@@ -41,7 +43,41 @@ from launchd_paths import (
     working_directory,
 )
 
-MIN_INTERVAL_S = 20 * 3600
+DEFAULT_SCHEDULE = "02:15"
+
+
+def scheduled_time(value: str) -> tuple[int, int]:
+    if re.fullmatch(r"(?:[01]\d|2[0-3]):[0-5]\d", value) is None:
+        raise argparse.ArgumentTypeError("scheduled time must be HH:MM (00:00–23:59)")
+    hour, minute = value.split(":")
+    return int(hour), int(minute)
+
+
+def local_slot(day: date, scheduled_at: tuple[int, int]) -> float:
+    nominal = datetime(day.year, day.month, day.day, *scheduled_at)  # noqa: DTZ001 -- host calendar
+    for offset in range(24 * 60 + 1):
+        wall = nominal + timedelta(minutes=offset)
+        parts = wall.timetuple()
+        candidates = {
+            value
+            for is_dst in (-1, 0, 1)
+            if time.localtime(value := time.mktime((*parts[:8], is_dst)))[:6]
+            == parts[:6]
+        }
+        if candidates:
+            return min(
+                candidates
+            )  # First fold; gaps advance to the first valid minute.
+    raise ValueError("cannot resolve maintenance calendar slot")
+
+
+def latest_scheduled_slot(now: float, scheduled_at: tuple[int, int]) -> float:
+    today = datetime.fromtimestamp(now).date()  # noqa: DTZ006 -- launchd host calendar
+    for offset in range(3):
+        slot = local_slot(today - timedelta(days=offset), scheduled_at)
+        if slot <= now:
+            return slot
+    raise ValueError("cannot locate the most recent maintenance slot")
 
 
 def timestamp() -> str:
@@ -50,20 +86,25 @@ def timestamp() -> str:
 
 def stamp_success(stamp: Path, started_at: float) -> None:
     """Publish start-based freshness only after the whole run succeeds."""
+    from grounded_weather_forecast.storage import (  # noqa: PLC0415
+        output_target,
+        stage_text,
+    )
+
     candidate: Path | None = None
     try:
-        with NamedTemporaryFile(
-            prefix="maintenance-stamp-", dir=stamp.parent, delete=False
-        ) as staged:
-            candidate = Path(staged.name)
+        target = output_target(stamp)
+        candidate = stage_text("", target)
         os.utime(candidate, (started_at, started_at))
-        # No fallible cleanup follows successful publication.
-        os.replace(candidate, stamp)
-    except (OSError,):
+        os.replace(candidate, target)  # noqa: PTH105 -- fault-injected atomic publication boundary
+    except OSError as error:
+        raise type(error)(
+            f"cannot publish maintenance stamp {stamp}: {error}"
+        ) from error
+    finally:
         if candidate is not None:
             with suppress(OSError):
                 candidate.unlink(missing_ok=True)
-        raise
 
 
 def maintenance_steps(*, restore: bool) -> list[list[str]]:
@@ -204,7 +245,13 @@ def maintenance_lock(stamp: Path) -> Iterator[bool]:
         yield True
 
 
-def maintain(stamp: Path, *, restore: bool, paths: RuntimePaths) -> int:
+def maintain(
+    stamp: Path,
+    *,
+    restore: bool,
+    paths: RuntimePaths,
+    scheduled_at: tuple[int, int] = (2, 15),
+) -> int:
     try:
         from grounded_weather_forecast.status import (  # noqa: PLC0415 -- guarded startup
             EXIT_NO_FOLDS,
@@ -229,7 +276,9 @@ def maintain(stamp: Path, *, restore: bool, paths: RuntimePaths) -> int:
         if (
             not restore
             and stamp.exists()
-            and started_at - stamp.stat().st_mtime < MIN_INTERVAL_S
+            and latest_scheduled_slot(started_at, scheduled_at)
+            <= stamp.stat().st_mtime
+            <= started_at
         ):
             print(
                 "last successful maintenance is fresh; skipping catch-up run",
@@ -289,8 +338,7 @@ def maintain(stamp: Path, *, restore: bool, paths: RuntimePaths) -> int:
             if restore:
                 return EXIT_NO_FOLDS
         elif not restore:
-            # Freshness measures successful run STARTS; stage duration adds
-            # no extra delay to the twenty-hour interval.
+            # Only a successful start can satisfy the current calendar slot.
             stamp_success(stamp, started_at)
         return 0
 
@@ -321,13 +369,18 @@ def main(argv: Sequence[str] | None = None) -> int:
             description="Daily maintenance or live-only restore"
         )
         parser.add_argument("--restore", action="store_true")
+        parser.add_argument(
+            "--scheduled-at", type=scheduled_time, default=DEFAULT_SCHEDULE
+        )
         args = parser.parse_args(argv)
         paths = resolve_runtime()
         print(
             f"{timestamp()} PROJECT project={paths.project} forecast={paths.forecast}",
             flush=True,
         )
-        code = maintain(stamp, restore=args.restore, paths=paths)
+        code = maintain(
+            stamp, restore=args.restore, paths=paths, scheduled_at=args.scheduled_at
+        )
         return code  # noqa: RET504 -- finally logs the actual exit status
     except (RuntimePathError,) as exc:  # noqa: B013 -- project convention
         print(f"configuration error: {exc}", flush=True)

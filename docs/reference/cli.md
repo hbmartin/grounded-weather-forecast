@@ -794,6 +794,13 @@ a latched drift verdict stays red. Successful refreshes clear older failures.
 
 > render leaderboards and correlation reports from scores
 
+Winner rows retain `decision_gate` and expose `board_minimum_ineligible` plus
+`evidence_scope` (`slice` or `pooled_D3-10`). `gate` preserves the causal
+statistical rejection; eligibility is inferred only without a statistical gate.
+Retention and winner-bias correction use the canonical decision and exclude
+reference fallbacks and pooled selections. Rule-comparison `mcs_gate`/`seq_gate`
+show those decisions, with matching `_scope` and `_board_minimum_ineligible`
+columns. Sparse board minima cannot change a rejected challenger's fallback.
 No flags, and the heaviest command. For every readable scores file it builds the
 leaderboard, applies BH and e-BH multiplicity control, updates the e-process
 store, computes MCS winners and winner's-curse corrections, gates promotions,
@@ -952,19 +959,14 @@ apparent diversity without adding information.
 
 ## `predict`
 
-Automatic output preserves statistical gate decisions in `selection_reasons`.
-For example, `reference fallback: seq_e_below_threshold` means the challenger did
-not clear the sequential evidence threshold; it is not labelled the lowest-error
-challenger. Eligibility exclusions and successful pooled daily decisions have
-separate explanations. When an ineligible board minimum coexists with a
-statistical rejection of an eligible challenger, both explanations are retained.
-The leaderboard winners table's `decision_gate` column records the explicit statistical decision while
-the existing `gate` gap annotation and incumbent-retention behavior are preserved.
-Incumbent retention and live quality guards may replace
-this reason with their own verdict. Forecast values, thresholds and weights
-are unchanged.
-
 > emit the current blended forecast as JSON
+
+Automatic `selection_reasons` distinguish reference fallbacks, pooled evidence
+and an ineligible board minimum. These explanations retain both a rejection and
+its scope/exclusion context. Incumbent retention and live guards may supply their
+own verdict, but cannot use an eligibility annotation to override statistical
+rejection. See `report` for winner metadata.
+
 
 | Flag | Type | Default | Meaning |
 |---|---|---|---|
@@ -1051,7 +1053,8 @@ document, and genuine available archive completion clocks into a private,
 exclusive issuance capsule. It is off by default. It performs no additional
 collection or fit and does not enroll or publish a shadow. Capture errors are
 reported as warnings while the forecast continues. `--now` captures are marked
-historical; cached archived documents cannot manufacture original input capsules.
+historical; cached archived documents are returned normally with a capture-unavailable
+warning and cannot manufacture original input capsules.
 Prospective records require already-served interval-mean temperature and hourly inputs;
 freezing a future enrollment requires no serving snapshot.
 Incompatible captures abstain with a warning; enabling capture never changes
@@ -1068,19 +1071,21 @@ that the forecast was published and returns a failure for the shadow step.
 
 ### Standalone temperature shadow
 
-The v2 runner requires a fresh enrollment; v1 prospective records and branch-readback
-receipts are preserved but cannot be upgraded or pooled into v2 evidence. Candidate
+The v3 runner requires a fresh enrollment; v1/v2 prospective artifacts are
+preserved but cannot be upgraded or pooled into v3 evidence. Candidate
 mathematics, practical thresholds and the proposal dates are unchanged. Replay is
 still the default and is excluded from prospective analysis.
 
 `freeze --protocol PROPOSAL --out ENROLLMENT` copies a reviewed future six-week
 protocol and locks the protocol, runner, evidence helper, candidate and package
-identities. An elapsed start is rejected and requires an explicitly reviewed new
+identities, Python patch version, numerical-library/backend/platform identity,
+two-thread numerical controls and dependency-lock digest. Runtime drift is refused;
+evaluate in the retained environment. An elapsed start is rejected and requires an explicitly reviewed new
 window; freezing creates no job.
 
 `record --input CAPSULE --out STORE --protocol ENROLLMENT/protocol.json
 --mode replay|prospective` computes fixed predictions from supplied files.
-Prospective records require contemporaneous v2 serving capsules, already-served
+Prospective records require contemporaneous v3 serving capsules, already-served
 interval-mean temperature, the frozen window and an original successful-push
 receipt. Capture never changes production semantics or method selection.
 Capsules are private immutable directories of regular files; manifest keys must
@@ -1097,17 +1102,35 @@ SHA-256 must match the captured production document; issuance, data, unique grid
 hoisted mean semantics, two-decimal Fahrenheit rounding and per-row temperature
 method/release/reason attribution are verified. Public schema remains 2.
 A missing original receipt cannot be reconstructed from a later branch tip.
-Malformed receipt objects and field types are refused with exit 2 and a concise
-`shadow refused` diagnostic.
+Malformed receipt objects, nested fields and input schemas are refused with exit 2
+and a field-specific `shadow refused` diagnostic. Operational I/O or coordination
+failures return 1 as `shadow runtime failure`; argument errors remain exit 2.
 
-The hourly wrapper transports the receipt privately and allows 300 seconds for
-validation/fitting. Failed publication never records a shadow. An unchanged
-publication may reuse only its verified original sealed receipt or record;
-conflicting partial state fails closed. Held records keep their original issuance
-and recording time. An older publisher remains usable for ordinary publishing;
-shadow-enabled publication succeeds normally but reports an unsupported-receipt
-API failure and creates no prospective evidence. Install compatible publisher
-and wrapper versions deliberately; merging does not deploy them.
+The wrapper writes each returned receipt exclusively to a synchronized private
+`receipts/ISSUANCE/SHA256.json` spool before starting the child; failures retain it.
+Finalization validates source/publication projections before writing capsule
+publication files. `evidence.lock.json` is published last after synchronizing the
+complete evidence. It binds declared input hashes, protocol, implementation and
+runtime, with `evidence_sealed_at`. A later record may recover only from a complete
+seal made within issuance +30 minutes and before outcomes. A transport receipt
+alone cannot authorize late recovery. `recorded_at` is the actual finalization
+time. Completed record directories include `record.lock.json`, binding the record
+to its seal. Conflicting artifacts are preserved and refused.
+
+Held pushes verify their new receipt against the original source/issuance,
+destination, grid and projection, then reuse verified original evidence without
+replacing it or refitting a completed record. Evaluation still reconstructs every
+prospective record. Unchanged publication needs verified original evidence; no
+branch tip can reconstruct a missing receipt. Incidental unmanifested regular
+files do not enter evidence digests; aliases and unsafe children remain refused.
+
+Outside the window, the wrapper skips shadow work and publishes normally. A
+capture-capability preflight failure selects ordinary prediction/publication,
+then reports shadow failure. Publisher 2.3+ is required for shadow receipts; older
+publishers remain usable for ordinary publishing. Child shadow failures map to
+wrapper exit 1 after publication. The child retains its diagnostic and has a
+300-second timeout. Install compatible source and wrappers deliberately;
+merging does not deploy them.
 
 After `window_end +98 hours`, review the QC hourly-mean truth, then seal it:
 
@@ -1119,7 +1142,7 @@ uv run --no-sync python scripts/temperature_shadow.py freeze-truth \
 The exclusive private directory contains the exact Parquet bytes and a lock with
 protocol/enrollment identity, target, SHA-256, coverage and sealing time. Labels
 must be numeric finite-or-null interval means at unique timezone-aware exact
-hours. Sealing records the operator-reviewed input; it does not independently
+hours, normalized to UTC microseconds; sub-hour nanosecond residues are refused. Sealing records the operator-reviewed input; it does not independently
 certify QC or prehash future observations at enrollment.
 
 `evaluate --input STORE --capsules CAPSULE_ROOT --truth-lock SEALED_TRUTH
@@ -1130,11 +1153,12 @@ and reconstructs each prediction record from the original inputs and recording
 clock before admitting any row. Attribution, grid and identity fields must match;
 floating predictions use `rtol=1e-10`, `atol=1e-10`. Duplicate issuances and
 inconsistent evidence fail before publishing output. An optional `--truth FILE`
-must byte-match the sealed copy. Replay evaluation retains raw `--truth` support.
+must byte-match the sealed copy. Replay evaluation retains raw `--truth` support and rejects `--capsules` or
+`--truth-lock`, rather than silently ignoring them.
 
 Scoring retains identical-case counts, pairwise attrition, daily losses and the
-predeclared calendar-block uncertainty. Exact truth, truth-lock and selected
-record hashes are recorded. Replay output never claims an unused truth-lock
+predeclared calendar-block uncertainty. Truth, truth-lock, protocol and selected record files are read into byte
+snapshots. Validation, scoring and audit hashes use those same snapshots. Replay output never claims an unused truth-lock
 digest. Results are staged privately and published only
 after validation and scoring succeed. A failed attempt leaves no accepted output;
 a crash can leave a `.NAME.publishing` lease requiring operator inspection before
@@ -1507,3 +1531,22 @@ establish retention age. Published-score suspension keeps its existing exit code
 score coordination release errors still return 1. Dashboard artifact warnings
 expose damaged verification inputs. Repair the named source and rerun a dry run;
 do not delete approval history to silence a warning.
+
+### Standalone daily-wrapper calendar freshness
+
+`daily-maintenance.py --scheduled-at HH:MM` defaults to `02:15` in the scheduler
+host's local calendar and does not change an installed job. Skip only when the
+last successful run started between the most recent slot and now. Late wake-up
+or manual starts cannot suppress the next day's slot. Ambiguous slots use their
+earlier occurrence; nonexistent slots advance to the first valid local minute.
+Future stamps do not suppress work. Successful stamps preserve symlinks and modes;
+failed, pending and restore runs leave them unchanged. Stage faults return 1 and
+name the logical stamp path; configuration/argument faults return 2.
+
+Authoritative command exits are integers 0–255; recognized negative subprocess
+signals become `128 + signal`. Invalid exits return 1 with
+`invalid_command_outcome`, retain original exit/classification in bounded damage
+evidence and never receive pipeline continuation exemptions. Annotation failures
+are isolated per extension field, with inherited primitive wire fields retained.
+Verification and cleanup share lineage grouping, not recovery policy; each has
+its own stat color and uncertainty boundary.
