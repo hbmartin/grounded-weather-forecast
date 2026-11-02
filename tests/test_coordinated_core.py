@@ -132,15 +132,17 @@ def test_extreme_timestamp_offsets_are_named_refusals(value):
         shadow_artifacts.timestamp(value)
 
 
-def test_invalid_exit_retains_valid_original_kind_without_misclassifying_it():
-    result = status.CommandOutcome.normalize(
-        status.CommandOutcome(256, "promotion_evidence_invalid")
-    )
+@pytest.mark.parametrize("kind", ["promotion_evidence_invalid", "long_kind" * 100])
+def test_invalid_exit_retains_valid_original_kind_without_misclassifying_it(kind):
+    result = status.CommandOutcome.normalize(status.CommandOutcome(256, kind))
     original = [
         d for d in result.diagnostics if "original_failure_kind" in (d.detail or "")
     ]
     assert len(original) == 1
     assert original[0].failure_kind == status.INVALID_COMMAND_OUTCOME
+    assert len(original[0].detail) <= 400
+    if len(kind) > 400:
+        assert original[0].detail.endswith("...")
 
 
 def test_grouped_reader_reuses_input_identity_assessments(monkeypatch):

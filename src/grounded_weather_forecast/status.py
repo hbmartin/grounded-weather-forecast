@@ -346,12 +346,18 @@ class CommandOutcome:
         if code is None or not 0 <= code <= 255:
             damage += (invalid_metadata("exit_code", outcome.exit_code),)
             if kind is not None:
+                from grounded_weather_forecast.runs import (  # noqa: PLC0415 -- invalid evidence only
+                    normalize_error_detail,
+                )
+
                 damage += (
                     ComponentDiagnostic(
                         "diagnostic_metadata",
                         0,
                         INVALID_COMMAND_OUTCOME,
-                        detail=f"original_failure_kind={kind!r}"[:400],
+                        detail=normalize_error_detail(
+                            f"original_failure_kind={kind!r}"
+                        ),
                     ),
                 )
             code, kind = 1, INVALID_COMMAND_OUTCOME
