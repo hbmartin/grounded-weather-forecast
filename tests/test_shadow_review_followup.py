@@ -469,6 +469,48 @@ def test_bad_subprocess_codes_still_fail_closed(code):
     assert result.invalid
 
 
+@pytest.mark.parametrize("hourly", [False, True])
+@pytest.mark.parametrize("returncode", [0, -int(signal.SIGTERM)])
+def test_wrappers_support_previous_outcome_api(
+    tmp_path, monkeypatch, hourly, returncode
+):
+    calls = []
+
+    class PreviousOutcome:
+        @staticmethod
+        def normalize(value):
+            calls.append(value)
+            # The base runtime interprets recognized subprocess signals here.
+            return SimpleNamespace(exit_code=128 - value if value < 0 else value)
+
+    assert not hasattr(PreviousOutcome, "from_subprocess")
+    monkeypatch.setattr(status, "CommandOutcome", PreviousOutcome)
+    module = load_script(
+        SCRIPT.with_name("hourly-predict-publish.py") if hourly else SCRIPT
+    )
+    paths = SimpleNamespace(
+        project=tmp_path,
+        config=tmp_path / "config.toml",
+        forecast=tmp_path / "forecast.json",
+        command=lambda _name: [sys.executable],
+    )
+    monkeypatch.setattr(
+        module.subprocess,
+        "run",
+        lambda command, **_kwargs: subprocess.CompletedProcess(command, returncode),
+    )
+    result = (
+        module.run_predict(paths) if hourly else module.run_stage(["report"], paths)
+    )
+    expected = (
+        (0 if returncode == 0 else 1)
+        if hourly
+        else (128 - returncode if returncode < 0 else returncode)
+    )
+    assert result == expected
+    assert calls == [returncode]
+
+
 @pytest.mark.parametrize("wrong_pool", [False, True])
 def test_thread_contract_refusal_in_an_isolated_runtime(tmp_path, wrong_pool):
     program = """

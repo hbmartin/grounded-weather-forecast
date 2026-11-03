@@ -97,7 +97,10 @@ def run_predict(paths: RuntimePaths, shadow_capture: Path | None = None) -> int:
             ],
             check=False,
         ).returncode
-        code = CommandOutcome.from_subprocess(code).exit_code
+        convert_subprocess = getattr(
+            CommandOutcome, "from_subprocess", CommandOutcome.normalize
+        )
+        code = convert_subprocess(code).exit_code
     except (SystemExit,) as exc:  # noqa: B013 -- project exception convention
         code = CommandOutcome.normalize(exc.code).exit_code
     except (Exception,) as exc:  # noqa: B013 -- prediction boundary

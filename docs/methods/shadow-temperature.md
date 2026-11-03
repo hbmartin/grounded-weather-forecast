@@ -59,8 +59,9 @@ fitting happens after the complete timely seal. Enrollment publishes its compute
 protocol/lock pair atomically. A per-invocation capsule snapshot reads and hashes
 each declared existing file once, reuses parsed inputs without changing source
 values, and is released before evaluating the next capsule.
-The named `preflight --protocol FILE` checks capture capability and complete v3
-enrollment in the selected runtime. The wrapper allows 30 seconds for preflight
+The named `preflight --protocol FILE` checks the window first. Inside the window
+it checks capture capability and complete v3 enrollment in the selected runtime;
+outside it returns `outside_window` without those checks. The wrapper allows 30 seconds for preflight
 and 300 seconds for finalization; capability/preflight failures preserve ordinary
 publication and report shadow failure. There is no persistent validation cache.
 

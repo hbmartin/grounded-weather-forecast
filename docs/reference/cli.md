@@ -1143,8 +1143,9 @@ merging does not deploy them.
 
 `preflight --protocol FILE` needs no `--out` and performs no writes. Exit 0 emits
 one JSON object with `status` equal to `ready` or `outside_window`; evidence or
-capability refusals exit 2, and operational failures exit 1. It checks capture
-capability and the v3 enrollment/implementation/runtime lock before capture.
+capability refusals exit 2, and operational failures exit 1. Inside the window,
+it checks capture capability and the v3 enrollment/implementation/runtime lock
+before capture. Outside the window it skips those checks and returns the skip status.
 The wrapper retains a cheap outside-window check for older checkouts, invokes
 this named command in the selected runtime with a 30-second timeout, and logs
 elapsed time. Preflight is repeated each hour without a persistent cache.
@@ -1419,6 +1420,11 @@ dependent stages even when a stage normally permits continuation. Valid exits wi
 invalid optional classifications retain the exit and record null classification
 plus damage; every pending/promotion exemption uses normalized values. Repeated
 normalization does not duplicate damage.
+
+Standalone wrappers remain compatible with the previous runtime: if
+`CommandOutcome.from_subprocess` is absent, child return codes use that runtime's
+existing `normalize` API. This fallback applies only to the child-result boundary
+and preserves ordinary publishing and maintenance without requiring a source update.
 
 Backtest outcome hints are optional transport. Ordinary validation, encoding and
 filesystem failures cannot prevent the recorder attempt or change the return

@@ -8,6 +8,9 @@ Review the maintenance freshness fix independently. Its success stamp measures
 the start of a successful run; each host-local daily slot (default 02:15)
 requires a successful start since that slot. Custom schedules use `--scheduled-at`. Preserve the previous stamp on failure, and retain restore semantics.
 Installing only that wrapper need not change the source implementation digest.
+Both wrappers retain the older outcome-normalization API when the selected
+interpreter lacks `CommandOutcome.from_subprocess`; ordinary operation does not
+require installing the new source just to obtain that helper.
 
 For source changes, choose and record an immutable reviewed release commit.
 Record current runtime import path, implementation/config/dataset identities,
