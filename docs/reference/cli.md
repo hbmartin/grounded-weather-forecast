@@ -1081,7 +1081,9 @@ protocol and locks the protocol, runner, evidence helper, candidate and package
 identities, Python patch version, numerical-library/backend/platform identity,
 two-thread numerical controls and dependency-lock digest. Runtime drift is refused;
 evaluate in the retained environment. An elapsed start is rejected and requires an explicitly reviewed new
-window; freezing creates no job.
+window; freezing creates no job. The implementation/runtime lock is computed
+before staging, and the synchronized protocol/lock pair is published atomically.
+A failed pre-publication attempt leaves no accepted enrollment directory.
 
 The OS family and architecture are part of that numerical identity; the kernel
 release is not, so an unrelated kernel security update alone does not invalidate
@@ -1106,14 +1108,17 @@ SHA-256 must match the captured production document; issuance, data, unique grid
 hoisted mean semantics, two-decimal Fahrenheit rounding and per-row temperature
 method/release/reason attribution are verified. Public schema remains 2.
 A missing original receipt cannot be reconstructed from a later branch tip.
-Malformed receipt objects, nested fields and input schemas are refused with exit 2
+Malformed receipt objects, nested fields, replay records and input schemas are refused with exit 2
 and a field-specific `shadow refused` diagnostic. Operational I/O or coordination
 failures return 1 as `shadow runtime failure`; argument errors remain exit 2.
 
 The wrapper writes each returned receipt exclusively to a synchronized private
 `receipts/ISSUANCE/SHA256.json` spool before starting the child; failures retain it.
-Finalization validates source/publication projections before writing capsule
-publication files. `evidence.lock.json` is published last after synchronizing the
+Finalization validates source/publication projections and all consumed matrix
+schemas, including forecast columns, before writing capsule publication files.
+Input schema refusals do not run a fit or poison a corrected retry. Unexpected
+computation failures remain failures rather than being relabeled as input damage.
+`evidence.lock.json` is published last after synchronizing the
 complete evidence. It binds declared input hashes, protocol, implementation and
 runtime, with `evidence_sealed_at`. A later record may recover only from a complete
 seal made within issuance +30 minutes and before outcomes. A transport receipt
@@ -1136,10 +1141,21 @@ wrapper exit 1 after publication. The child retains its diagnostic and has a
 300-second timeout. Install compatible source and wrappers deliberately;
 merging does not deploy them.
 
-Preflight also validates the v3 enrollment and implementation/runtime lock in the
-selected runtime before capture. Finalization uses an operating-system file lock;
-process exit releases ownership, so a leftover `.sealing` sidecar does not block
-recovery. Concurrent finalization still fails immediately as an operational error.
+`preflight --protocol FILE` needs no `--out` and performs no writes. Exit 0 emits
+one JSON object with `status` equal to `ready` or `outside_window`; evidence or
+capability refusals exit 2, and operational failures exit 1. It checks capture
+capability and the v3 enrollment/implementation/runtime lock before capture.
+The wrapper retains a cheap outside-window check for older checkouts, invokes
+this named command in the selected runtime with a 30-second timeout, and logs
+elapsed time. Preflight is repeated each hour without a persistent cache.
+
+Finalization reads capsule state after acquiring the `.sealing` OS-managed lock.
+Directory publication uses the same ownership policy through `.NAME.publishing`.
+Process exit releases both guards; leftover regular sidecars do not block retry.
+Concurrent ownership fails immediately as an operational error. Existing complete
+records must verify their manifests before reuse; conflicting artifacts remain
+preserved. Required post-rename synchronization failures report the complete
+output path for inspection, while ordinary staging cleanup cannot reverse success.
 
 After `window_end +98 hours`, review the QC hourly-mean truth, then seal it:
 
@@ -1164,14 +1180,21 @@ floating predictions use `rtol=1e-10`, `atol=1e-10`. Duplicate issuances and
 inconsistent evidence fail before publishing output. An optional `--truth FILE`
 must byte-match the sealed copy. Replay evaluation retains raw `--truth` support and rejects `--capsules` or
 `--truth-lock`, rather than silently ignoring them.
+Legacy replay records need no v3 manifest. Their raw truth still permits
+microsecond timestamps away from exact hours and nonfinite numeric labels, which
+remain unavailable to scoring; prospective reviewed-truth sealing stays stricter.
 
 Scoring retains identical-case counts, pairwise attrition, daily losses and the
 predeclared calendar-block uncertainty. Truth, truth-lock, protocol and selected record files are read into byte
-snapshots. Validation, scoring and audit hashes use those same snapshots. Replay output never claims an unused truth-lock
-digest. Results are staged privately and published only
-after validation and scoring succeed. A failed attempt leaves no accepted output;
-a crash can leave a `.NAME.publishing` lease requiring operator inspection before
-retry. There is no automatic promotion. These private same-user artifacts detect
+snapshots. Declared capsule files are also read and hashed once per invocation;
+one capsule snapshot is reused for validation and reconstruction, then released
+before the next capsule. Parsed source values are retained unchanged when deriving
+the public projection. New publication/seal bytes extend the current owner's
+snapshot. Validation, scoring and audit hashes use these same bytes. Replay output
+never claims an unused truth-lock digest. Results are staged privately and
+published only after validation and scoring succeed. Interrupted staging may
+leave an unused temporary directory, but its guard does not prevent recovery.
+There is no automatic promotion. These private same-user artifacts detect
 inconsistency; they are not authenticated against an operator rewriting every
 file. See the [rollout review](../shadow-rollout.md) before activation.
 
@@ -1384,8 +1407,10 @@ inputs with `ValueError`.
 
 `CommandOutcome.normalize` establishes trusted values before any pipeline policy,
 hint transport, or recorder projection. Real integer subclasses/enums are
-normalized, retaining signed signal-derived values. Booleans, floats, strings,
-and integers outside signed 64-bit ledger range become exit 1 with
+normalized. Internally returned exits must be integers 0–255. Negative child
+signals are converted only at an explicit subprocess boundary through
+`CommandOutcome.from_subprocess`; internal negatives, booleans, floats, strings
+and out-of-range integers become exit 1 with
 `invalid_command_outcome` and bounded original-value evidence. Such outcomes stop
 dependent stages even when a stage normally permits continuation. Valid exits with
 invalid optional classifications retain the exit and record null classification

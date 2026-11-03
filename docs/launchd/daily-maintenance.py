@@ -97,7 +97,7 @@ def stamp_success(stamp: Path, started_at: float) -> None:
         candidate = stage_text("", target)
         os.utime(candidate, (started_at, started_at))
         os.replace(candidate, target)  # noqa: PTH105 -- fault-injected atomic publication boundary
-    except OSError as error:
+    except (OSError,) as error:  # noqa: B013 -- project exception convention
         raise type(error)(
             f"cannot publish maintenance stamp {stamp}: {error}"
         ) from error
@@ -181,6 +181,8 @@ def synthetic_enabled(mode: str, directory: Path) -> bool:
 def run_stage(
     step: list[str], paths: RuntimePaths, *, env: dict[str, str] | None = None
 ) -> int:
+    from grounded_weather_forecast.status import CommandOutcome  # noqa: PLC0415
+
     started = time.monotonic()
     name = " ".join(step)
     print(f"{timestamp()} == {' '.join(step)} ==", flush=True)
@@ -198,11 +200,10 @@ def run_stage(
             check=False,
             env=env,
         ).returncode
-        if code < 0:
-            code = 128 - code
-    except SystemExit as exc:
-        code = exc.code if isinstance(exc.code, int) else 1
-    except Exception as exc:
+        code = CommandOutcome.from_subprocess(code).exit_code
+    except (SystemExit,) as exc:  # noqa: B013 -- project exception convention
+        code = CommandOutcome.normalize(exc.code).exit_code
+    except (Exception,) as exc:  # noqa: B013 -- stage boundary
         print(f"{name} crashed: {exc!r}", flush=True)
         code = 70
     print(
@@ -250,7 +251,7 @@ def maintain(
     *,
     restore: bool,
     paths: RuntimePaths,
-    scheduled_at: tuple[int, int] = (2, 15),
+    scheduled_at: tuple[int, int] = scheduled_time(DEFAULT_SCHEDULE),
 ) -> int:
     try:
         from grounded_weather_forecast.status import (  # noqa: PLC0415 -- guarded startup

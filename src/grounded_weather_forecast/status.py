@@ -329,6 +329,14 @@ class CommandOutcome:
         return self.failure_kind == INVALID_COMMAND_OUTCOME
 
     @classmethod
+    def from_subprocess(cls, returncode: int) -> "CommandOutcome":
+        """Interpret signals only at a real subprocess return-code boundary."""
+        code = actual_integer(returncode)
+        if code is not None and code < 0 and -code in signal.valid_signals():
+            return cls(128 - code)
+        return cls.normalize(returncode)
+
+    @classmethod
     def normalize(cls, value: "CommandOutcome | int") -> "CommandOutcome":
         outcome = (
             cast(CommandOutcome, value)
@@ -341,8 +349,6 @@ class CommandOutcome:
         detail = actual_string(outcome.error_detail)
         if outcome.failure_kind is not None and kind is None:
             damage += (invalid_metadata("failure_kind", outcome.failure_kind),)
-        if code is not None and code < 0 and -code in signal.valid_signals():
-            code = 128 - code
         if code is None or not 0 <= code <= 255:
             damage += (invalid_metadata("exit_code", outcome.exit_code),)
             if kind is not None:

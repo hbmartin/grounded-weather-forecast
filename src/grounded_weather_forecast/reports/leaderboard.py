@@ -904,11 +904,12 @@ def _annotate_winner(
     decision_gate = gate
     best_id = str(best["method_id"])
     minimum_ineligible = not (eligible["method_id"] == best_id).any()
-    if not infer_gate:
-        pass
-    elif gate is None and str(candidate["method_id"]) == best_id:
-        gate = None
-    elif gate is None and minimum_ineligible:
+    if (
+        infer_gate
+        and gate is None
+        and str(candidate["method_id"]) != best_id
+        and minimum_ineligible
+    ):
         # The board minimum never even reached the statistical gates.
         gate = ELIGIBILITY
     best_mae = best["mae"] if isinstance(best["mae"], (int, float)) else None
