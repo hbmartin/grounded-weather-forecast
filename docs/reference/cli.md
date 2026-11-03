@@ -1148,6 +1148,9 @@ capability and the v3 enrollment/implementation/runtime lock before capture.
 The wrapper retains a cheap outside-window check for older checkouts, invokes
 this named command in the selected runtime with a 30-second timeout, and logs
 elapsed time. Preflight is repeated each hour without a persistent cache.
+Elapsed time is logged on timeout and process-start failures too. Nonzero child
+exits retain their distinction in the wrapper diagnostic: exit 2 is unavailable
+or refused capture/enrollment; exit 1 and other abnormal exits are runtime failures.
 
 Finalization reads capsule state after acquiring the `.sealing` OS-managed lock.
 Directory publication uses the same ownership policy through `.NAME.publishing`.

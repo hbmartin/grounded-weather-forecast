@@ -485,7 +485,7 @@ else:
     os.environ['OMP_NUM_THREADS'] = '1'
 try:
     runtime_identity(Path(sys.argv[2]))
-except EvidenceError as error:
+except (EvidenceError,) as error:
     print(error)
     raise SystemExit(2)
 raise SystemExit(3)
@@ -504,9 +504,12 @@ raise SystemExit(3)
     assert all(os.environ[name] == "2" for name in THREAD_CONTROLS)
 
 
-@pytest.mark.parametrize("response", ["ready", "outside_window", "invalid", "timeout"])
+@pytest.mark.parametrize(
+    "response",
+    ["ready", "outside_window", "invalid", "timeout", "refusal", "runtime", "spawn"],
+)
 def test_wrapper_named_preflight_status_and_failure_isolation(
-    tmp_path, monkeypatch, response
+    tmp_path, monkeypatch, capsys, response
 ):
     wrapper = load_script(SCRIPT.with_name("hourly-predict-publish.py"))
     now = datetime.now(UTC)
@@ -527,11 +530,24 @@ def test_wrapper_named_preflight_status_and_failure_isolation(
         assert kwargs["timeout"] == 30
         if response == "timeout":
             raise subprocess.TimeoutExpired(command, 30)
+        if response == "spawn":
+            raise OSError("selected runtime could not start")
+        if response in {"refusal", "runtime"}:
+            return subprocess.CompletedProcess(
+                command,
+                2 if response == "refusal" else 1,
+                "",
+                "specific child diagnostic",
+            )
         return subprocess.CompletedProcess(
             command, 0, json.dumps({"status": response}), ""
         )
 
     monkeypatch.setattr(wrapper.subprocess, "run", run)
+    clocks = iter((10.0, 40.0))
+    monkeypatch.setattr(
+        wrapper, "time", SimpleNamespace(monotonic=lambda: next(clocks))
+    )
     enabled, error = wrapper.shadow_preflight(paths, protocol)
     assert commands[0][1:] == [
         str(tmp_path / "scripts/temperature_shadow.py"),
@@ -541,6 +557,13 @@ def test_wrapper_named_preflight_status_and_failure_isolation(
     ]
     assert enabled == (response == "ready")
     assert (error is None) == (response in {"ready", "outside_window"})
+    assert "shadow preflight duration_s=30.000" in capsys.readouterr().out
+    if response == "refusal":
+        assert error.startswith("shadow unavailable:")
+        assert error.endswith("specific child diagnostic")
+    elif response == "runtime":
+        assert error.startswith("shadow preflight runtime failure:")
+        assert error.endswith("specific child diagnostic")
 
 
 def test_preflight_cli_has_no_output_requirement_or_writes(shadow, tmp_path):

@@ -394,28 +394,35 @@ def shadow_preflight(paths: RuntimePaths, protocol: Path) -> tuple[bool, str | N
             print("shadow skipped: outside enrollment window", flush=True)
             return False, None
         started = time.monotonic()
-        check = subprocess.run(  # noqa: S603 -- selected local runtime, no providers
-            [
-                *paths.command("python"),
-                str(paths.project / "scripts/temperature_shadow.py"),
-                "preflight",
-                "--protocol",
-                str(protocol),
-            ],
-            capture_output=True,
-            text=True,
-            check=False,
-            timeout=30,
-        )
-        print(
-            f"shadow preflight duration_s={time.monotonic() - started:.3f}", flush=True
-        )
+        try:
+            check = subprocess.run(  # noqa: S603 -- selected local runtime, no providers
+                [
+                    *paths.command("python"),
+                    str(paths.project / "scripts/temperature_shadow.py"),
+                    "preflight",
+                    "--protocol",
+                    str(protocol),
+                ],
+                capture_output=True,
+                text=True,
+                check=False,
+                timeout=30,
+            )
+        finally:
+            print(
+                f"shadow preflight duration_s={time.monotonic() - started:.3f}",
+                flush=True,
+            )
         if check.returncode:
             detail = (getattr(check, "stderr", "") or "").strip().splitlines()
+            classification = (
+                "shadow unavailable: selected prediction runtime lacks compatible v3 capture/enrollment"
+                if check.returncode == 2
+                else f"shadow preflight runtime failure: selected runtime exited {check.returncode}"
+            )
             return (
                 False,
-                "shadow unavailable: selected prediction runtime lacks compatible v3 capture/enrollment"
-                + (f": {detail[-1][:400]}" if detail else ""),
+                classification + (f": {detail[-1][:400]}" if detail else ""),
             )
         result = json.loads(check.stdout)
         if not isinstance(result, dict) or result.get("status") not in {
