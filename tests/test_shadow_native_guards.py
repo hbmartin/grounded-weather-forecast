@@ -23,8 +23,6 @@ from test_temperature_shadow import make_capsule, make_prospective_record
 
 from grounded_weather_forecast.shadow_artifacts import EvidenceError
 
-pytest_plugins = ["test_temperature_shadow"]
-
 
 def window_protocol(path):
     now = datetime.now(UTC)
@@ -424,7 +422,6 @@ def test_snapshot_equality_is_identity_and_mode_is_explicit(shadow, frames, tmp_
     right = shadow.CapsuleSnapshot.load(capsule, prospective=False)
     left.parquet("training.parquet")
     right.parquet("training.parquet")
-    assert left == left
     assert left != right
     with pytest.raises(TypeError, match="prospective"):
         shadow.CapsuleSnapshot.load(capsule)

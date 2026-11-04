@@ -197,8 +197,9 @@ def test_protocol_edit_requires_new_enrollment(shadow, frames, tmp_path):
 
 def test_history_candidate_is_not_publication_evidence(shadow, frames, tmp_path):
     capsule, _ = make_capsule(shadow, frames, tmp_path)
+    snapshot = captured_snapshot(shadow, capsule, {})
     with pytest.raises(ValueError, match="committed payload"):
-        shadow.production_rows(captured_snapshot(shadow, capsule, {}))
+        shadow.production_rows(snapshot)
 
 
 @pytest.mark.parametrize("temperature", [15.0, 15.123, 15.00277])
@@ -254,8 +255,9 @@ def test_committed_payload_validation_uses_public_rounded_temperature(
     published["hourly"][0]["values"]["temp_f"] = 100.0
     (capsule / "published.json").write_text(json.dumps(published))
     bind_public(shadow, capsule, published, receipt)
+    snapshot = captured_snapshot(shadow, capsule, meta)
     with pytest.raises(ValueError, match="temperature differs"):
-        shadow.production_rows(captured_snapshot(shadow, capsule, meta))
+        shadow.production_rows(snapshot)
 
 
 def test_replay_never_enters_prospective_analysis(shadow, frames, tmp_path):

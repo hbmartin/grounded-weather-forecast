@@ -28,8 +28,6 @@ from test_temperature_shadow import (
 from grounded_weather_forecast import cli, status
 from grounded_weather_forecast.shadow_artifacts import THREAD_CONTROLS, EvidenceError
 
-pytest_plugins = ["test_temperature_shadow"]
-
 
 @pytest.fixture
 def mature_record(shadow, frames, tmp_path, monkeypatch):

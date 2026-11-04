@@ -19,7 +19,7 @@ from pathlib import Path
 from typing import Any, cast
 
 import polars as pl
-from filelock import FileLock, Timeout
+from filelock import BaseFileLock, FileLock, Timeout
 
 from grounded_weather_forecast.shadow_artifacts import (
     ARTIFACT_VERSION,
@@ -55,6 +55,25 @@ INPUT_FILES = frozenset(
 )
 
 
+def manifest_hashes(
+    meta: dict[str, Any], children: set[str], *, prospective: bool
+) -> dict[str, Any]:
+    if prospective and not current_artifact(meta.get("artifact_version")):
+        raise EvidenceError("prospective capsules require a fresh v3 enrollment")
+    hashes = object_value(meta.get("input_sha256", {}), "capsule.input_sha256")
+    if prospective and not hashes.keys() >= INPUT_FILES:
+        raise EvidenceError("prospective requires the complete captured input manifest")
+    for name, expected in hashes.items():
+        if not name or name in {".", ".."} or any(c in name for c in "/\\:"):
+            raise EvidenceError(f"invalid capsule filename: {name!r}")
+        if name not in children:
+            raise EvidenceError(
+                f"invalid capsule filename: {name!r} is not a regular file"
+            )
+        hex_identity(expected, f"capsule.input_sha256.{name}", 64)
+    return hashes
+
+
 @dataclass(eq=False)
 class CapsuleSnapshot:
     """One invocation's bytes; parsed projections never mutate these inputs."""
@@ -78,21 +97,7 @@ class CapsuleSnapshot:
         raw = (capsule / "capsule.json").read_bytes()
         meta = json_object(raw, "capsule manifest")
         timestamp(required_string(meta.get("input_as_of"), "capsule.input_as_of"))
-        if prospective and not current_artifact(meta.get("artifact_version")):
-            raise EvidenceError("prospective capsules require a fresh v3 enrollment")
-        hashes = object_value(meta.get("input_sha256", {}), "capsule.input_sha256")
-        if prospective and not hashes.keys() >= INPUT_FILES:
-            raise EvidenceError(
-                "prospective requires the complete captured input manifest"
-            )
-        for name, expected in hashes.items():
-            if not name or name in {".", ".."} or any(c in name for c in "/\\:"):
-                raise EvidenceError(f"invalid capsule filename: {name!r}")
-            if name not in child_names:
-                raise EvidenceError(
-                    f"invalid capsule filename: {name!r} is not a regular file"
-                )
-            hex_identity(expected, f"capsule.input_sha256.{name}", 64)
+        hashes = manifest_hashes(meta, child_names, prospective=prospective)
         optional = INPUT_FILES | {
             "publication.json",
             "published.json",
@@ -403,23 +408,34 @@ def native_guard(
     try:
         yield
     except (BaseException,) as error:  # noqa: B013 -- retain cancellation and primary failure
-        try:
-            lock.release()
-        except (Exception,) as secondary:  # noqa: B013 -- secondary failure is evidence
-            error.add_note(f"{label} guard release failed at {lease}: {secondary}")
+        release_guard(lock, lease, label, primary=error)
         raise
     else:
-        try:
-            lock.release()
-        except (Exception,) as error:  # noqa: B013 -- coordination boundary
-            preserved = (
-                f"; complete output preserved at {output}"
-                if output is not None and output.exists()
-                else ""
-            )
-            raise OSError(
-                f"{label} guard release failed at {lease}{preserved}: {error}"
-            ) from error
+        release_guard(lock, lease, label, output=output)
+
+
+def release_guard(
+    lock: BaseFileLock,
+    lease: Path,
+    label: str,
+    *,
+    primary: BaseException | None = None,
+    output: Path | None = None,
+) -> None:
+    try:
+        lock.release()
+    except (Exception,) as error:  # noqa: B013 -- coordination boundary
+        if primary is not None:
+            primary.add_note(f"{label} guard release failed at {lease}: {error}")
+            return
+        preserved = (
+            f"; complete output preserved at {output}"
+            if output is not None and output.exists()
+            else ""
+        )
+        raise OSError(
+            f"{label} guard release failed at {lease}{preserved}: {error}"
+        ) from error
 
 
 @contextmanager

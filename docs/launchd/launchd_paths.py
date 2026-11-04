@@ -26,7 +26,8 @@ def run_shadow_child(
     command: Sequence[str], *, timeout: float, capture_output: bool = False
 ) -> subprocess.CompletedProcess[str]:
     """Own the POSIX uv/Python process group so timeouts cannot orphan a runner."""
-    process = subprocess.Popen(  # noqa: S603 -- reviewed shadow argv, no shell
+    # Reviewed shadow argv; shell parsing is never enabled.
+    process = subprocess.Popen(  # noqa: S603
         command,
         stdout=subprocess.PIPE if capture_output else None,
         stderr=subprocess.PIPE if capture_output else None,

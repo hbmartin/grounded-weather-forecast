@@ -383,6 +383,41 @@ def _shadow_child(
     return 1 if result.returncode else 0
 
 
+def preflight_result(
+    check: subprocess.CompletedProcess[str],
+) -> tuple[bool, str | None]:
+    """Interpret runner envelopes separately from launching and window checks."""
+    try:
+        result = json.loads(check.stdout)
+    except (ValueError, TypeError):
+        result = None
+    if check.returncode:
+        detail = (getattr(check, "stderr", "") or "").strip().splitlines()
+        tagged = (
+            isinstance(result, dict)
+            and result.get("kind") == "temperature_shadow_preflight"
+            and type(result.get("schema_version")) is int
+            and result.get("schema_version") == 1
+            and isinstance(result.get("detail"), str)
+            and bool(result["detail"].strip())
+        )
+        classification = (
+            "shadow unavailable: " + result["detail"][:400]
+            if tagged and check.returncode == 2 and result.get("status") == "refused"
+            else f"shadow preflight runtime failure: selected runtime exited {check.returncode}"
+        )
+        return False, classification + (f": {detail[-1][:400]}" if detail else "")
+    if not isinstance(result, dict) or result.get("status") not in {
+        "ready",
+        "outside_window",
+    }:
+        raise ValueError("selected runtime returned an invalid preflight status")
+    if result["status"] == "outside_window":
+        print("shadow skipped: outside enrollment window", flush=True)
+        return False, None
+    return True, None
+
+
 def shadow_preflight(paths: RuntimePaths, protocol: Path) -> tuple[bool, str | None]:
     """Shadow-specific faults cannot prevent ordinary production publication."""
     try:
@@ -414,39 +449,7 @@ def shadow_preflight(paths: RuntimePaths, protocol: Path) -> tuple[bool, str | N
                 f"shadow preflight duration_s={time.monotonic() - started:.3f}",
                 flush=True,
             )
-        try:
-            result = json.loads(check.stdout)
-        except (ValueError, TypeError):
-            result = None
-        if check.returncode:
-            detail = (getattr(check, "stderr", "") or "").strip().splitlines()
-            tagged = (
-                isinstance(result, dict)
-                and result.get("kind") == "temperature_shadow_preflight"
-                and type(result.get("schema_version")) is int
-                and result.get("schema_version") == 1
-                and isinstance(result.get("detail"), str)
-                and bool(result["detail"].strip())
-            )
-            classification = (
-                "shadow unavailable: " + result["detail"][:400]
-                if tagged
-                and check.returncode == 2
-                and result.get("status") == "refused"
-                else f"shadow preflight runtime failure: selected runtime exited {check.returncode}"
-            )
-            return (
-                False,
-                classification + (f": {detail[-1][:400]}" if detail else ""),
-            )
-        if not isinstance(result, dict) or result.get("status") not in {
-            "ready",
-            "outside_window",
-        }:
-            raise ValueError("selected runtime returned an invalid preflight status")
-        if result["status"] == "outside_window":
-            print("shadow skipped: outside enrollment window", flush=True)
-            return False, None
+        return preflight_result(check)
     except (
         OSError,
         ValueError,
@@ -459,7 +462,6 @@ def shadow_preflight(paths: RuntimePaths, protocol: Path) -> tuple[bool, str | N
         return False, f"shadow preflight failed: {error}" + (
             f"; {notes}" if notes else ""
         )
-    return True, None
 
 
 def main(argv: Sequence[str] | None = None) -> int:

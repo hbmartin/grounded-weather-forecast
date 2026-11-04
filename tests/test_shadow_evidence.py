@@ -13,8 +13,6 @@ import pytest
 from filelock import FileLock
 from test_temperature_shadow import make_capsule, make_prospective_record
 
-pytest_plugins = ["test_temperature_shadow"]
-
 
 @pytest.fixture
 def publication_fixture():

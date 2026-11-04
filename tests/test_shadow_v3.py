@@ -22,8 +22,6 @@ from test_temperature_shadow import make_prospective_record, publisher_receipt
 
 from grounded_weather_forecast.shadow_artifacts import json_value
 
-pytest_plugins = ["test_temperature_shadow"]
-
 
 @pytest.fixture
 def mature_record(shadow, frames, tmp_path, monkeypatch):
@@ -468,5 +466,6 @@ def test_sealed_commit_type_is_refused(shadow, mature_record, value):
     receipt = json.loads((capsule / "publication.json").read_text())
     receipt["commit"] = value
     (capsule / "publication.json").write_text(json.dumps(receipt))
+    snapshot = shadow.CapsuleSnapshot.load(capsule, prospective=True)
     with pytest.raises(ValueError, match="commit identity"):
-        shadow.production_rows(shadow.CapsuleSnapshot.load(capsule, prospective=True))
+        shadow.production_rows(snapshot)

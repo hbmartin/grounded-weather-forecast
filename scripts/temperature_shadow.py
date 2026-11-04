@@ -476,7 +476,6 @@ def finalize(
             snapshot, prepared = seal_publication(
                 snapshot, publication_receipt, enrolled
             )
-            meta = snapshot.metadata()
         elif "publication" not in meta:
             raise EvidenceError(
                 "missing original successful-push receipt; cannot reconstruct from a branch"
