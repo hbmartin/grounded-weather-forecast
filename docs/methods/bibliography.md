@@ -165,6 +165,13 @@ validated rollback snapshots and refuses WAL/journal dependencies. It does not u
 immutable live reads or write sidecars/private disk snapshots. See
 [daily reporting](daily-report.md) for evidence compatibility and isolation policy.
 
+The shadow evidence helpers implement operational consistency policies: atomic
+enrollment publication, process-owned publication guards, schema validation before
+sealing, and reuse of declared byte snapshots in validation and reconstruction.
+`status.py::CommandOutcome.from_subprocess` interprets negative child signals;
+generic internal outcome normalization rejects negative exits. These changes add
+no statistical method or empirical skill claim.
+
 The [inactive temperature shadow](shadow-temperature.md) includes a self-contained
 fixed experiment definition, implemented in `scripts/shadow_candidate_v1.py` and
 `scripts/temperature_shadow.py`. Its calendar half-life, shrinkage, optimization

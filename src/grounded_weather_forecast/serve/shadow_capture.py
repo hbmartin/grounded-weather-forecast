@@ -19,6 +19,7 @@ from grounded_weather_forecast.shadow_artifacts import (
     ARTIFACT_VERSION,
     issuance_name,
     sync_directory,
+    sync_files,
 )
 
 
@@ -100,10 +101,7 @@ def capture_issue(
         (folder / "capsule.json").write_text(
             json.dumps(manifest, indent=2), encoding="utf-8"
         )
-        for path in folder.iterdir():
-            with path.open("rb") as handle:
-                __import__("os").fsync(handle.fileno())
-        sync_directory(folder)
+        sync_files(folder, folder.iterdir())
         # The forecast pipeline serializes capture; reject existing issues and
         # never replace a non-empty capsule directory.
         folder.rename(target)

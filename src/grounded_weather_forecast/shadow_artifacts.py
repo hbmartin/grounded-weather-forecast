@@ -6,9 +6,10 @@ import math
 import os
 import platform
 import re
+import stat
 import sys
 import tempfile
-from collections.abc import Mapping
+from collections.abc import Iterable, Mapping
 from contextlib import suppress
 from datetime import UTC, datetime
 from importlib.metadata import version
@@ -114,7 +115,7 @@ def finite_number(value: object) -> bool:
         return False
     try:
         return math.isfinite(value)
-    except OverflowError:
+    except (OverflowError,):  # noqa: B013 -- project exception convention
         return False
 
 
@@ -182,6 +183,22 @@ def sync_directory(path: Path) -> None:
         os.fsync(descriptor)
     finally:
         os.close(descriptor)
+
+
+def regular(path: Path) -> None:
+    if path.is_symlink() or path.is_junction():
+        raise EvidenceError(f"{path}: evidence must be a regular local file")
+    if not stat.S_ISREG(path.stat().st_mode):
+        raise EvidenceError(f"{path}: evidence must be a regular local file")
+
+
+def sync_files(directory: Path, paths: Iterable[Path]) -> None:
+    """Synchronize explicitly selected regular files before their directory."""
+    for path in paths:
+        regular(path)
+        with path.open("rb") as handle:
+            os.fsync(handle.fileno())
+    sync_directory(directory)
 
 
 def private_directory(path: Path) -> None:

@@ -6,18 +6,20 @@ import base64
 import hashlib
 import json
 import math
-import os
 import shutil
-import stat
 import tempfile
 from collections.abc import Iterator
 from contextlib import contextmanager, suppress
+from copy import deepcopy
+from dataclasses import dataclass
+from dataclasses import field as dataclass_field
 from datetime import datetime, timedelta
 from io import BytesIO
 from pathlib import Path
 from typing import Any, cast
 
 import polars as pl
+from filelock import FileLock, Timeout
 
 from grounded_weather_forecast.shadow_artifacts import (
     ARTIFACT_VERSION,
@@ -32,11 +34,134 @@ from grounded_weather_forecast.shadow_artifacts import (
     issuance_name,
     json_object,
     object_value,
+    regular,
     required_string,
     sha256,
     sync_directory,
+    sync_files,
     timestamp,
 )
+
+INPUT_FILES = frozenset(
+    {
+        "issue.parquet",
+        "training.parquet",
+        "truth_hourly.parquet",
+        "production.json",
+        "provider_completions.parquet",
+    }
+)
+
+
+@dataclass
+class CapsuleSnapshot:
+    """One invocation's bytes; parsed projections never mutate these inputs."""
+
+    capsule: Path
+    files: dict[str, bytes]
+    hashes: dict[str, str]
+    objects: dict[str, dict[str, Any]] = dataclass_field(default_factory=dict)
+    frames: dict[str, pl.DataFrame] = dataclass_field(default_factory=dict)
+
+    @classmethod
+    def load(cls, capsule: Path, *, prospective: bool = False) -> CapsuleSnapshot:
+        children = tuple(capsule.iterdir())
+        if any(path.is_symlink() or path.is_junction() for path in children):
+            raise EvidenceError("capsule symlink is not a self-contained input")
+        if any(not path.is_file() for path in children):
+            raise EvidenceError("capsule child must be a regular file")
+        child_names = {path.name for path in children}
+        raw = (capsule / "capsule.json").read_bytes()
+        meta = json_object(raw, "capsule manifest")
+        timestamp(required_string(meta.get("input_as_of"), "capsule.input_as_of"))
+        if prospective and not current_artifact(meta.get("artifact_version")):
+            raise EvidenceError("prospective capsules require a fresh v3 enrollment")
+        hashes = object_value(meta.get("input_sha256", {}), "capsule.input_sha256")
+        if prospective and not hashes.keys() >= INPUT_FILES:
+            raise EvidenceError(
+                "prospective requires the complete captured input manifest"
+            )
+        for name, expected in hashes.items():
+            if not name or name in {".", ".."} or any(c in name for c in "/\\:"):
+                raise EvidenceError(f"invalid capsule filename: {name!r}")
+            if name not in child_names:
+                raise EvidenceError(
+                    f"invalid capsule filename: {name!r} is not a regular file"
+                )
+            hex_identity(expected, f"capsule.input_sha256.{name}", 64)
+        optional = INPUT_FILES | {
+            "publication.json",
+            "published.json",
+            "evidence.lock.json",
+        }
+        names = set(hashes) | {name for name in optional if (capsule / name).is_file()}
+        files = {"capsule.json": raw}
+        for name in sorted(names - files.keys()):
+            path = capsule / name
+            if not path.is_file():
+                raise EvidenceError(
+                    f"invalid capsule filename: {name!r} is not a regular file"
+                )
+            regular(path)
+            files[name] = path.read_bytes()
+        snapshot = cls(
+            capsule, files, {name: sha256(data) for name, data in files.items()}
+        )
+        snapshot.objects["capsule.json"] = meta
+        for name, expected in hashes.items():
+            if snapshot.hashes[name] != expected:
+                raise EvidenceError(f"captured input changed: {name}")
+        return snapshot
+
+    def read(self, name: str) -> bytes:
+        if name not in self.files:
+            raise EvidenceError(f"{self.capsule / name}: missing captured evidence")
+        return self.files[name]
+
+    def document(self, name: str, label: str) -> dict[str, Any]:
+        if name not in self.objects:
+            self.objects[name] = json_object(self.read(name), label)
+        return deepcopy(self.objects[name])
+
+    def parquet(self, name: str) -> pl.DataFrame:
+        if name not in self.frames:
+            try:
+                self.frames[name] = pl.read_parquet(BytesIO(self.read(name)))
+            except (pl.exceptions.PolarsError,) as error:  # noqa: B013 -- input boundary
+                raise EvidenceError(f"{name}: invalid Parquet input") from error
+        return self.frames[name].clone()
+
+    def metadata(self) -> dict[str, Any]:
+        meta = self.document("capsule.json", "capsule manifest")
+        if "publication.json" in self.files:
+            meta["publication"] = self.document(
+                "publication.json", "sealed publication receipt"
+            )
+        return meta
+
+    def digests(self, *, sealed: bool = True) -> dict[str, str]:
+        return {
+            name: self.hashes[name]
+            for name in sorted(self.hashes)
+            if sealed or name != "evidence.lock.json"
+        }
+
+    def with_files(
+        self, files: dict[str, bytes], *, known_hashes: dict[str, str] | None = None
+    ) -> CapsuleSnapshot:
+        """Extend a view with this owner's bytes and already validated digests."""
+        known_hashes = known_hashes or {}
+        return CapsuleSnapshot(
+            self.capsule,
+            self.files | files,
+            self.hashes
+            | {
+                name: known_hashes[name] if name in known_hashes else sha256(raw)
+                for name, raw in files.items()
+            },
+            {name: value for name, value in self.objects.items() if name not in files},
+            {name: value for name, value in self.frames.items() if name not in files},
+        )
 
 
 def protocol_rules(protocol: dict[str, Any], *, complete: bool = True) -> None:
@@ -95,13 +220,6 @@ def protocol_document(payload: bytes) -> dict[str, Any]:
     return protocol
 
 
-def regular(path: Path) -> None:
-    if path.is_symlink() or path.is_junction():
-        raise EvidenceError(f"{path}: evidence must be a regular local file")
-    if not stat.S_ISREG(path.stat().st_mode):
-        raise EvidenceError(f"{path}: evidence must be a regular local file")
-
-
 def capsule_for(root: Path, origin: datetime) -> Path:
     path = root / issuance_name(origin)
     if (
@@ -114,7 +232,9 @@ def capsule_for(root: Path, origin: datetime) -> Path:
     return path
 
 
-def publication(value: object) -> tuple[bytes, dict[str, Any]]:
+def publication(
+    value: object, *, payload_snapshot: tuple[bytes, str] | None = None
+) -> tuple[bytes, dict[str, Any]]:
     receipt = object_value(value, "publisher receipt")
     if (
         type(receipt.get("schema_version")) is not int
@@ -143,11 +263,18 @@ def publication(value: object) -> tuple[bytes, dict[str, Any]]:
         hex_identity(receipt[key], f"publisher receipt.{key}", 64)
     try:
         payload = base64.b64decode(receipt["forecast_base64"], validate=True)
-    except ValueError as error:
+    except (ValueError,) as error:  # noqa: B013 -- project exception convention
         raise EvidenceError("invalid publisher receipt payload") from error
     document = json_object(payload, "publisher receipt payload")
+    if payload_snapshot is not None and payload != payload_snapshot[0]:
+        raise EvidenceError("publisher receipt payload mismatch")
+    payload_digest = (
+        payload_snapshot[1]
+        if payload_snapshot is not None
+        else hashlib.sha256(payload).hexdigest()
+    )
     if (
-        hashlib.sha256(payload).hexdigest() != receipt.get("forecast_sha256")
+        payload_digest != receipt.get("forecast_sha256")
         or document.get("issued_at") != receipt.get("issued_at")
         or document.get("published_at") != receipt.get("published_at")
         or document.get("publisher_version") != receipt.get("publisher_version")
@@ -192,7 +319,7 @@ def mature(protocol: dict[str, Any], now: datetime) -> None:
         )
 
 
-def truth_frame(path: Path | bytes) -> pl.DataFrame:
+def truth_frame(path: Path | bytes, *, prospective: bool = True) -> pl.DataFrame:
     if isinstance(path, Path):
         regular(path)
         payload = path.read_bytes()
@@ -200,7 +327,7 @@ def truth_frame(path: Path | bytes) -> pl.DataFrame:
         payload = path
     try:
         frame = pl.read_parquet(BytesIO(payload))
-    except pl.exceptions.PolarsError as error:
+    except (pl.exceptions.PolarsError,) as error:  # noqa: B013 -- input boundary
         raise EvidenceError("truth: invalid Parquet input") from error
     if not {"valid_hour", TARGET} <= set(frame.columns):
         raise EvidenceError("truth requires QC interval-mean temperature labels")
@@ -209,8 +336,18 @@ def truth_frame(path: Path | bytes) -> pl.DataFrame:
         raise EvidenceError("truth hours must include timezone")
     # Check nanosecond residues before casting so sub-hour evidence cannot round
     # into a valid hour during normalization.
-    if frame.filter(pl.col("valid_hour").dt.epoch("ns") % (3600 * 10**9) != 0).height:
+    if (
+        prospective
+        and frame.filter(
+            pl.col("valid_hour").dt.epoch("ns") % (3600 * 10**9) != 0
+        ).height
+    ):
         raise EvidenceError("truth must contain unique nonempty exact hours")
+    if (
+        not prospective
+        and frame.filter(pl.col("valid_hour").dt.epoch("ns") % 1000 != 0).height
+    ):
+        raise EvidenceError("replay truth: expected microsecond-precision timestamps")
     frame = frame.with_columns(
         pl.col("valid_hour").dt.convert_time_zone("UTC").cast(pl.Datetime("us", "UTC"))
     )
@@ -219,12 +356,12 @@ def truth_frame(path: Path | bytes) -> pl.DataFrame:
         not len(times)
         or times.null_count()
         or times.n_unique() != len(times)
-        or any(t.minute or t.second or t.microsecond for t in times)
+        or (prospective and any(t.minute or t.second or t.microsecond for t in times))
     ):
         raise EvidenceError("truth must contain unique nonempty exact hours")
-    if (
-        not frame.schema[TARGET].is_numeric()
-        or frame.filter(pl.col(TARGET).is_infinite() | pl.col(TARGET).is_nan()).height
+    if not frame.schema[TARGET].is_numeric() or (
+        prospective
+        and frame.filter(pl.col(TARGET).is_infinite() | pl.col(TARGET).is_nan()).height
     ):
         raise EvidenceError("truth must contain numeric finite-or-null QC labels")
     return frame
@@ -232,34 +369,42 @@ def truth_frame(path: Path | bytes) -> pl.DataFrame:
 
 @contextmanager
 def staged_directory(output: Path) -> Iterator[Path]:
-    """Reserve a sibling lease; publish a complete directory only after success."""
+    """Hold an OS-managed guard; publish a complete directory after success."""
     output.parent.mkdir(parents=True, exist_ok=True)
     lease = output.with_name(f".{output.name}.publishing")
-    fd = os.open(lease, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+    if lease.exists() or lease.is_symlink():
+        regular(lease)
+    lock = FileLock(lease, timeout=0)
+    try:
+        lock.acquire()
+    except (Timeout,) as error:  # noqa: B013 -- coordination is operational
+        raise OSError(f"output publication is already running: {output}") from error
     temporary = None
     try:
-        os.close(fd)
         if output.exists() or output.is_symlink():
             raise FileExistsError(output)
         temporary = Path(tempfile.mkdtemp(prefix="shadow-stage-", dir=output.parent))
         folder = temporary / "complete"
         folder.mkdir(mode=0o700)
         yield folder
-        for path in folder.iterdir():
-            regular(path)
-            with path.open("rb") as handle:
-                os.fsync(handle.fileno())
-        sync_directory(folder)
+        sync_files(folder, folder.iterdir())
         if output.exists() or output.is_symlink():
             raise FileExistsError(output)
         folder.rename(output)
-        sync_directory(output.parent)
+        try:
+            sync_directory(output.parent)
+        except (OSError,) as error:  # noqa: B013 -- preserve published evidence
+            raise OSError(
+                f"complete output preserved at {output}; directory synchronization failed: {error}"
+            ) from error
     finally:
-        # Cleanup cannot turn a published complete result into a reported failure.
-        with suppress(OSError):
-            lease.unlink(missing_ok=True)
-        if temporary is not None:
-            shutil.rmtree(temporary, ignore_errors=True)
+        try:
+            # Never unlink the guard: another process may already be using it.
+            lock.release()
+        finally:
+            if temporary is not None:
+                with suppress(OSError):
+                    shutil.rmtree(temporary, ignore_errors=True)
 
 
 def freeze_truth(

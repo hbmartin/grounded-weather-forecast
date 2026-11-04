@@ -8,6 +8,9 @@ Review the maintenance freshness fix independently. Its success stamp measures
 the start of a successful run; each host-local daily slot (default 02:15)
 requires a successful start since that slot. Custom schedules use `--scheduled-at`. Preserve the previous stamp on failure, and retain restore semantics.
 Installing only that wrapper need not change the source implementation digest.
+Both wrappers retain the older outcome-normalization API when the selected
+interpreter lacks `CommandOutcome.from_subprocess`; ordinary operation does not
+require installing the new source just to obtain that helper.
 
 For source changes, choose and record an immutable reviewed release commit.
 Record current runtime import path, implementation/config/dataset identities,
@@ -103,6 +106,12 @@ them into a new enrollment. The rollout decision must specify maintenance
 catch-up timing, public hold behavior, the snapshot/receipt hook, and exact
 window. A successful merge alone authorizes none of those production actions.
 
+Before capture, the wrapper runs the selected runtime's named `preflight`
+command with a 30-second timeout and logs its duration. Outside-window skips
+remain successful even when an older checkout lacks shadow capability. A
+preflight failure preserves ordinary prediction/publication and reports the
+shadow failure. Install the reviewed source and compatible wrappers together.
+
 V3 freezes Python, numerical-library versions, backend/platform, effective
 thread controls (two threads) and dependency-lock digest. Preserve that runtime
 for evaluation. Receipts are durably spooled before finalization, then complete
@@ -112,6 +121,12 @@ does not. Held forecast pushes keep original evidence and completed record hashe
 Before rollout, verify the v3 seal, record manifest, runtime and declared input
 hashes; incidental regular files do not change them. Review all six methods'
 availability because descriptive persistence/climatology still restrict matching.
+The `.sealing` and `.NAME.publishing` guards release ownership on process exit;
+do not delete their sidecars to recover a stopped process. Verify an existing
+complete record before reuse, retain conflicting/corrupt outputs, and investigate
+any reported post-publication synchronization failure. Enrollments publish their
+protocol and implementation lock as one complete directory. Validation and
+reconstruction reuse each capsule's captured byte snapshot.
 No old prospective evidence is migrated or relabeled. Legacy replay finalization
 requires its original compatible runner; raw-truth replay evaluation remains
 available without prospective-only flags.

@@ -88,7 +88,7 @@ def test_nonportable_exit_preserves_original_kind_and_fails_closed(exit_code):
 
 
 def test_subprocess_signal_is_normalized_once():
-    outcome = status.CommandOutcome.normalize(-int(signal.SIGTERM))
+    outcome = status.CommandOutcome.from_subprocess(-int(signal.SIGTERM))
     assert outcome.exit_code == 128 + signal.SIGTERM
     assert status.CommandOutcome.normalize(outcome) is outcome
 

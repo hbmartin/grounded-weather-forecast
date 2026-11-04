@@ -51,9 +51,19 @@ pushes reuse the original issuance/receipt, and evaluation reconstructs each
 prediction with `rtol=1e-10`, `atol=1e-10`. Declared evidence files are hashed;
 incidental regular files are excluded while aliases remain invalid.
 
-The `.sealing` file carries an OS-managed lock, not persistent lease ownership.
-Process exit releases it; a live concurrent owner causes an operational refusal.
-Capture preflight validates a complete v3 enrollment in the selected runtime.
+The `.sealing` and `.NAME.publishing` files carry OS-managed locks, not persistent
+lease ownership. Process exit releases ownership; a live concurrent owner causes
+an operational refusal. Capsule state is read after taking the sealing lock.
+All consumed matrix schemas are checked before publication evidence is written;
+fitting happens after the complete timely seal. Enrollment publishes its computed
+protocol/lock pair atomically. A per-invocation capsule snapshot reads and hashes
+each declared existing file once, reuses parsed inputs without changing source
+values, and is released before evaluating the next capsule.
+The named `preflight --protocol FILE` checks the window first. Inside the window
+it checks capture capability and complete v3 enrollment in the selected runtime;
+outside it returns `outside_window` without those checks. The wrapper allows 30 seconds for preflight
+and 300 seconds for finalization; capability/preflight failures preserve ordinary
+publication and report shadow failure. There is no persistent validation cache.
 
 Freeze Python patch, numerical-library/backend/platform identity, two-thread
 controls and dependency-lock digest. Truth matures at window end +98 hours and

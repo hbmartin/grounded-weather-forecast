@@ -78,6 +78,8 @@ def timestamp() -> str:
 # error, which is exactly how every scheduled run between 2026-07-27 and
 # 2026-08-03 died silently.
 def run_predict(paths: RuntimePaths, shadow_capture: Path | None = None) -> int:
+    from grounded_weather_forecast.status import CommandOutcome  # noqa: PLC0415
+
     predict_started = time.monotonic()
     print(f"{timestamp()} == predict ==", flush=True)
     try:
@@ -95,11 +97,13 @@ def run_predict(paths: RuntimePaths, shadow_capture: Path | None = None) -> int:
             ],
             check=False,
         ).returncode
-        if code < 0:
-            code = 128 - code
-    except SystemExit as exc:
-        code = exc.code if isinstance(exc.code, int) else 1
-    except Exception as exc:  # report and skip publishing, never traceback out
+        convert_subprocess = getattr(
+            CommandOutcome, "from_subprocess", CommandOutcome.normalize
+        )
+        code = convert_subprocess(code).exit_code
+    except (SystemExit,) as exc:  # noqa: B013 -- project exception convention
+        code = CommandOutcome.normalize(exc.code).exit_code
+    except (Exception,) as exc:  # noqa: B013 -- prediction boundary
         print(f"predict crashed: {exc!r}", flush=True)
         code = 70
 
@@ -392,38 +396,46 @@ def shadow_preflight(paths: RuntimePaths, protocol: Path) -> tuple[bool, str | N
         if not start <= datetime.now(UTC) < end:
             print("shadow skipped: outside enrollment window", flush=True)
             return False, None
-        check = subprocess.run(  # noqa: S603 -- local capability inspection, no providers
-            [
-                *paths.command("python"),
-                "-c",
-                (
-                    "import inspect, os, runpy, sys; from pathlib import Path; "
-                    "from grounded_weather_forecast.shadow_artifacts import THREAD_CONTROLS, current_artifact; "
-                    "os.environ.update({key: '2' for key in THREAD_CONTROLS}); "
-                    "from grounded_weather_forecast.serve.predict import predict; "
-                    "\nif 'shadow_capture' not in inspect.signature(predict).parameters:\n"
-                    " raise SystemExit('missing capture capability')\n"
-                    "script = Path(sys.argv[1]); sys.path.insert(0, str(script.parent)); "
-                    "runner = runpy.run_path(str(script)); "
-                    "enrolled = runner['enrollment'](Path(sys.argv[2])); "
-                    "\nif not current_artifact(enrolled.protocol.get('artifact_version')):\n"
-                    " raise SystemExit('fresh v3 enrollment required')"
-                ),
-                str(paths.project / "scripts/temperature_shadow.py"),
-                str(protocol),
-            ],
-            capture_output=True,
-            text=True,
-            check=False,
-            timeout=30,
-        )
+        started = time.monotonic()
+        try:
+            check = subprocess.run(  # noqa: S603 -- selected local runtime, no providers
+                [
+                    *paths.command("python"),
+                    str(paths.project / "scripts/temperature_shadow.py"),
+                    "preflight",
+                    "--protocol",
+                    str(protocol),
+                ],
+                capture_output=True,
+                text=True,
+                check=False,
+                timeout=30,
+            )
+        finally:
+            print(
+                f"shadow preflight duration_s={time.monotonic() - started:.3f}",
+                flush=True,
+            )
         if check.returncode:
             detail = (getattr(check, "stderr", "") or "").strip().splitlines()
+            classification = (
+                "shadow unavailable: selected prediction runtime lacks compatible v3 capture/enrollment"
+                if check.returncode == 2
+                else f"shadow preflight runtime failure: selected runtime exited {check.returncode}"
+            )
             return (
                 False,
-                "shadow unavailable: selected prediction runtime lacks compatible v3 capture/enrollment"
-                + (f": {detail[-1][:400]}" if detail else ""),
+                classification + (f": {detail[-1][:400]}" if detail else ""),
             )
+        result = json.loads(check.stdout)
+        if not isinstance(result, dict) or result.get("status") not in {
+            "ready",
+            "outside_window",
+        }:
+            raise ValueError("selected runtime returned an invalid preflight status")
+        if result["status"] == "outside_window":
+            print("shadow skipped: outside enrollment window", flush=True)
+            return False, None
     except (
         OSError,
         ValueError,

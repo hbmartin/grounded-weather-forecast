@@ -10,6 +10,7 @@ from pathlib import Path
 
 import polars as pl
 import pytest
+from filelock import FileLock
 from test_temperature_shadow import make_capsule, make_prospective_record
 
 pytest_plugins = ["test_temperature_shadow"]
@@ -361,7 +362,8 @@ def test_scoring_failure_does_not_publish_partial_results(
     with pytest.raises(ValueError, match="injected"):
         evaluate(shadow, mature_record, tmp_path / "result")
     assert not (tmp_path / "result").exists()
-    assert not (tmp_path / ".result.publishing").exists()
+    with FileLock(tmp_path / ".result.publishing", timeout=0):
+        assert not list(tmp_path.glob("shadow-stage-*"))
 
 
 @pytest.mark.parametrize("index", [0, 1])
