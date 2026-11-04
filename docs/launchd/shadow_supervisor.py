@@ -220,6 +220,9 @@ class StatusChannel:
 
     def worker_pid(self) -> int | None:
         self.collect()
+        return self.known_worker_pid()
+
+    def known_worker_pid(self) -> int | None:
         if self.messages and self.messages[0].get("status") == "started":
             value = self.messages[0].get("worker_pid")
             if type(value) is int and value > 1:
@@ -228,11 +231,30 @@ class StatusChannel:
 
 
 def emergency_stop(process: subprocess.Popen[str], channel: StatusChannel) -> None:
-    worker = channel.worker_pid()
+    failures: list[Exception] = []
+    try:
+        worker = channel.worker_pid()
+    except (Exception,) as error:  # noqa: B013 -- still stop and reap after malformed status
+        failures.append(error)
+        worker = channel.known_worker_pid()
     if worker is not None:
-        signal_group(worker, signal.SIGKILL)
-    signal_group(process.pid, signal.SIGKILL)
-    process.communicate(timeout=REAP_TIMEOUT)
+        try:
+            signal_group(worker, signal.SIGKILL)
+        except (Exception,) as error:  # noqa: B013 -- supervisor cleanup must still run
+            failures.append(error)
+    try:
+        signal_group(process.pid, signal.SIGKILL)
+    except (Exception,) as error:  # noqa: B013 -- reaping must still run
+        failures.append(error)
+    try:
+        process.communicate(timeout=REAP_TIMEOUT)
+    except (Exception,) as error:  # noqa: B013 -- retain all cleanup diagnostics
+        failures.append(error)
+    if failures:
+        primary, *secondary = failures
+        for error in secondary:
+            primary.add_note(f"shadow emergency cleanup failed: {error}")
+        raise primary
 
 
 def result(
@@ -310,10 +332,10 @@ def cancel_supervisor(
             primary.add_note(
                 f"shadow child cleanup failed: {channel.messages[-1].get('detail')}"
             )
-    except (Exception, KeyboardInterrupt, SystemExit):
+    except (Exception,):  # noqa: B013 -- a new user cancellation must propagate
         try:
             emergency_stop(process, channel)
-        except (Exception, KeyboardInterrupt, SystemExit) as secondary:
+        except (Exception,) as secondary:  # noqa: B013 -- do not swallow user cancellation
             primary.add_note(f"shadow child cleanup failed: {secondary}")
 
 

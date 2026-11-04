@@ -244,6 +244,8 @@ def directory_child(root: Path, name: str, *, required: bool, label: str) -> Pat
     root = system_path(root)
     if root.exists() or root.is_symlink() or root.is_junction():
         existing_directory(root)
+    else:
+        existing_ancestor_directory(root.parent)
     path = root / name
     if (
         path.is_symlink()
@@ -254,6 +256,22 @@ def directory_child(root: Path, name: str, *, required: bool, label: str) -> Pat
     ):
         raise EvidenceError(f"{path}: {label}")
     return path
+
+
+def existing_ancestor_directory(path: Path) -> None:
+    """Refuse file ancestors without banning trusted operator prefix aliases."""
+    while True:
+        try:
+            metadata = path.stat()
+        except (FileNotFoundError, NotADirectoryError):
+            parent = path.parent
+            if parent == path:
+                raise
+            path = parent
+            continue
+        if not stat.S_ISDIR(metadata.st_mode):
+            raise EvidenceError(f"{path}: output ancestor must be a directory")
+        return
 
 
 def sync_files(directory: Path, paths: Iterable[Path]) -> None:

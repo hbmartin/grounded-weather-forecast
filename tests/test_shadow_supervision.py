@@ -480,3 +480,45 @@ def test_descriptor_cleanup_preserves_explicit_primary(supervisor, monkeypatch):
     monkeypatch.setattr(supervisor.os, "close", failed)
     supervisor.close_handles({read, write}, None, primary=primary)
     assert "secondary close failure" in " ".join(primary.__notes__)
+
+
+def test_emergency_cleanup_attempts_every_step_and_keeps_first_failure(
+    supervisor, monkeypatch
+):
+    first = OSError("invalid terminal status")
+    calls = []
+
+    def status_failed():
+        calls.append("status")
+        raise first
+
+    def signal_failed(pid, _signum):
+        calls.append(pid)
+        raise PermissionError(f"signal denied for {pid}")
+
+    def reap_failed(**_kwargs):
+        calls.append("reap")
+        raise OSError("reap failed")
+
+    channel = SimpleNamespace(worker_pid=status_failed, known_worker_pid=lambda: 123456)
+    process = SimpleNamespace(pid=987654, communicate=reap_failed)
+    monkeypatch.setattr(supervisor, "signal_group", signal_failed)
+    with pytest.raises(OSError, match="invalid terminal status") as caught:
+        supervisor.emergency_stop(process, channel)
+    assert caught.value is first
+    assert calls == ["status", 123456, 987654, "reap"]
+    assert len(first.__notes__) == 3
+    assert "reap failed" in first.__notes__[-1]
+
+
+def test_fresh_cancellation_is_not_swallowed_by_cleanup(supervisor):
+    cancelled = KeyboardInterrupt("new operator cancellation")
+    primary = OSError("earlier failure")
+
+    def interrupted(**_kwargs):
+        raise cancelled
+
+    process = SimpleNamespace(communicate=interrupted)
+    with pytest.raises(KeyboardInterrupt) as caught:
+        supervisor.cancel_supervisor(process, None, primary)
+    assert caught.value is cancelled
