@@ -71,10 +71,11 @@ Importing them does not change the environment or working directory, register
 exit logging, or execute jobs. Their entry points default `POLARS_MAX_THREADS`
 to **2** and log the job's start/end and exit status.
 
-Install `launchd_paths.py` alongside both standalone wrappers:
+Install `launchd_paths.py` alongside both standalone wrappers, and include the
+standard-library supervisor helper when preparing shadow support:
 
 ```bash
-cp docs/launchd/{launchd_paths.py,daily-maintenance.py,hourly-predict-publish.py} \
+cp docs/launchd/{launchd_paths.py,shadow_supervisor.py,daily-maintenance.py,hourly-predict-publish.py} \
   "$HOME/Library/Application Support/grounded-weather-forecast/"
 ```
 
@@ -85,6 +86,13 @@ executable, falling back to `PATH` only when unset. Invalid explicit executables
 fail with exit 2, and launcher symlinks remain intact for macOS permissions.
 Configuration and argument errors have START/END records, including stripped
 Python docstrings and unavailable working directories.
+For opt-in shadow work on POSIX, the supervisor monitors wrapper liveness and
+the 30-second preflight/300-second finalize deadlines. It stops the worker group
+after wrapper death, including SIGKILL, with two seconds of SIGTERM grace and
+three seconds for forced termination/reaping. Worker output remains separate
+from the internal status channel. Ordinary operation needs no supervisor;
+missing helpers report shadow failure after ordinary publication. Installation
+and activation remain separate reviewed operator actions.
 
 The hourly wrapper predicts before discovering the sibling `ambientweather2sqlite`
 project. Use `--station-project /path/to/collector` for another layout. The station

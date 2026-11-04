@@ -565,6 +565,7 @@ def test_cancellation_keeps_primary_when_process_group_cleanup_fails(monkeypatch
 
     process.communicate = interrupted
     monkeypatch.setattr(support.subprocess, "Popen", lambda *_args, **_kwargs: process)
+    monkeypatch.setattr(support.os, "write", lambda *_args: 1)
 
     def denied(*_args):
         raise PermissionError("group cleanup denied")

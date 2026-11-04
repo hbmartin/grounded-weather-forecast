@@ -44,6 +44,13 @@ permission. Deploy source and wrapper paths deliberately; an environment that
 still pins an older `PYTHONPATH` will continue importing that older code.
 Install publisher 2.3+ with `run_with_receipt()` before enabling v3 shadow flags
 ([publisher follow-up #48](https://github.com/hbmartin/open-sun/pull/48)).
+Prepare reviewed `shadow_supervisor.py` beside the installed wrappers and
+`launchd_paths.py`; it uses only the existing Python standard library. Its
+private liveness pipe bounds worker lifetime after wrapper death, including
+SIGKILL, assuming the supervisor survives. Keep this helper with the matching
+wrapper set for rollback. Missing helpers preserve ordinary publication but
+make requested shadow work fail. No schedule or activation changes follow from
+copying or merging these sources.
 Preserve old enrollments; the new runner requires a fresh v3 enrollment.
 Verify one complete maintenance cycle, truthful gate explanations, a ready
 forecast and successful public publication before enrolling the shadow.

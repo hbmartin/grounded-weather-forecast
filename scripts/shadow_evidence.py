@@ -24,11 +24,14 @@ from filelock import BaseFileLock, FileLock, Timeout
 from grounded_weather_forecast.shadow_artifacts import (
     ARTIFACT_VERSION,
     BINDING,
+    ISSUE_FILE,
     TARGET,
+    TRAINING_FILE,
     EvidenceError,
     capsule_directory,
     current_artifact,
     digest,
+    directory_child,
     finite_number,
     forecast_rows,
     hex_identity,
@@ -41,11 +44,9 @@ from grounded_weather_forecast.shadow_artifacts import (
     sha256,
     sync_directory,
     sync_files,
+    system_path,
     timestamp,
 )
-
-ISSUE_FILE = "issue.parquet"
-TRAINING_FILE = "training.parquet"
 
 INPUT_FILES = frozenset(
     {
@@ -90,6 +91,7 @@ class CapsuleSnapshot:
 
     @classmethod
     def load(cls, capsule: Path, *, prospective: bool) -> CapsuleSnapshot:
+        capsule = system_path(capsule)
         capsule_directory(capsule, prospective=prospective)
         children = tuple(capsule.iterdir())
         if any(path.is_symlink() or path.is_junction() for path in children):
@@ -237,15 +239,12 @@ def protocol_document(payload: bytes) -> dict[str, Any]:
 
 
 def capsule_for(root: Path, origin: datetime) -> Path:
-    path = root / issuance_name(origin)
-    if (
-        path.is_symlink()
-        or path.is_junction()
-        or not path.is_dir()
-        or path.resolve().parent != root.resolve()
-    ):
-        raise EvidenceError("capsule must remain within the selected capsule root")
-    return path
+    return directory_child(
+        root,
+        issuance_name(origin),
+        required=True,
+        label="capsule must remain within the selected capsule root",
+    )
 
 
 @dataclass(frozen=True, eq=False)
@@ -391,10 +390,13 @@ def truth_frame(path: Path | bytes, *, prospective: bool = True) -> pl.DataFrame
     return frame
 
 
+@dataclass
+class GuardOutput:
+    completed: Path | None = None
+
+
 @contextmanager
-def native_guard(
-    lease: Path, label: str, *, output: Path | None = None
-) -> Iterator[None]:
+def native_guard(lease: Path, label: str) -> Iterator[GuardOutput]:
     """Never substitute marker existence for native ownership or mask a primary error."""
     if lease.exists() or lease.is_symlink():
         regular(lease)
@@ -408,13 +410,14 @@ def native_guard(
         if error.errno is None:
             raise OSError(message) from error
         raise OSError(error.errno, message) from error
+    output = GuardOutput()
     try:
-        yield
+        yield output
     except (BaseException,) as error:  # noqa: B013 -- retain cancellation and primary failure
         release_guard(lock, lease, label, primary=error)
         raise
     else:
-        release_guard(lock, lease, label, output=output)
+        release_guard(lock, lease, label, output=output.completed)
 
 
 def release_guard(
@@ -432,9 +435,7 @@ def release_guard(
             primary.add_note(f"{label} guard release failed at {lease}: {error}")
             return
         preserved = (
-            f"; complete output preserved at {output}"
-            if output is not None and output.exists()
-            else ""
+            f"; complete output preserved at {output}" if output is not None else ""
         )
         raise OSError(
             f"{label} guard release failed at {lease}{preserved}: {error}"
@@ -444,14 +445,14 @@ def release_guard(
 @contextmanager
 def staged_directory(output: Path) -> Iterator[Path]:
     """Hold an OS-managed guard; publish a complete directory after success."""
+    output = system_path(output)
     private_directory(output.parent)
     temporary = None
     try:
         with native_guard(
             output.with_name(f".{output.name}.publishing"),
             "output publication",
-            output=output,
-        ):
+        ) as published:
             if output.exists() or output.is_symlink():
                 raise FileExistsError(output)
             temporary = Path(
@@ -464,6 +465,7 @@ def staged_directory(output: Path) -> Iterator[Path]:
             if output.exists() or output.is_symlink():
                 raise FileExistsError(output)
             folder.rename(output)
+            published.completed = output
             try:
                 sync_directory(output.parent)
             except (OSError,) as error:  # noqa: B013 -- preserve published evidence

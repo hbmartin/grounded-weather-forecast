@@ -1158,13 +1158,25 @@ before capture. Outside the window it skips those checks and returns the skip st
 The wrapper retains a cheap outside-window check for older checkouts, invokes
 this named command in the selected runtime with a 30-second timeout, and logs
 elapsed time. Preflight is repeated each hour without a persistent cache.
-Elapsed time is logged on timeout and process-start failures too. Timeouts
-terminate the POSIX uv/Python process group and reap the direct child;
-the same policy covers finalization. Cancellation also cleans up that group.
+Elapsed time is logged on timeout and process-start failures too. On POSIX,
+install `shadow_supervisor.py` beside the wrappers and `launchd_paths.py`.
+The standard-library supervisor owns the uv/Python worker group and watches a
+private pipe whose only writer is the wrapper. EOF detects wrapper death,
+including SIGKILL; workers cannot inherit the writer. A separate status channel
+keeps supervision metadata out of worker stdout/stderr. Deadlines remain 30/300
+seconds, followed by at most two seconds of SIGTERM grace and three seconds to
+force termination and reap the launcher. The CLI's SIGTERM handler unwinds
+evidence contexts and restores prior handlers when leaving command execution.
+Timeout/cancellation cleanup also applies to descendants whose launcher exits.
+The hard-kill guarantee assumes the supervisor survives; forced termination can
+still leave staging files. Existing non-POSIX direct-child behavior is retained.
 Nonzero child exits are classified as runner refusals only when exit 2 accompanies the tagged,
 versioned `refused` envelope. Unknown exits, including launcher/lockfile,
 missing-script and usage exit 2, remain generic child failures with their stderr
 diagnostic. Existing untagged successful readiness objects remain accepted.
+Tagged refusals use JSON `detail` once; secondary stderr remains separately
+labelled instead of being appended to the refusal. Missing supervisor helpers
+fail shadow preflight while ordinary publication continues.
 
 Finalization reads capsule state after acquiring the `.sealing` OS-managed lock.
 Directory publication uses the same ownership policy through `.NAME.publishing`.
@@ -1183,12 +1195,30 @@ An unlock failure during another failure adds a visible cleanup diagnostic while
 preserving the primary exception/exit, including cancellation. An unlock failure
 after otherwise successful publication remains exit 1 and identifies the preserved
 output. Immutable outputs are never removed as recovery.
+The reported completed output is the actual published or verified issuance,
+never inferred from an existing records-root directory.
+
+`finalize --publication-receipt` requires `--mode prospective`; replay rejects
+the combination before guard creation or evidence writes. Finalization validates
+the records root and issuance destination before sealing or fitting and checks
+them again at publication. Missing output parents are created with mode `0700`.
+Existing evidence permissions are never silently changed. On macOS, system
+prefixes `/tmp` and `/var` are canonicalized without resolving selected evidence
+aliases. Direct system-prefix output/replay paths work; prospective capsules
+directly under shared `/tmp` still fail the private-root permission requirement.
 
 Each computed record prepares its filtered training, supervised slice and forecast
 matrix once in orchestration and reuses the matrix for attribution. Frozen
 candidate-internal calculations remain unchanged. Completed held records do not
 refit. Snapshot mode is explicit; internal helpers share the same byte snapshot
 and validated publication digest without rereading or rehashing files.
+`VerifiedEvidence` carries the validated receipt, source/publication projection,
+complete seal, checked issue and optional prepared matrices through one owner.
+A first seal decodes and checks correspondence once. Recovery and evaluation
+verify their own snapshots afresh; held pushes check original and later receipts
+without refitting completed records. Missing required enrollment files produce
+named exit-2 refusals consistently, including evaluation; permission and other
+operational I/O failures remain exit 1.
 
 After `window_end +98 hours`, review the QC hourly-mean truth, then seal it:
 
