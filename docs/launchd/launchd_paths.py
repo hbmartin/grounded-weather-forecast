@@ -12,10 +12,18 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-try:
-    from shadow_supervisor import run_supervised
-except (ImportError,):  # noqa: B013 -- ordinary operation needs no shadow helper
-    run_supervised = None
+
+def run_supervised(
+    command: Sequence[str], *, timeout: float, capture_output: bool = False
+) -> subprocess.CompletedProcess[str]:
+    """Only optional shadow execution imports its independently installed helper."""
+    try:
+        from shadow_supervisor import run_supervised as supervise  # noqa: PLC0415
+    except (ImportError, SyntaxError, OSError) as error:
+        raise OSError(
+            f"shadow supervisor helper unavailable beside installed wrappers: {error}"
+        ) from error
+    return supervise(command, timeout=timeout, capture_output=capture_output)
 
 
 def subprocess_exit_code(returncode: int) -> int:
@@ -31,10 +39,6 @@ def run_shadow_child(
 ) -> subprocess.CompletedProcess[str]:
     """Supervise POSIX workers beyond wrapper death; retain direct Windows behavior."""
     if os.name == "posix":
-        if run_supervised is None:
-            raise OSError(
-                "shadow supervisor helper unavailable beside installed wrappers"
-            )
         return run_supervised(command, timeout=timeout, capture_output=capture_output)
     # Reviewed shadow argv; shell parsing is never enabled.
     process = subprocess.Popen(  # noqa: S603

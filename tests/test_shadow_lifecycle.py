@@ -313,7 +313,7 @@ def test_file_output_ancestor_refused_before_sealing(
         "prepare_matrices",
         lambda *_args: pytest.fail("prepared below a file ancestor"),
     )
-    with pytest.raises(EvidenceError, match="output ancestor must be a directory"):
+    with pytest.raises(EvidenceError, match="ancestor must be a directory"):
         shadow.finalize(
             capsule,
             output,

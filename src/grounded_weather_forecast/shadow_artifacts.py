@@ -1,5 +1,6 @@
 """Pure shadow contracts and durable local evidence primitives."""
 
+import errno
 import hashlib
 import json
 import math
@@ -14,13 +15,17 @@ from contextlib import suppress
 from datetime import UTC, datetime
 from importlib.metadata import version
 from pathlib import Path
-from typing import Any, cast
+from typing import Any, Literal, cast
 
 ARTIFACT_VERSION = 3
 ISSUE_FILE = "issue.parquet"
 TRAINING_FILE = "training.parquet"
 PRODUCTION_FILE = "production.json"
 PUBLISHED_FILE = "published.json"
+PUBLICATION_FILE = "publication.json"
+EVIDENCE_LOCK_FILE = "evidence.lock.json"
+CAPTURED_TRUTH_FILE = "truth_hourly.parquet"
+COMPLETIONS_FILE = "provider_completions.parquet"
 TARGET = "t__temp_c__mean"
 BINDING = "publisher successful explicit-commit push"
 THREAD_CONTROLS = (
@@ -207,13 +212,26 @@ def system_path(path: Path) -> Path:
     return path
 
 
-def required_artifact(path: Path, *, snapshot: bytes | None = None) -> bytes:
+def required_artifact(
+    path: Path,
+    *,
+    snapshot: bytes | None = None,
+    policy: Literal["operator", "sealed"] = "sealed",
+) -> bytes:
     path = system_path(path)
     try:
+        if policy == "operator":
+            path = path.resolve(strict=True)
         regular(path)
         return path.read_bytes() if snapshot is None else snapshot
     except (FileNotFoundError,) as error:  # noqa: B013 -- required supplied evidence
         raise EvidenceError(f"{path}: missing required enrollment artifact") from error
+    except (OSError,) as error:  # noqa: B013 -- preserve operational permission failures
+        if error.errno == errno.ELOOP:
+            raise EvidenceError(
+                f"{path}: evidence path contains an alias loop"
+            ) from error
+        raise
 
 
 def existing_directory(path: Path, *, private: bool = False) -> None:
@@ -242,10 +260,9 @@ def capsule_directory(path: Path, *, prospective: bool) -> None:
 def directory_child(root: Path, name: str, *, required: bool, label: str) -> Path:
     """Check selected roots and issuance leaves, allowing trusted ancestor prefixes."""
     root = system_path(root)
-    if root.exists() or root.is_symlink() or root.is_junction():
+    existing_ancestor_directory(root.parent)
+    if root.is_symlink() or root.is_junction() or root.exists():
         existing_directory(root)
-    else:
-        existing_ancestor_directory(root.parent)
     path = root / name
     if (
         path.is_symlink()
@@ -262,15 +279,27 @@ def existing_ancestor_directory(path: Path) -> None:
     """Refuse file ancestors without banning trusted operator prefix aliases."""
     while True:
         try:
+            # lstat distinguishes a missing component from a dangling alias.
+            path.lstat()
             metadata = path.stat()
         except (FileNotFoundError, NotADirectoryError):
+            if path.is_symlink() or path.is_junction():
+                raise EvidenceError(
+                    f"{path}: ancestor alias has no directory target"
+                ) from None
             parent = path.parent
             if parent == path:
                 raise
             path = parent
             continue
+        except (OSError,) as error:  # noqa: B013 -- loops are supplied path damage
+            if error.errno == errno.ELOOP:
+                raise EvidenceError(
+                    f"{path}: ancestor path contains an alias loop"
+                ) from error
+            raise
         if not stat.S_ISDIR(metadata.st_mode):
-            raise EvidenceError(f"{path}: output ancestor must be a directory")
+            raise EvidenceError(f"{path}: ancestor must be a directory")
         return
 
 
@@ -285,6 +314,9 @@ def sync_files(directory: Path, paths: Iterable[Path]) -> None:
 
 def private_directory(path: Path) -> None:
     path = system_path(path)
+    existing_ancestor_directory(path.parent)
+    if path.is_symlink() or path.is_junction():
+        raise EvidenceError(f"{path}: expected a private local directory")
     missing = []
     current = path
     while not current.exists():

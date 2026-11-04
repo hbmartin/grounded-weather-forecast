@@ -24,8 +24,12 @@ from filelock import BaseFileLock, FileLock, Timeout
 from grounded_weather_forecast.shadow_artifacts import (
     ARTIFACT_VERSION,
     BINDING,
+    CAPTURED_TRUTH_FILE,
+    COMPLETIONS_FILE,
+    EVIDENCE_LOCK_FILE,
     ISSUE_FILE,
     PRODUCTION_FILE,
+    PUBLICATION_FILE,
     PUBLISHED_FILE,
     TARGET,
     TRAINING_FILE,
@@ -42,6 +46,7 @@ from grounded_weather_forecast.shadow_artifacts import (
     object_value,
     private_directory,
     regular,
+    required_artifact,
     required_string,
     sha256,
     sync_directory,
@@ -54,9 +59,9 @@ INPUT_FILES = frozenset(
     {
         ISSUE_FILE,
         TRAINING_FILE,
-        "truth_hourly.parquet",
+        CAPTURED_TRUTH_FILE,
         PRODUCTION_FILE,
-        "provider_completions.parquet",
+        COMPLETIONS_FILE,
     }
 )
 
@@ -106,9 +111,9 @@ class CapsuleSnapshot:
         timestamp(required_string(meta.get("input_as_of"), "capsule.input_as_of"))
         hashes = manifest_hashes(meta, child_names, prospective=prospective)
         optional = INPUT_FILES | {
-            "publication.json",
+            PUBLICATION_FILE,
             PUBLISHED_FILE,
-            "evidence.lock.json",
+            EVIDENCE_LOCK_FILE,
         }
         names = set(hashes) | {name for name in optional if (capsule / name).is_file()}
         files = {"capsule.json": raw}
@@ -152,9 +157,9 @@ class CapsuleSnapshot:
 
     def metadata(self) -> dict[str, Any]:
         meta = self.document("capsule.json", "capsule manifest")
-        if "publication.json" in self.files:
+        if PUBLICATION_FILE in self.files:
             meta["publication"] = self.document(
-                "publication.json", "sealed publication receipt"
+                PUBLICATION_FILE, "sealed publication receipt"
             )
         return meta
 
@@ -162,7 +167,7 @@ class CapsuleSnapshot:
         return {
             name: self.hashes[name]
             for name in sorted(self.hashes)
-            if sealed or name != "evidence.lock.json"
+            if sealed or name != EVIDENCE_LOCK_FILE
         }
 
     def with_files(
@@ -490,10 +495,10 @@ def freeze_truth(
     enrollment_bytes: bytes | None = None,
 ) -> Path:
     protocol_bytes = (
-        protocol_path.read_bytes() if protocol_bytes is None else protocol_bytes
+        required_artifact(protocol_path) if protocol_bytes is None else protocol_bytes
     )
     enrollment_bytes = (
-        protocol_path.with_suffix(".lock.json").read_bytes()
+        required_artifact(protocol_path.with_suffix(".lock.json"))
         if enrollment_bytes is None
         else enrollment_bytes
     )
@@ -539,9 +544,11 @@ def locked_truth(
     truth_bytes, lock_bytes = truth.read_bytes(), lock_path.read_bytes()
     frame = truth_frame(truth_bytes)
     lock = json_object(lock_bytes, "truth lock")
-    protocol_bytes = protocol.read_bytes() if protocol_bytes is None else protocol_bytes
+    protocol_bytes = (
+        required_artifact(protocol) if protocol_bytes is None else protocol_bytes
+    )
     enrollment_bytes = (
-        protocol.with_suffix(".lock.json").read_bytes()
+        required_artifact(protocol.with_suffix(".lock.json"))
         if enrollment_bytes is None
         else enrollment_bytes
     )

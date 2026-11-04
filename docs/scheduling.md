@@ -89,9 +89,16 @@ Python docstrings and unavailable working directories.
 For opt-in shadow work on POSIX, the supervisor monitors wrapper liveness and
 the 30-second preflight/300-second finalize deadlines. It stops the worker group
 after wrapper death, including SIGKILL, with two seconds of SIGTERM grace and
-three seconds for forced termination/reaping. Worker output remains separate
-from the internal status channel. Ordinary operation needs no supervisor;
-missing helpers report shadow failure after ordinary publication. Installation
+three seconds for forced termination/reaping. The wrapper adds one second of wait
+margin; exceptional rescue has its own three-second bound. Matching helper code
+uses internal protocol 2: bootstrap admission and final cleanup are acknowledged,
+and the launcher PID remains reserved until release. A reader continuously drains
+the separate status pipe (64 KiB total), without consuming worker stdout/stderr.
+Repeated cancellation is deferred until cleanup completes. Emergency handling
+verifies stopped, live ownership before signaling a worker group; an unexpectedly
+dead supervisor yields an explicit cleanup-uncertainty diagnostic.
+Ordinary operation does not import the optional supervisor; missing, unreadable
+or syntax-broken helpers report shadow failure after ordinary publication. Installation
 and activation remain separate reviewed operator actions.
 
 The hourly wrapper predicts before discovering the sibling `ambientweather2sqlite`

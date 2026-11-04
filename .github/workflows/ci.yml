@@ -95,6 +95,23 @@ jobs:
           token: ${{ secrets.CODECOV_TOKEN }}
           verbose: true
 
+  macos-shadow-lifecycle:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+        with:
+          version: "latest"
+      - name: Set up Python
+        run: uv python install 3.13
+      - name: Install locked test dependencies
+        run: uv sync --locked --dev --python 3.13
+      - name: Repeat native shadow ownership and fault tests
+        run: |
+          for attempt in 1 2 3; do
+            uv run --no-sync pytest tests/test_shadow_supervision.py tests/test_shadow_owned_lifecycle.py tests/test_shadow_native_guards.py tests/test_shadow_output_preparation.py tests/test_shadow_lifecycle.py
+          done
+
   windows-import-smoke:
     runs-on: windows-latest
 

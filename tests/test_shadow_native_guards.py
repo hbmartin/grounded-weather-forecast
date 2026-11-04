@@ -281,6 +281,7 @@ def test_unknown_preflight_failures_are_not_capability_claims(
 def test_wrapper_unknown_action_preserves_ordinary_publishing(
     tmp_path, monkeypatch, capsys
 ):
+    monkeypatch.syspath_prepend(str(SCRIPT.parent))
     wrapper = load_script(SCRIPT.with_name("hourly-predict-publish.py"))
     scripts = tmp_path / "scripts"
     scripts.mkdir()
@@ -326,7 +327,13 @@ def test_known_invalid_forecast_names_are_explicit_refusals(
     pl.read_parquet(training).rename({"fx__a__temp_c": invalid}).write_parquet(training)
     with pytest.raises(EvidenceError, match="invalid temperature forecast column"):
         shadow.record(capsule, tmp_path / "records", protocol, mode="replay")
-    assert not (tmp_path / "records").exists()
+    assert not list((tmp_path / "records").glob("*/record.json"))
+    assert not list((tmp_path / "records").glob("shadow-stage-*"))
+    pl.read_parquet(training).rename({invalid: "fx__a__temp_c"}).write_parquet(training)
+    assert (
+        shadow.record(capsule, tmp_path / "records", protocol, mode="replay")
+        / "record.json"
+    ).is_file()
 
 
 def test_unexpected_transform_defect_is_cli_failure(shadow, frames, tmp_path):
@@ -360,7 +367,8 @@ runpy.run_path(sys.argv[0], run_name='__main__')
     assert result.returncode == 1
     assert "TypeError: injected transformation bug" in result.stderr
     assert "shadow refused" not in result.stderr
-    assert not (tmp_path / "records").exists()
+    assert not list((tmp_path / "records").glob("*/record.json"))
+    assert not list((tmp_path / "records").glob("shadow-stage-*"))
 
 
 def test_first_seal_prepares_once_and_keeps_predictions(
@@ -551,33 +559,24 @@ child.wait()
 @pytest.mark.skipif(os.name != "posix", reason="launchd process-group cancellation")
 def test_cancellation_keeps_primary_when_process_group_cleanup_fails(monkeypatch):
     monkeypatch.syspath_prepend(str(SCRIPT.parent))
-    support = importlib.import_module("launchd_paths")
+    supervisor = importlib.import_module("shadow_supervisor")
     cancelled = KeyboardInterrupt("operator cancelled")
-    closed = []
-    process = SimpleNamespace(
-        pid=123456,
-        stdout=SimpleNamespace(close=lambda: closed.append(True)),
-        stderr=None,
-    )
-
-    attempts = []
+    channel = supervisor.StatusChannel(-1, owned_pid=123456)
+    channel.control = SimpleNamespace(cancel=lambda: None, send=lambda _token: None)
 
     def interrupted(**_kwargs):
-        attempts.append(True)
-        if len(attempts) == 1:
-            raise cancelled
         raise OSError("supervisor cleanup communication failed")
 
-    process.communicate = interrupted
-    monkeypatch.setattr(support.subprocess, "Popen", lambda *_args, **_kwargs: process)
-    monkeypatch.setattr(support.os, "write", lambda *_args: 1)
+    process = SimpleNamespace(
+        pid=987654, returncode=None, communicate=interrupted, wait=lambda **_: 0
+    )
+    monkeypatch.setattr(supervisor, "stopped_supervisor", lambda *_: True)
+    monkeypatch.setattr(supervisor.os, "kill", lambda *_: None)
 
     def denied(*_args):
         raise PermissionError("group cleanup denied")
 
-    monkeypatch.setattr(support.os, "killpg", denied)
-    with pytest.raises(KeyboardInterrupt) as caught:
-        support.run_shadow_child(["synthetic"], timeout=30)
-    assert caught.value is cancelled
+    monkeypatch.setattr(supervisor.os, "killpg", denied)
+    supervisor.cancel_supervisor(process, channel, cancelled)
     assert "group cleanup denied" in " ".join(cancelled.__notes__)
-    assert closed == [True]
+    assert "supervisor cleanup communication failed" in " ".join(cancelled.__notes__)

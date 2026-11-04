@@ -397,9 +397,19 @@ def refused_preflight(result: object, returncode: int) -> bool:
 
 
 def preflight_secondary(detail: list[str], primary: str) -> None:
-    for line in detail:
-        if line != f"shadow refused: {primary}":
-            print(f"shadow preflight stderr: {line[:400]}", flush=True)
+    text = "\n".join(detail)
+    text = text.replace(f"shadow refused: {primary}", "", 1).strip()
+    if not text:
+        return
+    text = (
+        "\n".join(f"shadow preflight stderr: {line}" for line in text.splitlines())
+        + "\n"
+    )
+    raw = text.encode()
+    if len(raw) > 8192:
+        marker = "\nshadow preflight stderr: [stderr truncated]\n"
+        text = raw[: 8192 - len(marker.encode())].decode(errors="ignore") + marker
+    print(text, end="", flush=True)
 
 
 def preflight_result(

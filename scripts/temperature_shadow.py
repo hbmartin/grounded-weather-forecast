@@ -72,7 +72,11 @@ from grounded_weather_forecast.dataset.matrix import (
 )
 from grounded_weather_forecast.evaluation import code_identity
 from grounded_weather_forecast.shadow_artifacts import (
+    CAPTURED_TRUTH_FILE,
+    COMPLETIONS_FILE,
+    EVIDENCE_LOCK_FILE,
     PRODUCTION_FILE,
+    PUBLICATION_FILE,
     PUBLISHED_FILE,
     TARGET,
     EvidenceError,
@@ -86,7 +90,6 @@ from grounded_weather_forecast.shadow_artifacts import (
     issuance_name,
     json_object,
     object_value,
-    private_directory,
     required_artifact,
     required_string,
     runtime_identity,
@@ -175,7 +178,7 @@ def enrollment(
 
 def freeze(protocol_path: Path, output: Path) -> Path:
     """Seal a reviewed, future enrollment without scheduling any work."""
-    protocol_bytes = protocol_path.read_bytes()
+    protocol_bytes = required_artifact(protocol_path, policy="operator")
     protocol = protocol_document(protocol_bytes)
     if not current_artifact(protocol.get("artifact_version")):
         raise EvidenceError("freeze requires a fresh v3 protocol")
@@ -282,11 +285,11 @@ def prospective_clock(
 @dataclass(frozen=True, eq=False)
 class VerifiedEvidence:
     snapshot: CapsuleSnapshot
-    publication: ValidatedPublication
     document: dict[str, Any]
     production: dict[str, dict[str, Any]]
     seal: dict[str, Any]
     issue: pl.DataFrame
+    sealed_at: datetime
     prepared: PreparedInputs | None = None
 
 
@@ -310,11 +313,11 @@ def verified_seal(
     if not snapshot.prospective:
         raise EvidenceError("prospective seal requires a prospective capsule snapshot")
     meta = snapshot.metadata()
-    if "evidence.lock.json" not in snapshot.files:
+    if EVIDENCE_LOCK_FILE not in snapshot.files:
         raise EvidenceError(
             "missing complete evidence seal: evidence.lock.json; late recovery requires a timely seal"
         )
-    seal = snapshot.document("evidence.lock.json", "evidence seal")
+    seal = snapshot.document(EVIDENCE_LOCK_FILE, "evidence seal")
     if (
         not current_artifact(seal.get("artifact_version"))
         or seal.get("protocol_sha256") != sha256(enrolled.protocol_bytes)
@@ -337,7 +340,7 @@ def verified_seal(
         production,
         sealed_at,
     )
-    return VerifiedEvidence(snapshot, public, document, production, seal, issue)
+    return VerifiedEvidence(snapshot, document, production, seal, issue, sealed_at)
 
 
 def ensure_bytes(path: Path, payload: bytes, *, snapshot: CapsuleSnapshot) -> None:
@@ -376,7 +379,7 @@ def seal_publication(
     if timestamp(published["issued_at"]) != timestamp(meta["input_as_of"]):
         raise EvidenceError("public commit belongs to a different issuance")
     document, production = production_rows(snapshot, public=public)
-    if "evidence.lock.json" in snapshot.files:
+    if EVIDENCE_LOCK_FILE in snapshot.files:
         evidence = verified_seal(snapshot, enrolled)
         original = meta["publication"]
         if (receipt["remote"], receipt["branch"]) != (
@@ -399,9 +402,9 @@ def seal_publication(
     # Serialize before any exclusive write: malformed evidence cannot poison retries.
     receipt_bytes = json.dumps(receipt, indent=2, allow_nan=False).encode()
     ensure_bytes(capsule / PUBLISHED_FILE, payload, snapshot=snapshot)
-    ensure_bytes(capsule / "publication.json", receipt_bytes, snapshot=snapshot)
+    ensure_bytes(capsule / PUBLICATION_FILE, receipt_bytes, snapshot=snapshot)
     snapshot = snapshot.with_files(
-        {PUBLISHED_FILE: payload, "publication.json": receipt_bytes},
+        {PUBLISHED_FILE: payload, PUBLICATION_FILE: receipt_bytes},
         known_hashes={PUBLISHED_FILE: receipt["published_sha256"]},
     )
     meta = snapshot.metadata()
@@ -416,10 +419,10 @@ def seal_publication(
         "enrollment_sha256": sha256(enrolled.lock_bytes),
         "input_sha256": hashes,
     }
-    seal_bytes = write_new(capsule / "evidence.lock.json", seal)
-    snapshot = snapshot.with_files({"evidence.lock.json": seal_bytes})
+    seal_bytes = write_new(capsule / EVIDENCE_LOCK_FILE, seal)
+    snapshot = snapshot.with_files({EVIDENCE_LOCK_FILE: seal_bytes})
     return VerifiedEvidence(
-        snapshot, public, document, production, seal, prepared.issue, prepared
+        snapshot, document, production, seal, prepared.issue, now, prepared
     )
 
 
@@ -432,6 +435,7 @@ def completed_record(
     record_bytes: bytes | None = None,
     evidence: VerifiedEvidence | None = None,
 ) -> None:
+    matching_evidence(snapshot, evidence)
     regular(path)
     version = saved.get("artifact_version")
     if not current_artifact(version):
@@ -448,11 +452,12 @@ def completed_record(
         verified = (
             evidence if evidence is not None else verified_seal(snapshot, enrolled)
         )
-        if timestamp(
-            required_string(saved.get("recorded_at"), "record.recorded_at")
-        ) < timestamp(verified.seal["evidence_sealed_at"]):
+        if (
+            timestamp(required_string(saved.get("recorded_at"), "record.recorded_at"))
+            < verified.sealed_at
+        ):
             raise EvidenceError("record clock precedes complete evidence seal")
-        seal_hash = snapshot.hashes["evidence.lock.json"]
+        seal_hash = snapshot.hashes[EVIDENCE_LOCK_FILE]
     if (
         type(manifest.get("artifact_version")) is not int
         or manifest.get("artifact_version") != ARTIFACT_VERSION
@@ -489,7 +494,6 @@ def finalize(
     capsule_directory(capsule, prospective=mode == "prospective")
     with native_guard(capsule / ".sealing", "capsule finalization") as published:
         snapshot = CapsuleSnapshot.load(capsule, prospective=mode == "prospective")
-        meta = snapshot.metadata()
         origin = timestamp(
             required_string(
                 snapshot.document(PRODUCTION_FILE, SOURCE_FORECAST).get("issued_at"),
@@ -508,17 +512,9 @@ def finalize(
                 raise EvidenceError(
                     "publisher chose a different source; do not relabel held forecasts"
                 )
-        if publication_receipt is not None:
-            evidence = seal_publication(snapshot, publication_receipt, enrolled)
-            snapshot = evidence.snapshot
-        elif "publication" not in meta:
-            raise EvidenceError(
-                "missing original successful-push receipt; cannot reconstruct from a branch"
-            )
-        elif snapshot.prospective:
-            evidence = verified_seal(snapshot, enrolled)
         existing = target / "record.json"
         if existing.exists() or existing.is_symlink():
+            snapshot, evidence = final_evidence(snapshot, enrolled, publication_receipt)
             regular(existing)
             raw = existing.read_bytes()
             saved = json_object(raw, "record")
@@ -531,9 +527,46 @@ def finalize(
             )
             published.completed = target
             return target
-        target = publish_record(snapshot, output, enrolled, evidence=evidence)
+        # Acquire and exercise the real output transaction before immutable sealing.
+        with staged_record(target) as staged:
+            snapshot, evidence = final_evidence(snapshot, enrolled, publication_receipt)
+            payload = build_record(
+                snapshot, enrolled, now=datetime.now(UTC), evidence=evidence
+            )
+            payload["recorded_at"] = datetime.now(UTC).isoformat()
+            write_record(staged, payload)
         published.completed = target
         return target
+
+
+def final_evidence(
+    snapshot: CapsuleSnapshot, enrolled: Enrollment, receipt: object
+) -> tuple[CapsuleSnapshot, VerifiedEvidence | None]:
+    if receipt is not None:
+        evidence = seal_publication(snapshot, receipt, enrolled)
+        return evidence.snapshot, evidence
+    if "publication" not in snapshot.metadata():
+        raise EvidenceError(
+            "missing original successful-push receipt; cannot reconstruct from a branch"
+        )
+    return snapshot, verified_seal(snapshot, enrolled) if snapshot.prospective else None
+
+
+@contextmanager
+def staged_record(target: Path) -> Iterator[Path]:
+    if target.exists() and not any(target.iterdir()):
+        target.rmdir()  # Recover the supported empty pre-publication issuance.
+    with staged_directory(target) as staged:
+        yield staged
+
+
+def matching_evidence(
+    snapshot: CapsuleSnapshot, evidence: VerifiedEvidence | None
+) -> None:
+    if evidence is not None and evidence.snapshot is not snapshot:
+        raise RuntimeError(
+            "verified evidence and capsule snapshot must be the same object"
+        )
 
 
 def validate_provenance(meta: dict[str, Any], document: dict[str, Any]) -> None:
@@ -838,9 +871,9 @@ def validated_inputs(
             TARGET,
         },
     )
-    truth = capsule_frame(snapshot, "truth_hourly.parquet", {"valid_hour", TARGET})
-    if "provider_completions.parquet" in snapshot.files:
-        snapshot.parquet("provider_completions.parquet")
+    truth = capsule_frame(snapshot, CAPTURED_TRUTH_FILE, {"valid_hour", TARGET})
+    if COMPLETIONS_FILE in snapshot.files:
+        snapshot.parquet(COMPLETIONS_FILE)
     validate_matrix_schema(train, TRAINING_FILE)
     validate_matrix_schema(issue, ISSUE_FILE, require_sources=False)
     training_kind = matrix_kind(train, TRAINING_FILE)
@@ -881,14 +914,10 @@ def record_clock(
 ) -> tuple[datetime, str | None]:
     if evidence is None:
         return now, None
-    sealed_at = timestamp(
-        required_string(
-            evidence.seal.get("evidence_sealed_at"), "evidence.evidence_sealed_at"
-        )
-    )
+    sealed_at = evidence.sealed_at
     if now < sealed_at:
         raise EvidenceError("record clock precedes complete evidence seal")
-    return sealed_at, evidence.snapshot.hashes["evidence.lock.json"]
+    return sealed_at, evidence.snapshot.hashes[EVIDENCE_LOCK_FILE]
 
 
 def build_record(
@@ -899,6 +928,7 @@ def build_record(
     evidence: VerifiedEvidence | None = None,
 ) -> dict[str, Any]:
     """Pure reconstruction from retained files and the original recording clock."""
+    matching_evidence(snapshot, evidence)
     prospective = snapshot.prospective
     mode = "prospective" if prospective else "replay"
     meta = snapshot.metadata()
@@ -996,33 +1026,30 @@ def publish_record(
 ) -> Path:
     output = system_path(output)
     document = snapshot.document(PRODUCTION_FILE, SOURCE_FORECAST)
-    issue_record_target(
+    target = issue_record_target(
         output,
         timestamp(required_string(document.get("issued_at"), "source.issued_at")),
     )
-    payload = build_record(
-        snapshot,
-        enrolled,
-        now=datetime.now(UTC),
-        evidence=evidence,
-    )
-    payload["recorded_at"] = datetime.now(UTC).isoformat()
-    private_directory(output)
-    target = issue_record_target(output, timestamp(payload["issued_at"]))
-    if target.exists() and not any(target.iterdir()):
-        target.rmdir()  # Recover an exclusively named empty pre-publication directory.
-    with staged_directory(target) as staged:
-        raw = json.dumps(payload, indent=2, allow_nan=False, default=str).encode()
-        write_bytes_new(staged / "record.json", raw)
-        write_new(
-            staged / "record.lock.json",
-            {
-                "artifact_version": ARTIFACT_VERSION,
-                "record_sha256": sha256(raw),
-                "evidence_lock_sha256": payload["evidence_lock_sha256"],
-            },
+    with staged_record(target) as staged:
+        payload = build_record(
+            snapshot, enrolled, now=datetime.now(UTC), evidence=evidence
         )
+        payload["recorded_at"] = datetime.now(UTC).isoformat()
+        write_record(staged, payload)
     return target
+
+
+def write_record(staged: Path, payload: dict[str, Any]) -> None:
+    raw = json.dumps(payload, indent=2, allow_nan=False, default=str).encode()
+    write_bytes_new(staged / "record.json", raw)
+    write_new(
+        staged / "record.lock.json",
+        {
+            "artifact_version": ARTIFACT_VERSION,
+            "record_sha256": sha256(raw),
+            "evidence_lock_sha256": payload["evidence_lock_sha256"],
+        },
+    )
 
 
 def validate_record(
@@ -1265,7 +1292,9 @@ def evaluation_inputs(
     capsules: Path | None = None,
     truth_lock: Path | None = None,
 ) -> EvaluationInputs:
-    protocol_bytes = required_artifact(protocol_path)
+    protocol_bytes = required_artifact(
+        protocol_path, policy="operator" if mode == "replay" else "sealed"
+    )
     protocol = protocol_document(protocol_bytes)
     enrolled = (
         enrollment(protocol_path, protocol_bytes=protocol_bytes)
@@ -1444,6 +1473,7 @@ def report_error(error: BaseException, label: str) -> None:
 
 
 def terminate_shadow(signum: int, _frame: object) -> None:
+    signal.signal(signal.SIGTERM, signal.SIG_IGN)
     raise SystemExit(128 + signum)
 
 

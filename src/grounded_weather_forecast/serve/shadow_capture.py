@@ -17,6 +17,8 @@ from grounded_weather_forecast.evaluation import code_identity
 from grounded_weather_forecast.serve.schema import Forecast
 from grounded_weather_forecast.shadow_artifacts import (
     ARTIFACT_VERSION,
+    CAPTURED_TRUTH_FILE,
+    COMPLETIONS_FILE,
     ISSUE_FILE,
     PRODUCTION_FILE,
     TRAINING_FILE,
@@ -84,9 +86,9 @@ def capture_issue(
         inputs.write_parquet(folder / ISSUE_FILE)
         temperature_frame(training, training=True).write_parquet(folder / TRAINING_FILE)
         truth.select("valid_hour", "t__temp_c__mean").write_parquet(
-            folder / "truth_hourly.parquet"
+            folder / CAPTURED_TRUTH_FILE
         )
-        completions.write_parquet(folder / "provider_completions.parquet")
+        completions.write_parquet(folder / COMPLETIONS_FILE)
         (folder / PRODUCTION_FILE).write_text(document.to_json(), encoding="utf-8")
         provenance = {
             "production_code_identity": code_identity(),

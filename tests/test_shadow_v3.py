@@ -412,6 +412,7 @@ def test_sealing_lock_survives_concurrency_and_recovers_after_process_exit(
 def test_preflight_validates_the_selected_runtime_enrollment(
     shadow, frames, tmp_path, monkeypatch
 ):
+    monkeypatch.syspath_prepend(str(SCRIPT.parent))
     _capsule, protocol, _target, clock = make_prospective_record(
         shadow, frames, tmp_path, monkeypatch
     )
