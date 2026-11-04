@@ -40,6 +40,7 @@ from launchd_paths import (
     RuntimePathError,
     RuntimePaths,
     resolve_runtime,
+    subprocess_exit_code,
     working_directory,
 )
 
@@ -200,10 +201,7 @@ def run_stage(
             check=False,
             env=env,
         ).returncode
-        convert_subprocess = getattr(
-            CommandOutcome, "from_subprocess", CommandOutcome.normalize
-        )
-        code = convert_subprocess(code).exit_code
+        code = subprocess_exit_code(code)
     except (SystemExit,) as exc:  # noqa: B013 -- project exception convention
         code = CommandOutcome.normalize(exc.code).exit_code
     except (Exception,) as exc:  # noqa: B013 -- stage boundary

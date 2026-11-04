@@ -1,5 +1,6 @@
 import importlib
 import json
+import os
 from dataclasses import replace
 from datetime import timedelta, timezone
 
@@ -80,6 +81,40 @@ def test_capture_is_exclusive(config, tmp_path):
     with pytest.raises(FileExistsError, match="already captured"):
         capture_issue(tmp_path / "capsules", config, document, **options)
     assert {p.name: p.read_bytes() for p in capsule.iterdir()} == before
+
+
+@pytest.mark.skipif(os.name != "posix", reason="POSIX private-capsule permissions")
+@pytest.mark.parametrize("unsafe", ["root", "issuance"])
+def test_prospective_capture_refuses_public_existing_directories(
+    config, tmp_path, unsafe
+):
+    module = importlib.import_module("grounded_weather_forecast.serve.predict")
+    now = utc(2026, 3, 22, 17)
+    snapshot = module.build_snapshot(config, now, capture=True)
+    document = module.predict(
+        config, {}, now=now, semantics=TruthSemantics.INTERVAL_MEAN
+    )
+    root = tmp_path / "capsules"
+    root.mkdir(mode=0o755 if unsafe == "root" else 0o700)
+    root.chmod(0o755 if unsafe == "root" else 0o700)
+    selected = root
+    if unsafe == "issuance":
+        selected = root / "20260322T170000Z"
+        selected.mkdir(mode=0o755)
+        selected.chmod(0o755)
+    with pytest.raises(ValueError, match=f"{selected}: private capsule directory"):
+        capture_issue(
+            root,
+            config,
+            document,
+            issue=snapshot.hourly,
+            training=snapshot.hourly,
+            truth=snapshot.truth_hourly,
+            completions=snapshot.completions,
+            historical=False,
+        )
+    assert selected.stat().st_mode & 0o777 == 0o755
+    assert not list(selected.iterdir())
 
 
 @pytest.mark.parametrize("kind", ["empty", "instantaneous"])

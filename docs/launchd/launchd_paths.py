@@ -3,11 +3,55 @@
 
 import os
 import shutil
+import signal
 import stat
+import subprocess
 import tomllib
+from collections.abc import Sequence
+from contextlib import suppress
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
+
+
+def subprocess_exit_code(returncode: int) -> int:
+    """Keep installed wrappers usable with the prior outcome runtime."""
+    from grounded_weather_forecast.status import CommandOutcome  # noqa: PLC0415
+
+    convert = getattr(CommandOutcome, "from_subprocess", CommandOutcome.normalize)
+    return convert(returncode).exit_code
+
+
+def run_shadow_child(
+    command: Sequence[str], *, timeout: float, capture_output: bool = False
+) -> subprocess.CompletedProcess[str]:
+    """Own the POSIX uv/Python process group so timeouts cannot orphan a runner."""
+    # Reviewed shadow argv; shell parsing is never enabled.
+    process = subprocess.Popen(  # noqa: S603
+        command,
+        stdout=subprocess.PIPE if capture_output else None,
+        stderr=subprocess.PIPE if capture_output else None,
+        text=True,
+        start_new_session=os.name == "posix",
+    )
+    try:
+        stdout, stderr = process.communicate(timeout=timeout)
+    except (BaseException,) as error:  # noqa: B013 -- cancellation also releases children
+        try:
+            if os.name == "posix":
+                with suppress(ProcessLookupError):
+                    os.killpg(process.pid, signal.SIGKILL)
+            else:
+                process.kill()
+            process.communicate(timeout=5)
+        except (Exception,) as secondary:  # noqa: B013 -- preserve the triggering failure
+            error.add_note(f"shadow child cleanup failed: {secondary}")
+        raise
+    finally:
+        for pipe in (process.stdout, process.stderr):
+            if pipe is not None:
+                pipe.close()
+    return subprocess.CompletedProcess(command, process.returncode, stdout, stderr)
 
 
 class RuntimePathError(ValueError):

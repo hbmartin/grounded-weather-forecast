@@ -65,7 +65,7 @@ def test_held_shadow_issue_still_requires_validation(monkeypatch, tmp_path):
         commands.append(command)
         return subprocess.CompletedProcess(command, 1)
 
-    monkeypatch.setattr(subprocess, "run", child)
+    monkeypatch.setattr(module, "run_shadow_child", child)
     assert (
         module.finalize_shadow(
             module.RuntimePaths(tmp_path, "uv"),
@@ -90,7 +90,7 @@ def test_successful_publication_passes_exact_source_to_shadow(monkeypatch, tmp_p
         commands.append(command)
         return subprocess.CompletedProcess(command, 0)
 
-    monkeypatch.setattr(subprocess, "run", child)
+    monkeypatch.setattr(module, "run_shadow_child", child)
     root = tmp_path / "shadow"
     protocol = tmp_path / "protocol.json"
     assert (
@@ -211,7 +211,7 @@ def test_wrapper_spools_exact_receipt_durably(monkeypatch, tmp_path, child_code)
         files.append(transport)
         return subprocess.CompletedProcess(command, child_code)
 
-    monkeypatch.setattr(subprocess, "run", child)
+    monkeypatch.setattr(module, "run_shadow_child", child)
     assert module.finalize_shadow(
         module.RuntimePaths(tmp_path, "uv"),
         source,
@@ -1282,7 +1282,7 @@ def test_shadow_receipt_timeout_reports_publication_already_succeeded(
         assert kwargs["timeout"] == 300
         raise subprocess.TimeoutExpired("fixture receipt", timeout=300)
 
-    monkeypatch.setattr(subprocess, "run", timeout)
+    monkeypatch.setattr(module, "run_shadow_child", timeout)
     assert (
         module.finalize_shadow(
             paths,
@@ -1319,8 +1319,8 @@ def test_shadow_preflight_preserves_ordinary_publication(
         module, "publish", lambda _paths, _station: events.append("publish") or 0
     )
     monkeypatch.setattr(
-        subprocess,
-        "run",
+        module,
+        "run_shadow_child",
         lambda command, **_kw: subprocess.CompletedProcess(command, 2),
     )
     root = tmp_path / "shadow"
@@ -1331,7 +1331,7 @@ def test_shadow_preflight_preserves_ordinary_publication(
     assert not root.exists()
     output = capsys.readouterr().out
     assert (
-        "shadow unavailable"
+        "shadow preflight runtime failure: selected runtime exited 2"
         if state == "unsupported"
         else "shadow preflight failed"
         if state == "malformed"

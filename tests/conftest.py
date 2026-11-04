@@ -9,8 +9,7 @@ from pathlib import Path
 # isort: split
 from grounded_weather_forecast.shadow_artifacts import THREAD_CONTROLS
 
-for thread_control in THREAD_CONTROLS:
-    os.environ[thread_control] = "2"
+os.environ.update(dict.fromkeys(THREAD_CONTROLS, "2"))
 
 # isort: split
 import numpy as np
@@ -27,6 +26,8 @@ from grounded_weather_forecast.backtest import score_storage as storage
 from grounded_weather_forecast.config import load_config
 from grounded_weather_forecast.leads import hourly_bucket
 from grounded_weather_forecast.timeutil import utc
+
+pytest_plugins = ["test_temperature_shadow"]
 
 STATION_DB_COLUMNS = (
     "outTemp",

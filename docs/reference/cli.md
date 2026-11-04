@@ -1118,6 +1118,13 @@ Finalization validates source/publication projections and all consumed matrix
 schemas, including forecast columns, before writing capsule publication files.
 Input schema refusals do not run a fit or poison a corrected retry. Unexpected
 computation failures remain failures rather than being relabeled as input damage.
+Required enrollment files that are absent produce a named exit-2 refusal;
+permission errors and other operational I/O failures remain exit 1. Known column,
+numeric-type and source-provenance requirements are checked explicitly before
+transformations. Unexpected transformation and contract exceptions are not
+translated into schema refusals.
+Training and issue matrices each require one valid `source_kind`, and their kinds
+must match; live training cannot be paired with synthetic issue rows or vice versa.
 `evidence.lock.json` is published last after synchronizing the
 complete evidence. It binds declared input hashes, protocol, implementation and
 runtime, with `evidence_sealed_at`. A later record may recover only from a complete
@@ -1141,25 +1148,47 @@ wrapper exit 1 after publication. The child retains its diagnostic and has a
 300-second timeout. Install compatible source and wrappers deliberately;
 merging does not deploy them.
 
-`preflight --protocol FILE` needs no `--out` and performs no writes. Exit 0 emits
-one JSON object with `status` equal to `ready` or `outside_window`; evidence or
-capability refusals exit 2, and operational failures exit 1. Inside the window,
-it checks capture capability and the v3 enrollment/implementation/runtime lock
+`preflight --protocol FILE` needs no `--out` and performs no writes. Its JSON has
+`kind="temperature_shadow_preflight"`, integer `schema_version=1`, and `status`:
+`ready` or `outside_window` at exit 0, `refused` at exit 2, or `runtime_failure`
+at exit 1. Handled failures include a nonempty `detail` and retain their stderr
+diagnostic. Argument/usage errors remain argparse exit 2 without this envelope.
+Inside the window it checks capture capability and the v3 enrollment/implementation/runtime lock
 before capture. Outside the window it skips those checks and returns the skip status.
 The wrapper retains a cheap outside-window check for older checkouts, invokes
 this named command in the selected runtime with a 30-second timeout, and logs
 elapsed time. Preflight is repeated each hour without a persistent cache.
-Elapsed time is logged on timeout and process-start failures too. Nonzero child
-exits retain their distinction in the wrapper diagnostic: exit 2 is unavailable
-or refused capture/enrollment; exit 1 and other abnormal exits are runtime failures.
+Elapsed time is logged on timeout and process-start failures too. Timeouts
+terminate the POSIX uv/Python process group and reap the direct child;
+the same policy covers finalization. Cancellation also cleans up that group.
+Nonzero child exits are classified as runner refusals only when exit 2 accompanies the tagged,
+versioned `refused` envelope. Unknown exits, including launcher/lockfile,
+missing-script and usage exit 2, remain generic child failures with their stderr
+diagnostic. Existing untagged successful readiness objects remain accepted.
 
 Finalization reads capsule state after acquiring the `.sealing` OS-managed lock.
 Directory publication uses the same ownership policy through `.NAME.publishing`.
+Both guards require native FileLock 3.31.0+ ownership, disable soft-lock fallback,
+and create sidecars with mode `0600`. Unsupported native locking is an operational
+failure. Finalization first requires an existing nonaliased capsule and never
+creates a missing input path. Prospective capture and finalization reject POSIX
+capsule roots/issuance directories granting group/world access; they do not chmod
+existing evidence. Legacy replay retains its existing permissions contract.
 Process exit releases both guards; leftover regular sidecars do not block retry.
 Concurrent ownership fails immediately as an operational error. Existing complete
 records must verify their manifests before reuse; conflicting artifacts remain
 preserved. Required post-rename synchronization failures report the complete
 output path for inspection, while ordinary staging cleanup cannot reverse success.
+An unlock failure during another failure adds a visible cleanup diagnostic while
+preserving the primary exception/exit, including cancellation. An unlock failure
+after otherwise successful publication remains exit 1 and identifies the preserved
+output. Immutable outputs are never removed as recovery.
+
+Each computed record prepares its filtered training, supervised slice and forecast
+matrix once in orchestration and reuses the matrix for attribution. Frozen
+candidate-internal calculations remain unchanged. Completed held records do not
+refit. Snapshot mode is explicit; internal helpers share the same byte snapshot
+and validated publication digest without rereading or rehashing files.
 
 After `window_end +98 hours`, review the QC hourly-mean truth, then seal it:
 
@@ -1425,6 +1454,10 @@ Standalone wrappers remain compatible with the previous runtime: if
 `CommandOutcome.from_subprocess` is absent, child return codes use that runtime's
 existing `normalize` API. This fallback applies only to the child-result boundary
 and preserves ordinary publishing and maintenance without requiring a source update.
+This guarantee covers ordinary operation only. Shadow requires compatible source,
+wrappers, the named preflight interface and a matching frozen enrollment. With a
+runner that lacks the named action, the wrapper publishes normally, reports the
+unclassified preflight failure and returns 1 when shadow was requested.
 
 Backtest outcome hints are optional transport. Ordinary validation, encoding and
 filesystem failures cannot prevent the recorder attempt or change the return
