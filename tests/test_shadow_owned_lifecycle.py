@@ -211,10 +211,10 @@ def test_second_cancellation_runs_emergency_before_propagating(supervisor, monke
     monkeypatch.setattr(
         supervisor, "emergency_stop", lambda *_: calls.append("cleaned")
     )
+    process = SimpleNamespace()
+    channel = SimpleNamespace(control=None)
     with pytest.raises(KeyboardInterrupt, match="second") as caught:
-        supervisor.cancel_supervisor(
-            SimpleNamespace(), SimpleNamespace(control=None), primary
-        )
+        supervisor.cancel_supervisor(process, channel, primary)
     assert calls == ["cleaned"]
     assert caught.value.__cause__ is primary
     assert "second" in " ".join(primary.__notes__)
