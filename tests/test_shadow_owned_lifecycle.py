@@ -211,11 +211,13 @@ def test_second_cancellation_runs_emergency_before_propagating(supervisor, monke
     monkeypatch.setattr(
         supervisor, "emergency_stop", lambda *_: calls.append("cleaned")
     )
-    supervisor.cancel_supervisor(
-        SimpleNamespace(), SimpleNamespace(control=None), primary
-    )
+    with pytest.raises(KeyboardInterrupt, match="second") as caught:
+        supervisor.cancel_supervisor(
+            SimpleNamespace(), SimpleNamespace(control=None), primary
+        )
     assert calls == ["cleaned"]
-    assert "additional cancellation deferred" in " ".join(primary.__notes__)
+    assert caught.value.__cause__ is primary
+    assert "second" in " ".join(primary.__notes__)
 
 
 def test_nested_emergency_notes_reach_primary(supervisor, monkeypatch):

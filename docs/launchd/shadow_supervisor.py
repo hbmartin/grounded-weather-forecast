@@ -812,7 +812,6 @@ def rescue_cancellation(
 def propagate_cancellation(
     primary: BaseException,
     pending: Cancellation,
-    new_cancellation: BaseException | None,
 ) -> None:
     if not pending.requested:
         return
@@ -821,32 +820,28 @@ def propagate_cancellation(
             "additional cancellation deferred until shadow cleanup completed"
         )
         return
-    if new_cancellation is None and pending.signum == signal.SIGTERM:
-        new_cancellation = SystemExit(128 + signal.SIGTERM)
-    raise (
-        new_cancellation
-        or KeyboardInterrupt("operator cancelled during shadow cleanup")
-    ) from primary
+    if pending.signum == signal.SIGTERM:
+        raise SystemExit(128 + signal.SIGTERM) from primary
+    raise KeyboardInterrupt("operator cancelled during shadow cleanup") from primary
 
 
 def cancel_supervisor(
     process: subprocess.Popen[str], channel: StatusChannel, primary: BaseException
 ) -> None:
     completed = False
-    new_cancellation = None
     with deferred_cancellation() as pending:
         try:
             finish_cancellation(process, channel, primary)
             completed = True
-        except (Exception, KeyboardInterrupt, SystemExit) as error:
+        except (KeyboardInterrupt, SystemExit) as error:
             attach_failure(primary, "shadow cancellation diagnostic", error)
-            if isinstance(error, (KeyboardInterrupt, SystemExit)):
-                pending.requested = True
-                new_cancellation = error
+            raise error from primary
+        except (Exception,) as error:  # noqa: B013 -- operational diagnostic; caller retains primary
+            attach_failure(primary, "shadow cancellation diagnostic", error)
         finally:
             if not completed:
                 rescue_cancellation(process, channel, primary)
-    propagate_cancellation(primary, pending, new_cancellation)
+    propagate_cancellation(primary, pending)
 
 
 def close_handles(
