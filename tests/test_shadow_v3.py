@@ -97,7 +97,9 @@ def test_held_push_keeps_original_seal_and_never_refits(
     later = publisher_receipt(shadow, capsule, public)
     later["commit"] = "b" * 40
     monkeypatch.setattr(
-        shadow, "predictions", lambda *_a: pytest.fail("held record must not refit")
+        shadow,
+        "prepared_predictions",
+        lambda *_a: pytest.fail("held record must not refit"),
     )
     assert (
         shadow.finalize(
@@ -465,7 +467,6 @@ def test_sealed_commit_type_is_refused(shadow, mature_record, value):
     capsule = mature_record[0]
     receipt = json.loads((capsule / "publication.json").read_text())
     receipt["commit"] = value
-    meta = shadow.capsule_metadata(capsule, prospective=True)
-    meta["publication"] = receipt
+    (capsule / "publication.json").write_text(json.dumps(receipt))
     with pytest.raises(ValueError, match="commit identity"):
-        shadow.production_rows(capsule, meta, prospective=True)
+        shadow.production_rows(shadow.CapsuleSnapshot.load(capsule, prospective=True))

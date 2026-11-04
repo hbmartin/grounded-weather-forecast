@@ -145,7 +145,7 @@ def mature_record(shadow, frames, tmp_path, monkeypatch):
         shadow, frames, tmp_path, monkeypatch
     )
     root = tmp_path / "capsules"
-    root.mkdir()
+    root.mkdir(mode=0o700)
     retained = root / target.name
     capsule.rename(retained)
     clock.instant = shadow.timestamp(

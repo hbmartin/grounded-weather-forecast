@@ -126,7 +126,7 @@ def bind_public(shadow, capsule, public, receipt):
 def make_capsule(shadow, frames, tmp_path):
     origin, train, issue, truth = frames
     capsule = tmp_path / "capsule"
-    capsule.mkdir()
+    capsule.mkdir(mode=0o700)
     train.write_parquet(capsule / "training.parquet")
     issue.write_parquet(capsule / "issue.parquet")
     truth.write_parquet(capsule / "truth_hourly.parquet")
@@ -166,6 +166,17 @@ def make_capsule(shadow, frames, tmp_path):
     return capsule, protocol
 
 
+def captured_snapshot(shadow, capsule, meta):
+    """Build consistent synthetic capture evidence for projection contract tests."""
+    original = json.loads((capsule / "capsule.json").read_bytes())
+    original.update(meta)
+    original["input_sha256"] = {
+        name: shadow.digest(capsule / name) for name in shadow.INPUT_FILES
+    }
+    (capsule / "capsule.json").write_text(json.dumps(original))
+    return shadow.CapsuleSnapshot.load(capsule, prospective=True)
+
+
 def test_record_is_immutable_and_stale_observation_abstains(shadow, frames, tmp_path):
     capsule, protocol = make_capsule(shadow, frames, tmp_path)
     store = tmp_path / "store"
@@ -187,7 +198,7 @@ def test_protocol_edit_requires_new_enrollment(shadow, frames, tmp_path):
 def test_history_candidate_is_not_publication_evidence(shadow, frames, tmp_path):
     capsule, _ = make_capsule(shadow, frames, tmp_path)
     with pytest.raises(ValueError, match="committed payload"):
-        shadow.production_rows(capsule, {}, prospective=True)
+        shadow.production_rows(captured_snapshot(shadow, capsule, {}))
 
 
 @pytest.mark.parametrize("temperature", [15.0, 15.123, 15.00277])
@@ -234,7 +245,7 @@ def test_committed_payload_validation_uses_public_rounded_temperature(
     }
     bind_public(shadow, capsule, published, receipt)
     meta = {"publication": receipt, "provenance": provenance}
-    _, rows = shadow.production_rows(capsule, meta, prospective=True)
+    _, rows = shadow.production_rows(captured_snapshot(shadow, capsule, meta))
     assert all(
         row["values"]["temp_c"]
         == pytest.approx((round(temperature * 9.0 / 5.0 + 32.0, 2) - 32) / 1.8)
@@ -244,7 +255,7 @@ def test_committed_payload_validation_uses_public_rounded_temperature(
     (capsule / "published.json").write_text(json.dumps(published))
     bind_public(shadow, capsule, published, receipt)
     with pytest.raises(ValueError, match="temperature differs"):
-        shadow.production_rows(capsule, meta, prospective=True)
+        shadow.production_rows(captured_snapshot(shadow, capsule, meta))
 
 
 def test_replay_never_enters_prospective_analysis(shadow, frames, tmp_path):
@@ -363,10 +374,12 @@ def test_input_hashes_reject_modified_packets(shadow, frames, tmp_path):
         "issue.parquet": shadow.digest(capsule / "issue.parquet")
     }
     (capsule / "capsule.json").write_text(json.dumps(metadata))
-    assert shadow.capsule_metadata(capsule)["input_sha256"]
+    assert shadow.CapsuleSnapshot.load(capsule, prospective=False).metadata()[
+        "input_sha256"
+    ]
     (capsule / "issue.parquet").write_bytes(b"changed")
     with pytest.raises(ValueError, match="input changed"):
-        shadow.capsule_metadata(capsule)
+        shadow.CapsuleSnapshot.load(capsule, prospective=False)
 
 
 @pytest.mark.parametrize(
@@ -394,7 +407,7 @@ def test_capsule_manifest_rejects_nonlocal_names_before_hashing(
     (capsule / "capsule.json").write_text(json.dumps(metadata))
     monkeypatch.setattr(shadow, "digest", lambda *_a: pytest.fail("unsafe hash read"))
     with pytest.raises(ValueError, match="capsule filename"):
-        shadow.capsule_metadata(capsule)
+        shadow.CapsuleSnapshot.load(capsule, prospective=False)
 
 
 @pytest.mark.parametrize(
@@ -410,14 +423,15 @@ def test_capsule_rejects_declared_and_undeclared_symlinks(
     target.unlink(missing_ok=True)
     target.symlink_to(outside)
     with pytest.raises(ValueError, match="capsule symlink"):
-        shadow.capsule_metadata(capsule)
+        shadow.CapsuleSnapshot.load(capsule, prospective=False)
 
 
-def test_operator_can_choose_a_capsule_root_alias(shadow, frames, tmp_path):
+def test_capsule_directory_alias_is_refused(shadow, frames, tmp_path):
     capsule, _ = make_capsule(shadow, frames, tmp_path)
     alias = tmp_path / "operator-selected-alias"
     alias.symlink_to(capsule, target_is_directory=True)
-    assert shadow.capsule_metadata(alias) == shadow.capsule_metadata(capsule)
+    with pytest.raises(ValueError, match="nonaliased local directory"):
+        shadow.CapsuleSnapshot.load(alias, prospective=False)
 
 
 @pytest.mark.parametrize("name", ["issue.parquet", "unlisted"])
@@ -430,7 +444,7 @@ def test_capsule_rejects_directories_before_parquet_reads(
     target.mkdir()
     (target / "nested.parquet").symlink_to(tmp_path / "outside.parquet")
     with pytest.raises(ValueError, match="capsule child must be a regular file"):
-        shadow.capsule_metadata(capsule)
+        shadow.CapsuleSnapshot.load(capsule, prospective=False)
 
 
 def test_finalize_cannot_reconstruct_a_missing_push_receipt(shadow, frames, tmp_path):
@@ -550,7 +564,7 @@ def test_prospective_requires_a_complete_input_manifest(
         }
     (capsule / "capsule.json").write_text(json.dumps(metadata))
     with pytest.raises(ValueError, match="complete captured input manifest"):
-        shadow.capsule_metadata(capsule, prospective=True)
+        shadow.CapsuleSnapshot.load(capsule, prospective=True)
 
 
 @pytest.mark.parametrize(
@@ -647,11 +661,7 @@ def test_publication_projection_rejects_grid_and_attribution_changes(
         ValueError,
         match=r"grid differs|duplicated published forecast grid|interval mean|attribution differs|temperature differs|payload mismatch",
     ):
-        shadow.production_rows(
-            capsule,
-            shadow.capsule_metadata(capsule, prospective=True),
-            prospective=True,
-        )
+        shadow.production_rows(shadow.CapsuleSnapshot.load(capsule, prospective=True))
 
 
 def test_freeze_rejects_changed_candidate_bytes(shadow, tmp_path, monkeypatch):
@@ -700,7 +710,7 @@ def test_evaluation_audit_hashes_only_the_scored_records(
         clock.instant,
     )
     root = tmp_path / "capsules"
-    root.mkdir()
+    root.mkdir(mode=0o700)
     capsule.rename(root / target.name)
     original = json.loads((target / "record.json").read_text())
     for name, change in (

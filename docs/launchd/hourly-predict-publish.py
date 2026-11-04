@@ -40,6 +40,8 @@ from launchd_paths import (
     RuntimePaths,
     resolve_publishing,
     resolve_runtime,
+    run_shadow_child,
+    subprocess_exit_code,
     working_directory,
 )
 
@@ -97,10 +99,7 @@ def run_predict(paths: RuntimePaths, shadow_capture: Path | None = None) -> int:
             ],
             check=False,
         ).returncode
-        convert_subprocess = getattr(
-            CommandOutcome, "from_subprocess", CommandOutcome.normalize
-        )
-        code = convert_subprocess(code).exit_code
+        code = subprocess_exit_code(code)
     except (SystemExit,) as exc:  # noqa: B013 -- project exception convention
         code = CommandOutcome.normalize(exc.code).exit_code
     except (Exception,) as exc:  # noqa: B013 -- prediction boundary
@@ -298,6 +297,8 @@ def finalize_shadow(
         )
     except (OSError, ValueError, KeyError, subprocess.SubprocessError) as error:
         print(f"forecast published; shadow receipt/record failed: {error}", flush=True)
+        for note in getattr(error, "__notes__", ()):
+            print(f"shadow cleanup detail: {note}", flush=True)
         return 1
 
 
@@ -358,7 +359,7 @@ def _shadow_child(
     name: str,
     receipt_file: str | None,
 ) -> int:
-    result = subprocess.run(  # noqa: S603 -- reviewed local shadow script, no shell
+    result = run_shadow_child(
         [
             *paths.command("python"),
             str(paths.project / "scripts/temperature_shadow.py"),
@@ -375,7 +376,6 @@ def _shadow_child(
             "--mode",
             "prospective",
         ],
-        check=False,
         timeout=300,
     )
     if result.returncode:
@@ -398,7 +398,7 @@ def shadow_preflight(paths: RuntimePaths, protocol: Path) -> tuple[bool, str | N
             return False, None
         started = time.monotonic()
         try:
-            check = subprocess.run(  # noqa: S603 -- selected local runtime, no providers
+            check = run_shadow_child(
                 [
                     *paths.command("python"),
                     str(paths.project / "scripts/temperature_shadow.py"),
@@ -407,8 +407,6 @@ def shadow_preflight(paths: RuntimePaths, protocol: Path) -> tuple[bool, str | N
                     str(protocol),
                 ],
                 capture_output=True,
-                text=True,
-                check=False,
                 timeout=30,
             )
         finally:
@@ -416,18 +414,31 @@ def shadow_preflight(paths: RuntimePaths, protocol: Path) -> tuple[bool, str | N
                 f"shadow preflight duration_s={time.monotonic() - started:.3f}",
                 flush=True,
             )
+        try:
+            result = json.loads(check.stdout)
+        except (ValueError, TypeError):
+            result = None
         if check.returncode:
             detail = (getattr(check, "stderr", "") or "").strip().splitlines()
+            tagged = (
+                isinstance(result, dict)
+                and result.get("kind") == "temperature_shadow_preflight"
+                and type(result.get("schema_version")) is int
+                and result.get("schema_version") == 1
+                and isinstance(result.get("detail"), str)
+                and bool(result["detail"].strip())
+            )
             classification = (
-                "shadow unavailable: selected prediction runtime lacks compatible v3 capture/enrollment"
-                if check.returncode == 2
+                "shadow unavailable: " + result["detail"][:400]
+                if tagged
+                and check.returncode == 2
+                and result.get("status") == "refused"
                 else f"shadow preflight runtime failure: selected runtime exited {check.returncode}"
             )
             return (
                 False,
                 classification + (f": {detail[-1][:400]}" if detail else ""),
             )
-        result = json.loads(check.stdout)
         if not isinstance(result, dict) or result.get("status") not in {
             "ready",
             "outside_window",
@@ -444,7 +455,10 @@ def shadow_preflight(paths: RuntimePaths, protocol: Path) -> tuple[bool, str | N
         RecursionError,
         subprocess.SubprocessError,
     ) as error:
-        return False, f"shadow preflight failed: {error}"
+        notes = "; ".join(getattr(error, "__notes__", ()))
+        return False, f"shadow preflight failed: {error}" + (
+            f"; {notes}" if notes else ""
+        )
     return True, None
 
 

@@ -11,6 +11,11 @@ Installing only that wrapper need not change the source implementation digest.
 Both wrappers retain the older outcome-normalization API when the selected
 interpreter lacks `CommandOutcome.from_subprocess`; ordinary operation does not
 require installing the new source just to obtain that helper.
+This compatibility guarantee applies only to ordinary publishing and maintenance.
+Shadow needs compatible reviewed source/wrappers and a matching enrollment; the
+#102 runner does not implement named preflight. Its rejection preserves ordinary
+publication and reports shadow failure instead of inferring a capability defect
+from exit 2 alone.
 
 For source changes, choose and record an immutable reviewed release commit.
 Record current runtime import path, implementation/config/dataset identities,
@@ -111,6 +116,8 @@ command with a 30-second timeout and logs its duration. Outside-window skips
 remain successful even when an older checkout lacks shadow capability. A
 preflight failure preserves ordinary prediction/publication and reports the
 shadow failure. Install the reviewed source and compatible wrappers together.
+Timeouts/cancellation terminate the POSIX uv/Python process group, including for
+300-second finalization, so killing only the launcher cannot leave a runner alive.
 
 V3 freezes Python, numerical-library versions, backend/platform, effective
 thread controls (two threads) and dependency-lock digest. Preserve that runtime

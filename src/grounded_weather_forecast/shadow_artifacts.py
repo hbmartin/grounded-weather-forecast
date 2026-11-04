@@ -192,6 +192,27 @@ def regular(path: Path) -> None:
         raise EvidenceError(f"{path}: evidence must be a regular local file")
 
 
+def existing_directory(path: Path, *, private: bool = False) -> None:
+    """Inspect supplied directories without creating or repairing their paths."""
+    if path.is_symlink() or path.is_junction():
+        raise EvidenceError(f"{path}: expected a nonaliased local directory")
+    try:
+        metadata = path.stat()
+    except (FileNotFoundError,) as error:  # noqa: B013 -- missing supplied evidence
+        raise EvidenceError(f"{path}: missing capsule directory") from error
+    if not stat.S_ISDIR(metadata.st_mode):
+        raise EvidenceError(f"{path}: expected a local directory")
+    if private and os.name == "posix" and metadata.st_mode & 0o077:
+        raise EvidenceError(
+            f"{path}: private capsule directory permits group/world access"
+        )
+
+
+def capsule_directory(path: Path, *, prospective: bool) -> None:
+    existing_directory(path.parent, private=prospective)
+    existing_directory(path, private=prospective)
+
+
 def sync_files(directory: Path, paths: Iterable[Path]) -> None:
     """Synchronize explicitly selected regular files before their directory."""
     for path in paths:

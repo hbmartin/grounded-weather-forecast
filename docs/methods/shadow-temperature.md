@@ -59,11 +59,31 @@ fitting happens after the complete timely seal. Enrollment publishes its compute
 protocol/lock pair atomically. A per-invocation capsule snapshot reads and hashes
 each declared existing file once, reuses parsed inputs without changing source
 values, and is released before evaluating the next capsule.
+Native guards require FileLock 3.31.0+, mode `0600`, nonblocking acquisition and
+`fallback_to_soft=False`. Unsupported native locking returns operational exit 1;
+no marker-existence fallback is permitted. Missing capsule paths are checked
+before acquisition without creating directories. Prospective capsule roots and
+issuance directories must exclude POSIX group/world access; existing evidence is
+not chmodded. Primary failures and cancellation survive secondary unlock errors,
+which remain visible diagnostics; successful publication followed by failed
+unlock reports the preserved output with exit 1.
+
+`PreparedInputs` reuses filtered training, the supervised slice and forecast
+matrix once per computed record, including attribution. Candidate-internal
+transforms and all numerical operations/constants remain unchanged. Explicit
+schema checks precede transformation; unexpected transformation/contract errors
+are failures rather than evidence refusals. Snapshot identity uses object
+identity, its mode is explicit, and publication bytes carry their validated digest.
 The named `preflight --protocol FILE` checks the window first. Inside the window
 it checks capture capability and complete v3 enrollment in the selected runtime;
 outside it returns `outside_window` without those checks. The wrapper allows 30 seconds for preflight
 and 300 seconds for finalization; capability/preflight failures preserve ordinary
 publication and report shadow failure. There is no persistent validation cache.
+The result envelope uses `kind="temperature_shadow_preflight"`, schema version 1,
+and `ready`/`outside_window` (exit 0), `refused` (exit 2), or `runtime_failure`
+(exit 1). Only tagged refusals authorize the wrapper's evidence/capability
+classification; launcher and usage exits retain their own diagnostics. Older
+runtimes remain compatible for ordinary publishing/maintenance only.
 
 Freeze Python patch, numerical-library/backend/platform identity, two-thread
 controls and dependency-lock digest. Truth matures at window end +98 hours and

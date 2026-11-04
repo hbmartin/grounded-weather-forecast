@@ -17,7 +17,9 @@ from grounded_weather_forecast.evaluation import code_identity
 from grounded_weather_forecast.serve.schema import Forecast
 from grounded_weather_forecast.shadow_artifacts import (
     ARTIFACT_VERSION,
+    existing_directory,
     issuance_name,
+    private_directory,
     sync_directory,
     sync_files,
 )
@@ -58,10 +60,16 @@ def capture_issue(
         raise ValueError(
             "temperature shadow requires production interval-mean semantics"
         )
-    root.mkdir(parents=True, exist_ok=True, mode=0o700)
+    private_directory(root)
+    if not historical:
+        existing_directory(root, private=True)
     issued_at = datetime.fromisoformat(document.issued_at).astimezone(UTC)
     target = root / issuance_name(issued_at)
+    if target.is_symlink() or target.is_junction():
+        existing_directory(target, private=not historical)
     if target.exists():
+        if not historical:
+            existing_directory(target, private=True)
         raise FileExistsError(f"shadow inputs already captured: {target}")
     inputs = temperature_frame(issue, training=False)
     if any(c.startswith("t__") for c in inputs.columns):

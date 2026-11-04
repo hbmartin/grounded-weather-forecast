@@ -157,7 +157,7 @@ runner['finalize'](Path(capsule), Path(output), Path(protocol), source=None, mod
     if after_rename:
         monkeypatch.setattr(
             shadow,
-            "predictions",
+            "prepared_predictions",
             lambda *_a: pytest.fail("completed recovery must not refit"),
         )
     assert (
@@ -168,7 +168,10 @@ runner['finalize'](Path(capsule), Path(output), Path(protocol), source=None, mod
     )
     saved = json.loads((target / "record.json").read_bytes())
     shadow.completed_record(
-        target / "record.json", saved, capsule, shadow.enrollment(protocol)
+        target / "record.json",
+        saved,
+        shadow.CapsuleSnapshot.load(capsule, prospective=True),
+        shadow.enrollment(protocol),
     )
 
 
@@ -190,7 +193,9 @@ def test_finalize_reads_state_only_after_sealing_acquisition(
 
     monkeypatch.setattr(FileLock, "acquire", peer_finishes)
     monkeypatch.setattr(
-        shadow, "predictions", lambda *_a: pytest.fail("held records must not refit")
+        shadow,
+        "prepared_predictions",
+        lambda *_a: pytest.fail("held records must not refit"),
     )
     assert (
         shadow.finalize(
@@ -386,9 +391,7 @@ def test_capsule_bytes_are_read_once_and_cached_source_is_unmodified(
     assert hashes == dict.fromkeys(file_bytes, 1)
     snapshot = shadow.CapsuleSnapshot.load(capsule, prospective=True)
     original = snapshot.document("production.json", "source")
-    shadow.production_rows(
-        capsule, snapshot.metadata(), prospective=True, snapshot=snapshot
-    )
+    shadow.production_rows(snapshot)
     assert snapshot.document("production.json", "source") == original
 
 
@@ -432,8 +435,8 @@ def test_finalization_reuses_input_bytes_and_freezes_one_implementation_identity
     shadow.validate_record(
         target / "record.json",
         json.loads((target / "record.json").read_bytes()),
-        capsule,
-        protocol,
+        shadow.CapsuleSnapshot.load(capsule, prospective=True),
+        shadow.enrollment(protocol),
     )
 
 
@@ -578,14 +581,23 @@ def test_wrapper_named_preflight_status_and_failure_isolation(
             return subprocess.CompletedProcess(
                 command,
                 2 if response == "refusal" else 1,
-                "",
+                json.dumps(
+                    {
+                        "kind": "temperature_shadow_preflight",
+                        "schema_version": 1,
+                        "status": "refused"
+                        if response == "refusal"
+                        else "runtime_failure",
+                        "detail": "specific child diagnostic",
+                    }
+                ),
                 "specific child diagnostic",
             )
         return subprocess.CompletedProcess(
             command, 0, json.dumps({"status": response}), ""
         )
 
-    monkeypatch.setattr(wrapper.subprocess, "run", run)
+    monkeypatch.setattr(wrapper, "run_shadow_child", run)
     clocks = iter((10.0, 40.0))
     monkeypatch.setattr(
         wrapper, "time", SimpleNamespace(monotonic=lambda: next(clocks))
@@ -621,7 +633,11 @@ def test_preflight_cli_has_no_output_requirement_or_writes(shadow, tmp_path):
     )
     result = run_shadow(shadow, "preflight", "--protocol", protocol)
     assert result.returncode == 0, result.stderr
-    assert json.loads(result.stdout) == {"status": "outside_window"}
+    assert json.loads(result.stdout) == {
+        "kind": "temperature_shadow_preflight",
+        "schema_version": 1,
+        "status": "outside_window",
+    }
     assert list(tmp_path.iterdir()) == [protocol]
 
 

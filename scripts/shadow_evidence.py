@@ -26,6 +26,7 @@ from grounded_weather_forecast.shadow_artifacts import (
     BINDING,
     TARGET,
     EvidenceError,
+    capsule_directory,
     current_artifact,
     digest,
     finite_number,
@@ -34,6 +35,7 @@ from grounded_weather_forecast.shadow_artifacts import (
     issuance_name,
     json_object,
     object_value,
+    private_directory,
     regular,
     required_string,
     sha256,
@@ -53,18 +55,20 @@ INPUT_FILES = frozenset(
 )
 
 
-@dataclass
+@dataclass(eq=False)
 class CapsuleSnapshot:
     """One invocation's bytes; parsed projections never mutate these inputs."""
 
     capsule: Path
     files: dict[str, bytes]
     hashes: dict[str, str]
+    prospective: bool
     objects: dict[str, dict[str, Any]] = dataclass_field(default_factory=dict)
     frames: dict[str, pl.DataFrame] = dataclass_field(default_factory=dict)
 
     @classmethod
-    def load(cls, capsule: Path, *, prospective: bool = False) -> CapsuleSnapshot:
+    def load(cls, capsule: Path, *, prospective: bool) -> CapsuleSnapshot:
+        capsule_directory(capsule, prospective=prospective)
         children = tuple(capsule.iterdir())
         if any(path.is_symlink() or path.is_junction() for path in children):
             raise EvidenceError("capsule symlink is not a self-contained input")
@@ -105,7 +109,10 @@ class CapsuleSnapshot:
             regular(path)
             files[name] = path.read_bytes()
         snapshot = cls(
-            capsule, files, {name: sha256(data) for name, data in files.items()}
+            capsule,
+            files,
+            {name: sha256(data) for name, data in files.items()},
+            prospective,
         )
         snapshot.objects["capsule.json"] = meta
         for name, expected in hashes.items():
@@ -159,6 +166,7 @@ class CapsuleSnapshot:
                 name: known_hashes[name] if name in known_hashes else sha256(raw)
                 for name, raw in files.items()
             },
+            self.prospective,
             {name: value for name, value in self.objects.items() if name not in files},
             {name: value for name, value in self.frames.items() if name not in files},
         )
@@ -232,9 +240,17 @@ def capsule_for(root: Path, origin: datetime) -> Path:
     return path
 
 
+@dataclass(frozen=True, eq=False)
+class ValidatedPublication:
+    payload: bytes
+    payload_sha256: str
+    document: dict[str, Any]
+    receipt: dict[str, Any]
+
+
 def publication(
     value: object, *, payload_snapshot: tuple[bytes, str] | None = None
-) -> tuple[bytes, dict[str, Any]]:
+) -> ValidatedPublication:
     receipt = object_value(value, "publisher receipt")
     if (
         type(receipt.get("schema_version")) is not int
@@ -285,7 +301,7 @@ def publication(
     timestamp(receipt["issued_at"])
     timestamp(receipt["published_at"])
     forecast_rows(document, public=True)
-    return payload, document
+    return ValidatedPublication(payload, payload_digest, document, receipt)
 
 
 def assert_equivalent(actual: Any, expected: Any) -> None:
@@ -368,43 +384,77 @@ def truth_frame(path: Path | bytes, *, prospective: bool = True) -> pl.DataFrame
 
 
 @contextmanager
-def staged_directory(output: Path) -> Iterator[Path]:
-    """Hold an OS-managed guard; publish a complete directory after success."""
-    output.parent.mkdir(parents=True, exist_ok=True)
-    lease = output.with_name(f".{output.name}.publishing")
+def native_guard(
+    lease: Path, label: str, *, output: Path | None = None
+) -> Iterator[None]:
+    """Never substitute marker existence for native ownership or mask a primary error."""
     if lease.exists() or lease.is_symlink():
         regular(lease)
-    lock = FileLock(lease, timeout=0)
+    lock = FileLock(lease, timeout=0, mode=0o600, fallback_to_soft=False)
     try:
         lock.acquire()
     except (Timeout,) as error:  # noqa: B013 -- coordination is operational
-        raise OSError(f"output publication is already running: {output}") from error
+        raise OSError(f"{label} is already running: {lease}") from error
+    except (OSError,) as error:  # noqa: B013 -- native ownership is mandatory
+        message = f"{label}: cannot acquire native guard {lease}: {error}"
+        if error.errno is None:
+            raise OSError(message) from error
+        raise OSError(error.errno, message) from error
+    try:
+        yield
+    except (BaseException,) as error:  # noqa: B013 -- retain cancellation and primary failure
+        try:
+            lock.release()
+        except (Exception,) as secondary:  # noqa: B013 -- secondary failure is evidence
+            error.add_note(f"{label} guard release failed at {lease}: {secondary}")
+        raise
+    else:
+        try:
+            lock.release()
+        except (Exception,) as error:  # noqa: B013 -- coordination boundary
+            preserved = (
+                f"; complete output preserved at {output}"
+                if output is not None and output.exists()
+                else ""
+            )
+            raise OSError(
+                f"{label} guard release failed at {lease}{preserved}: {error}"
+            ) from error
+
+
+@contextmanager
+def staged_directory(output: Path) -> Iterator[Path]:
+    """Hold an OS-managed guard; publish a complete directory after success."""
+    private_directory(output.parent)
     temporary = None
     try:
-        if output.exists() or output.is_symlink():
-            raise FileExistsError(output)
-        temporary = Path(tempfile.mkdtemp(prefix="shadow-stage-", dir=output.parent))
-        folder = temporary / "complete"
-        folder.mkdir(mode=0o700)
-        yield folder
-        sync_files(folder, folder.iterdir())
-        if output.exists() or output.is_symlink():
-            raise FileExistsError(output)
-        folder.rename(output)
-        try:
-            sync_directory(output.parent)
-        except (OSError,) as error:  # noqa: B013 -- preserve published evidence
-            raise OSError(
-                f"complete output preserved at {output}; directory synchronization failed: {error}"
-            ) from error
+        with native_guard(
+            output.with_name(f".{output.name}.publishing"),
+            "output publication",
+            output=output,
+        ):
+            if output.exists() or output.is_symlink():
+                raise FileExistsError(output)
+            temporary = Path(
+                tempfile.mkdtemp(prefix="shadow-stage-", dir=output.parent)
+            )
+            folder = temporary / "complete"
+            folder.mkdir(mode=0o700)
+            yield folder
+            sync_files(folder, folder.iterdir())
+            if output.exists() or output.is_symlink():
+                raise FileExistsError(output)
+            folder.rename(output)
+            try:
+                sync_directory(output.parent)
+            except (OSError,) as error:  # noqa: B013 -- preserve published evidence
+                raise OSError(
+                    f"complete output preserved at {output}; directory synchronization failed: {error}"
+                ) from error
     finally:
-        try:
-            # Never unlink the guard: another process may already be using it.
-            lock.release()
-        finally:
-            if temporary is not None:
-                with suppress(OSError):
-                    shutil.rmtree(temporary, ignore_errors=True)
+        if temporary is not None:
+            with suppress(OSError):
+                shutil.rmtree(temporary, ignore_errors=True)
 
 
 def freeze_truth(

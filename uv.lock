@@ -369,7 +369,7 @@ profiling = [
 [package.metadata]
 requires-dist = [
     { name = "dynamical-catalog", marker = "extra == 'backfill'", specifier = ">=0.1" },
-    { name = "filelock", specifier = ">=3.20.3" },
+    { name = "filelock", specifier = ">=3.31.0" },
     { name = "lightgbm", specifier = ">=4.6.0" },
     { name = "numpy", specifier = ">=2.5.1" },
     { name = "polars", specifier = ">=1.42.1" },
