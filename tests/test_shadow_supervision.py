@@ -12,6 +12,7 @@ from types import SimpleNamespace
 
 import pytest
 from filelock import FileLock, Timeout
+from shadow_supervision_helpers import raw_owner, statuses
 from test_launchd import SCRIPT, load_script
 from test_shadow_native_guards import window_protocol
 
@@ -188,31 +189,41 @@ finally:
         assert elapsed >= 2 + supervisor.TERM_GRACE
 
 
-def test_runner_sigterm_cleans_staging(supervisor, tmp_path):
+@pytest.mark.parametrize("startup_delay", [0, 3])
+def test_runner_sigterm_cleans_staging(supervisor, tmp_path, startup_delay):
     output = tmp_path / "record"
+    ready = tmp_path / "staging-ready"
     program = """
 import sys,time
 from pathlib import Path
 sys.path.insert(0,sys.argv[1])
+time.sleep(float(sys.argv[4]))
 from temperature_shadow import cli_signals, staged_directory
 with cli_signals(), staged_directory(Path(sys.argv[2])) as folder:
     (folder/'partial').write_bytes(b'partial')
-    print('staging ready',flush=True)
+    Path(sys.argv[3]).touch()
     time.sleep(30)
 """
-    with pytest.raises(subprocess.TimeoutExpired) as caught:
-        supervisor.run_supervised(
-            [
-                sys.executable,
-                "-c",
-                program,
-                str(SCRIPT.parents[2] / "scripts"),
-                str(output),
-            ],
-            timeout=2,
-            capture_output=True,
-        )
-    assert b"staging ready" in caught.value.output
+    command = [
+        sys.executable,
+        "-c",
+        program,
+        str(SCRIPT.parents[2] / "scripts"),
+        str(output),
+        str(ready),
+        str(startup_delay),
+    ]
+    with raw_owner(supervisor, command, timeout=20) as (process, control, channel):
+        control.send(b"S")
+        wait_for(lambda: statuses(channel) == ["worker_ready"])
+        control.send(b"A")
+        wait_for(ready.exists, timeout=15)
+        control.cancel()
+        wait_for(lambda: len(statuses(channel)) == 2, timeout=7)
+        assert statuses(channel)[-1] == "cancelled"
+        assert channel.messages[-1]["returncode"] == 143
+        control.send(b"R")
+        assert process.wait(timeout=3) == 0
     assert not output.exists()
     assert not list(tmp_path.glob("shadow-stage-*"))
     with FileLock(tmp_path / ".record.publishing", timeout=0):

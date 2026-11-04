@@ -8,10 +8,10 @@ import signal
 import subprocess
 import sys
 import time
-from contextlib import contextmanager
 from types import SimpleNamespace
 
 import pytest
+from shadow_supervision_helpers import raw_owner, statuses
 from test_launchd import SCRIPT
 from test_shadow_supervision import (
     supervisor as supervisor,  # noqa: PLC0414 -- expose pytest fixture
@@ -19,38 +19,6 @@ from test_shadow_supervision import (
 from test_shadow_supervision import unlocked, wait_for
 
 pytestmark = pytest.mark.skipif(os.name != "posix", reason="native POSIX ownership")
-
-
-@contextmanager
-def raw_owner(supervisor, command, *, timeout=3):
-    control_read, control_write = os.pipe()
-    status_read, status_write = os.pipe()
-    process = supervisor.start_supervisor(
-        command,
-        timeout=timeout,
-        capture_output=False,
-        control_read=control_read,
-        status_write=status_write,
-    )
-    os.close(control_read)
-    os.close(status_write)
-    control = supervisor.ControlChannel(control_write)
-    channel = supervisor.StatusChannel(status_read)
-    try:
-        yield process, control, channel
-    finally:
-        control.close()
-        try:
-            process.wait(timeout=8)
-        except (subprocess.TimeoutExpired,):  # noqa: B013 -- synthetic child backstop
-            process.kill()
-            process.wait(timeout=3)
-        os.close(status_read)
-
-
-def statuses(channel):
-    channel.collect()
-    return [item["status"] for item in channel.messages]
 
 
 @pytest.mark.parametrize("initial", [b"", b"S"])
@@ -277,6 +245,7 @@ def test_real_uv_double_term_unwinds_runner_staging(supervisor, tmp_path):
     assert uv is not None
     output = tmp_path / "record"
     cleaned = tmp_path / "cleanup-finished"
+    ready = tmp_path / "staging-ready"
     program = """
 import sys,time
 from pathlib import Path
@@ -285,6 +254,7 @@ from temperature_shadow import cli_signals,staged_directory
 with cli_signals(),staged_directory(Path(sys.argv[2])) as folder:
  try:
   (folder/'partial').write_text('retain no accepted record')
+  Path(sys.argv[4]).touch()
   print('staging ready',flush=True)
   time.sleep(30)
  finally:
@@ -304,10 +274,19 @@ with cli_signals(),staged_directory(Path(sys.argv[2])) as folder:
         str(SCRIPT.parents[2] / "scripts"),
         str(output),
         str(cleaned),
+        str(ready),
     ]
-    with pytest.raises(subprocess.TimeoutExpired) as caught:
-        supervisor.run_supervised(command, timeout=2, capture_output=True)
-    assert b"staging ready" in caught.value.output
+    with raw_owner(supervisor, command, timeout=20) as (process, control, channel):
+        control.send(b"S")
+        wait_for(lambda: statuses(channel) == ["worker_ready"])
+        control.send(b"A")
+        wait_for(ready.exists, timeout=15)
+        control.cancel()
+        wait_for(lambda: len(statuses(channel)) == 2, timeout=7)
+        assert statuses(channel)[-1] == "cancelled"
+        assert channel.messages[-1]["returncode"] != 0
+        control.send(b"R")
+        assert process.wait(timeout=3) == 0
     assert cleaned.read_text() == "cleanup survived forwarded SIGTERM"
     assert not output.exists()
     assert not list(tmp_path.glob("shadow-stage-*"))
