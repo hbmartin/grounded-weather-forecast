@@ -110,6 +110,7 @@ METHODS = (
 )
 HORIZONS = ("0-6h", "6-24h", "24-72h", "72-96h")
 SOURCE_FORECAST = "source forecast"
+RECORDED_AT_LABEL = "record.recorded_at"
 
 
 def write_new(path: Path, payload: Any) -> bytes:
@@ -453,7 +454,7 @@ def completed_record(
             evidence if evidence is not None else verified_seal(snapshot, enrolled)
         )
         if (
-            timestamp(required_string(saved.get("recorded_at"), "record.recorded_at"))
+            timestamp(required_string(saved.get("recorded_at"), RECORDED_AT_LABEL))
             < verified.sealed_at
         ):
             raise EvidenceError("record clock precedes complete evidence seal")
@@ -467,7 +468,7 @@ def completed_record(
         or saved.get("evidence_lock_sha256") != seal_hash
         or saved.get("input_sha256") != snapshot.digests()
         or saved.get("protocol_sha256") != sha256(enrolled.protocol_bytes)
-        or timestamp(required_string(saved.get("recorded_at"), "record.recorded_at"))
+        or timestamp(required_string(saved.get("recorded_at"), RECORDED_AT_LABEL))
         > datetime.now(UTC)
         or path.parent.name
         != issuance_name(
@@ -1073,9 +1074,7 @@ def validate_record(
         record_bytes=record_bytes,
         evidence=evidence,
     )
-    recorded = timestamp(
-        required_string(saved.get("recorded_at"), "record.recorded_at")
-    )
+    recorded = timestamp(required_string(saved.get("recorded_at"), RECORDED_AT_LABEL))
     expected = build_record(
         snapshot,
         enrolled,

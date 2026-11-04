@@ -275,6 +275,14 @@ def directory_child(root: Path, name: str, *, required: bool, label: str) -> Pat
     return path
 
 
+def missing_ancestor_parent(path: Path) -> Path:
+    if path.is_symlink() or path.is_junction():
+        raise EvidenceError(f"{path}: ancestor alias has no directory target") from None
+    if path.parent == path:
+        raise FileNotFoundError(path)
+    return path.parent
+
+
 def existing_ancestor_directory(path: Path) -> None:
     """Refuse file ancestors without banning trusted operator prefix aliases."""
     while True:
@@ -283,14 +291,7 @@ def existing_ancestor_directory(path: Path) -> None:
             path.lstat()
             metadata = path.stat()
         except (FileNotFoundError, NotADirectoryError):
-            if path.is_symlink() or path.is_junction():
-                raise EvidenceError(
-                    f"{path}: ancestor alias has no directory target"
-                ) from None
-            parent = path.parent
-            if parent == path:
-                raise
-            path = parent
+            path = missing_ancestor_parent(path)
             continue
         except (OSError,) as error:  # noqa: B013 -- loops are supplied path damage
             if error.errno == errno.ELOOP:

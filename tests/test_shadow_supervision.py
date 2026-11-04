@@ -529,7 +529,11 @@ def test_emergency_cleanup_attempts_every_step_and_keeps_first_failure(
         cancel=lambda: calls.append("cancel"), send=lambda _: calls.append("release")
     )
     process = SimpleNamespace(
-        pid=987654, returncode=None, communicate=reap_failed, wait=reap_failed
+        pid=987654,
+        returncode=None,
+        communicate=reap_failed,
+        wait=reap_failed,
+        kill=lambda: calls.append((987654, signal.SIGKILL)),
     )
     monkeypatch.setattr(supervisor, "stopped_supervisor", lambda *_: True)
     monkeypatch.setattr(
@@ -569,3 +573,28 @@ def test_fresh_cancellation_is_not_swallowed_by_cleanup(supervisor, monkeypatch)
     assert caught.value is cancelled
     assert cleaned == [True]
     assert caught.value.__cause__ is primary
+
+
+def test_rescue_reaping_preserves_communication_error_after_kill_failure(supervisor):
+    primary = OSError("communication failed")
+    calls = []
+
+    def communicate(**_kwargs):
+        raise primary
+
+    def kill():
+        calls.append("kill")
+        raise PermissionError("kill denied")
+
+    def wait(**_kwargs):
+        calls.append("wait")
+        raise OSError("wait failed")
+
+    process = SimpleNamespace(communicate=communicate, kill=kill, wait=wait)
+    deadline = time.monotonic() + 1
+    with pytest.raises(OSError, match="communication failed") as caught:
+        supervisor.reap_supervisor(process, deadline)
+    assert caught.value is primary
+    assert calls == ["kill", "wait"]
+    assert "kill denied" in " ".join(primary.__notes__)
+    assert "supervisor left unreaped" in " ".join(primary.__notes__)

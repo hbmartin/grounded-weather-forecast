@@ -417,8 +417,9 @@ def test_worker_pipe_allocation_failure_closes_prior_descriptors(
         return pair
 
     monkeypatch.setattr(supervisor.os, "pipe", fail_second)
+    deadline = time.monotonic() + 1
     with pytest.raises(OSError, match="second pipe failed"):
-        supervisor.start_worker(["never-admitted"], time.monotonic() + 1)
+        supervisor.start_worker(["never-admitted"], deadline)
     for descriptor in allocated:
         with pytest.raises(OSError, match="Bad file descriptor"):
             os.fstat(descriptor)

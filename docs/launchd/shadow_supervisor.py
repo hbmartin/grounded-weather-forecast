@@ -17,7 +17,7 @@ from contextlib import contextmanager, suppress
 from dataclasses import dataclass, field
 from functools import partial
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 TERM_GRACE = 2.0
 REAP_TIMEOUT = 3.0
@@ -114,13 +114,23 @@ def group_exists(pid: int) -> bool:
     return True
 
 
+def wait_notification(
+    process: subprocess.Popen[str], flags: int
+) -> os.waitid_result | None:
+    """WNOHANG returns None on supported runtimes, despite narrower platform stubs."""
+    return cast(
+        "os.waitid_result | None",
+        os.waitid(os.P_PID, process.pid, flags | os.WNOHANG | os.WNOWAIT),
+    )
+
+
 def observe_exit(process: subprocess.Popen[str]) -> int | None:
     """Inspect our direct child without releasing the PID that reserves its group ID."""
     if process.returncode is not None:
         raise OSError(
             "shadow ownership already released; refusing historical PID signaling"
         )
-    info = os.waitid(os.P_PID, process.pid, os.WEXITED | os.WNOHANG | os.WNOWAIT)
+    info = wait_notification(process, os.WEXITED)
     if info is None or info.si_code not in (
         os.CLD_EXITED,
         os.CLD_KILLED,
@@ -246,7 +256,8 @@ def bootstrap(
                 return 125
         os.close(admission)
         os.set_inheritable(error_pipe, False)  # noqa: FBT003 -- POSIX positional-only API
-        os.execvp(command[0], list(command))  # noqa: S606 -- reviewed operator argv, no shell
+        # Reviewed operator-selected argv; no shell interpretation.
+        os.execvp(command[0], list(command))  # noqa: S606
     except (OSError,) as error:  # noqa: B013 -- retain launcher failure semantics
         payload = json.dumps({"detail": str(error), "errno": error.errno}).encode()
         os.write(error_pipe, payload)
@@ -259,6 +270,8 @@ class Worker:
     process: subprocess.Popen[str]
     admission: int
     errors: int
+    cleaned: bool = False
+    released: bool = False
 
     def admit(self) -> None:
         os.write(self.admission, b"G")
@@ -329,81 +342,89 @@ def await_release(control: int) -> None:
         pass  # Cancellation may precede the terminal ACK.
 
 
+def worker_outcome(
+    worker: Worker, control: int, status: int, deadline: float, cancelled: Cancellation
+) -> str:
+    send_status(status, "worker_ready", worker_pid=worker.process.pid)
+    admitted = await_token(control, b"A", deadline, cancelled)
+    if admitted != "ready":
+        return admitted
+    if cancelled.requested or control_cancelled(control):
+        return "cancelled"
+    if time.monotonic() >= deadline:
+        return "timed_out"
+    worker.admit()
+    return monitor(worker.process, control, deadline, cancelled)
+
+
+def finish_worker(worker: Worker, control: int, status: int, outcome: str) -> None:
+    worker.close_admission()
+    code = stop_worker(worker.process)
+    worker.cleaned = True
+    worker.exec_error()
+    send_status(status, outcome, returncode=code, cleanup_complete=True)
+    await_release(control)
+    worker.released = True
+    worker.process.wait(timeout=REAP_TIMEOUT)
+
+
+def failed_worker(
+    worker: Worker | None, control: int, status: int, error: Exception
+) -> None:
+    cleaned = worker is None or worker.cleaned
+    if worker is not None and not cleaned:
+        worker.close_admission()
+        try:
+            signal_group(worker.process.pid, signal.SIGKILL)
+            wait_exit(worker.process, time.monotonic() + REAP_TIMEOUT)
+            cleaned = True
+        except (Exception,) as secondary:  # noqa: B013 -- keep the original supervisor failure
+            attach_failure(error, "worker cleanup failed", secondary)
+    send_status(
+        status,
+        "runtime_failure",
+        detail=str(error),
+        notes=getattr(error, "__notes__", []),
+        cleanup_complete=cleaned,
+    )
+    if worker is not None:
+        await_release(control)
+        if cleaned:
+            worker.process.wait(timeout=REAP_TIMEOUT)
+
+
 def supervise(
     command: Sequence[str], control: int, status: int, deadline: float
 ) -> int:
     cancelled = Cancellation()
     previous = {
-        signum: signal.signal(signum, cancelled.handle)
-        for signum in (signal.SIGINT, signal.SIGTERM)
+        sig: signal.signal(sig, cancelled.handle)
+        for sig in (signal.SIGINT, signal.SIGTERM)
     }
     worker = None
-    released = False
-    group_cleaned = False
     try:
         readiness = await_start(control, deadline, cancelled)
         if readiness != "ready":
             send_status(status, readiness, cleanup_complete=True)
             return 0
         worker = start_worker(command, deadline)
-        send_status(status, "worker_ready", worker_pid=worker.process.pid)
-        admitted = await_token(control, b"A", deadline, cancelled)
-        if (
-            admitted == "ready"
-            and not cancelled.requested
-            and not control_cancelled(control)
-            and time.monotonic() < deadline
-        ):
-            worker.admit()
-            outcome = monitor(worker.process, control, deadline, cancelled)
-        else:
-            outcome = (
-                admitted
-                if admitted != "ready"
-                else ("timed_out" if time.monotonic() >= deadline else "cancelled")
-            )
-        worker.close_admission()
-        code = stop_worker(worker.process)
-        group_cleaned = True
-        worker.exec_error()
-        send_status(status, outcome, returncode=code, cleanup_complete=True)
-        await_release(control)
-        released = True
-        worker.process.wait(timeout=REAP_TIMEOUT)
+        outcome = worker_outcome(worker, control, status, deadline, cancelled)
+        finish_worker(worker, control, status, outcome)
         return 0
     except (Exception,) as error:  # noqa: B013 -- supervisor boundary
-        if released:
+        if worker is not None and worker.released:
             print(
                 f"shadow supervisor after ownership release: {error}", file=sys.stderr
             )
             return 1
-        cleaned = worker is None or group_cleaned
-        if worker is not None and not cleaned:
-            worker.close_admission()
-            try:
-                signal_group(worker.process.pid, signal.SIGKILL)
-                wait_exit(worker.process, time.monotonic() + REAP_TIMEOUT)
-                cleaned = True
-            except (Exception,) as secondary:  # noqa: B013 -- preserve primary error
-                attach_failure(error, "worker cleanup failed", secondary)
-        send_status(
-            status,
-            "runtime_failure",
-            detail=str(error),
-            notes=getattr(error, "__notes__", []),
-            cleanup_complete=cleaned,
-        )
-        if worker is not None:
-            await_release(control)
-            if cleaned:
-                worker.process.wait(timeout=REAP_TIMEOUT)
+        failed_worker(worker, control, status, error)
         return 1
     finally:
         if worker is not None:
             worker.close_admission()
             os.close(worker.errors)
-        for signum, handler in previous.items():
-            signal.signal(signum, handler)
+        for sig, handler in previous.items():
+            signal.signal(sig, handler)
         os.close(control)
         os.close(status)
 
@@ -436,6 +457,27 @@ class ControlChannel:
             if not self.closed:
                 self.closed = True
                 os.close(self.descriptor)
+
+
+def validate_diagnostic(value: dict[str, Any]) -> None:
+    if not isinstance(value.get("status"), str) or not isinstance(
+        value.get("detail", ""), str
+    ):
+        raise OSError("invalid shadow supervisor diagnostic fields")
+    notes = value.get("notes", [])
+    if not isinstance(notes, list) or any(not isinstance(note, str) for note in notes):
+        raise OSError("invalid shadow supervisor diagnostic fields")
+
+
+def diagnostic_error(
+    value: dict[str, Any], default: str = "worker cancelled"
+) -> OSError:
+    error = OSError(
+        f"shadow supervisor {value['status']}: {value.get('detail', default)}"
+    )
+    for note in value.get("notes", []):
+        error.add_note(str(note))
+    return error
 
 
 @dataclass
@@ -478,21 +520,24 @@ class StatusChannel:
             except (BlockingIOError,):  # noqa: B013 -- continuous nonblocking reader
                 return True
             with self.lock:
-                if not chunk:
-                    if self.payload and self.error is None:
-                        self.error = OSError("incomplete shadow supervisor status")
-                    return False
-                self.total += len(chunk)
-                if self.total > STATUS_LIMIT:
-                    self.error = self.error or OSError(
-                        "shadow supervisor status exceeds limit"
-                    )
-                if self.error is None:
-                    try:
-                        self.parse(chunk)
-                    except (Exception,) as error:  # noqa: B013 -- keep draining a broken producer
-                        self.error = error
+                self.feed(chunk)
+            if not chunk:
+                return False
         return False
+
+    def feed(self, chunk: bytes) -> None:
+        if not chunk:
+            if self.payload and self.error is None:
+                self.error = OSError("incomplete shadow supervisor status")
+            return
+        self.total += len(chunk)
+        if self.total > STATUS_LIMIT:
+            self.error = self.error or OSError("shadow supervisor status exceeds limit")
+        if self.error is None:
+            try:
+                self.parse(chunk)
+            except (Exception,) as error:  # noqa: B013 -- keep draining broken producers
+                self.error = error
 
     def parse(self, chunk: bytes) -> None:
         self.payload += chunk
@@ -514,35 +559,29 @@ class StatusChannel:
             self.messages.append(value)
 
     def accept(self, value: dict[str, Any]) -> None:
-        status = value.get("status")
-        if (
-            not isinstance(status, str)
-            or not isinstance(value.get("detail", ""), str)
-            or not isinstance(value.get("notes", []), list)
-            or any(not isinstance(note, str) for note in value.get("notes", []))
-        ):
-            raise OSError("invalid shadow supervisor diagnostic fields")
+        validate_diagnostic(value)
+        status = value["status"]
         if status == "worker_ready" and not self.messages:
-            pid = value.get("worker_pid")
-            if type(pid) is not int or pid <= 1:
-                raise OSError("invalid owned shadow worker identity")
-            self.owned_pid = pid
-            if self.control is not None:
-                self.control.send(b"A")
+            self.admit_identity(value)
         elif status in TERMINAL and type(value.get("cleanup_complete")) is bool:
-            if value.get("cleanup_complete"):
-                self.released = True
-                if self.control is not None:
-                    self.control.send(b"R")
-            else:
-                error = OSError(
-                    f"shadow supervisor {status}: {value.get('detail', 'cleanup incomplete')}"
-                )
-                for note in value.get("notes", []):
-                    error.add_note(note)
-                raise error
+            self.release_identity(value)
         else:
             raise OSError("invalid shadow supervision phase")
+
+    def admit_identity(self, value: dict[str, Any]) -> None:
+        pid = value.get("worker_pid")
+        if type(pid) is not int or pid <= 1:
+            raise OSError("invalid owned shadow worker identity")
+        self.owned_pid = pid
+        if self.control is not None:
+            self.control.send(b"A")
+
+    def release_identity(self, value: dict[str, Any]) -> None:
+        if not value["cleanup_complete"]:
+            raise diagnostic_error(value, "cleanup incomplete")
+        self.released = True
+        if self.control is not None:
+            self.control.send(b"R")
 
     def collect(self) -> None:
         if self.thread is None:
@@ -575,13 +614,34 @@ def stopped_supervisor(process: subprocess.Popen[str], deadline: float) -> bool:
         return False
     os.kill(process.pid, signal.SIGSTOP)
     while time.monotonic() < deadline:
-        info = os.waitid(
-            os.P_PID, process.pid, os.WEXITED | os.WSTOPPED | os.WNOHANG | os.WNOWAIT
-        )
+        info = wait_notification(process, os.WEXITED | os.WSTOPPED)
         if info is not None:
             return info.si_code == os.CLD_STOPPED
         time.sleep(POLL_INTERVAL)
     raise OSError("could not verify stopped shadow supervisor")
+
+
+def resume_supervisor(process: subprocess.Popen[str], channel: StatusChannel) -> None:
+    if channel.control is not None:
+        channel.control.cancel()
+        channel.control.send(b"R")
+    os.kill(process.pid, signal.SIGCONT)
+
+
+def reap_supervisor(process: subprocess.Popen[str], deadline: float) -> None:
+    try:
+        process.communicate(timeout=max(0, deadline - time.monotonic()))
+    except (Exception,) as error:  # noqa: B013 -- bounded final rescue
+        # Popen.kill safely handles a direct child that exited during communicate.
+        try:
+            process.kill()
+        except (Exception,) as secondary:  # noqa: B013 -- reaping must still be attempted
+            attach_failure(error, "supervisor kill failed", secondary)
+        try:
+            process.wait(timeout=max(0.01, deadline - time.monotonic()))
+        except (Exception,) as secondary:  # noqa: B013 -- expose unreaped state
+            attach_failure(error, "supervisor left unreaped", secondary)
+        raise
 
 
 def emergency_stop(process: subprocess.Popen[str], channel: StatusChannel) -> None:
@@ -603,23 +663,13 @@ def emergency_stop(process: subprocess.Popen[str], channel: StatusChannel) -> No
     finally:
         if stopped:
             try:
-                if channel.control is not None:
-                    channel.control.cancel()
-                    channel.control.send(b"R")
-                os.kill(process.pid, signal.SIGCONT)
-            except (Exception,) as error:  # noqa: B013 -- preserve all independent failures
+                resume_supervisor(process, channel)
+            except (Exception,) as error:  # noqa: B013 -- retain independent failures
                 failures.append(error)
         try:
-            process.communicate(timeout=max(0, deadline - time.monotonic()))
-        except (Exception,) as error:  # noqa: B013 -- bounded final rescue
+            reap_supervisor(process, deadline)
+        except (Exception,) as error:  # noqa: B013 -- retain independent reaping failure
             failures.append(error)
-            if process.returncode is None:
-                with suppress(ProcessLookupError):
-                    os.kill(process.pid, signal.SIGKILL)
-                try:
-                    process.wait(timeout=max(0.01, deadline - time.monotonic()))
-                except (Exception,) as secondary:  # noqa: B013 -- make unreaped state visible
-                    attach_failure(error, "supervisor left unreaped", secondary)
     if failures:
         primary, *secondary = failures
         for error in secondary:
@@ -735,6 +785,50 @@ def deferred_cancellation() -> Iterator[Cancellation]:
             signal.signal(sig, handler)
 
 
+def finish_cancellation(
+    process: subprocess.Popen[str], channel: StatusChannel, primary: BaseException
+) -> None:
+    if channel.control is not None:
+        channel.control.cancel()
+    communicate_until(
+        process, channel, time.monotonic() + TERM_GRACE + REAP_TIMEOUT + WAIT_MARGIN
+    )
+    channel.finish()
+    if channel.messages and channel.messages[-1].get("status") == "runtime_failure":
+        attach_failure(
+            primary, "shadow supervisor failure", diagnostic_error(channel.messages[-1])
+        )
+
+
+def rescue_cancellation(
+    process: subprocess.Popen[str], channel: StatusChannel, primary: BaseException
+) -> None:
+    try:
+        emergency_stop(process, channel)
+    except (Exception,) as error:  # noqa: B013 -- retain primary plus nested notes
+        attach_failure(primary, "shadow child cleanup failed", error)
+
+
+def propagate_cancellation(
+    primary: BaseException,
+    pending: Cancellation,
+    new_cancellation: BaseException | None,
+) -> None:
+    if not pending.requested:
+        return
+    if isinstance(primary, (KeyboardInterrupt, SystemExit)):
+        primary.add_note(
+            "additional cancellation deferred until shadow cleanup completed"
+        )
+        return
+    if new_cancellation is None and pending.signum == signal.SIGTERM:
+        new_cancellation = SystemExit(128 + signal.SIGTERM)
+    raise (
+        new_cancellation
+        or KeyboardInterrupt("operator cancelled during shadow cleanup")
+    ) from primary
+
+
 def cancel_supervisor(
     process: subprocess.Popen[str], channel: StatusChannel, primary: BaseException
 ) -> None:
@@ -742,46 +836,17 @@ def cancel_supervisor(
     new_cancellation = None
     with deferred_cancellation() as pending:
         try:
-            if channel.control is not None:
-                channel.control.cancel()
-            communicate_until(
-                process,
-                channel,
-                time.monotonic() + TERM_GRACE + REAP_TIMEOUT + WAIT_MARGIN,
-            )
-            channel.finish()
+            finish_cancellation(process, channel, primary)
             completed = True
-            if (
-                channel.messages
-                and channel.messages[-1].get("status") == "runtime_failure"
-            ):
-                error = OSError(str(channel.messages[-1].get("detail")))
-                for note in channel.messages[-1].get("notes", []):
-                    error.add_note(str(note))
-                attach_failure(primary, "shadow supervisor failure", error)
-        except (BaseException,) as error:  # noqa: B013 -- cleanup still runs after repeated cancellation
+        except (Exception, KeyboardInterrupt, SystemExit) as error:
             attach_failure(primary, "shadow cancellation diagnostic", error)
             if isinstance(error, (KeyboardInterrupt, SystemExit)):
                 pending.requested = True
                 new_cancellation = error
         finally:
             if not completed:
-                try:
-                    emergency_stop(process, channel)
-                except (Exception,) as error:  # noqa: B013 -- preserve primary plus nested notes
-                    attach_failure(primary, "shadow child cleanup failed", error)
-    if pending.requested:
-        if isinstance(primary, (KeyboardInterrupt, SystemExit)):
-            primary.add_note(
-                "additional cancellation deferred until shadow cleanup completed"
-            )
-        else:
-            if new_cancellation is None and pending.signum == signal.SIGTERM:
-                new_cancellation = SystemExit(128 + signal.SIGTERM)
-            raise (
-                new_cancellation
-                or KeyboardInterrupt("operator cancelled during shadow cleanup")
-            ) from primary
+                rescue_cancellation(process, channel, primary)
+    propagate_cancellation(primary, pending, new_cancellation)
 
 
 def close_handles(

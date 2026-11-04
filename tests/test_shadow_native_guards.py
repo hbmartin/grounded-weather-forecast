@@ -568,8 +568,13 @@ def test_cancellation_keeps_primary_when_process_group_cleanup_fails(monkeypatch
         raise OSError("supervisor cleanup communication failed")
 
     process = SimpleNamespace(
-        pid=987654, returncode=None, communicate=interrupted, wait=lambda **_: 0
+        pid=987654,
+        returncode=None,
+        communicate=interrupted,
+        wait=lambda **_: 0,
+        kill=lambda: None,
     )
+    monkeypatch.setattr(channel, "collect", lambda: None)
     monkeypatch.setattr(supervisor, "stopped_supervisor", lambda *_: True)
     monkeypatch.setattr(supervisor.os, "kill", lambda *_: None)
 

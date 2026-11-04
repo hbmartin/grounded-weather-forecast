@@ -179,12 +179,13 @@ def test_direct_truth_helper_missing_protocol_and_permission_classification(
     shadow, tmp_path, monkeypatch
 ):
     missing = tmp_path / "missing.json"
+    now = shadow.datetime.now(UTC)
     with pytest.raises(EvidenceError, match="missing required enrollment artifact"):
         shadow.seal_truth(
             tmp_path / "truth.parquet",
             missing,
             tmp_path / "out",
-            shadow.datetime.now(UTC),
+            now,
         )
 
     def denied(*_):
