@@ -36,6 +36,8 @@ from shadow_evidence import (
     ARTIFACT_VERSION,
     BINDING,
     INPUT_FILES,  # noqa: F401 -- shared capture contract exposed to offline callers
+    ISSUE_FILE,
+    TRAINING_FILE,
     CapsuleSnapshot,
     ValidatedPublication,
     assert_equivalent,
@@ -734,7 +736,7 @@ def checked_issue(
 ) -> pl.DataFrame:
     issue = capsule_frame(
         snapshot,
-        "issue.parquet",
+        ISSUE_FILE,
         {"issue_time", "valid_time", "lead_hours", "lead_bucket", "source_kind"},
     ).sort("valid_time")
     if issue["lead_hours"].null_count() or not issue["lead_hours"].is_finite().all():
@@ -780,7 +782,7 @@ def validated_inputs(
     )
     train = capsule_frame(
         snapshot,
-        "training.parquet",
+        TRAINING_FILE,
         {
             "issue_time",
             "valid_time",
@@ -793,10 +795,10 @@ def validated_inputs(
     truth = capsule_frame(snapshot, "truth_hourly.parquet", {"valid_hour", TARGET})
     if "provider_completions.parquet" in snapshot.files:
         snapshot.parquet("provider_completions.parquet")
-    validate_matrix_schema(train, "training.parquet")
-    validate_matrix_schema(issue, "issue.parquet", require_sources=False)
-    training_kind = matrix_kind(train, "training.parquet")
-    if matrix_kind(issue, "issue.parquet") != training_kind:
+    validate_matrix_schema(train, TRAINING_FILE)
+    validate_matrix_schema(issue, ISSUE_FILE, require_sources=False)
+    training_kind = matrix_kind(train, TRAINING_FILE)
+    if matrix_kind(issue, ISSUE_FILE) != training_kind:
         raise EvidenceError(
             "issue.parquet.source_kind: differs from training provenance"
         )

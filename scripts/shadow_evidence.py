@@ -44,10 +44,13 @@ from grounded_weather_forecast.shadow_artifacts import (
     timestamp,
 )
 
+ISSUE_FILE = "issue.parquet"
+TRAINING_FILE = "training.parquet"
+
 INPUT_FILES = frozenset(
     {
-        "issue.parquet",
-        "training.parquet",
+        ISSUE_FILE,
+        TRAINING_FILE,
         "truth_hourly.parquet",
         "production.json",
         "provider_completions.parquet",
