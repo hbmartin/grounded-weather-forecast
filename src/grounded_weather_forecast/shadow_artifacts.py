@@ -19,6 +19,8 @@ from typing import Any, cast
 ARTIFACT_VERSION = 3
 ISSUE_FILE = "issue.parquet"
 TRAINING_FILE = "training.parquet"
+PRODUCTION_FILE = "production.json"
+PUBLISHED_FILE = "published.json"
 TARGET = "t__temp_c__mean"
 BINDING = "publisher successful explicit-commit push"
 THREAD_CONTROLS = (

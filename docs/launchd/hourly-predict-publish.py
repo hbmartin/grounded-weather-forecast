@@ -383,6 +383,25 @@ def _shadow_child(
     return 1 if result.returncode else 0
 
 
+def refused_preflight(result: object, returncode: int) -> bool:
+    return (
+        returncode == 2
+        and isinstance(result, dict)
+        and result.get("kind") == "temperature_shadow_preflight"
+        and type(result.get("schema_version")) is int
+        and result.get("schema_version") == 1
+        and result.get("status") == "refused"
+        and isinstance(result.get("detail"), str)
+        and bool(result["detail"].strip())
+    )
+
+
+def preflight_secondary(detail: list[str], primary: str) -> None:
+    for line in detail:
+        if line != f"shadow refused: {primary}":
+            print(f"shadow preflight stderr: {line[:400]}", flush=True)
+
+
 def preflight_result(
     check: subprocess.CompletedProcess[str],
 ) -> tuple[bool, str | None]:
@@ -393,18 +412,8 @@ def preflight_result(
         result = None
     if check.returncode:
         detail = (getattr(check, "stderr", "") or "").strip().splitlines()
-        tagged = (
-            isinstance(result, dict)
-            and result.get("kind") == "temperature_shadow_preflight"
-            and type(result.get("schema_version")) is int
-            and result.get("schema_version") == 1
-            and isinstance(result.get("detail"), str)
-            and bool(result["detail"].strip())
-        )
-        if tagged and check.returncode == 2 and result.get("status") == "refused":
-            for line in detail:
-                if line != f"shadow refused: {result['detail']}":
-                    print(f"shadow preflight stderr: {line[:400]}", flush=True)
+        if refused_preflight(result, check.returncode):
+            preflight_secondary(detail, result["detail"])
             return False, "shadow unavailable: " + result["detail"][:400]
         classification = f"shadow preflight runtime failure: selected runtime exited {check.returncode}"
         return False, classification + (f": {detail[-1][:400]}" if detail else "")

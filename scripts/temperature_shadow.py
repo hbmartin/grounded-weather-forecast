@@ -72,6 +72,8 @@ from grounded_weather_forecast.dataset.matrix import (
 )
 from grounded_weather_forecast.evaluation import code_identity
 from grounded_weather_forecast.shadow_artifacts import (
+    PRODUCTION_FILE,
+    PUBLISHED_FILE,
     TARGET,
     EvidenceError,
     capsule_directory,
@@ -104,6 +106,7 @@ METHODS = (
     "climatology",
 )
 HORIZONS = ("0-6h", "6-24h", "24-72h", "72-96h")
+SOURCE_FORECAST = "source forecast"
 
 
 def write_new(path: Path, payload: Any) -> bytes:
@@ -294,8 +297,8 @@ def sealed_publication(snapshot: CapsuleSnapshot) -> ValidatedPublication:
     return publication(
         receipt.get("publisher_receipt"),
         payload_snapshot=(
-            snapshot.read("published.json"),
-            snapshot.hashes["published.json"],
+            snapshot.read(PUBLISHED_FILE),
+            snapshot.hashes[PUBLISHED_FILE],
         ),
     )
 
@@ -395,11 +398,11 @@ def seal_publication(
     prepared = validated_inputs(snapshot, document, production, now)
     # Serialize before any exclusive write: malformed evidence cannot poison retries.
     receipt_bytes = json.dumps(receipt, indent=2, allow_nan=False).encode()
-    ensure_bytes(capsule / "published.json", payload, snapshot=snapshot)
+    ensure_bytes(capsule / PUBLISHED_FILE, payload, snapshot=snapshot)
     ensure_bytes(capsule / "publication.json", receipt_bytes, snapshot=snapshot)
     snapshot = snapshot.with_files(
-        {"published.json": payload, "publication.json": receipt_bytes},
-        known_hashes={"published.json": receipt["published_sha256"]},
+        {PUBLISHED_FILE: payload, "publication.json": receipt_bytes},
+        known_hashes={PUBLISHED_FILE: receipt["published_sha256"]},
     )
     meta = snapshot.metadata()
     hashes = snapshot.digests(sealed=False)
@@ -489,9 +492,7 @@ def finalize(
         meta = snapshot.metadata()
         origin = timestamp(
             required_string(
-                snapshot.document("production.json", "source forecast").get(
-                    "issued_at"
-                ),
+                snapshot.document(PRODUCTION_FILE, SOURCE_FORECAST).get("issued_at"),
                 "source.issued_at",
             )
         )
@@ -499,11 +500,11 @@ def finalize(
         evidence = None
         if source is not None:
             source_hash = (
-                snapshot.hashes["production.json"]
-                if source.resolve() == (capsule / "production.json").resolve()
+                snapshot.hashes[PRODUCTION_FILE]
+                if source.resolve() == (capsule / PRODUCTION_FILE).resolve()
                 else digest(source)
             )
-            if source_hash != snapshot.hashes["production.json"]:
+            if source_hash != snapshot.hashes[PRODUCTION_FILE]:
                 raise EvidenceError(
                     "publisher chose a different source; do not relabel held forecasts"
                 )
@@ -571,12 +572,12 @@ def production_rows(
     supplied: bool = True,
 ) -> tuple[dict[str, Any], dict[str, dict[str, Any]]]:
     meta = projection_metadata(snapshot, public, supplied=supplied)
-    document = snapshot.document("production.json", "source forecast")
+    document = snapshot.document(PRODUCTION_FILE, SOURCE_FORECAST)
     rows = forecast_rows(document, public=False)
     if not snapshot.prospective:
         return document, rows
     if "publication" not in meta or (
-        public is None and "published.json" not in snapshot.files
+        public is None and PUBLISHED_FILE not in snapshot.files
     ):
         raise EvidenceError(
             "prospective requires a committed payload and publication receipt"
@@ -605,7 +606,7 @@ def production_rows(
     hex_identity(receipt.get("commit"), "sealed publication.commit", 40)
     if (
         receipt["published_sha256"] != public.payload_sha256
-        or receipt["source_sha256"] != snapshot.hashes["production.json"]
+        or receipt["source_sha256"] != snapshot.hashes[PRODUCTION_FILE]
         or receipt["issued_at"] != document["issued_at"]
         or published["issued_at"] != document["issued_at"]
         or published["dataset_fingerprint"] != document["dataset_fingerprint"]
@@ -613,7 +614,7 @@ def production_rows(
         or published.get("units", {}).get("temp_f") != "F"
         or published.get("truth_semantics", {}).get("temp_f") != "mean"
         or timestamp(receipt["published_at"]) != timestamp(published["published_at"])
-        or public.receipt["source_sha256"] != snapshot.hashes["production.json"]
+        or public.receipt["source_sha256"] != snapshot.hashes[PRODUCTION_FILE]
         or any(
             public.receipt[key] != receipt[key]
             for key in ("commit", "remote", "branch")
@@ -875,6 +876,21 @@ def validate_matrix_schema(
             raise EvidenceError(f"{label}.{name}: invalid temperature forecast column")
 
 
+def record_clock(
+    evidence: VerifiedEvidence | None, now: datetime
+) -> tuple[datetime, str | None]:
+    if evidence is None:
+        return now, None
+    sealed_at = timestamp(
+        required_string(
+            evidence.seal.get("evidence_sealed_at"), "evidence.evidence_sealed_at"
+        )
+    )
+    if now < sealed_at:
+        raise EvidenceError("record clock precedes complete evidence seal")
+    return sealed_at, evidence.snapshot.hashes["evidence.lock.json"]
+
+
 def build_record(
     snapshot: CapsuleSnapshot,
     enrolled: Enrollment,
@@ -899,21 +915,7 @@ def build_record(
     origin = timestamp(document["issued_at"])
     if timestamp(meta["input_as_of"]) != origin:
         raise EvidenceError("features must have the production issuance time")
-    evidence_at, seal_hash = now, None
-    if prospective:
-        if evidence is None:
-            raise RuntimeError("prospective reconstruction requires verified evidence")
-        seal = evidence.seal
-        evidence_at, seal_hash = (
-            timestamp(
-                required_string(
-                    seal.get("evidence_sealed_at"), "evidence.evidence_sealed_at"
-                )
-            ),
-            snapshot.hashes["evidence.lock.json"],
-        )
-        if now < evidence_at:
-            raise EvidenceError("record clock precedes complete evidence seal")
+    evidence_at, seal_hash = record_clock(evidence if prospective else None, now)
     prepared = evidence.prepared if evidence is not None else None
     if prepared is None:
         prepared = validated_inputs(
@@ -993,8 +995,8 @@ def publish_record(
     evidence: VerifiedEvidence | None = None,
 ) -> Path:
     output = system_path(output)
-    document = snapshot.document("production.json", "source forecast")
-    target = issue_record_target(
+    document = snapshot.document(PRODUCTION_FILE, SOURCE_FORECAST)
+    issue_record_target(
         output,
         timestamp(required_string(document.get("issued_at"), "source.issued_at")),
     )

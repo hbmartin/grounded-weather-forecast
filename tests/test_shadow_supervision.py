@@ -325,9 +325,10 @@ def test_status_channel_refuses_malformed_or_missing_results(
     path = tmp_path / "status"
     path.write_bytes(payload)
     read = os.open(path, os.O_RDONLY)
+    channel = supervisor.StatusChannel(read)
     try:
         with pytest.raises(OSError, match="status"):
-            supervisor.result([], 1, supervisor.StatusChannel(read), "", "")
+            supervisor.result([], 1, channel, "", "")
     finally:
         os.close(read)
 
@@ -362,15 +363,120 @@ def test_success_status_cannot_hide_failed_supervisor(supervisor, tmp_path):
         + "\n"
     )
     descriptor = os.open(path, os.O_RDONLY)
+    channel = supervisor.StatusChannel(descriptor)
     try:
         with pytest.raises(OSError, match="supervisor exited 1 after completed"):
             supervisor.result(
                 [],
                 5,
-                supervisor.StatusChannel(descriptor),
+                channel,
                 "",
                 "cleanup failed",
                 supervisor_code=1,
             )
     finally:
         os.close(descriptor)
+
+
+def test_long_failure_fits_status_pipe_and_preserves_prefixes(supervisor):
+    read, write = os.pipe()
+    detail = "original primary failure: " + "𝄞" * 10000
+    note = "secondary cleanup failure: " + "𝄞" * 10000
+    try:
+        supervisor.send_status(write, "started", worker_pid=123456)
+        supervisor.send_status(
+            write, "runtime_failure", detail=detail, notes=[note] * 20
+        )
+        os.close(write)
+        write = None
+        channel = supervisor.StatusChannel(read)
+        channel.collect()
+        terminal = channel.messages[-1]
+        assert terminal["detail"]
+        assert detail.startswith(terminal["detail"])
+        assert terminal["notes"]
+        assert note.startswith(terminal["notes"][0])
+        with pytest.raises(OSError, match="runtime_failure: original"):
+            supervisor.result([], 1, channel, "", "", supervisor_code=1)
+    finally:
+        os.close(read)
+        if write is not None:
+            os.close(write)
+
+
+def test_handshake_deadline_expires_with_live_parent(supervisor, tmp_path):
+    control_read, control_write = os.pipe()
+    status_read, status_write = os.pipe()
+    marker = tmp_path / "never-started"
+    command = [
+        sys.executable,
+        supervisor.__file__,
+        "--control-fd",
+        str(control_read),
+        "--status-fd",
+        str(status_write),
+        "--deadline",
+        str(time.monotonic() + 0.2),
+        "--",
+        sys.executable,
+        "-c",
+        "from pathlib import Path; import sys; Path(sys.argv[1]).touch()",
+        str(marker),
+    ]
+    process = subprocess.Popen(  # noqa: S603 - synthetic supervisor and marker
+        command, pass_fds=(control_read, status_write), start_new_session=True
+    )
+    os.close(control_read)
+    os.close(status_write)
+    try:
+        assert process.wait(timeout=3) == 0
+        channel = supervisor.StatusChannel(status_read)
+        channel.collect()
+        assert [message["status"] for message in channel.messages] == ["timed_out"]
+        assert not marker.exists()
+    finally:
+        os.close(control_write)
+        os.close(status_read)
+        if process.poll() is None:
+            os.killpg(process.pid, signal.SIGKILL)
+            process.wait(timeout=3)
+
+
+def test_close_failure_inside_callers_except_is_operational(supervisor, monkeypatch):
+    pipe, close = os.pipe, os.close
+    allocated = []
+
+    def created():
+        pair = pipe()
+        allocated.extend(pair)
+        return pair
+
+    def failed(descriptor):
+        close(descriptor)
+        if len(allocated) >= 4 and descriptor == allocated[2]:
+            raise OSError("injected status descriptor close failure")
+
+    monkeypatch.setattr(supervisor.os, "pipe", created)
+    monkeypatch.setattr(supervisor.os, "close", failed)
+    outer = ValueError("unrelated caller exception")
+    try:
+        raise outer
+    except (ValueError,):  # noqa: B013 -- exercise an active caller exception
+        with pytest.raises(OSError, match="status descriptor close failure"):
+            supervisor.run_supervised([sys.executable, "-c", "pass"], timeout=5)
+    assert not getattr(outer, "__notes__", [])
+
+
+def test_descriptor_cleanup_preserves_explicit_primary(supervisor, monkeypatch):
+    read, write = os.pipe()
+    close = os.close
+    primary = KeyboardInterrupt("original cancellation")
+
+    def failed(descriptor):
+        close(descriptor)
+        if descriptor == read:
+            raise OSError("secondary close failure")
+
+    monkeypatch.setattr(supervisor.os, "close", failed)
+    supervisor.close_handles({read, write}, None, primary=primary)
+    assert "secondary close failure" in " ".join(primary.__notes__)

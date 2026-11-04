@@ -64,13 +64,15 @@ def test_replay_receipt_refused_before_guard_and_corrected_retry_succeeds(
             publication_receipt=bad,
         )
     assert {p.name: p.read_bytes() for p in capsule.iterdir()} == before
+    snapshot = shadow.CapsuleSnapshot.load(capsule, prospective=False)
+    enrolled = shadow.enrollment(protocol)
     with pytest.raises(
         EvidenceError, match="receipts require prospective finalization"
     ):
         shadow.seal_publication(
-            shadow.CapsuleSnapshot.load(capsule, prospective=False),
+            snapshot,
             bad,
-            shadow.enrollment(protocol),
+            enrolled,
         )
     assert not (capsule / "evidence.lock.json").exists()
     assert (
