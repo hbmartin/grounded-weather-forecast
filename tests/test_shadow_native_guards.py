@@ -443,6 +443,7 @@ def test_prediction_compatibility_wrapper_uses_same_prepared_math(shadow, frames
 
 @pytest.mark.skipif(os.name != "posix", reason="launchd process-group ownership")
 def test_timeout_terminates_descendant_and_reaps_launcher(tmp_path, monkeypatch):
+    monkeypatch.syspath_prepend(str(SCRIPT.parent))
     support = importlib.import_module("launchd_paths")
     guard = tmp_path / ".descendant"
     marker = tmp_path / "started"
@@ -488,6 +489,7 @@ child.wait()
 
 @pytest.mark.skipif(os.name != "posix", reason="launchd process-group cancellation")
 def test_cancellation_keeps_primary_when_process_group_cleanup_fails(monkeypatch):
+    monkeypatch.syspath_prepend(str(SCRIPT.parent))
     support = importlib.import_module("launchd_paths")
     cancelled = KeyboardInterrupt("operator cancelled")
     closed = []
