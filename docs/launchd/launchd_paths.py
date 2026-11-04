@@ -3,7 +3,6 @@
 
 import os
 import shutil
-import signal
 import stat
 import subprocess
 import tomllib
@@ -12,6 +11,11 @@ from contextlib import suppress
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
+
+try:
+    from shadow_supervisor import run_supervised
+except (ImportError,):  # noqa: B013 -- ordinary operation needs no shadow helper
+    run_supervised = None
 
 
 def subprocess_exit_code(returncode: int) -> int:
@@ -25,23 +29,25 @@ def subprocess_exit_code(returncode: int) -> int:
 def run_shadow_child(
     command: Sequence[str], *, timeout: float, capture_output: bool = False
 ) -> subprocess.CompletedProcess[str]:
-    """Own the POSIX uv/Python process group so timeouts cannot orphan a runner."""
+    """Supervise POSIX workers beyond wrapper death; retain direct Windows behavior."""
+    if os.name == "posix":
+        if run_supervised is None:
+            raise OSError(
+                "shadow supervisor helper unavailable beside installed wrappers"
+            )
+        return run_supervised(command, timeout=timeout, capture_output=capture_output)
     # Reviewed shadow argv; shell parsing is never enabled.
     process = subprocess.Popen(  # noqa: S603
         command,
         stdout=subprocess.PIPE if capture_output else None,
         stderr=subprocess.PIPE if capture_output else None,
         text=True,
-        start_new_session=os.name == "posix",
     )
     try:
         stdout, stderr = process.communicate(timeout=timeout)
     except (BaseException,) as error:  # noqa: B013 -- cancellation also releases children
         try:
-            if os.name == "posix":
-                with suppress(ProcessLookupError):
-                    os.killpg(process.pid, signal.SIGKILL)
-            else:
+            with suppress(ProcessLookupError):
                 process.kill()
             process.communicate(timeout=5)
         except (Exception,) as secondary:  # noqa: B013 -- preserve the triggering failure

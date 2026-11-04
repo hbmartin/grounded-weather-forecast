@@ -401,11 +401,12 @@ def preflight_result(
             and isinstance(result.get("detail"), str)
             and bool(result["detail"].strip())
         )
-        classification = (
-            "shadow unavailable: " + result["detail"][:400]
-            if tagged and check.returncode == 2 and result.get("status") == "refused"
-            else f"shadow preflight runtime failure: selected runtime exited {check.returncode}"
-        )
+        if tagged and check.returncode == 2 and result.get("status") == "refused":
+            for line in detail:
+                if line != f"shadow refused: {result['detail']}":
+                    print(f"shadow preflight stderr: {line[:400]}", flush=True)
+            return False, "shadow unavailable: " + result["detail"][:400]
+        classification = f"shadow preflight runtime failure: selected runtime exited {check.returncode}"
         return False, classification + (f": {detail[-1][:400]}" if detail else "")
     if not isinstance(result, dict) or result.get("status") not in {
         "ready",

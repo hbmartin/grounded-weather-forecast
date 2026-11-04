@@ -17,6 +17,8 @@ from pathlib import Path
 from typing import Any, cast
 
 ARTIFACT_VERSION = 3
+ISSUE_FILE = "issue.parquet"
+TRAINING_FILE = "training.parquet"
 TARGET = "t__temp_c__mean"
 BINDING = "publisher successful explicit-commit push"
 THREAD_CONTROLS = (
@@ -192,8 +194,29 @@ def regular(path: Path) -> None:
         raise EvidenceError(f"{path}: evidence must be a regular local file")
 
 
+def system_path(path: Path) -> Path:
+    """Canonicalize macOS system prefixes without resolving selected evidence aliases."""
+    if sys.platform == "darwin":
+        absolute = path.absolute()
+        for name in ("tmp", "var"):
+            prefix = Path("/") / name
+            if absolute.is_relative_to(prefix) and prefix.is_symlink():
+                return prefix.resolve() / absolute.relative_to(prefix)
+    return path
+
+
+def required_artifact(path: Path, *, snapshot: bytes | None = None) -> bytes:
+    path = system_path(path)
+    try:
+        regular(path)
+        return path.read_bytes() if snapshot is None else snapshot
+    except (FileNotFoundError,) as error:  # noqa: B013 -- required supplied evidence
+        raise EvidenceError(f"{path}: missing required enrollment artifact") from error
+
+
 def existing_directory(path: Path, *, private: bool = False) -> None:
     """Inspect supplied directories without creating or repairing their paths."""
+    path = system_path(path)
     try:
         metadata = path.lstat()
     except (FileNotFoundError,) as error:  # noqa: B013 -- missing supplied evidence
@@ -209,8 +232,26 @@ def existing_directory(path: Path, *, private: bool = False) -> None:
 
 
 def capsule_directory(path: Path, *, prospective: bool) -> None:
+    path = system_path(path)
     existing_directory(path.parent, private=prospective)
     existing_directory(path, private=prospective)
+
+
+def directory_child(root: Path, name: str, *, required: bool, label: str) -> Path:
+    """Check selected roots and issuance leaves, allowing trusted ancestor prefixes."""
+    root = system_path(root)
+    if root.exists() or root.is_symlink() or root.is_junction():
+        existing_directory(root)
+    path = root / name
+    if (
+        path.is_symlink()
+        or path.is_junction()
+        or (path.exists() and not path.is_dir())
+        or (required and not path.is_dir())
+        or path.resolve().parent != root.resolve()
+    ):
+        raise EvidenceError(f"{path}: {label}")
+    return path
 
 
 def sync_files(directory: Path, paths: Iterable[Path]) -> None:
@@ -223,6 +264,7 @@ def sync_files(directory: Path, paths: Iterable[Path]) -> None:
 
 
 def private_directory(path: Path) -> None:
+    path = system_path(path)
     missing = []
     current = path
     while not current.exists():

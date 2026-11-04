@@ -17,11 +17,14 @@ from grounded_weather_forecast.evaluation import code_identity
 from grounded_weather_forecast.serve.schema import Forecast
 from grounded_weather_forecast.shadow_artifacts import (
     ARTIFACT_VERSION,
+    ISSUE_FILE,
+    TRAINING_FILE,
     existing_directory,
     issuance_name,
     private_directory,
     sync_directory,
     sync_files,
+    system_path,
 )
 
 
@@ -60,13 +63,14 @@ def capture_issue(
         raise ValueError(
             "temperature shadow requires production interval-mean semantics"
         )
+    root = system_path(root)
     private_directory(root)
     if not historical:
         existing_directory(root, private=True)
     issued_at = datetime.fromisoformat(document.issued_at).astimezone(UTC)
     target = root / issuance_name(issued_at)
     if target.is_symlink() or target.is_junction():
-        existing_directory(target, private=not historical)
+        existing_directory(target)
     if target.exists():
         if not historical:
             existing_directory(target, private=True)
@@ -76,10 +80,8 @@ def capture_issue(
         raise ValueError("shadow issue inputs must not contain truth labels")
     with TemporaryDirectory(prefix="shadow-input-", dir=root) as temporary:
         folder = Path(temporary)
-        inputs.write_parquet(folder / "issue.parquet")
-        temperature_frame(training, training=True).write_parquet(
-            folder / "training.parquet"
-        )
+        inputs.write_parquet(folder / ISSUE_FILE)
+        temperature_frame(training, training=True).write_parquet(folder / TRAINING_FILE)
         truth.select("valid_hour", "t__temp_c__mean").write_parquet(
             folder / "truth_hourly.parquet"
         )

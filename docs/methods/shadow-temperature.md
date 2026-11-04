@@ -2,7 +2,8 @@
 
 Implemented in: `scripts/shadow_candidate_v1.py` and
 `scripts/temperature_shadow.py`, `scripts/shadow_evidence.py`,
-`scripts/shadow_environment.py` and `shadow_artifacts.py`. These standalone scripts register no new
+`scripts/shadow_environment.py`, `shadow_artifacts.py` and the standalone
+`docs/launchd/shadow_supervisor.py`. These standalone scripts register no new
 production method. They preserve the preselected October 26 experiment's
 `simplex_decay21` candidate and `decay21` reference. The definitions below are
 self-contained local experimental choices, not a reproduction of an operational
@@ -46,6 +47,11 @@ Complete input/publication evidence is validated and synchronized before
 `evidence.lock.json` is published. `evidence_sealed_at` must lie within issuance
 +30 minutes and before the first outcome; only a complete timely seal authorizes
 late deterministic reconstruction. Actual `recorded_at` is retained separately.
+Publication receipts are prospective-only: replay finalization refuses them
+before guard creation or writes, and the sealing helper independently enforces
+the mode. Output-root/issuance checks precede sealing and fitting. New output
+parents are private; macOS `/tmp` and `/var` prefixes are canonicalized without
+relaxing selected-alias or prospective capsule-permission checks.
 A completed `record.lock.json` binds record bytes to the evidence seal. Held
 pushes reuse the original issuance/receipt, and evaluation reconstructs each
 prediction with `rtol=1e-10`, `atol=1e-10`. Declared evidence files are hashed;
@@ -77,12 +83,25 @@ are failures rather than evidence refusals. Snapshot identity uses object
 identity, its mode is explicit, and publication bytes carry their validated digest.
 Training and issue matrices must each contain one valid matching live/synthetic
 provenance; this preserves the source-kind boundary before sealing and fitting.
+`VerifiedEvidence` retains the snapshot, publication, source/publication
+projection, seal, checked issue and optional prepared inputs for the current
+owner. First-seal decoding and correspondence validation each run once;
+recovery/evaluation verify independent snapshots, and held pushes verify both
+receipts without refitting completed records. `ISSUE_FILE` and `TRAINING_FILE`
+are shared by capture and readers through `shadow_artifacts.py`.
 
 The named `preflight --protocol FILE` checks the window first. Inside the window
 it checks capture capability and complete v3 enrollment in the selected runtime;
 outside it returns `outside_window` without those checks. The wrapper allows 30 seconds for preflight
 and 300 seconds for finalization; capability/preflight failures preserve ordinary
 publication and report shadow failure. There is no persistent validation cache.
+The installed standard-library supervisor monitors a wrapper-only pipe and owns
+the POSIX worker group. Wrapper death, including SIGKILL, closes the pipe and
+triggers termination even though the wrapper cannot run cleanup. The execution
+deadlines are followed by two seconds of SIGTERM grace and three seconds for
+forced termination/reaping. The shadow CLI handles SIGTERM by unwinding its
+contexts. A surviving supervisor is required; forced termination can leave
+recoverable staging files. Non-POSIX direct-child behavior is unchanged.
 
 The [CLI reference](../reference/cli.md#standalone-temperature-shadow) owns the
 versioned preflight envelope and exit-code contract. Only tagged refusals authorize

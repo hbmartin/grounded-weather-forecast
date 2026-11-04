@@ -173,6 +173,13 @@ and [Python exception notes](https://docs.python.org/3/library/exceptions.html#B
 underlie `scripts/shadow_evidence.py` native-only guards and preservation of
 primary failures. `PreparedInputs` in `scripts/temperature_shadow.py` reuses
 validated matrix projections without changing the fixed candidate mathematics.
+`VerifiedEvidence` reuses validated publication/seal projections within one
+snapshot. The [Python subprocess process-group and descriptor contracts](https://docs.python.org/3.13/library/subprocess.html#subprocess.Popen),
+[signal handlers](https://docs.python.org/3.13/library/signal.html), and
+[Apple launchd process-group cleanup policy](https://github.com/apple-oss-distributions/launchd/blob/main/man/launchd.plist.5)
+underlie `docs/launchd/shadow_supervisor.py`: a wrapper-only liveness pipe,
+independent worker group and bounded graceful/forced shutdown. These are
+operational ownership mechanisms, not statistical methods.
 `status.py::CommandOutcome.from_subprocess` interprets negative child signals;
 generic internal outcome normalization rejects negative exits. These changes add
 no statistical method or empirical skill claim.
