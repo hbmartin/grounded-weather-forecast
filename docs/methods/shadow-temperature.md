@@ -49,7 +49,11 @@ Complete input/publication evidence is validated and synchronized before
 late deterministic reconstruction. Actual `recorded_at` is retained separately.
 Publication receipts are prospective-only: replay finalization refuses them
 before guard creation or writes, and the sealing helper independently enforces
-the mode. Output-root/issuance checks precede sealing and fitting. New output
+the mode. Output-root/issuance checks and acquisition of the actual private
+publication staging directory precede sealing and fitting. Unwritable output
+stores fail before a new capsule seal; successful records reuse that transaction.
+An unsuccessful attempt can leave private empty output parents and harmless
+native guard sidecars, but no accepted record. New output
 parents are private; macOS `/tmp` and `/var` prefixes are canonicalized without
 relaxing selected-alias or prospective capsule-permission checks.
 A completed `record.lock.json` binds record bytes to the evidence seal. Held
@@ -83,12 +87,16 @@ are failures rather than evidence refusals. Snapshot identity uses object
 identity, its mode is explicit, and publication bytes carry their validated digest.
 Training and issue matrices must each contain one valid matching live/synthetic
 provenance; this preserves the source-kind boundary before sealing and fitting.
-`VerifiedEvidence` retains the snapshot, publication, source/publication
-projection, seal, checked issue and optional prepared inputs for the current
-owner. First-seal decoding and correspondence validation each run once;
+`VerifiedEvidence` retains the snapshot, source/publication projection, seal,
+validated sealing timestamp, checked issue and optional prepared inputs for the
+current owner. Record helpers enforce matching snapshot object identity as an
+internal contract. First-seal decoding and correspondence validation each run once;
 recovery/evaluation verify independent snapshots, and held pushes verify both
-receipts without refitting completed records. `ISSUE_FILE` and `TRAINING_FILE`
-are shared by capture and readers through `shadow_artifacts.py`.
+receipts without refitting completed records. Capture/readers share issue,
+training, truth, completion, publication and evidence-lock filenames through
+`shadow_artifacts.py`. Operator proposal/replay protocol inputs may follow a
+symlink; prospective enrollment files remain nonaliased. Missing required files
+produce named exit-2 refusals; permission/I/O failures remain exit 1.
 
 The named `preflight --protocol FILE` checks the window first. Inside the window
 it checks capture capability and complete v3 enrollment in the selected runtime;
@@ -96,12 +104,22 @@ outside it returns `outside_window` without those checks. The wrapper allows 30 
 and 300 seconds for finalization; capability/preflight failures preserve ordinary
 publication and report shadow failure. There is no persistent validation cache.
 The installed standard-library supervisor monitors a wrapper-only pipe and owns
-the POSIX worker group. Wrapper death, including SIGKILL, closes the pipe and
-triggers termination even though the wrapper cannot run cleanup. The execution
-deadlines are followed by two seconds of SIGTERM grace and three seconds for
-forced termination/reaping. The shadow CLI handles SIGTERM by unwinding its
-contexts. A surviving supervisor is required; forced termination can leave
-recoverable staging files. Non-POSIX direct-child behavior is unchanged.
+the POSIX worker group. Internal protocol **2** acknowledges bootstrap ownership
+before admitting the command. Exit observation uses `waitid(WNOWAIT)` to reserve
+the group identity until cleanup and the terminal acknowledgment (or wrapper EOF).
+The wrapper continuously drains the separate status pipe, bounded to **64 KiB**;
+oversized diagnostics retain error/path context with explicit truncation markers.
+Worker completion takes precedence over simultaneous cancellation. Repeated
+SIGTERM is ignored while the shadow CLI unwinds; repeated wrapper cancellation
+is deferred until bounded cleanup completes. Emergency rescue stops and verifies
+the still-owned supervisor before signaling an unreleased worker identity.
+Wrapper death, including SIGKILL, closes the liveness pipe. The **30/300-second**
+execution deadlines retain **2 seconds** of TERM grace and **3 seconds** to force
+termination/reap, with **1 second** of wrapper wait margin. Exceptional rescue
+has a separate **3-second** bound. A surviving supervisor is required: unexpected
+supervisor death reports inability to certify cleanup rather than signaling a
+historical PID. Forced termination can leave recoverable staging files.
+The monitoring interval remains **0.05 seconds**. Non-POSIX behavior is unchanged.
 
 The [CLI reference](../reference/cli.md#standalone-temperature-shadow) owns the
 versioned preflight envelope and exit-code contract. Only tagged refusals authorize

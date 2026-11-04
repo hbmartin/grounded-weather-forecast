@@ -1164,21 +1164,41 @@ The standard-library supervisor owns the uv/Python worker group and watches a
 private pipe whose only writer is the wrapper. EOF detects wrapper death,
 including SIGKILL; workers cannot inherit the writer. A separate status channel
 keeps supervision metadata out of worker stdout/stderr. Deadlines remain 30/300
-seconds, followed by at most two seconds of SIGTERM grace and three seconds to
-force termination and reap the launcher. The CLI's SIGTERM handler unwinds
-evidence contexts and restores prior handlers when leaving command execution.
+seconds, followed by two seconds of SIGTERM grace and three seconds to force
+termination/reap, plus one second of wrapper wait margin. Exceptional rescue has
+a separate three-second maximum. Internal protocol 2 admits the bootstrap only
+after worker ownership is acknowledged; `waitid(WNOWAIT)` reserves its PID until
+group cleanup and the terminal release acknowledgment (or wrapper EOF). The status
+pipe is continuously drained and capped at 64 KiB, with primary error/path context
+prioritized in explicitly truncated oversized diagnostics. Worker completion wins
+over simultaneous cancellation. Repeated wrapper cancellation is deferred through
+bounded cleanup; the CLI ignores subsequent SIGTERM while unwinding evidence
+contexts and restores prior handlers outside command execution.
 Timeout/cancellation cleanup also applies to descendants whose launcher exits.
-The hard-kill guarantee assumes the supervisor survives; forced termination can
-still leave staging files. Existing non-POSIX direct-child behavior is retained.
+Emergency rescue stops/verifies the owned supervisor before signaling a reserved
+worker identity. The hard-kill guarantee assumes the supervisor survives; an
+unexpectedly dead supervisor reports inability to certify cleanup instead of
+signaling a historical PID. Forced termination can still leave staging files.
+Existing non-POSIX direct-child behavior is retained.
 Nonzero child exits are classified as runner refusals only when exit 2 accompanies the tagged,
 versioned `refused` envelope. Unknown exits, including launcher/lockfile,
 missing-script and usage exit 2, remain generic child failures with their stderr
 diagnostic. Existing untagged successful readiness objects remain accepted.
 Tagged refusals use JSON `detail` once; secondary stderr remains separately
-labelled instead of being appended to the refusal. Missing supervisor helpers
-fail shadow preflight while ordinary publication continues.
+labelled instead of being appended to the refusal, with supplementary stderr
+capped at 8 KiB and an explicit truncation marker. Multiline primary details are
+filtered as a complete message. Missing, unreadable or syntax-broken supervisor
+helpers fail shadow preflight while ordinary publication and maintenance continue.
 
 Finalization reads capsule state after acquiring the `.sealing` OS-managed lock.
+Before a new seal or fit it acquires the actual records publication guard and
+private staging directory, then reuses that transaction to publish the record.
+Malformed evidence can leave empty private output parents/native sidecars, but no
+accepted record. Missing required proposals/enrollment files return named exit-2
+refusals, including `freeze`; operational permission/I/O failures return 1.
+Operator proposal files and replay `--protocol` paths may follow explicit aliases;
+prospective sealed enrollment files remain nonaliased. Dangling/looped ancestors
+are contextual refusals, without banning trusted directory prefixes.
 Directory publication uses the same ownership policy through `.NAME.publishing`.
 Both guards require native FileLock 3.31.0+ ownership, disable soft-lock fallback,
 and create sidecars with mode `0600`. Unsupported native locking is an operational

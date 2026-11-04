@@ -48,7 +48,14 @@ Prepare reviewed `shadow_supervisor.py` beside the installed wrappers and
 `launchd_paths.py`; it uses only the existing Python standard library. Its
 private liveness pipe bounds worker lifetime after wrapper death, including
 SIGKILL, assuming the supervisor survives. Keep this helper with the matching
-wrapper set for rollback. Missing helpers preserve ordinary publication but
+wrapper set for rollback, including internal supervision protocol 2; mixing old
+and new helper implementations is unsupported. The worker bootstrap waits for
+admission and its PID remains reserved through acknowledged cleanup. The wrapper
+continuously drains bounded status independently of worker output. Shutdown adds
+one second of wrapper wait margin to the 2-/3-second cleanup phases; exceptional
+rescue is bounded separately to three seconds. Unexpected supervisor death is
+reported as cleanup uncertainty without signaling historical worker identities.
+Missing, unreadable or syntax-broken helpers preserve ordinary publication but
 make requested shadow work fail. No schedule or activation changes follow from
 copying or merging these sources.
 Preserve old enrollments; the new runner requires a fresh v3 enrollment.
@@ -141,6 +148,8 @@ complete record before reuse, retain conflicting/corrupt outputs, and investigat
 any reported post-publication synchronization failure. Enrollments publish their
 protocol and implementation lock as one complete directory. Validation and
 reconstruction reuse each capsule's captured byte snapshot.
+The real output guard/staging directory must be acquired before sealing or fitting;
+verify unwritable/dangling output failures leave capsule evidence unchanged.
 No old prospective evidence is migrated or relabeled. Legacy replay finalization
 requires its original compatible runner; raw-truth replay evaluation remains
 available without prospective-only flags.

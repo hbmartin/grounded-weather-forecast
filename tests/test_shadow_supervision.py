@@ -6,11 +6,13 @@ import os
 import signal
 import subprocess
 import sys
+import threading
 import time
 from types import SimpleNamespace
 
 import pytest
 from filelock import FileLock, Timeout
+from shadow_supervision_helpers import raw_owner, statuses
 from test_launchd import SCRIPT, load_script
 from test_shadow_native_guards import window_protocol
 
@@ -187,31 +189,41 @@ finally:
         assert elapsed >= 2 + supervisor.TERM_GRACE
 
 
-def test_runner_sigterm_cleans_staging(supervisor, tmp_path):
+@pytest.mark.parametrize("startup_delay", [0, 3])
+def test_runner_sigterm_cleans_staging(supervisor, tmp_path, startup_delay):
     output = tmp_path / "record"
+    ready = tmp_path / "staging-ready"
     program = """
 import sys,time
 from pathlib import Path
 sys.path.insert(0,sys.argv[1])
+time.sleep(float(sys.argv[4]))
 from temperature_shadow import cli_signals, staged_directory
 with cli_signals(), staged_directory(Path(sys.argv[2])) as folder:
     (folder/'partial').write_bytes(b'partial')
-    print('staging ready',flush=True)
+    Path(sys.argv[3]).touch()
     time.sleep(30)
 """
-    with pytest.raises(subprocess.TimeoutExpired) as caught:
-        supervisor.run_supervised(
-            [
-                sys.executable,
-                "-c",
-                program,
-                str(SCRIPT.parents[2] / "scripts"),
-                str(output),
-            ],
-            timeout=2,
-            capture_output=True,
-        )
-    assert b"staging ready" in caught.value.output
+    command = [
+        sys.executable,
+        "-c",
+        program,
+        str(SCRIPT.parents[2] / "scripts"),
+        str(output),
+        str(ready),
+        str(startup_delay),
+    ]
+    with raw_owner(supervisor, command, timeout=20) as (process, control, channel):
+        control.send(b"S")
+        wait_for(lambda: statuses(channel) == ["worker_ready"])
+        control.send(b"A")
+        wait_for(ready.exists, timeout=15)
+        control.cancel()
+        wait_for(lambda: len(statuses(channel)) == 2, timeout=7)
+        assert statuses(channel)[-1] == "cancelled"
+        assert channel.messages[-1]["returncode"] == 143
+        control.send(b"R")
+        assert process.wait(timeout=3) == 0
     assert not output.exists()
     assert not list(tmp_path.glob("shadow-stage-*"))
     with FileLock(tmp_path / ".record.publishing", timeout=0):
@@ -262,7 +274,10 @@ def test_supervisor_fault_stops_and_reaps_worker(supervisor, monkeypatch):
 
     monkeypatch.setattr(supervisor.subprocess, "Popen", created)
     monkeypatch.setattr(supervisor, "monitor", broken)
-    os.write(control_write, b"S")
+    channel = supervisor.StatusChannel(status_read)
+    control = supervisor.ControlChannel(control_write)
+    channel.start(control)
+    control.send(b"S")
     try:
         assert (
             supervisor.supervise(
@@ -273,14 +288,15 @@ def test_supervisor_fault_stops_and_reaps_worker(supervisor, monkeypatch):
             )
             == 1
         )
-        channel = supervisor.StatusChannel(status_read)
+        channel.finish()
         with pytest.raises(OSError, match="runtime_failure: injected monitor fault"):
             supervisor.result([], 5, channel, "", "")
         assert owners[0].returncode is not None
         with pytest.raises(ChildProcessError):
             os.waitpid(owners[0].pid, os.WNOHANG)
     finally:
-        os.close(control_write)
+        channel.stop()
+        control.close()
         os.close(status_read)
 
 
@@ -305,16 +321,20 @@ def test_permission_probes_retry_but_persistent_denial_fails(
         if persistent and signum == signal.SIGKILL:
             raise PermissionError("group termination denied")
 
-    monkeypatch.setattr(supervisor.time, "monotonic", now)
-    monkeypatch.setattr(supervisor.time, "sleep", lambda _seconds: None)
+    timing = supervisor.Clock(now, lambda _seconds: None)
+    monkeypatch.setattr(
+        supervisor,
+        "observe_exit",
+        lambda _process: None if persistent or len(probes) == 1 else 0,
+    )
     monkeypatch.setattr(supervisor, "group_exists", exists)
     monkeypatch.setattr(supervisor, "signal_group", sent)
     process = SimpleNamespace(pid=987654, poll=lambda: 0, wait=lambda **_kwargs: 0)
     if persistent:
         with pytest.raises(PermissionError, match="group termination denied"):
-            supervisor.stop_worker(process)
+            supervisor.stop_worker(process, clock=timing)
     else:
-        supervisor.stop_worker(process)
+        supervisor.stop_worker(process, clock=timing)
         assert len(probes) == 2
 
 
@@ -336,7 +356,11 @@ def test_status_channel_refuses_malformed_or_missing_results(
 def test_missing_supervisor_does_not_block_ordinary_publication(monkeypatch, tmp_path):
     wrapper = load_script(SCRIPT.with_name("hourly-predict-publish.py"))
     support = importlib.import_module("launchd_paths")
-    monkeypatch.setattr(support, "run_supervised", None)
+
+    def unavailable(*_args, **_kwargs):
+        raise OSError("shadow supervisor helper unavailable beside installed wrappers")
+
+    monkeypatch.setattr(support, "run_supervised", unavailable)
     protocol = tmp_path / "protocol.json"
     window_protocol(protocol)
     paths = type(
@@ -355,9 +379,10 @@ def test_success_status_cannot_hide_failed_supervisor(supervisor, tmp_path):
         json.dumps(
             {
                 "kind": "shadow_supervision",
-                "schema_version": 1,
+                "schema_version": 2,
                 "status": "completed",
                 "returncode": 0,
+                "cleanup_complete": True,
             }
         )
         + "\n"
@@ -365,7 +390,9 @@ def test_success_status_cannot_hide_failed_supervisor(supervisor, tmp_path):
     descriptor = os.open(path, os.O_RDONLY)
     channel = supervisor.StatusChannel(descriptor)
     try:
-        with pytest.raises(OSError, match="supervisor exited 1 after completed"):
+        with pytest.raises(
+            OSError, match="supervisor exited 1 after completed"
+        ) as caught:
             supervisor.result(
                 [],
                 5,
@@ -374,28 +401,40 @@ def test_success_status_cannot_hide_failed_supervisor(supervisor, tmp_path):
                 "cleanup failed",
                 supervisor_code=1,
             )
+        assert "cleanup failed" in " ".join(caught.value.__notes__)
     finally:
         os.close(descriptor)
 
 
-def test_long_failure_fits_status_pipe_and_preserves_prefixes(supervisor):
+def test_long_failure_is_drained_and_preserves_error_and_path(supervisor):
     read, write = os.pipe()
-    detail = "original primary failure: " + "𝄞" * 10000
-    note = "secondary cleanup failure: " + "𝄞" * 10000
+    detail = (
+        "original primary failure: "
+        + "𝄞" * 30000
+        + "/Application Support/records/record.json"
+    )
+    note = "secondary cleanup failure: " + "𝄞" * 10000 + "supervisor left unreaped"
+    channel = supervisor.StatusChannel(read)
+    reader = threading.Thread(target=channel.read_loop)
+    reader.start()
     try:
-        supervisor.send_status(write, "started", worker_pid=123456)
+        supervisor.send_status(write, "worker_ready", worker_pid=123456)
         supervisor.send_status(
-            write, "runtime_failure", detail=detail, notes=[note] * 20
+            write, "runtime_failure", detail=detail, notes=[note], cleanup_complete=True
         )
         os.close(write)
         write = None
-        channel = supervisor.StatusChannel(read)
+        reader.join(timeout=2)
+        assert not reader.is_alive()
         channel.collect()
         terminal = channel.messages[-1]
         assert terminal["detail"]
-        assert detail.startswith(terminal["detail"])
+        assert terminal["detail"].startswith("original primary failure: ")
+        assert terminal["detail"].endswith("/Application Support/records/record.json")
+        assert "[truncated]" in terminal["detail"]
         assert terminal["notes"]
-        assert note.startswith(terminal["notes"][0])
+        assert terminal["notes"][0].startswith("secondary cleanup failure: ")
+        assert terminal["notes"][0].endswith("supervisor left unreaped")
         with pytest.raises(OSError, match="runtime_failure: original"):
             supervisor.result([], 1, channel, "", "", supervisor_code=1)
     finally:
@@ -485,40 +524,88 @@ def test_descriptor_cleanup_preserves_explicit_primary(supervisor, monkeypatch):
 def test_emergency_cleanup_attempts_every_step_and_keeps_first_failure(
     supervisor, monkeypatch
 ):
-    first = OSError("invalid terminal status")
+    first = PermissionError("worker signal denied")
     calls = []
-
-    def status_failed():
-        calls.append("status")
-        raise first
 
     def signal_failed(pid, _signum):
         calls.append(pid)
-        raise PermissionError(f"signal denied for {pid}")
+        raise first
 
     def reap_failed(**_kwargs):
         calls.append("reap")
         raise OSError("reap failed")
 
-    channel = SimpleNamespace(worker_pid=status_failed, known_worker_pid=lambda: 123456)
-    process = SimpleNamespace(pid=987654, communicate=reap_failed)
+    channel = supervisor.StatusChannel(-1, owned_pid=123456)
+    channel.control = SimpleNamespace(
+        cancel=lambda: calls.append("cancel"), send=lambda _: calls.append("release")
+    )
+    process = SimpleNamespace(
+        pid=987654,
+        returncode=None,
+        communicate=reap_failed,
+        wait=reap_failed,
+        kill=lambda: calls.append((987654, signal.SIGKILL)),
+    )
+    monkeypatch.setattr(supervisor, "stopped_supervisor", lambda *_: True)
+    monkeypatch.setattr(
+        supervisor.os, "kill", lambda pid, sig: calls.append((pid, sig))
+    )
     monkeypatch.setattr(supervisor, "signal_group", signal_failed)
-    with pytest.raises(OSError, match="invalid terminal status") as caught:
+    with pytest.raises(PermissionError, match="worker signal denied") as caught:
         supervisor.emergency_stop(process, channel)
     assert caught.value is first
-    assert calls == ["status", 123456, 987654, "reap"]
-    assert len(first.__notes__) == 3
-    assert "reap failed" in first.__notes__[-1]
+    assert calls == [
+        123456,
+        "cancel",
+        "release",
+        (987654, signal.SIGCONT),
+        "reap",
+        (987654, signal.SIGKILL),
+        "reap",
+    ]
+    assert "reap failed" in " ".join(first.__notes__)
+    assert "supervisor left unreaped" in " ".join(first.__notes__)
 
 
-def test_fresh_cancellation_is_not_swallowed_by_cleanup(supervisor):
+def test_fresh_cancellation_is_not_swallowed_by_cleanup(supervisor, monkeypatch):
     cancelled = KeyboardInterrupt("new operator cancellation")
     primary = OSError("earlier failure")
 
-    def interrupted(**_kwargs):
+    def interrupted(*_args, **_kwargs):
         raise cancelled
 
     process = SimpleNamespace(communicate=interrupted)
+    channel = SimpleNamespace(control=None)
+    cleaned = []
+    monkeypatch.setattr(supervisor, "communicate_until", interrupted)
+    monkeypatch.setattr(supervisor, "emergency_stop", lambda *_: cleaned.append(True))
     with pytest.raises(KeyboardInterrupt) as caught:
-        supervisor.cancel_supervisor(process, None, primary)
+        supervisor.cancel_supervisor(process, channel, primary)
     assert caught.value is cancelled
+    assert cleaned == [True]
+    assert caught.value.__cause__ is primary
+
+
+def test_rescue_reaping_preserves_communication_error_after_kill_failure(supervisor):
+    primary = OSError("communication failed")
+    calls = []
+
+    def communicate(**_kwargs):
+        raise primary
+
+    def kill():
+        calls.append("kill")
+        raise PermissionError("kill denied")
+
+    def wait(**_kwargs):
+        calls.append("wait")
+        raise OSError("wait failed")
+
+    process = SimpleNamespace(communicate=communicate, kill=kill, wait=wait)
+    deadline = time.monotonic() + 1
+    with pytest.raises(OSError, match="communication failed") as caught:
+        supervisor.reap_supervisor(process, deadline)
+    assert caught.value is primary
+    assert calls == ["kill", "wait"]
+    assert "kill denied" in " ".join(primary.__notes__)
+    assert "supervisor left unreaped" in " ".join(primary.__notes__)
