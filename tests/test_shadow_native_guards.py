@@ -560,8 +560,13 @@ def test_cancellation_keeps_primary_when_process_group_cleanup_fails(monkeypatch
         stderr=None,
     )
 
+    attempts = []
+
     def interrupted(**_kwargs):
-        raise cancelled
+        attempts.append(True)
+        if len(attempts) == 1:
+            raise cancelled
+        raise OSError("supervisor cleanup communication failed")
 
     process.communicate = interrupted
     monkeypatch.setattr(support.subprocess, "Popen", lambda *_args, **_kwargs: process)

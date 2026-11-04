@@ -25,14 +25,41 @@ STATUS_LIMIT = 8192
 
 
 def send_status(descriptor: int, status: str, **fields: Any) -> None:
-    payload = (
+    if "detail" in fields:
+        fields["detail"] = str(fields["detail"])[:320]
+    if "notes" in fields:
+        fields["notes"] = [str(note)[:120] for note in fields["notes"][:2]]
+    # At most two frames are sent. Fit both in the minimum atomic pipe capacity
+    # so the producer cannot block while its parent is draining worker output.
+    budget = min(2048, os.fpathconf(descriptor, "PC_PIPE_BUF") // 2)
+    payload = encode_status(status, fields)
+    while len(payload) > budget:
+        shrink_status(fields)
+        payload = encode_status(status, fields)
+    with suppress(BrokenPipeError):
+        os.write(descriptor, payload)
+
+
+def encode_status(status: str, fields: dict[str, Any]) -> bytes:
+    return (
         json.dumps(
             dict(kind="shadow_supervision", schema_version=1, status=status, **fields)
         ).encode()
         + b"\n"
     )
-    with suppress(BrokenPipeError):
-        os.write(descriptor, payload)
+
+
+def shrink_status(fields: dict[str, Any]) -> None:
+    notes = fields.get("notes", [])
+    detail = fields.get("detail", "")
+    if len(notes) > 1:
+        notes.pop()
+    elif detail and (not notes or len(detail) >= len(notes[0])):
+        fields["detail"] = detail[: len(detail) // 2]
+    elif notes and notes[0]:
+        notes[0] = notes[0][: len(notes[0]) // 2]
+    else:
+        raise OSError("shadow supervisor status cannot fit pipe budget")
 
 
 def signal_group(pid: int, signum: int) -> None:
@@ -98,6 +125,18 @@ def monitor(
                 return "cancelled"
 
 
+def await_start(control: int, deadline: float, cancelled: Cancellation) -> str:
+    with selectors.DefaultSelector() as selector:
+        selector.register(control, selectors.EVENT_READ)
+        while not cancelled.requested:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return "timed_out"
+            if selector.select(min(POLL_INTERVAL, remaining)):
+                return "ready" if os.read(control, 1) == b"S" else "cancelled"
+    return "cancelled"
+
+
 def supervise(
     command: Sequence[str], control: int, status: int, deadline: float
 ) -> int:
@@ -109,8 +148,9 @@ def supervise(
     process = None
     try:
         # No worker is started if its wrapper died before completing the handshake.
-        if os.read(control, 1) != b"S" or cancelled.requested:
-            send_status(status, "cancelled")
+        readiness = await_start(control, deadline, cancelled)
+        if readiness != "ready":
+            send_status(status, readiness)
             return 0
         if time.monotonic() >= deadline:
             send_status(status, "timed_out")
@@ -166,7 +206,7 @@ class StatusChannel:
             raw, self.payload = self.payload.split(b"\n", 1)
             try:
                 value = json.loads(raw)
-            except (ValueError, UnicodeError) as error:
+            except (ValueError,) as error:  # noqa: B013 -- JSON input boundary
                 raise OSError("malformed shadow supervisor status") from error
             if (
                 not isinstance(value, dict)
@@ -180,6 +220,9 @@ class StatusChannel:
 
     def worker_pid(self) -> int | None:
         self.collect()
+        return self.known_worker_pid()
+
+    def known_worker_pid(self) -> int | None:
         if self.messages and self.messages[0].get("status") == "started":
             value = self.messages[0].get("worker_pid")
             if type(value) is int and value > 1:
@@ -188,11 +231,30 @@ class StatusChannel:
 
 
 def emergency_stop(process: subprocess.Popen[str], channel: StatusChannel) -> None:
-    worker = channel.worker_pid()
+    failures: list[Exception] = []
+    try:
+        worker = channel.worker_pid()
+    except (Exception,) as error:  # noqa: B013 -- still stop and reap after malformed status
+        failures.append(error)
+        worker = channel.known_worker_pid()
     if worker is not None:
-        signal_group(worker, signal.SIGKILL)
-    signal_group(process.pid, signal.SIGKILL)
-    process.communicate(timeout=REAP_TIMEOUT)
+        try:
+            signal_group(worker, signal.SIGKILL)
+        except (Exception,) as error:  # noqa: B013 -- supervisor cleanup must still run
+            failures.append(error)
+    try:
+        signal_group(process.pid, signal.SIGKILL)
+    except (Exception,) as error:  # noqa: B013 -- reaping must still run
+        failures.append(error)
+    try:
+        process.communicate(timeout=REAP_TIMEOUT)
+    except (Exception,) as error:  # noqa: B013 -- retain all cleanup diagnostics
+        failures.append(error)
+    if failures:
+        primary, *secondary = failures
+        for error in secondary:
+            primary.add_note(f"shadow emergency cleanup failed: {error}")
+        raise primary
 
 
 def result(
@@ -238,7 +300,8 @@ def start_supervisor(
     control_read: int,
     status_write: int,
 ) -> subprocess.Popen[str]:
-    return subprocess.Popen(  # noqa: S603 -- this installed helper, no shell
+    # The installed helper executes reviewed argv without shell parsing.
+    return subprocess.Popen(  # noqa: S603
         [
             sys.executable,
             str(Path(__file__).resolve()),
@@ -269,15 +332,19 @@ def cancel_supervisor(
             primary.add_note(
                 f"shadow child cleanup failed: {channel.messages[-1].get('detail')}"
             )
-    except (BaseException,):  # noqa: B013 -- preserve the original cancellation
+    except (Exception,):  # noqa: B013 -- a new user cancellation must propagate
         try:
             emergency_stop(process, channel)
-        except (BaseException,) as secondary:  # noqa: B013 -- secondary cleanup failure
+        except (Exception,) as secondary:  # noqa: B013 -- do not swallow user cancellation
             primary.add_note(f"shadow child cleanup failed: {secondary}")
 
 
-def close_handles(descriptors: set[int], process: subprocess.Popen[str] | None) -> None:
-    primary = sys.exception()
+def close_handles(
+    descriptors: set[int],
+    process: subprocess.Popen[str] | None,
+    *,
+    primary: BaseException | None,
+) -> None:
     failures = []
     closers: list[Callable[[], None]] = [
         partial(os.close, descriptor) for descriptor in descriptors
@@ -303,6 +370,7 @@ def run_supervised(
 ) -> subprocess.CompletedProcess[str]:
     descriptors: set[int] = set()
     process = None
+    primary = None
     try:
         control_read, control_write = os.pipe()
         descriptors.update((control_read, control_write))
@@ -350,8 +418,11 @@ def run_supervised(
             except (Exception,) as secondary:  # noqa: B013 -- preserve supervision failure
                 error.add_note(f"shadow child cleanup failed: {secondary}")
             raise
+    except (BaseException,) as error:  # noqa: B013 -- retain only this call's propagating failure
+        primary = error
+        raise
     finally:
-        close_handles(descriptors, process)
+        close_handles(descriptors, process, primary=primary)
 
 
 def main() -> int:

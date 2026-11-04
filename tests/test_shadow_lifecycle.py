@@ -64,13 +64,15 @@ def test_replay_receipt_refused_before_guard_and_corrected_retry_succeeds(
             publication_receipt=bad,
         )
     assert {p.name: p.read_bytes() for p in capsule.iterdir()} == before
+    snapshot = shadow.CapsuleSnapshot.load(capsule, prospective=False)
+    enrolled = shadow.enrollment(protocol)
     with pytest.raises(
         EvidenceError, match="receipts require prospective finalization"
     ):
         shadow.seal_publication(
-            shadow.CapsuleSnapshot.load(capsule, prospective=False),
+            snapshot,
             bad,
-            shadow.enrollment(protocol),
+            enrolled,
         )
     assert not (capsule / "evidence.lock.json").exists()
     assert (
@@ -293,3 +295,32 @@ def test_tagged_refusal_has_one_detail_and_separate_notes(capsys):
         capsys.readouterr().out
         == "shadow preflight stderr: shadow cleanup detail: second note\n"
     )
+
+
+@pytest.mark.parametrize("depth", [1, 3])
+def test_file_output_ancestor_refused_before_sealing(
+    shadow, frames, tmp_path, monkeypatch, depth
+):
+    capsule, protocol, _target, _clock, receipt, _expected = unsealed(
+        shadow, frames, tmp_path, monkeypatch
+    )
+    blocker = tmp_path / "regular-file"
+    blocker.write_bytes(b"preserve")
+    output = blocker.joinpath(*(["missing"] * depth))
+    before = {path.name: path.read_bytes() for path in capsule.iterdir()}
+    monkeypatch.setattr(
+        shadow,
+        "prepare_matrices",
+        lambda *_args: pytest.fail("prepared below a file ancestor"),
+    )
+    with pytest.raises(EvidenceError, match="output ancestor must be a directory"):
+        shadow.finalize(
+            capsule,
+            output,
+            protocol,
+            source=None,
+            mode="prospective",
+            publication_receipt=receipt,
+        )
+    assert {path.name: path.read_bytes() for path in capsule.iterdir()} == before
+    assert blocker.read_bytes() == b"preserve"
