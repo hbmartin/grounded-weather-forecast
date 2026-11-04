@@ -2,7 +2,7 @@
 
 Implemented in: `scripts/shadow_candidate_v1.py` and
 `scripts/temperature_shadow.py`, `scripts/shadow_evidence.py`,
-`scripts/shadow_environment.py`, `shadow_artifacts.py` and the standalone
+`scripts/shadow_environment.py`, `src/grounded_weather_forecast/shadow_artifacts.py` and the standalone
 `docs/launchd/shadow_supervisor.py`. These standalone scripts register no new
 production method. They preserve the preselected October 26 experiment's
 `simplex_decay21` candidate and `decay21` reference. The definitions below are

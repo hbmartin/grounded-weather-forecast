@@ -176,7 +176,7 @@ validated matrix projections without changing the fixed candidate mathematics.
 `VerifiedEvidence` reuses validated publication/seal projections within one
 snapshot. The [Python subprocess process-group and descriptor contracts](https://docs.python.org/3.13/library/subprocess.html#subprocess.Popen),
 [signal handlers](https://docs.python.org/3.13/library/signal.html), and
-[Apple launchd process-group cleanup policy](https://github.com/apple-oss-distributions/launchd/blob/main/man/launchd.plist.5)
+[Apple launchd process-group cleanup policy](https://github.com/apple-oss-distributions/launchd/blob/d448a1c8f70a61202f8705f94337f686b87c30c4/man/launchd.plist.5)
 underlie `docs/launchd/shadow_supervisor.py`: a wrapper-only liveness pipe,
 independent worker group and bounded graceful/forced shutdown. These are
 operational ownership mechanisms, not statistical methods.

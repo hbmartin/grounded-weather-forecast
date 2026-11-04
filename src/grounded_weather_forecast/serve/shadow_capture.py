@@ -18,6 +18,7 @@ from grounded_weather_forecast.serve.schema import Forecast
 from grounded_weather_forecast.shadow_artifacts import (
     ARTIFACT_VERSION,
     ISSUE_FILE,
+    PRODUCTION_FILE,
     TRAINING_FILE,
     existing_directory,
     issuance_name,
@@ -86,7 +87,7 @@ def capture_issue(
             folder / "truth_hourly.parquet"
         )
         completions.write_parquet(folder / "provider_completions.parquet")
-        (folder / "production.json").write_text(document.to_json(), encoding="utf-8")
+        (folder / PRODUCTION_FILE).write_text(document.to_json(), encoding="utf-8")
         provenance = {
             "production_code_identity": code_identity(),
             "config_fingerprint": config_fingerprint(config),

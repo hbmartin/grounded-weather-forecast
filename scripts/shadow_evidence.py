@@ -25,6 +25,8 @@ from grounded_weather_forecast.shadow_artifacts import (
     ARTIFACT_VERSION,
     BINDING,
     ISSUE_FILE,
+    PRODUCTION_FILE,
+    PUBLISHED_FILE,
     TARGET,
     TRAINING_FILE,
     EvidenceError,
@@ -53,7 +55,7 @@ INPUT_FILES = frozenset(
         ISSUE_FILE,
         TRAINING_FILE,
         "truth_hourly.parquet",
-        "production.json",
+        PRODUCTION_FILE,
         "provider_completions.parquet",
     }
 )
@@ -105,7 +107,7 @@ class CapsuleSnapshot:
         hashes = manifest_hashes(meta, child_names, prospective=prospective)
         optional = INPUT_FILES | {
             "publication.json",
-            "published.json",
+            PUBLISHED_FILE,
             "evidence.lock.json",
         }
         names = set(hashes) | {name for name in optional if (capsule / name).is_file()}
