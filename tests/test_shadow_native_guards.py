@@ -427,6 +427,70 @@ def test_snapshot_equality_is_identity_and_mode_is_explicit(shadow, frames, tmp_
         shadow.CapsuleSnapshot.load(capsule)
 
 
+@pytest.mark.parametrize(
+    "kind", ["missing", "different", "mixed", "invalid", "numeric"]
+)
+def test_issue_provenance_refused_before_sealing_and_corrected_retry(
+    shadow, frames, tmp_path, monkeypatch, kind
+):
+    capsule, protocol, target, _clock = make_prospective_record(
+        shadow, frames, tmp_path, monkeypatch
+    )
+    receipt = original_receipt(capsule)
+    remove_record(target)
+    for name in ("publication.json", "published.json", "evidence.lock.json"):
+        (capsule / name).unlink()
+    path = capsule / "issue.parquet"
+    original = path.read_bytes()
+    issue = pl.read_parquet(path)
+    if kind == "missing":
+        issue = issue.drop("source_kind")
+    elif kind == "mixed":
+        issue = issue.with_columns(pl.Series("source_kind", ["live", "synthetic"]))
+    else:
+        value = (
+            "synthetic"
+            if kind == "different"
+            else 1
+            if kind == "numeric"
+            else "unknown"
+        )
+        issue = issue.with_columns(pl.lit(value).alias("source_kind"))
+    issue.write_parquet(path)
+    manifest = capsule / "capsule.json"
+    meta = json.loads(manifest.read_bytes())
+    meta["input_sha256"][path.name] = shadow.digest(path)
+    manifest.write_text(json.dumps(meta))
+    with pytest.raises(EvidenceError, match="source_kind"):
+        shadow.finalize(
+            capsule,
+            target.parent,
+            protocol,
+            source=None,
+            publication_receipt=receipt,
+            mode="prospective",
+        )
+    assert not any(
+        (capsule / name).exists()
+        for name in ("publication.json", "published.json", "evidence.lock.json")
+    )
+    assert not target.exists()
+    path.write_bytes(original)
+    meta["input_sha256"][path.name] = shadow.digest(path)
+    manifest.write_text(json.dumps(meta))
+    assert (
+        shadow.finalize(
+            capsule,
+            target.parent,
+            protocol,
+            source=None,
+            publication_receipt=receipt,
+            mode="prospective",
+        )
+        == target
+    )
+
+
 def test_prediction_compatibility_wrapper_uses_same_prepared_math(shadow, frames):
     origin, train, issue, truth = frames
     original, fitted = shadow.predictions(train, issue, truth, origin)

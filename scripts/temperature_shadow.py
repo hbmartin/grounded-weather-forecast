@@ -735,7 +735,7 @@ def checked_issue(
     issue = capsule_frame(
         snapshot,
         "issue.parquet",
-        {"issue_time", "valid_time", "lead_hours", "lead_bucket"},
+        {"issue_time", "valid_time", "lead_hours", "lead_bucket", "source_kind"},
     ).sort("valid_time")
     if issue["lead_hours"].null_count() or not issue["lead_hours"].is_finite().all():
         raise EvidenceError("issue.lead_hours: expected finite values")
@@ -795,12 +795,24 @@ def validated_inputs(
         snapshot.parquet("provider_completions.parquet")
     validate_matrix_schema(train, "training.parquet")
     validate_matrix_schema(issue, "issue.parquet", require_sources=False)
-    kinds = train["source_kind"].unique().to_list()
-    if len(kinds) != 1 or kinds[0] not in {"live", "synthetic"}:
+    training_kind = matrix_kind(train, "training.parquet")
+    if matrix_kind(issue, "issue.parquet") != training_kind:
         raise EvidenceError(
-            "training.parquet.source_kind: expected one live or synthetic provenance"
+            "issue.parquet.source_kind: differs from training provenance"
         )
     return prepare_matrices(train, issue, truth, origin)
+
+
+def matrix_kind(frame: pl.DataFrame, label: str) -> str:
+    dtype = frame.schema["source_kind"]
+    if dtype.base_type() not in {pl.String, pl.Categorical, pl.Enum}:
+        raise EvidenceError(f"{label}.source_kind: expected string provenance")
+    kinds = frame["source_kind"].unique().to_list()
+    if len(kinds) != 1 or kinds[0] not in {"live", "synthetic"}:
+        raise EvidenceError(
+            f"{label}.source_kind: expected one live or synthetic provenance"
+        )
+    return cast(str, kinds[0])
 
 
 def validate_matrix_schema(

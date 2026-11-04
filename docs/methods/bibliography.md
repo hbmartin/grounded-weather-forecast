@@ -168,7 +168,7 @@ immutable live reads or write sidecars/private disk snapshots. See
 The shadow evidence helpers implement operational consistency policies: atomic
 enrollment publication, process-owned publication guards, schema validation before
 sealing, and reuse of declared byte snapshots in validation and reconstruction.
-The [FileLock native/soft locking distinction](https://py-filelock.readthedocs.io/en/latest/)
+The [FileLock native/soft locking distinction](https://py-filelock.readthedocs.io/en/3.31.0/)
 and [Python exception notes](https://docs.python.org/3/library/exceptions.html#BaseException.add_note)
 underlie `scripts/shadow_evidence.py` native-only guards and preservation of
 primary failures. `PreparedInputs` in `scripts/temperature_shadow.py` reuses

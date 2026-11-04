@@ -1123,6 +1123,8 @@ permission errors and other operational I/O failures remain exit 1. Known column
 numeric-type and source-provenance requirements are checked explicitly before
 transformations. Unexpected transformation and contract exceptions are not
 translated into schema refusals.
+Training and issue matrices each require one valid `source_kind`, and their kinds
+must match; live training cannot be paired with synthetic issue rows or vice versa.
 `evidence.lock.json` is published last after synchronizing the
 complete evidence. It binds declared input hashes, protocol, implementation and
 runtime, with `evidence_sealed_at`. A later record may recover only from a complete
@@ -1453,8 +1455,8 @@ Standalone wrappers remain compatible with the previous runtime: if
 existing `normalize` API. This fallback applies only to the child-result boundary
 and preserves ordinary publishing and maintenance without requiring a source update.
 This guarantee covers ordinary operation only. Shadow requires compatible source,
-wrappers, the named preflight interface and a matching frozen enrollment. A #102
-runner lacks the named action: the wrapper publishes normally, reports the
+wrappers, the named preflight interface and a matching frozen enrollment. With a
+runner that lacks the named action, the wrapper publishes normally, reports the
 unclassified preflight failure and returns 1 when shadow was requested.
 
 Backtest outcome hints are optional transport. Ordinary validation, encoding and

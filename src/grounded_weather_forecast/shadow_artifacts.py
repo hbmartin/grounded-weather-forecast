@@ -194,12 +194,12 @@ def regular(path: Path) -> None:
 
 def existing_directory(path: Path, *, private: bool = False) -> None:
     """Inspect supplied directories without creating or repairing their paths."""
-    if path.is_symlink() or path.is_junction():
-        raise EvidenceError(f"{path}: expected a nonaliased local directory")
     try:
-        metadata = path.stat()
+        metadata = path.lstat()
     except (FileNotFoundError,) as error:  # noqa: B013 -- missing supplied evidence
         raise EvidenceError(f"{path}: missing capsule directory") from error
+    if stat.S_ISLNK(metadata.st_mode) or path.is_junction():
+        raise EvidenceError(f"{path}: expected a nonaliased local directory")
     if not stat.S_ISDIR(metadata.st_mode):
         raise EvidenceError(f"{path}: expected a local directory")
     if private and os.name == "posix" and metadata.st_mode & 0o077:

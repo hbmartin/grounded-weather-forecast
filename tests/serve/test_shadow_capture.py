@@ -96,10 +96,12 @@ def test_prospective_capture_refuses_public_existing_directories(
     )
     root = tmp_path / "capsules"
     root.mkdir(mode=0o755 if unsafe == "root" else 0o700)
+    root.chmod(0o755 if unsafe == "root" else 0o700)
     selected = root
     if unsafe == "issuance":
         selected = root / "20260322T170000Z"
         selected.mkdir(mode=0o755)
+        selected.chmod(0o755)
     with pytest.raises(ValueError, match=f"{selected}: private capsule directory"):
         capture_issue(
             root,
