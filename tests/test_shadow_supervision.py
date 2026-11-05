@@ -402,6 +402,9 @@ def test_success_status_cannot_hide_failed_supervisor(supervisor, tmp_path):
                 supervisor_code=1,
             )
         assert "cleanup failed" in " ".join(caught.value.__notes__)
+        assert str(caught.value) == (
+            "shadow supervisor exited 1 after completed: supervisor did not exit successfully"
+        )
     finally:
         os.close(descriptor)
 

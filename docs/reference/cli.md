@@ -1166,25 +1166,35 @@ including SIGKILL; workers cannot inherit the writer. A separate status channel
 keeps supervision metadata out of worker stdout/stderr. Deadlines remain 30/300
 seconds, followed by two seconds of SIGTERM grace and three seconds to force
 termination/reap, plus one second of wrapper wait margin. Exceptional rescue has
-a separate three-second maximum. Internal protocol 3 admits the launcher only
+a separate three-second maximum. The final second of forced cleanup and rescue
+is reserved for collection/resumption rather than permission-error retries;
+failed shutdown does not restart either budget. Internal protocol 4 admits the launcher only
 after guardian ownership is acknowledged. The guardian moves outside the worker
 group before readiness, retaining its PID as that group's ID, and reaps the
-launcher before exiting. `waitid(WNOWAIT)` reserves the guardian until group
+launcher and reports its actual exit separately from its own process exit.
+It ignores INT/TERM, retains ownership after reporting the launcher, and initiates
+fallback group cleanup only on supervisor-liveness EOF. The supervisor alone owns
+normal deadlines, signals and outcome selection. Structured guardian readiness,
+exit and errno events share one incremental parser; missing exit evidence is an
+operational failure. `waitid(WNOWAIT)` reserves the guardian until group
 cleanup and terminal release acknowledgment (or wrapper EOF). Clean empty groups
 need no two-second wait or force signal; surviving descendants still receive the
 full graceful/forced cleanup. Native exec restores the standard ignored-signal
 defaults. Mode-specific helper descriptors are required arguments; omission is
 an argparse exit-2 error without a traceback. The status
 pipe is continuously drained and capped at 64 KiB, with primary error/path context
-prioritized in explicitly truncated oversized diagnostics. Worker completion wins
-over simultaneous cancellation. Repeated wrapper cancellation is deferred through
+prioritized in explicitly truncated oversized diagnostics. An observed launcher
+exit wins over simultaneous cancellation; once cancellation or timeout is selected,
+a subsequent cleanup exit (including zero) cannot override it. Repeated wrapper cancellation is deferred through
 bounded cleanup; the CLI ignores subsequent SIGTERM while unwinding evidence
 contexts and restores prior handlers outside command execution.
 Timeout/cancellation cleanup also applies to descendants whose launcher exits.
 Emergency rescue stops/verifies the owned supervisor before signaling a reserved
-worker identity. The hard-kill guarantee assumes the supervisor survives; an
-unexpectedly dead supervisor reports inability to certify cleanup instead of
-signaling a historical PID. Forced termination can still leave staging files.
+worker identity. Wrapper-death cleanup assumes a surviving supervisor; guardian
+fallback covers supervisor-only death when the guardian survives. Loss of the
+identity owner or persistent kernel denial reports inability to certify cleanup
+instead of signaling historical PIDs or claiming successful collection.
+Forced termination can still leave staging files.
 Existing non-POSIX direct-child behavior is retained.
 Nonzero child exits are classified as runner refusals only when exit 2 accompanies the tagged,
 versioned `refused` envelope. Unknown exits, including launcher/lockfile,
@@ -1196,6 +1206,9 @@ capped at 8 KiB and an explicit truncation marker. Multiline primary details are
 filtered as a complete line sequence after newline normalization, never as a
 substring of unrelated stderr. A latched status error does not bypass graceful
 shutdown. Captured stderr and nested cleanup notes are attached once to failures.
+Distinct terminal runtime details remain visible beside a primary protocol error.
+Selectors are reused within event loops, and partial captured output remains bytes
+until a final result or diagnostic needs decoding; monitoring remains 50 ms.
 Missing, unreadable or syntax-broken supervisor
 helpers fail shadow preflight while ordinary publication and maintenance continue.
 Status-reader resource exhaustion has the same ordinary-publication fallback;

@@ -91,14 +91,23 @@ the 30-second preflight/300-second finalize deadlines. It stops the worker group
 after wrapper death, including SIGKILL, with two seconds of SIGTERM grace and
 three seconds for forced termination/reaping. The wrapper adds one second of wait
 margin; exceptional rescue has its own three-second bound. Matching helper code
-uses internal protocol 3: guardian admission and final cleanup are acknowledged.
+uses internal protocol 4: guardian admission and final cleanup are acknowledged.
 The guardian reserves its PID from outside the worker group, reaps the launcher,
-and remains waitable until release. Empty groups complete without the TERM delay;
+and reports its exit code separately, retaining identity until release. Normal
+deadlines, signals and outcomes belong only to the supervisor; INT/TERM cannot
+kill the guardian, whose fallback requires supervisor-liveness EOF. Observed
+completion wins before a stop decision; selected cancellation/timeouts cannot
+be overwritten by cleanup exit zero. Empty groups complete without the TERM delay;
 surviving descendants retain the shutdown bounds. A reader continuously drains
 the separate status pipe (64 KiB total), without consuming worker stdout/stderr.
 Repeated cancellation is deferred until cleanup completes. Emergency handling
 verifies stopped, live ownership before signaling a worker group; an unexpectedly
-dead supervisor yields an explicit cleanup-uncertainty diagnostic.
+dead identity owner yields an explicit cleanup-uncertainty diagnostic; a surviving
+guardian covers supervisor-only death. Shared shutdown budgets never restart,
+and their final second is reserved for resumption/collection instead of signal
+retries. Persistent kernel denial remains an operational failure. Structured
+guardian frames retain startup errno and missing-exit diagnostics. Event-loop
+selectors are reused and partial captured output is decoded only when needed.
 Ordinary operation does not import the optional supervisor; missing, unreadable
 or syntax-broken helpers report shadow failure after ordinary publication.
 Reader-start resource failures also preserve ordinary publication and reap the
