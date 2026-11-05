@@ -84,14 +84,19 @@ def test_terminal_ack_precedes_reaping_and_completion_wins_cancel(supervisor):
         assert process.wait(timeout=3) == 0
 
 
-def test_completion_checked_before_cancellation(supervisor, monkeypatch):
+def test_completion_checked_before_cancellation(supervisor):
     read, write = os.pipe()
-    monkeypatch.setattr(supervisor, "observe_exit", lambda _process: 0)
+    worker = SimpleNamespace(
+        collect=lambda: None,
+        events=SimpleNamespace(returncode=0),
+        check_error=lambda: None,
+        errors=read,
+    )
     try:
         assert (
             supervisor.monitor(
-                SimpleNamespace(),
-                read,
+                worker,
+                write,
                 time.monotonic() + 1,
                 supervisor.Cancellation(requested=True),
             )

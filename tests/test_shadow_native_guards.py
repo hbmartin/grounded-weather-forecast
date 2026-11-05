@@ -563,8 +563,10 @@ def test_cancellation_keeps_primary_when_process_group_cleanup_fails(monkeypatch
     cancelled = KeyboardInterrupt("operator cancelled")
     channel = supervisor.StatusChannel(-1, owned_pid=123456)
     channel.control = SimpleNamespace(cancel=lambda: None, send=lambda _token: None)
+    calls = []
 
     def interrupted(**_kwargs):
+        calls.append("communicate")
         raise OSError("supervisor cleanup communication failed")
 
     process = SimpleNamespace(
@@ -574,7 +576,7 @@ def test_cancellation_keeps_primary_when_process_group_cleanup_fails(monkeypatch
         wait=lambda **_: 0,
         kill=lambda: None,
     )
-    monkeypatch.setattr(channel, "collect", lambda: None)
+    monkeypatch.setattr(channel, "collect", lambda **kwargs: calls.append(kwargs))
     monkeypatch.setattr(supervisor, "stopped_supervisor", lambda *_: True)
     monkeypatch.setattr(supervisor.os, "kill", lambda *_: None)
 
@@ -585,3 +587,6 @@ def test_cancellation_keeps_primary_when_process_group_cleanup_fails(monkeypatch
     supervisor.cancel_supervisor(process, channel, cancelled)
     assert "group cleanup denied" in " ".join(cancelled.__notes__)
     assert "supervisor cleanup communication failed" in " ".join(cancelled.__notes__)
+    assert calls[0] == {"check_errors": False}
+    assert calls.count("communicate") == 2
+    assert "TypeError" not in " ".join(cancelled.__notes__)
