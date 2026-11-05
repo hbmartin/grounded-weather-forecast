@@ -388,7 +388,7 @@ def test_shutdown_announcement_does_not_invoke_guardian_fallback(
         supervisor.write_frame(
             write, "shadow_guardian_control", "release", group_cleaned=True
         )
-        assert guardian.run() == 0
+        assert guardian.run() is None
         assert guardian.budget is not None
     finally:
         os.close(read)
@@ -440,11 +440,10 @@ def test_emergency_denial_reserves_time_for_resume_and_reap(supervisor, monkeypa
         "reap_supervisor",
         lambda _process, deadline: calls.append(deadline - elapsed[0]),
     )
+    process = SimpleNamespace(returncode=None)
+    channel = supervisor.StatusChannel(-1, owned_pid=123456)
     with pytest.raises(PermissionError, match="rescue signal denied"):
-        supervisor.emergency_stop(
-            SimpleNamespace(returncode=None),
-            supervisor.StatusChannel(-1, owned_pid=123456),
-        )
+        supervisor.emergency_stop(process, channel)
     assert calls[0] == "resumed"
     assert 0.9 <= calls[1] <= 1
 

@@ -129,7 +129,7 @@ def signal_group(pid: int, signum: int) -> None:
 def group_exists(pid: int) -> bool:
     try:
         os.killpg(pid, 0)
-    except (ProcessLookupError,):  # noqa: B013 -- project exception convention
+    except (ProcessLookupError,):  # noqa: B013
         return False
     return True
 
@@ -196,36 +196,42 @@ class GroupShutdown:
     clock: Clock = CLOCK
     terminated: bool = False
     complete: bool = False
+    denial: PermissionError | None = None
+
+    def exists(self) -> bool:
+        try:
+            return group_exists(self.pid)
+        except (PermissionError,) as error:  # noqa: B013
+            self.denial = self.denial or error
+            return True
+
+    def signal_next(self) -> None:
+        if self.clock.now() >= self.budget.term_until:
+            signal_group(self.pid, signal.SIGKILL)
+            self.complete = True
+        elif not self.terminated:
+            signal_group(self.pid, signal.SIGTERM)
+            self.terminated = True
 
     def run(self, progress: Callable[[], None]) -> None:
         if self.complete:
             return
-        denial = None
         while True:
             progress()
-            try:
-                exists = group_exists(self.pid)
-            except (PermissionError,) as error:  # noqa: B013 -- still attempt owned signals
-                denial = denial or error
-                exists = True
-            if not exists:
+            if not self.exists():
                 self.complete = True
                 return
             if self.clock.now() >= self.budget.signal_until:
                 break
             try:
-                if self.clock.now() >= self.budget.term_until:
-                    signal_group(self.pid, signal.SIGKILL)
-                    self.complete = True
-                    return  # Collection has its own reserved final second.
-                if not self.terminated:
-                    signal_group(self.pid, signal.SIGTERM)
-                    self.terminated = True
-            except (PermissionError,) as error:  # noqa: B013 -- transient zombie denial
-                denial = error
+                self.signal_next()
+            except (PermissionError,) as error:  # noqa: B013
+                self.denial = error
+            if self.complete:
+                return  # Collection has its own reserved final second.
             self.clock.sleep(POLL_INTERVAL)
-        if denial is not None:
-            raise denial
+        if self.denial is not None:
+            raise self.denial
         raise OSError(
             "worker group termination was not certified before collection reserve"
         )
@@ -253,7 +259,7 @@ def force_group_once(pid: int, deadline: float, *, clock: Clock = CLOCK) -> bool
     try:
         signal_group(pid, signal.SIGKILL)
         return True
-    except (PermissionError,):  # noqa: B013 -- retry only within the force budget
+    except (PermissionError,):  # noqa: B013
         if clock.now() >= deadline:
             raise
         return False
@@ -318,15 +324,9 @@ def monitor(
         selector.register(control, selectors.EVENT_READ)
         selector.register(worker.errors, selectors.EVENT_READ)
         while True:
-            worker.collect()
-            if worker.events.returncode is not None:
-                return "completed"
-            worker.check_error()
-            if cancelled.requested:
-                return "cancelled"
+            if (phase := worker_phase(worker, cancelled, deadline, clock)) is not None:
+                return phase
             remaining = deadline - clock.now()
-            if remaining <= 0:
-                return "timed_out"
             for key, _ in selector.select(min(POLL_INTERVAL, remaining)):
                 if key.fd != control:
                     continue
@@ -337,6 +337,18 @@ def monitor(
                 return (
                     "completed" if worker.events.returncode is not None else "cancelled"
                 )
+
+
+def worker_phase(
+    worker: Worker, cancelled: Cancellation, deadline: float, clock: Clock
+) -> str | None:
+    worker.collect()
+    if worker.events.returncode is not None:
+        return "completed"
+    worker.check_error()
+    if cancelled.requested:
+        return "cancelled"
+    return "timed_out" if clock.now() >= deadline else None
 
 
 def write_frame(descriptor: int, kind: str, event: str, **fields: Any) -> None:
@@ -403,7 +415,7 @@ class FrameStream:
         while not self.eof:
             try:
                 chunk = os.read(descriptor, STATUS_LIMIT)
-            except (BlockingIOError,):  # noqa: B013 -- project exception convention
+            except (BlockingIOError,):  # noqa: B013
                 break
             if not chunk:
                 self.eof = True
@@ -425,7 +437,7 @@ class GuardianEvents:
         for value in self.stream.read(descriptor):
             try:
                 self.accept(value)
-            except (OSError,) as error:  # noqa: B013 -- project exception convention
+            except (OSError,) as error:  # noqa: B013
                 self.error = self.error or error
         self.error = self.error or self.stream.error
 
@@ -471,7 +483,7 @@ class OwnedLauncher:
             return
         try:
             pid, status = os.waitpid(self.pid, os.WNOHANG)
-        except (ChildProcessError,) as error:  # noqa: B013 -- project exception convention
+        except (ChildProcessError,) as error:  # noqa: B013
             self.pid = None  # An external reap ends ownership, even on failure.
             raise OSError("guardian lost waitable launcher ownership") from error
         if pid:
@@ -508,27 +520,27 @@ class Guardian:
     shutdown: GroupShutdown | None = None
     failed: bool = False
 
-    def run(self) -> int:
+    def run(self) -> None:
         commands = FrameStream("shadow_guardian_control")
         with selectors.DefaultSelector() as selector:
             selector.register(self.parent, selectors.EVENT_READ)
             while True:
                 try:
                     self.launcher.collect()
-                except (OSError,) as error:  # noqa: B013 -- owner retains shutdown authority
+                except (OSError,) as error:  # noqa: B013
                     self.report_failure(error)
                 for value in commands.read(self.parent):
                     try:
                         if self.command(value):
-                            return 0
-                    except (OSError,) as error:  # noqa: B013 -- reject command, retain ownership
+                            return
+                    except (OSError,) as error:  # noqa: B013
                         self.report_failure(error)
                 if commands.error is not None:
                     self.report_failure(commands.error)
                     commands.error = None
                 if commands.eof:
                     self.fallback()
-                    return 0
+                    return
                 selector.select(POLL_INTERVAL)
 
     def command(self, value: dict[str, Any]) -> bool:
@@ -586,9 +598,10 @@ def launcher_main(
         os.close(write)
         os.close(parent)
         code = execute_admitted(command, read, events, deadline)
-    except (BaseException,) as error:  # noqa: B013 -- project exception convention
+    except (BaseException,) as error:  # noqa: B013
         with suppress(Exception):
             guardian_error(events, error)
+        raise  # The unconditional _exit below remains the fork-child boundary.
     finally:
         os._exit(code)
 
@@ -600,11 +613,11 @@ def bootstrap(
         read, write = os.pipe()
         try:
             child = os.fork()
-        except (BaseException,):  # noqa: B013 -- project exception convention
+        except (BaseException,):  # noqa: B013
             os.close(read)
             os.close(write)
             raise
-    except (OSError,) as error:  # noqa: B013 -- project exception convention
+    except (OSError,) as error:  # noqa: B013
         guardian_error(error_pipe, error)
         return 127
     if child == 0:
@@ -618,32 +631,30 @@ def bootstrap(
         os.setpgid(0, os.getpgid(os.getppid()))
         guardian.reserved = True
         guardian_event(error_pipe, "ready")
-        return guardian.run()
-    except (BaseException,) as error:  # noqa: B013 -- project exception convention
-        with suppress(Exception):
-            guardian_error(error_pipe, error)
-        if guardian.reserved:
-            # The supervisor receives the failure and remains the ordinary
-            # shutdown authority. Only liveness EOF admits fallback signaling.
-            guardian.failed = True
-            try:
-                guardian.run()
-            except (Exception,) as secondary:  # noqa: B013 -- preserve owner failure
-                attach_failure(error, "guardian recovery failed", secondary)
-        else:
-            try:
-                guardian.fallback()  # Only our still-blocked direct child exists.
-            except (Exception,) as secondary:  # noqa: B013 -- preserve startup failure
-                attach_failure(error, "guardian cleanup failed", secondary)
-        print(f"shadow guardian failure: {error}", file=sys.stderr)
-        for note in getattr(error, "__notes__", ()):
-            print(note, file=sys.stderr)
-        return 127
+        guardian.run()
+        return 0
+    except (BaseException,) as error:  # noqa: B013
+        recover_guardian(guardian, error, error_pipe)
+        raise
     finally:
         for descriptor in (guardian.admission, admission, error_pipe):
             if descriptor >= 0:
                 with suppress(OSError):
                     os.close(descriptor)
+
+
+def recover_guardian(guardian: Guardian, error: BaseException, event_pipe: int) -> None:
+    with suppress(Exception):
+        guardian_error(event_pipe, error)
+    try:
+        if guardian.reserved:
+            # Retain the supervisor's ordinary shutdown authority until EOF.
+            guardian.failed = True
+            guardian.run()
+        else:
+            guardian.fallback()  # Only its still-blocked direct child exists.
+    except (Exception,) as secondary:  # noqa: B013
+        attach_failure(error, "guardian recovery failed", secondary)
 
 
 def execute_admitted(
@@ -661,9 +672,9 @@ def execute_admitted(
             ):
                 return 125
         os.close(admission)
-        os.set_inheritable(error_pipe, False)  # noqa: FBT003 -- native API
-        os.execvp(command[0], list(command))  # noqa: S606 -- reviewed argv, no shell
-    except (OSError,) as error:  # noqa: B013 -- project exception convention
+        os.set_inheritable(error_pipe, False)  # noqa: FBT003
+        os.execvp(command[0], list(command))  # noqa: S606
+    except (OSError,) as error:  # noqa: B013
         guardian_error(error_pipe, error)
         return 127
     return 127
@@ -723,7 +734,7 @@ class Worker:
             return self.worker_code()
         try:
             return self.stop_owned()
-        except (Exception,) as error:  # noqa: B013 -- project exception convention
+        except (Exception,) as error:  # noqa: B013
             self.stop_error = error
             try:
                 if (
@@ -732,7 +743,7 @@ class Worker:
                     and observe_exit(self.process) is not None
                 ):
                     self.cleaned = True  # Unknown result still allows safe collection.
-            except (OSError,) as secondary:  # noqa: B013 -- preserve original stop failure
+            except (OSError,) as secondary:  # noqa: B013
                 attach_failure(error, "guardian collection check failed", secondary)
             raise
 
@@ -741,7 +752,7 @@ class Worker:
             self.shutdown = GroupShutdown(self.process.pid, ShutdownBudget(CLOCK.now()))
             try:
                 self.command("shutdown", started=self.shutdown.budget.started)
-            except (OSError,) as error:  # noqa: B013 -- project exception convention
+            except (OSError,) as error:  # noqa: B013
                 self.events.error = self.events.error or error
         self.await_reservation(self.shutdown.budget.term_until)
         self.shutdown.run(self.collect_for_cleanup)
@@ -760,7 +771,7 @@ class Worker:
     def collect_for_cleanup(self) -> None:
         try:
             self.collect()
-        except (OSError,) as error:  # noqa: B013 -- transport failure cannot skip TERM grace
+        except (OSError,) as error:  # noqa: B013
             self.events.error = self.events.error or error
 
     def await_reservation(self, deadline: float) -> None:
@@ -813,7 +824,7 @@ def start_worker(command: Sequence[str], deadline: float) -> Worker:
         allocated.update((admission_read, admission_write))
         error_read, error_write = os.pipe()
         allocated.update((error_read, error_write))
-        process = subprocess.Popen(  # noqa: S603 -- bootstrap gates reviewed argv
+        process = subprocess.Popen(  # noqa: S603
             [
                 sys.executable,
                 str(Path(__file__).resolve()),
@@ -836,12 +847,12 @@ def start_worker(command: Sequence[str], deadline: float) -> Worker:
             os.close(descriptor)
             allocated.remove(descriptor)
         return Worker(process, admission_write, error_read)
-    except (BaseException,) as error:  # noqa: B013 -- allocation never admits a command
+    except (BaseException,) as error:  # noqa: B013
         if process is not None:
             try:
                 process.kill()
                 process.wait(timeout=REAP_TIMEOUT)
-            except (Exception,) as secondary:  # noqa: B013 -- retain allocation failure
+            except (Exception,) as secondary:  # noqa: B013
                 attach_failure(error, "bootstrap cleanup failed", secondary)
         close_handles(allocated, None, primary=error)
         raise
@@ -891,7 +902,7 @@ def failed_worker(
         try:
             worker.stop()
             cleaned = True
-        except (Exception,) as secondary:  # noqa: B013 -- keep the original supervisor failure
+        except (Exception,) as secondary:  # noqa: B013
             attach_failure(error, "worker cleanup failed", secondary)
     send_status(
         status,
@@ -924,7 +935,7 @@ def supervise(
         outcome = worker_outcome(worker, control, status, deadline, cancelled)
         finish_worker(worker, control, status, outcome)
         return 0
-    except (Exception,) as error:  # noqa: B013 -- supervisor boundary
+    except (Exception,) as error:  # noqa: B013
         if worker is not None and worker.released:
             print(
                 f"shadow supervisor after ownership release: {error}", file=sys.stderr
@@ -955,7 +966,7 @@ class ControlChannel:
                 return False
             try:
                 os.write(self.descriptor, token)
-            except (BrokenPipeError,):  # noqa: B013 -- terminal status remains authoritative
+            except (BrokenPipeError,):  # noqa: B013
                 return False
             return True
 
@@ -1029,7 +1040,7 @@ class StatusChannel:
         )
         try:
             thread.start()
-        except (RuntimeError,) as error:  # noqa: B013 -- resource allocation boundary
+        except (RuntimeError,) as error:  # noqa: B013
             raise OSError(f"cannot start shadow status reader: {error}") from error
         self.thread = thread
 
@@ -1040,7 +1051,7 @@ class StatusChannel:
                 while not self.stopping.is_set():
                     if selector.select(POLL_INTERVAL) and not self.drain():
                         return
-        except (Exception,) as error:  # noqa: B013 -- transport errors reach wrapper thread
+        except (Exception,) as error:  # noqa: B013
             with self.lock:
                 self.error = self.error or error
 
@@ -1049,7 +1060,7 @@ class StatusChannel:
         while not self.stopping.is_set():
             try:
                 chunk = os.read(self.descriptor, STATUS_LIMIT)
-            except (BlockingIOError,):  # noqa: B013 -- continuous nonblocking reader
+            except (BlockingIOError,):  # noqa: B013
                 return True
             with self.lock:
                 self.feed(chunk)
@@ -1068,7 +1079,7 @@ class StatusChannel:
         if self.total <= STATUS_LIMIT:
             try:
                 self.parse(chunk)
-            except (Exception,) as error:  # noqa: B013 -- keep draining broken producers
+            except (Exception,) as error:  # noqa: B013
                 self.error = error
 
     def parse(self, chunk: bytes) -> None:
@@ -1077,13 +1088,13 @@ class StatusChannel:
             raw, self.payload = self.payload.split(b"\n", 1)
             try:
                 self.parse_message(raw)
-            except (OSError,) as error:  # noqa: B013 -- preserve framing for bounded cleanup
+            except (OSError,) as error:  # noqa: B013
                 self.error = self.error or error
 
     def parse_message(self, raw: bytes) -> None:
         try:
             value = json.loads(raw)
-        except (ValueError,) as error:  # noqa: B013 -- private protocol boundary
+        except (ValueError,) as error:  # noqa: B013
             raise OSError("malformed shadow supervisor status") from error
         if (
             not isinstance(value, dict)
@@ -1167,11 +1178,11 @@ def resume_supervisor(process: subprocess.Popen[str], channel: StatusChannel) ->
         if channel.control is not None:
             channel.control.cancel()
             channel.control.send(b"R")
-    except (OSError,) as error:  # noqa: B013 -- SIGCONT must be independent of control I/O
+    except (OSError,) as error:  # noqa: B013
         primary = error
     try:
         os.kill(process.pid, signal.SIGCONT)
-    except (OSError,) as error:  # noqa: B013 -- retain independent resumption failure
+    except (OSError,) as error:  # noqa: B013
         if primary is None:
             raise
         attach_failure(primary, "supervisor resume failed", error)
@@ -1184,15 +1195,15 @@ def reap_supervisor(
 ) -> None:
     try:
         process.communicate(timeout=max(0, deadline - clock.now()))
-    except (Exception,) as error:  # noqa: B013 -- bounded final rescue
+    except (Exception,) as error:  # noqa: B013
         # Popen.kill safely handles a direct child that exited during communicate.
         try:
             process.kill()
-        except (Exception,) as secondary:  # noqa: B013 -- reaping must still be attempted
+        except (Exception,) as secondary:  # noqa: B013
             attach_failure(error, "supervisor kill failed", secondary)
         try:
             process.wait(timeout=max(0.01, deadline - clock.now()))
-        except (Exception,) as secondary:  # noqa: B013 -- expose unreaped state
+        except (Exception,) as secondary:  # noqa: B013
             attach_failure(error, "supervisor left unreaped", secondary)
         raise
 
@@ -1216,17 +1227,17 @@ def emergency_stop(process: subprocess.Popen[str], channel: StatusChannel) -> No
                     "emergency signal budget exhausted; collection reserve retained"
                 )
             force_group(worker, signal_deadline)
-    except (Exception,) as error:  # noqa: B013 -- still resume/reap the supervisor
+    except (Exception,) as error:  # noqa: B013
         failures.append(error)
     finally:
         if process.returncode is None:
             try:
                 resume_supervisor(process, channel)
-            except (Exception,) as error:  # noqa: B013 -- retain independent failures
+            except (Exception,) as error:  # noqa: B013
                 failures.append(error)
         try:
             reap_supervisor(process, deadline)
-        except (Exception,) as error:  # noqa: B013 -- retain independent reaping failure
+        except (Exception,) as error:  # noqa: B013
             failures.append(error)
     if failures:
         primary, *secondary = failures
@@ -1248,7 +1259,7 @@ def result(
         return terminal_result(
             command, timeout, channel, stdout, stderr, supervisor_code
         )
-    except (OSError,) as error:  # noqa: B013 -- every refusal retains captured context
+    except (OSError,) as error:  # noqa: B013
         attach_stderr(error, stderr)
         raise
 
@@ -1302,7 +1313,7 @@ def start_supervisor(
 ) -> subprocess.Popen[str]:
     if not all(hasattr(os, name) for name in ("waitid", "WNOWAIT", "WSTOPPED")):
         raise OSError("shadow supervision requires native waitid/WNOWAIT ownership")
-    return subprocess.Popen(  # noqa: S603 -- reviewed operator-selected argv
+    return subprocess.Popen(  # noqa: S603
         [
             sys.executable,
             str(Path(__file__).resolve()),
@@ -1340,7 +1351,7 @@ def communicate_until(
             stdout, stderr = process.communicate(timeout=min(POLL_INTERVAL, remaining))
             channel.stderr = stderr
             return stdout, stderr
-        except (subprocess.TimeoutExpired,) as error:  # noqa: B013 -- monitor protocol concurrently
+        except (subprocess.TimeoutExpired,) as error:  # noqa: B013
             channel.stderr = error.stderr
 
 
@@ -1390,7 +1401,7 @@ def rescue_cancellation(
 ) -> None:
     try:
         emergency_stop(process, channel)
-    except (Exception,) as error:  # noqa: B013 -- retain primary plus nested notes
+    except (Exception,) as error:  # noqa: B013
         attach_failure(primary, "shadow child cleanup failed", error)
 
 
@@ -1421,7 +1432,7 @@ def cancel_supervisor(
         except (KeyboardInterrupt, SystemExit) as error:
             attach_failure(primary, "shadow cancellation diagnostic", error)
             raise error from primary
-        except (Exception,) as error:  # noqa: B013 -- operational diagnostic; caller retains primary
+        except (Exception,) as error:  # noqa: B013
             attach_failure(primary, "shadow cancellation diagnostic", error)
         finally:
             if not completed:
@@ -1446,7 +1457,7 @@ def close_handles(
     for close in closers:
         try:
             close()
-        except (OSError,) as error:  # noqa: B013 -- close every descriptor
+        except (OSError,) as error:  # noqa: B013
             failures.append(error)
     if failures:
         if primary is None:
@@ -1459,7 +1470,7 @@ def stop_reader(channel: StatusChannel | None) -> OSError | None:
     if channel is not None:
         try:
             channel.stop()
-        except (OSError,) as error:  # noqa: B013 -- owner retains failed reader descriptors
+        except (OSError,) as error:  # noqa: B013
             return error
     return None
 
@@ -1481,7 +1492,7 @@ def close_control(
         )
     try:
         control.close()
-    except (OSError,) as error:  # noqa: B013 -- failed sender retains its descriptor
+    except (OSError,) as error:  # noqa: B013
         return error
     return None
 
@@ -1550,7 +1561,7 @@ def run_supervised(
                 stderr,
                 supervisor_code=process.returncode,
             )
-        except (BaseException,) as error:  # noqa: B013 -- cancellation must complete cleanup
+        except (BaseException,) as error:  # noqa: B013
             if process.returncode is None:
                 cancel_supervisor(process, channel, error)
             elif not channel.released:
@@ -1559,7 +1570,7 @@ def run_supervised(
                 )
             attach_stderr(error, channel.stderr)
             raise
-    except (BaseException,) as error:  # noqa: B013 -- retain this call's primary
+    except (BaseException,) as error:  # noqa: B013
         primary = error
         raise
     finally:
