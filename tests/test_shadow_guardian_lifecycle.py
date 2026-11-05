@@ -274,8 +274,9 @@ def test_broken_control_cannot_skip_resume(supervisor, monkeypatch):
     monkeypatch.setattr(
         supervisor.os, "kill", lambda pid, sig: calls.append((pid, sig))
     )
+    process = SimpleNamespace(pid=123456)
     with pytest.raises(OSError, match="control write failed"):
-        supervisor.resume_supervisor(SimpleNamespace(pid=123456), channel)
+        supervisor.resume_supervisor(process, channel)
     assert calls == [(123456, signal.SIGCONT)]
 
 
