@@ -183,8 +183,13 @@ operational ownership mechanisms, not statistical methods.
 The [Python `waitid` and `WNOWAIT` contracts](https://docs.python.org/3.13/library/os.html#os.waitid)
 support retaining child identity until acknowledged cleanup; the
 [standard-library threading primitives](https://docs.python.org/3.13/library/threading.html)
-support independently draining supervision status. Internal protocol 2 uses a
-blocked bootstrap and explicit admission/release acknowledgments. These references
+support independently draining supervision status. Internal protocol 3 uses a
+guardian outside its reserved worker group, a blocked launcher, and explicit
+admission/release acknowledgments. The [POSIX process-group operations](https://docs.python.org/3.13/library/os.html#os.setpgid)
+and [`Popen` signal restoration](https://docs.python.org/3.13/library/subprocess.html#subprocess.Popen)
+map to `bootstrap`, `guard_launcher`, `stop_worker`, and `execute_admitted` in the
+same supervisor helper. The guardian reaps the launcher before exiting, so its
+own retained zombie cannot make an empty worker group appear alive. These references
 describe implementation mechanisms, not an authentication or forecast-skill claim.
 `status.py::CommandOutcome.from_subprocess` interprets negative child signals;
 generic internal outcome normalization rejects negative exits. These changes add

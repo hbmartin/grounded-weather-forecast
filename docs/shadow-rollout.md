@@ -48,9 +48,11 @@ Prepare reviewed `shadow_supervisor.py` beside the installed wrappers and
 `launchd_paths.py`; it uses only the existing Python standard library. Its
 private liveness pipe bounds worker lifetime after wrapper death, including
 SIGKILL, assuming the supervisor survives. Keep this helper with the matching
-wrapper set for rollback, including internal supervision protocol 2; mixing old
-and new helper implementations is unsupported. The worker bootstrap waits for
-admission and its PID remains reserved through acknowledged cleanup. The wrapper
+wrapper set for rollback, including internal supervision protocol 3; mixing old
+and new helper implementations is unsupported. The guardian reserves the worker
+group ID from outside that group, reaps its blocked/admitted launcher, and remains
+waitable through acknowledged cleanup. Clean empty groups avoid unnecessary
+TERM/KILL; surviving descendants retain the bounds. The wrapper
 continuously drains bounded status independently of worker output. Shutdown adds
 one second of wrapper wait margin to the 2-/3-second cleanup phases; exceptional
 rescue is bounded separately to three seconds. Unexpected supervisor death is
@@ -58,6 +60,10 @@ reported as cleanup uncertainty without signaling historical worker identities.
 Missing, unreadable or syntax-broken helpers preserve ordinary publication but
 make requested shadow work fail. No schedule or activation changes follow from
 copying or merging these sources.
+Reader-start resource exhaustion also preserves ordinary publication. Required
+artifact paths below a regular file are input refusals; operational I/O stays a
+runtime failure. Keep the refreshed helper/wrapper sources together; the evidence
+artifact version stays v3 and existing enrollments retain their original runners.
 Preserve old enrollments; the new runner requires a fresh v3 enrollment.
 Verify one complete maintenance cycle, truthful gate explanations, a ready
 forecast and successful public publication before enrolling the shadow.

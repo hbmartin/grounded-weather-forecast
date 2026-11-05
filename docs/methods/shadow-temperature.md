@@ -104,9 +104,15 @@ outside it returns `outside_window` without those checks. The wrapper allows 30 
 and 300 seconds for finalization; capability/preflight failures preserve ordinary
 publication and report shadow failure. There is no persistent validation cache.
 The installed standard-library supervisor monitors a wrapper-only pipe and owns
-the POSIX worker group. Internal protocol **2** acknowledges bootstrap ownership
-before admitting the command. Exit observation uses `waitid(WNOWAIT)` to reserve
-the group identity until cleanup and the terminal acknowledgment (or wrapper EOF).
+the POSIX worker group. Internal protocol **3** acknowledges guardian ownership
+before admitting the command. The guardian forks a blocked launcher into its
+original group, then moves into the supervisor group before reporting readiness.
+Its PID reserves the worker group ID from outside that group; it reaps the launcher
+before exiting. `waitid(WNOWAIT)` retains the guardian identity until cleanup and
+the terminal acknowledgment (or wrapper EOF). Clean completion therefore adds no
+TERM grace or force signal when the worker group is already empty. Remaining
+descendants retain the full bounded TERM/KILL cleanup. The final native exec
+restores Python-ignored SIGPIPE/SIGXFZ/SIGXFSZ defaults, matching `Popen`.
 The wrapper continuously drains the separate status pipe, bounded to **64 KiB**;
 oversized diagnostics retain error/path context with explicit truncation markers.
 Worker completion takes precedence over simultaneous cancellation. Repeated
@@ -119,6 +125,15 @@ termination/reap, with **1 second** of wrapper wait margin. Exceptional rescue
 has a separate **3-second** bound. A surviving supervisor is required: unexpected
 supervisor death reports inability to certify cleanup rather than signaling a
 historical PID. Forced termination can leave recoverable staging files.
+Stop requests and confirmed stops are distinct: even failed confirmation or
+control writes cannot bypass an independent attempt to resume the owned supervisor.
+Reader startup is part of the cleanup boundary; resource exhaustion is a shadow
+operational failure and cannot prevent ordinary publication. Control descriptors
+close under the sender lock, after reader shutdown; failed shutdown preserves
+those descriptors rather than allowing reuse underneath a sender.
+Protocol errors remain primary while bounded graceful cleanup continues. Captured
+stderr and nested notes are retained once. Required-file paths with regular-file
+ancestors are input refusals; permission and operational I/O failures remain failures.
 The monitoring interval remains **0.05 seconds**. Non-POSIX behavior is unchanged.
 
 The [CLI reference](../reference/cli.md#standalone-temperature-shadow) owns the

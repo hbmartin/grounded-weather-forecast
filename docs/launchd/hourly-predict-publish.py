@@ -397,8 +397,13 @@ def refused_preflight(result: object, returncode: int) -> bool:
 
 
 def preflight_secondary(detail: list[str], primary: str) -> None:
-    text = "\n".join(detail)
-    text = text.replace(f"shadow refused: {primary}", "", 1).strip()
+    lines = "\n".join(detail).splitlines()
+    refusal = f"shadow refused: {primary}".splitlines()
+    for index in range(len(lines) - len(refusal) + 1):
+        if lines[index : index + len(refusal)] == refusal:
+            del lines[index : index + len(refusal)]
+            break
+    text = "\n".join(lines).strip()
     if not text:
         return
     text = (

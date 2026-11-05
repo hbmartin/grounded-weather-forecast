@@ -379,7 +379,7 @@ def test_success_status_cannot_hide_failed_supervisor(supervisor, tmp_path):
         json.dumps(
             {
                 "kind": "shadow_supervision",
-                "schema_version": 2,
+                "schema_version": supervisor.PROTOCOL_VERSION,
                 "status": "completed",
                 "returncode": 0,
                 "cleanup_complete": True,
@@ -551,6 +551,11 @@ def test_emergency_cleanup_attempts_every_step_and_keeps_first_failure(
         supervisor.os, "kill", lambda pid, sig: calls.append((pid, sig))
     )
     monkeypatch.setattr(supervisor, "signal_group", signal_failed)
+    monkeypatch.setattr(
+        supervisor,
+        "force_group",
+        lambda pid, _deadline: signal_failed(pid, signal.SIGKILL),
+    )
     with pytest.raises(PermissionError, match="worker signal denied") as caught:
         supervisor.emergency_stop(process, channel)
     assert caught.value is first

@@ -24,6 +24,7 @@ REAP_TIMEOUT = 3.0
 WAIT_MARGIN = 1.0
 POLL_INTERVAL = 0.05
 STATUS_LIMIT = 64 * 1024
+PROTOCOL_VERSION = 3
 TRUNCATED = " ... [truncated] ... "
 TERMINAL = frozenset({"completed", "cancelled", "timed_out", "runtime_failure"})
 
@@ -37,6 +38,14 @@ class Clock:
 CLOCK = Clock()
 
 
+def text_context(value: str, size: int) -> str:
+    return (
+        value[: (size + 1) // 2]
+        + TRUNCATED
+        + (value[-(size // 2) :] if size > 1 else "")
+    )
+
+
 def limited_text(value: str, budget: int) -> str:
     """Bound encoded JSON, retaining both the error prefix and its final path/context."""
     if len(json.dumps(value).encode()) <= budget:
@@ -44,18 +53,12 @@ def limited_text(value: str, budget: int) -> str:
     low, high = 0, len(value)
     while low < high:
         size = (low + high + 1) // 2
-        candidate = (
-            value[: (size + 1) // 2]
-            + TRUNCATED
-            + (value[-(size // 2) :] if size > 1 else "")
-        )
+        candidate = text_context(value, size)
         if len(json.dumps(candidate).encode()) <= budget:
             low = size
         else:
             high = size - 1
-    return (
-        value[: (low + 1) // 2] + TRUNCATED + (value[-(low // 2) :] if low > 1 else "")
-    )
+    return text_context(value, low)
 
 
 def encode_status(status: str, fields: dict[str, Any]) -> bytes:
@@ -72,7 +75,12 @@ def encode_status(status: str, fields: dict[str, Any]) -> bytes:
         ]
     payload = (
         json.dumps(
-            dict(kind="shadow_supervision", schema_version=2, status=status, **fields),
+            dict(
+                kind="shadow_supervision",
+                schema_version=PROTOCOL_VERSION,
+                status=status,
+                **fields,
+            ),
             ensure_ascii=True,
         ).encode()
         + b"\n"
@@ -97,8 +105,12 @@ def exception_notes(error: BaseException) -> list[str]:
 
 
 def attach_failure(primary: BaseException, label: str, error: BaseException) -> None:
+    if primary is error:
+        return
     for detail in exception_notes(error):
-        primary.add_note(f"{label}: {detail}")
+        note = f"{label}: {detail}"
+        if note not in getattr(primary, "__notes__", ()):
+            primary.add_note(note)
 
 
 def signal_group(pid: int, signum: int) -> None:
@@ -150,23 +162,44 @@ def wait_exit(
     return code
 
 
-def stop_worker(process: subprocess.Popen[str], *, clock: Clock = CLOCK) -> int:
-    """End the group, retaining the launcher as a waitable child until release ACK."""
-    with suppress(PermissionError):
-        signal_group(process.pid, signal.SIGTERM)
-    deadline = clock.now() + TERM_GRACE
+def stop_worker(
+    process: subprocess.Popen[str],
+    *,
+    clock: Clock = CLOCK,
+    started: float | None = None,
+) -> int:
+    """The reserved guardian is outside its group; clean completion needs no signals."""
+    deadline = (clock.now() if started is None else started) + TERM_GRACE
+    terminated = False
     while clock.now() < deadline:
         try:
             if not group_exists(process.pid):
-                return wait_exit(process, clock.now() + REAP_TIMEOUT, clock=clock)
-        except (PermissionError,):  # noqa: B013 -- retry only during TERM grace
-            # Darwin reports EPERM for a group containing only our reserved zombie.
-            # A live same-user descendant remains signalable (covered through uv).
-            if sys.platform == "darwin" and (code := observe_exit(process)) is not None:
-                return code
+                return wait_exit(process, deadline + REAP_TIMEOUT, clock=clock)
+            if not terminated:
+                signal_group(process.pid, signal.SIGTERM)
+                terminated = True
+        except (PermissionError,):  # noqa: B013 -- guardian may be reaping its child
+            pass  # Persistent denial still fails forced termination below.
         clock.sleep(POLL_INTERVAL)
-    signal_group(process.pid, signal.SIGKILL)
-    return wait_exit(process, clock.now() + REAP_TIMEOUT, clock=clock)
+    forced = deadline + REAP_TIMEOUT
+    force_group(process.pid, forced, clock=clock)
+    return wait_exit(process, forced, clock=clock)
+
+
+def force_group(pid: int, deadline: float, *, clock: Clock = CLOCK) -> None:
+    """Allow the outside guardian to reap a transient Darwin zombie; never ignore denial."""
+    while not force_group_once(pid, deadline, clock=clock):
+        clock.sleep(POLL_INTERVAL)
+
+
+def force_group_once(pid: int, deadline: float, *, clock: Clock = CLOCK) -> bool:
+    try:
+        signal_group(pid, signal.SIGKILL)
+        return True
+    except (PermissionError,):  # noqa: B013 -- retry only within the force budget
+        if clock.now() >= deadline:
+            raise
+        return False
 
 
 @dataclass
@@ -245,24 +278,136 @@ def monitor(
 def bootstrap(
     command: Sequence[str], admission: int, error_pipe: int, deadline: float
 ) -> int:
-    """No command executes without admission; EOF after supervisor death aborts."""
+    """Reserve our PID outside the worker group, reaping its launcher before exit."""
+    allocated: set[int] = set()
+    child = None
+    try:
+        read, write = os.pipe()
+        allocated.update((read, write))
+        child = os.fork()
+        if child == 0:
+            os.close(write)
+            os.close(admission)
+            code = execute_admitted(command, read, error_pipe, deadline)
+            os._exit(code)
+        os.close(read)
+        allocated.remove(read)
+        # Child has inherited our original group. Our live/waitable PID now
+        # reserves that group's identity without keeping the group nonempty.
+        os.setpgid(0, os.getpgid(os.getppid()))
+        os.write(error_pipe, b"R")
+        code, outcome = guard_launcher(child, admission, write, deadline)
+        child = None  # guard_launcher reaped the direct launcher.
+        os.write(error_pipe, json.dumps({"outcome": outcome}).encode() + b"\n")
+        os.close(error_pipe)
+        error_pipe = -1
+        return guardian_exit(code)
+    except (OSError,) as error:  # noqa: B013 -- retain launcher failure semantics
+        if error_pipe >= 0:
+            write_exec_error(error_pipe, error)
+        if child is not None:
+            os.kill(child, signal.SIGKILL)
+            os.waitpid(child, 0)
+        return 127
+    finally:
+        for descriptor in allocated:
+            with suppress(OSError):
+                os.close(descriptor)
+
+
+def write_exec_error(descriptor: int, error: OSError) -> None:
+    payload = json.dumps({"detail": str(error), "errno": error.errno}).encode() + b"\n"
+    os.write(descriptor, payload)
+
+
+def execute_admitted(
+    command: Sequence[str], admission: int, error_pipe: int, deadline: float
+) -> int:
     try:
         with selectors.DefaultSelector() as selector:
             selector.register(admission, selectors.EVENT_READ)
             if (
-                not selector.select(max(0, deadline - time.monotonic()))
+                not selector.select(max(0, deadline - CLOCK.now()))
                 or os.read(admission, 1) != b"G"
             ):
                 return 125
         os.close(admission)
         os.set_inheritable(error_pipe, False)  # noqa: FBT003 -- POSIX positional-only API
+        for name in ("SIGPIPE", "SIGXFZ", "SIGXFSZ"):
+            if (signum := getattr(signal, name, None)) is not None:
+                signal.signal(signum, signal.SIG_DFL)
         # Reviewed operator-selected argv; no shell interpretation.
         os.execvp(command[0], list(command))  # noqa: S606
-    except (OSError,) as error:  # noqa: B013 -- retain launcher failure semantics
-        payload = json.dumps({"detail": str(error), "errno": error.errno}).encode()
-        os.write(error_pipe, payload)
+    except (OSError,) as error:  # noqa: B013 -- launcher errors reach the supervisor
+        write_exec_error(error_pipe, error)
         return 127
     return 127
+
+
+def guardian_exit(code: int) -> int:
+    if code < 0:
+        signum = -code
+        if signum not in (signal.SIGKILL, signal.SIGSTOP):
+            signal.signal(signum, signal.SIG_DFL)
+        os.kill(os.getpid(), signum)
+    return code
+
+
+def guard_launcher(
+    child: int, parent: int, admission: int, deadline: float
+) -> tuple[int, str]:
+    """Parent EOF aborts a blocked command or terminates an admitted launcher."""
+    admitted = False
+    with selectors.DefaultSelector() as selector:
+        selector.register(parent, selectors.EVENT_READ)
+        while True:
+            pid, status = os.waitpid(child, os.WNOHANG)
+            if pid:
+                return os.waitstatus_to_exitcode(status), "completed"
+            if CLOCK.now() >= deadline:
+                return stop_launcher(child), "timed_out"
+            if selector.select(POLL_INTERVAL):
+                token = os.read(parent, 1)
+                if token != b"G" or admitted:
+                    return stop_launcher(child), "cancelled"
+                if CLOCK.now() >= deadline:
+                    return stop_launcher(child), "timed_out"
+                os.write(admission, b"G")
+                admitted = True
+
+
+def stop_launcher(child: int) -> int:
+    """The guardian can reap its launcher while continuing to reserve the group ID."""
+    group = os.getpid()
+    code = None
+    with suppress(ProcessLookupError, PermissionError):
+        signal_group(group, signal.SIGTERM)
+    deadline = CLOCK.now() + TERM_GRACE
+    while CLOCK.now() < deadline:
+        code = launcher_exit(child, code)
+        if code is not None and launcher_group_empty(group):
+            return code
+        CLOCK.sleep(POLL_INTERVAL)
+    while CLOCK.now() < deadline + REAP_TIMEOUT:
+        code = launcher_exit(child, code)
+        if force_group_once(group, deadline + REAP_TIMEOUT) and code is not None:
+            return code
+        CLOCK.sleep(POLL_INTERVAL)
+    raise OSError("guardian could not reap the forced launcher")
+
+
+def launcher_exit(child: int, previous: int | None) -> int | None:
+    if previous is not None:
+        return previous
+    pid, status = os.waitpid(child, os.WNOHANG)
+    return os.waitstatus_to_exitcode(status) if pid else None
+
+
+def launcher_group_empty(group: int) -> bool:
+    try:
+        return not group_exists(group)
+    except (PermissionError,):  # noqa: B013 -- next iteration reaps our exited launcher
+        return False
 
 
 @dataclass
@@ -272,11 +417,69 @@ class Worker:
     errors: int
     cleaned: bool = False
     released: bool = False
+    reserved: bool = False
+    error_prefix: bytes = b""
+    outcome: str | None = None
 
     def admit(self) -> None:
         os.write(self.admission, b"G")
-        os.close(self.admission)
-        self.admission = -1
+
+    def ready(self, control: int, deadline: float, cancelled: Cancellation) -> str:
+        with selectors.DefaultSelector() as selector:
+            selector.register(self.errors, selectors.EVENT_READ)
+            while not cancelled.requested:
+                if control_cancelled(control):
+                    return "cancelled"
+                remaining = deadline - CLOCK.now()
+                if remaining <= 0:
+                    return "timed_out"
+                if selector.select(min(POLL_INTERVAL, remaining)):
+                    first = os.read(self.errors, 1)
+                    if first == b"R":
+                        self.reserved = True
+                        return "ready"
+                    self.error_prefix += first
+                    raise OSError("guardian failed before reserving worker group")
+        return "cancelled"
+
+    def stop(self) -> int:
+        started = CLOCK.now()
+        self.close_admission()
+        os.set_blocking(self.errors, False)
+        # Cancellation can arrive while the guardian interpreter is still starting.
+        # EOF prevents admission; give it the existing TERM grace to move/reap.
+        if not self.reserved:
+            code = self.await_reservation(started + TERM_GRACE)
+            if code is not None:
+                return code
+        if self.reserved:
+            return stop_worker(self.process, started=started)
+        return self.stop_blocked(started + TERM_GRACE + REAP_TIMEOUT)
+
+    def await_reservation(self, deadline: float) -> int | None:
+        while CLOCK.now() < deadline:
+            if (code := observe_exit(self.process)) is not None:
+                return code  # Never admitted; bootstrap cleans its blocked child.
+            with suppress(BlockingIOError):
+                first = os.read(self.errors, 1)
+                if first == b"R" and not self.error_prefix:
+                    self.reserved = True
+                else:
+                    self.error_prefix += first
+            if self.reserved:
+                return None
+            CLOCK.sleep(POLL_INTERVAL)
+        return None
+
+    def stop_blocked(self, deadline: float) -> int:
+        # No readiness or admission was acknowledged. Only blocked bootstrap code
+        # can exist in this still-owned group, including the guardian itself.
+        try:
+            signal_group(self.process.pid, signal.SIGKILL)
+        except (PermissionError,):  # noqa: B013 -- only a verified pre-admission exit is harmless
+            if observe_exit(self.process) is None:
+                raise
+        return wait_exit(self.process, deadline)
 
     def close_admission(self) -> None:
         if self.admission >= 0:
@@ -286,12 +489,16 @@ class Worker:
     def exec_error(self) -> None:
         os.set_blocking(self.errors, False)
         try:
-            raw = os.read(self.errors, STATUS_LIMIT)
+            raw = self.error_prefix + os.read(self.errors, STATUS_LIMIT)
         except (BlockingIOError,):  # noqa: B013 -- execution still starting
             return
-        if raw:
-            value = json.loads(raw)
-            raise OSError(value["errno"], value["detail"])
+        for message in raw.splitlines():
+            value = json.loads(message)
+            if "errno" in value:
+                raise OSError(value["errno"], value["detail"])
+            if value.get("outcome") not in ("completed", "cancelled", "timed_out"):
+                raise OSError("invalid guardian outcome")
+            self.outcome = value["outcome"]
 
 
 def start_worker(command: Sequence[str], deadline: float) -> Worker:
@@ -345,23 +552,29 @@ def await_release(control: int) -> None:
 def worker_outcome(
     worker: Worker, control: int, status: int, deadline: float, cancelled: Cancellation
 ) -> str:
+    readiness = worker.ready(control, deadline, cancelled)
+    if readiness != "ready":
+        return readiness
     send_status(status, "worker_ready", worker_pid=worker.process.pid)
     admitted = await_token(control, b"A", deadline, cancelled)
     if admitted != "ready":
         return admitted
     if cancelled.requested or control_cancelled(control):
         return "cancelled"
-    if time.monotonic() >= deadline:
+    if CLOCK.now() >= deadline:
         return "timed_out"
     worker.admit()
     return monitor(worker.process, control, deadline, cancelled)
 
 
 def finish_worker(worker: Worker, control: int, status: int, outcome: str) -> None:
-    worker.close_admission()
-    code = stop_worker(worker.process)
+    code = worker.stop()
     worker.cleaned = True
     worker.exec_error()
+    if worker.outcome == "completed":
+        outcome = "completed"
+    elif outcome == "completed" and worker.outcome is not None:
+        outcome = worker.outcome
     send_status(status, outcome, returncode=code, cleanup_complete=True)
     await_release(control)
     worker.released = True
@@ -373,10 +586,8 @@ def failed_worker(
 ) -> None:
     cleaned = worker is None or worker.cleaned
     if worker is not None and not cleaned:
-        worker.close_admission()
         try:
-            signal_group(worker.process.pid, signal.SIGKILL)
-            wait_exit(worker.process, time.monotonic() + REAP_TIMEOUT)
+            worker.stop()
             cleaned = True
         except (Exception,) as secondary:  # noqa: B013 -- keep the original supervisor failure
             attach_failure(error, "worker cleanup failed", secondary)
@@ -453,10 +664,14 @@ class ControlChannel:
                 self.send(b"C")
 
     def close(self) -> None:
-        with self.lock:
+        if not self.lock.acquire(timeout=WAIT_MARGIN):
+            raise OSError("shadow control sender still running; descriptor preserved")
+        try:
             if not self.closed:
                 self.closed = True
                 os.close(self.descriptor)
+        finally:
+            self.lock.release()
 
 
 def validate_diagnostic(value: dict[str, Any]) -> None:
@@ -480,6 +695,13 @@ def diagnostic_error(
     return error
 
 
+def attach_stderr(error: BaseException, stderr: str | None) -> None:
+    if stderr:
+        note = f"shadow supervisor stderr: {limited_text(stderr, 8192)}"
+        if note not in getattr(error, "__notes__", ()):
+            error.add_note(note)
+
+
 @dataclass
 class StatusChannel:
     descriptor: int
@@ -491,15 +713,21 @@ class StatusChannel:
     total: int = 0
     control: ControlChannel | None = None
     thread: threading.Thread | None = None
+    stdout: str | None = None
+    stderr: str | None = None
     stopping: threading.Event = field(default_factory=threading.Event)
     lock: threading.RLock = field(default_factory=threading.RLock)
 
     def start(self, control: ControlChannel) -> None:
         self.control = control
-        self.thread = threading.Thread(
+        thread = threading.Thread(
             target=self.read_loop, name="shadow-status", daemon=True
         )
-        self.thread.start()
+        try:
+            thread.start()
+        except (RuntimeError,) as error:  # noqa: B013 -- resource allocation boundary
+            raise OSError(f"cannot start shadow status reader: {error}") from error
+        self.thread = thread
 
     def read_loop(self) -> None:
         try:
@@ -533,7 +761,7 @@ class StatusChannel:
         self.total += len(chunk)
         if self.total > STATUS_LIMIT:
             self.error = self.error or OSError("shadow supervisor status exceeds limit")
-        if self.error is None:
+        if self.total <= STATUS_LIMIT:
             try:
                 self.parse(chunk)
             except (Exception,) as error:  # noqa: B013 -- keep draining broken producers
@@ -544,19 +772,25 @@ class StatusChannel:
         while b"\n" in self.payload:
             raw, self.payload = self.payload.split(b"\n", 1)
             try:
-                value = json.loads(raw)
-            except (ValueError,) as error:  # noqa: B013 -- private protocol boundary
-                raise OSError("malformed shadow supervisor status") from error
-            if (
-                not isinstance(value, dict)
-                or value.get("kind") != "shadow_supervision"
-                or type(value.get("schema_version")) is not int
-                or value["schema_version"] != 2
-                or len(self.messages) >= 2
-            ):
-                raise OSError("invalid shadow supervisor status")
-            self.accept(value)
-            self.messages.append(value)
+                self.parse_message(raw)
+            except (OSError,) as error:  # noqa: B013 -- preserve framing for bounded cleanup
+                self.error = self.error or error
+
+    def parse_message(self, raw: bytes) -> None:
+        try:
+            value = json.loads(raw)
+        except (ValueError,) as error:  # noqa: B013 -- private protocol boundary
+            raise OSError("malformed shadow supervisor status") from error
+        if (
+            not isinstance(value, dict)
+            or value.get("kind") != "shadow_supervision"
+            or type(value.get("schema_version")) is not int
+            or value["schema_version"] != PROTOCOL_VERSION
+            or len(self.messages) >= 2
+        ):
+            raise OSError("invalid shadow supervisor status")
+        self.accept(value)
+        self.messages.append(value)
 
     def accept(self, value: dict[str, Any]) -> None:
         validate_diagnostic(value)
@@ -573,7 +807,7 @@ class StatusChannel:
         if type(pid) is not int or pid <= 1:
             raise OSError("invalid owned shadow worker identity")
         self.owned_pid = pid
-        if self.control is not None:
+        if self.control is not None and self.error is None:
             self.control.send(b"A")
 
     def release_identity(self, value: dict[str, Any]) -> None:
@@ -583,14 +817,14 @@ class StatusChannel:
         if self.control is not None:
             self.control.send(b"R")
 
-    def collect(self) -> None:
+    def collect(self, *, check_errors: bool = True) -> None:
         if self.thread is None:
             self.drain()
         with self.lock:
-            if self.error is not None:
+            if check_errors and self.error is not None:
                 raise self.error
 
-    def finish(self) -> None:
+    def finish(self, *, check_errors: bool = True) -> None:
         if self.thread is not None:
             self.thread.join(timeout=WAIT_MARGIN)
             if self.thread.is_alive():
@@ -598,7 +832,7 @@ class StatusChannel:
                 self.thread.join(timeout=WAIT_MARGIN)
                 if self.thread.is_alive():
                     raise OSError("shadow status reader did not stop")
-        self.collect()
+        self.collect(check_errors=check_errors)
 
     def stop(self) -> None:
         self.stopping.set()
@@ -608,29 +842,44 @@ class StatusChannel:
                 raise OSError("shadow status reader left running")
 
 
-def stopped_supervisor(process: subprocess.Popen[str], deadline: float) -> bool:
+def stopped_supervisor(
+    process: subprocess.Popen[str], deadline: float, *, clock: Clock = CLOCK
+) -> bool:
     """Only our still-waitable, stopped child can vouch for its unreaped worker."""
     if process.returncode is not None or observe_exit(process) is not None:
         return False
     os.kill(process.pid, signal.SIGSTOP)
-    while time.monotonic() < deadline:
+    while clock.now() < deadline:
         info = wait_notification(process, os.WEXITED | os.WSTOPPED)
         if info is not None:
             return info.si_code == os.CLD_STOPPED
-        time.sleep(POLL_INTERVAL)
+        clock.sleep(POLL_INTERVAL)
     raise OSError("could not verify stopped shadow supervisor")
 
 
 def resume_supervisor(process: subprocess.Popen[str], channel: StatusChannel) -> None:
-    if channel.control is not None:
-        channel.control.cancel()
-        channel.control.send(b"R")
-    os.kill(process.pid, signal.SIGCONT)
-
-
-def reap_supervisor(process: subprocess.Popen[str], deadline: float) -> None:
+    primary = None
     try:
-        process.communicate(timeout=max(0, deadline - time.monotonic()))
+        if channel.control is not None:
+            channel.control.cancel()
+            channel.control.send(b"R")
+    except (OSError,) as error:  # noqa: B013 -- SIGCONT must be independent of control I/O
+        primary = error
+    try:
+        os.kill(process.pid, signal.SIGCONT)
+    except (OSError,) as error:  # noqa: B013 -- retain independent resumption failure
+        if primary is None:
+            raise
+        attach_failure(primary, "supervisor resume failed", error)
+    if primary is not None:
+        raise primary
+
+
+def reap_supervisor(
+    process: subprocess.Popen[str], deadline: float, *, clock: Clock = CLOCK
+) -> None:
+    try:
+        process.communicate(timeout=max(0, deadline - clock.now()))
     except (Exception,) as error:  # noqa: B013 -- bounded final rescue
         # Popen.kill safely handles a direct child that exited during communicate.
         try:
@@ -638,16 +887,17 @@ def reap_supervisor(process: subprocess.Popen[str], deadline: float) -> None:
         except (Exception,) as secondary:  # noqa: B013 -- reaping must still be attempted
             attach_failure(error, "supervisor kill failed", secondary)
         try:
-            process.wait(timeout=max(0.01, deadline - time.monotonic()))
+            process.wait(timeout=max(0.01, deadline - clock.now()))
         except (Exception,) as secondary:  # noqa: B013 -- expose unreaped state
             attach_failure(error, "supervisor left unreaped", secondary)
         raise
 
 
 def emergency_stop(process: subprocess.Popen[str], channel: StatusChannel) -> None:
-    deadline = time.monotonic() + REAP_TIMEOUT
+    deadline = CLOCK.now() + REAP_TIMEOUT
     failures: list[Exception] = []
     stopped = False
+    stop_requested = process.returncode is None
     try:
         stopped = stopped_supervisor(process, deadline)
         with channel.lock:
@@ -657,11 +907,11 @@ def emergency_stop(process: subprocess.Popen[str], channel: StatusChannel) -> No
                 "supervisor exited; cannot certify worker cleanup without live ownership"
             )
         if stopped and worker is not None and not released:
-            signal_group(worker, signal.SIGKILL)
+            force_group(worker, deadline)
     except (Exception,) as error:  # noqa: B013 -- still resume/reap the supervisor
         failures.append(error)
     finally:
-        if stopped:
+        if stop_requested and process.returncode is None:
             try:
                 resume_supervisor(process, channel)
             except (Exception,) as error:  # noqa: B013 -- retain independent failures
@@ -686,6 +936,23 @@ def result(
     *,
     supervisor_code: int | None = 0,
 ) -> subprocess.CompletedProcess[str]:
+    try:
+        return terminal_result(
+            command, timeout, channel, stdout, stderr, supervisor_code
+        )
+    except (OSError,) as error:  # noqa: B013 -- every refusal retains captured context
+        attach_stderr(error, stderr)
+        raise
+
+
+def terminal_result(
+    command: Sequence[str],
+    timeout: float,
+    channel: StatusChannel,
+    stdout: str | None,
+    stderr: str | None,
+    supervisor_code: int | None,
+) -> subprocess.CompletedProcess[str]:
     channel.collect()
     if (
         not channel.messages
@@ -696,10 +963,9 @@ def result(
     terminal = channel.messages[-1]
     status = terminal["status"]
     if supervisor_code != 0 and status != "runtime_failure":
-        error = OSError(f"shadow supervisor exited {supervisor_code} after {status}")
-        if stderr:
-            error.add_note(f"shadow supervisor stderr: {limited_text(stderr, 8192)}")
-        raise error
+        raise diagnostic_error(
+            {**terminal, "status": f"exited {supervisor_code} after {status}"}
+        )
     if status == "timed_out":
         raise subprocess.TimeoutExpired(
             command,
@@ -715,12 +981,7 @@ def result(
         return subprocess.CompletedProcess(
             command, terminal["returncode"], stdout, stderr
         )
-    error = OSError(
-        f"shadow supervisor {status}: {terminal.get('detail', 'worker cancelled')}"
-    )
-    for note in terminal.get("notes", []):
-        error.add_note(str(note))
-    raise error
+    raise diagnostic_error(terminal)
 
 
 def start_supervisor(
@@ -742,7 +1003,7 @@ def start_supervisor(
             "--status-fd",
             str(status_write),
             "--deadline",
-            repr(time.monotonic() + timeout),
+            repr(CLOCK.now() + timeout),
             "--",
             *command,
         ],
@@ -755,17 +1016,30 @@ def start_supervisor(
 
 
 def communicate_until(
-    process: subprocess.Popen[str], channel: StatusChannel, deadline: float
+    process: subprocess.Popen[str],
+    channel: StatusChannel,
+    deadline: float,
+    *,
+    check_errors: bool = True,
+    clock: Clock = CLOCK,
 ) -> tuple[str | None, str | None]:
     while True:
-        channel.collect()
-        remaining = deadline - time.monotonic()
+        channel.collect(check_errors=check_errors)
+        remaining = deadline - clock.now()
         if remaining <= 0:
             raise OSError("shadow supervisor did not finish within shutdown allowance")
         try:
-            return process.communicate(timeout=min(POLL_INTERVAL, remaining))
-        except (subprocess.TimeoutExpired,):  # noqa: B013 -- monitor protocol concurrently
-            pass
+            channel.stdout, channel.stderr = process.communicate(
+                timeout=min(POLL_INTERVAL, remaining)
+            )
+            return channel.stdout, channel.stderr
+        except (subprocess.TimeoutExpired,) as error:  # noqa: B013 -- monitor protocol concurrently
+            channel.stdout = decoded_output(error.output)
+            channel.stderr = decoded_output(error.stderr)
+
+
+def decoded_output(output: str | bytes | None) -> str | None:
+    return output.decode(errors="replace") if isinstance(output, bytes) else output
 
 
 @contextmanager
@@ -791,10 +1065,19 @@ def finish_cancellation(
     if channel.control is not None:
         channel.control.cancel()
     communicate_until(
-        process, channel, time.monotonic() + TERM_GRACE + REAP_TIMEOUT + WAIT_MARGIN
+        process,
+        channel,
+        CLOCK.now() + TERM_GRACE + REAP_TIMEOUT + WAIT_MARGIN,
+        check_errors=False,
     )
-    channel.finish()
-    if channel.messages and channel.messages[-1].get("status") == "runtime_failure":
+    channel.finish(check_errors=False)
+    if not channel.released:
+        raise OSError("shadow cleanup lacks a valid terminal acknowledgment")
+    if (
+        channel.messages
+        and channel.messages[-1].get("status") == "runtime_failure"
+        and channel.error is not primary
+    ):
         attach_failure(
             primary, "shadow supervisor failure", diagnostic_error(channel.messages[-1])
         )
@@ -870,6 +1153,59 @@ def close_handles(
             attach_failure(primary, "shadow descriptor cleanup failed", error)
 
 
+def stop_reader(channel: StatusChannel | None) -> OSError | None:
+    if channel is not None:
+        try:
+            channel.stop()
+        except (OSError,) as error:  # noqa: B013 -- owner retains failed reader descriptors
+            return error
+    return None
+
+
+def close_control(
+    channel: StatusChannel | None,
+    control: ControlChannel | None,
+    descriptors: set[int],
+    reader_error: OSError | None,
+) -> OSError | None:
+    if control is None:
+        return None
+    descriptors.discard(control.descriptor)
+    if reader_error is not None:
+        if channel is not None:
+            descriptors.discard(channel.descriptor)
+        return (
+            None  # Still reachable by the failed reader; never race descriptor reuse.
+        )
+    try:
+        control.close()
+    except (OSError,) as error:  # noqa: B013 -- failed sender retains its descriptor
+        return error
+    return None
+
+
+def close_supervision(
+    descriptors: set[int],
+    process: subprocess.Popen[str] | None,
+    channel: StatusChannel | None,
+    control: ControlChannel | None,
+    primary: BaseException | None,
+) -> None:
+    reader_error = stop_reader(channel)
+    control_error = close_control(channel, control, descriptors, reader_error)
+    errors = [
+        ("shadow status reader cleanup failed", reader_error),
+        ("shadow control cleanup failed", control_error),
+    ]
+    first = primary or reader_error or control_error
+    for label, error in errors:
+        if first is not None and error is not None:
+            attach_failure(first, label, error)
+    close_handles(descriptors, process, primary=first)
+    if primary is None and first is not None:
+        raise first
+
+
 def run_supervised(
     command: Sequence[str], *, timeout: float, capture_output: bool = False
 ) -> subprocess.CompletedProcess[str]:
@@ -895,13 +1231,13 @@ def run_supervised(
         for descriptor in (control_read, status_write):
             os.close(descriptor)
             descriptors.remove(descriptor)
-        channel.start(control)
         try:
+            channel.start(control)
             control.send(b"S")
             stdout, stderr = communicate_until(
                 process,
                 channel,
-                time.monotonic() + timeout + TERM_GRACE + REAP_TIMEOUT + WAIT_MARGIN,
+                CLOCK.now() + timeout + TERM_GRACE + REAP_TIMEOUT + WAIT_MARGIN,
             )
             channel.finish()
             return result(
@@ -913,29 +1249,19 @@ def run_supervised(
                 supervisor_code=process.returncode,
             )
         except (BaseException,) as error:  # noqa: B013 -- cancellation must complete cleanup
-            cancel_supervisor(process, channel, error)
+            if process.returncode is None:
+                cancel_supervisor(process, channel, error)
+            elif not channel.released:
+                error.add_note(
+                    "supervisor exited; cannot certify worker cleanup without live ownership"
+                )
+            attach_stderr(error, channel.stderr)
             raise
     except (BaseException,) as error:  # noqa: B013 -- retain this call's primary
         primary = error
         raise
     finally:
-        cleanup_error = None
-        if channel is not None:
-            try:
-                channel.stop()
-            except (OSError,) as error:  # noqa: B013 -- preserve primary diagnostic
-                if primary is None:
-                    cleanup_error = error
-                else:
-                    attach_failure(
-                        primary, "shadow status reader cleanup failed", error
-                    )
-        if control is not None:
-            # Control closes only after cleanup, so EOF cannot release an identity mid-rescue.
-            control.closed = True
-        close_handles(descriptors, process, primary=primary or cleanup_error)
-        if cleanup_error is not None:
-            raise cleanup_error
+        close_supervision(descriptors, process, channel, control, primary)
 
 
 def main() -> int:
@@ -951,6 +1277,14 @@ def main() -> int:
     command = args.command[1:] if args.command[:1] == ["--"] else args.command
     if not command:
         parser.error("shadow supervision requires a command")
+    names = (
+        ("admission_fd", "error_fd") if args.bootstrap else ("control_fd", "status_fd")
+    )
+    for name in names:
+        if getattr(args, name) is None or getattr(args, name) < 0:
+            parser.error(
+                f"{'bootstrap' if args.bootstrap else 'supervisor'} requires --{name.replace('_', '-')}"
+            )
     if args.bootstrap:
         return bootstrap(command, args.admission_fd, args.error_fd, args.deadline)
     return supervise(command, args.control_fd, args.status_fd, args.deadline)

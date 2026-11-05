@@ -531,11 +531,7 @@ def finalize(
         # Acquire and exercise the real output transaction before immutable sealing.
         with staged_record(target) as staged:
             snapshot, evidence = final_evidence(snapshot, enrolled, publication_receipt)
-            payload = build_record(
-                snapshot, enrolled, now=datetime.now(UTC), evidence=evidence
-            )
-            payload["recorded_at"] = datetime.now(UTC).isoformat()
-            write_record(staged, payload)
+            compute_record(staged, snapshot, enrolled, evidence=evidence)
         published.completed = target
         return target
 
@@ -1022,8 +1018,6 @@ def publish_record(
     snapshot: CapsuleSnapshot,
     output: Path,
     enrolled: Enrollment,
-    *,
-    evidence: VerifiedEvidence | None = None,
 ) -> Path:
     output = system_path(output)
     document = snapshot.document(PRODUCTION_FILE, SOURCE_FORECAST)
@@ -1032,12 +1026,20 @@ def publish_record(
         timestamp(required_string(document.get("issued_at"), "source.issued_at")),
     )
     with staged_record(target) as staged:
-        payload = build_record(
-            snapshot, enrolled, now=datetime.now(UTC), evidence=evidence
-        )
-        payload["recorded_at"] = datetime.now(UTC).isoformat()
-        write_record(staged, payload)
+        compute_record(staged, snapshot, enrolled)
     return target
+
+
+def compute_record(
+    staged: Path,
+    snapshot: CapsuleSnapshot,
+    enrolled: Enrollment,
+    *,
+    evidence: VerifiedEvidence | None = None,
+) -> None:
+    payload = build_record(snapshot, enrolled, now=datetime.now(UTC), evidence=evidence)
+    payload["recorded_at"] = datetime.now(UTC).isoformat()
+    write_record(staged, payload)
 
 
 def write_record(staged: Path, payload: dict[str, Any]) -> None:

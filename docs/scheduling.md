@@ -91,14 +91,20 @@ the 30-second preflight/300-second finalize deadlines. It stops the worker group
 after wrapper death, including SIGKILL, with two seconds of SIGTERM grace and
 three seconds for forced termination/reaping. The wrapper adds one second of wait
 margin; exceptional rescue has its own three-second bound. Matching helper code
-uses internal protocol 2: bootstrap admission and final cleanup are acknowledged,
-and the launcher PID remains reserved until release. A reader continuously drains
+uses internal protocol 3: guardian admission and final cleanup are acknowledged.
+The guardian reserves its PID from outside the worker group, reaps the launcher,
+and remains waitable until release. Empty groups complete without the TERM delay;
+surviving descendants retain the shutdown bounds. A reader continuously drains
 the separate status pipe (64 KiB total), without consuming worker stdout/stderr.
 Repeated cancellation is deferred until cleanup completes. Emergency handling
 verifies stopped, live ownership before signaling a worker group; an unexpectedly
 dead supervisor yields an explicit cleanup-uncertainty diagnostic.
 Ordinary operation does not import the optional supervisor; missing, unreadable
-or syntax-broken helpers report shadow failure after ordinary publication. Installation
+or syntax-broken helpers report shadow failure after ordinary publication.
+Reader-start resource failures also preserve ordinary publication and reap the
+partially initialized supervisor. Stop confirmation and control-write failures
+still attempt independent resumption. Protocol errors retain the grace window,
+and captured diagnostics are reported once. Installation
 and activation remain separate reviewed operator actions.
 
 The hourly wrapper predicts before discovering the sibling `ambientweather2sqlite`
