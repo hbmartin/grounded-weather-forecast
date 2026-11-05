@@ -48,17 +48,25 @@ Prepare reviewed `shadow_supervisor.py` beside the installed wrappers and
 `launchd_paths.py`; it uses only the existing Python standard library. Its
 private liveness pipe bounds worker lifetime after wrapper death, including
 SIGKILL, assuming the supervisor survives. Keep this helper with the matching
-wrapper set for rollback, including internal supervision protocol 4; mixing old
-and new helper implementations is unsupported. The guardian reserves the worker
+wrapper set for rollback, including internal supervision protocol 5; mixing old
+and new helper implementations is unsupported. Protocol 5 adds explicit
+pre-fork authorization; old helper sets cannot participate in this handshake.
+Early unstarted helpers are collected promptly and timeout classification survives
+startup cleanup. The guardian reserves the worker
 group ID from outside that group, reaps its blocked/admitted launcher, and remains
 waitable through acknowledged cleanup. It reports launcher exit independently;
 normal shutdown belongs to the supervisor alone. The guardian ignores INT/TERM
-and falls back only on supervisor-liveness EOF, retaining any announced shutdown
-budget. Selected cancellation/timeouts cannot become completion because cleanup
+and falls back only on supervisor-liveness EOF. It uses one separate three-second
+force-only rescue even after an announced normal budget expires, reserving the
+final second for collection; normal TERM grace is not restarted. Selected cancellation/timeouts cannot become completion because cleanup
 exited zero, and missing launcher evidence is an operational failure.
 Clean empty groups avoid unnecessary
 TERM/KILL; surviving descendants retain the bounds. The wrapper
-continuously drains bounded status independently of worker output. Shutdown adds
+continuously drains bounded status independently of worker output, reserving
+8 KiB of the 64 KiB channel for lifecycle events (48/8 KiB guardian/launcher
+diagnostic quotas). Verify actual group disappearance after force termination,
+not just successful signal delivery. Expected bootstrap failures preserve errno
+and path once; a lost error reader cannot turn failed exec into SIGPIPE. Shutdown adds
 one second of wrapper wait margin to the 2-/3-second cleanup phases; exceptional
 rescue is bounded separately to three seconds. The final second of forced cleanup
 and rescue is reserved for collection/resumption; failures do not restart budgets.

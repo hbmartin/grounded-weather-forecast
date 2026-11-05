@@ -577,7 +577,7 @@ def test_cancellation_keeps_primary_when_process_group_cleanup_fails(monkeypatch
         kill=lambda: None,
     )
     monkeypatch.setattr(channel, "collect", lambda **kwargs: calls.append(kwargs))
-    monkeypatch.setattr(supervisor, "stopped_supervisor", lambda *_: True)
+    monkeypatch.setattr(supervisor, "stopped_supervisor", lambda *_, **__: True)
     monkeypatch.setattr(supervisor.os, "kill", lambda *_: None)
 
     def denied(*_args):

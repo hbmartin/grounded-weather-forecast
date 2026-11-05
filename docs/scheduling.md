@@ -91,7 +91,9 @@ the 30-second preflight/300-second finalize deadlines. It stops the worker group
 after wrapper death, including SIGKILL, with two seconds of SIGTERM grace and
 three seconds for forced termination/reaping. The wrapper adds one second of wait
 margin; exceptional rescue has its own three-second bound. Matching helper code
-uses internal protocol 4: guardian admission and final cleanup are acknowledged.
+uses internal protocol 5: pre-fork authorization, guardian admission and final
+cleanup are acknowledged. Early failures before fork authorization are reaped
+promptly; pre-admission timeout does not require a native launcher result.
 The guardian reserves its PID from outside the worker group, reaps the launcher,
 and reports its exit code separately, retaining identity until release. Normal
 deadlines, signals and outcomes belong only to the supervisor; INT/TERM cannot
@@ -99,11 +101,15 @@ kill the guardian, whose fallback requires supervisor-liveness EOF. Observed
 completion wins before a stop decision; selected cancellation/timeouts cannot
 be overwritten by cleanup exit zero. Empty groups complete without the TERM delay;
 surviving descendants retain the shutdown bounds. A reader continuously drains
-the separate status pipe (64 KiB total), without consuming worker stdout/stderr.
+the separate status pipe (64 KiB total, including 8 KiB reserved for lifecycle events),
+without consuming worker stdout/stderr. Guardian/launcher diagnostics are capped
+at 48/8 KiB so oversized errors cannot consume exit-event capacity. Cleanup
+requires confirmed disappearance after SIGKILL; sending it is not certification.
 Repeated cancellation is deferred until cleanup completes. Emergency handling
 verifies stopped, live ownership before signaling a worker group; an unexpectedly
 dead identity owner yields an explicit cleanup-uncertainty diagnostic; a surviving
-guardian covers supervisor-only death. Shared shutdown budgets never restart,
+guardian covers supervisor-only death through one separate three-second force-only
+rescue, even after normal budget expiry. Normal and rescue budgets never restart,
 and their final second is reserved for resumption/collection instead of signal
 retries. Persistent kernel denial remains an operational failure. Structured
 guardian frames retain startup errno and missing-exit diagnostics. Event-loop

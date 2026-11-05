@@ -24,7 +24,10 @@ REAP_TIMEOUT = 3.0
 WAIT_MARGIN = 1.0
 POLL_INTERVAL = 0.05
 STATUS_LIMIT = 64 * 1024
-PROTOCOL_VERSION = 4
+LIFECYCLE_LIMIT = 8 * 1024
+GUARDIAN_DIAGNOSTICS = 48 * 1024
+LAUNCHER_DIAGNOSTICS = 8 * 1024
+PROTOCOL_VERSION = 5
 TRUNCATED = " ... [truncated] ... "
 TERMINAL = frozenset({"completed", "cancelled", "timed_out", "runtime_failure"})
 
@@ -62,18 +65,24 @@ def limited_text(value: str, budget: int) -> str:
 
 
 def encode_status(
-    status: str, fields: dict[str, Any], *, kind: str = "shadow_supervision"
+    status: str,
+    fields: dict[str, Any],
+    *,
+    kind: str = "shadow_supervision",
+    budget: int = STATUS_LIMIT - LIFECYCLE_LIMIT,
 ) -> bytes:
     fields = dict(fields)
     if "detail" in fields:
-        fields["detail"] = limited_text(str(fields["detail"]), STATUS_LIMIT * 3 // 4)
+        fields["detail"] = limited_text(str(fields["detail"]), budget // 2)
+    for name in ("strerror", "filename", "filename2"):
+        if isinstance(fields.get(name), str):
+            fields[name] = limited_text(fields[name], budget // 16)
     if "notes" in fields:
         notes = [str(note) for note in fields["notes"]]
         if len(notes) > 32:
             notes = [*notes[:15], TRUNCATED, *notes[-16:]]
         fields["notes"] = [
-            limited_text(note, (STATUS_LIMIT // 8) // max(1, len(notes)))
-            for note in notes
+            limited_text(note, (budget // 8) // max(1, len(notes))) for note in notes
         ]
     payload = (
         json.dumps(
@@ -87,19 +96,14 @@ def encode_status(
         ).encode()
         + b"\n"
     )
-    if len(payload) > STATUS_LIMIT - 1024:
+    if len(payload) > budget:
         raise OSError("shadow supervisor status exceeds its encoded budget")
     return payload
 
 
 def send_status(descriptor: int, status: str, **fields: Any) -> None:
-    payload = memoryview(encode_status(status, fields))
     with suppress(BrokenPipeError):
-        while payload:
-            written = os.write(descriptor, payload)
-            if not written:
-                raise OSError("shadow status write made no progress")
-            payload = payload[written:]
+        write_frame(descriptor, "shadow_supervision", status, **fields)
 
 
 def exception_notes(error: BaseException) -> list[str]:
@@ -161,8 +165,9 @@ def observe_exit(process: subprocess.Popen[str]) -> int | None:
 
 
 def wait_exit(
-    process: subprocess.Popen[str], deadline: float, *, clock: Clock = CLOCK
+    process: subprocess.Popen[str], deadline: float, *, clock: Clock | None = None
 ) -> int:
+    clock = clock or CLOCK
     while (code := observe_exit(process)) is None:
         if clock.now() >= deadline:
             raise OSError("owned shadow worker did not exit after forced termination")
@@ -173,10 +178,11 @@ def wait_exit(
 @dataclass(frozen=True)
 class ShutdownBudget:
     started: float
+    grace: float = TERM_GRACE
 
     @property
     def term_until(self) -> float:
-        return self.started + TERM_GRACE
+        return self.started + self.grace
 
     @property
     def deadline(self) -> float:
@@ -193,8 +199,9 @@ class GroupShutdown:
 
     pid: int
     budget: ShutdownBudget
-    clock: Clock = CLOCK
+    clock: Clock = field(default_factory=lambda: CLOCK)
     terminated: bool = False
+    killed: bool = False
     complete: bool = False
     denial: PermissionError | None = None
 
@@ -207,8 +214,9 @@ class GroupShutdown:
 
     def signal_next(self) -> None:
         if self.clock.now() >= self.budget.term_until:
-            signal_group(self.pid, signal.SIGKILL)
-            self.complete = True
+            if not self.killed:
+                signal_group(self.pid, signal.SIGKILL)
+                self.killed = True
         elif not self.terminated:
             signal_group(self.pid, signal.SIGTERM)
             self.terminated = True
@@ -227,8 +235,6 @@ class GroupShutdown:
                 self.signal_next()
             except (PermissionError,) as error:  # noqa: B013
                 self.denial = error
-            if self.complete:
-                return  # Collection has its own reserved final second.
             self.clock.sleep(POLL_INTERVAL)
         if self.denial is not None:
             raise self.denial
@@ -237,32 +243,17 @@ class GroupShutdown:
         )
 
 
-def stop_worker(
-    process: subprocess.Popen[str],
+def force_group(
+    pid: int,
+    deadline: float,
     *,
-    clock: Clock = CLOCK,
-    started: float | None = None,
-) -> int:
-    """Compatibility helper for a still-owned, waitable group reservation."""
-    budget = ShutdownBudget(clock.now() if started is None else started)
-    GroupShutdown(process.pid, budget, clock).run(lambda: None)
-    return wait_exit(process, budget.deadline, clock=clock)
-
-
-def force_group(pid: int, deadline: float, *, clock: Clock = CLOCK) -> None:
-    """Allow the outside guardian to reap a transient Darwin zombie; never ignore denial."""
-    while not force_group_once(pid, deadline, clock=clock):
-        clock.sleep(POLL_INTERVAL)
-
-
-def force_group_once(pid: int, deadline: float, *, clock: Clock = CLOCK) -> bool:
-    try:
-        signal_group(pid, signal.SIGKILL)
-        return True
-    except (PermissionError,):  # noqa: B013
-        if clock.now() >= deadline:
-            raise
-        return False
+    clock: Clock | None = None,
+    progress: Callable[[], None] = lambda: None,
+) -> None:
+    """Force-only policy; deadline ends signaling, reserving a final collection second."""
+    clock = clock or CLOCK
+    budget = ShutdownBudget(deadline - REAP_TIMEOUT + WAIT_MARGIN, grace=0)
+    GroupShutdown(pid, budget, clock).run(progress)
 
 
 @dataclass
@@ -284,32 +275,51 @@ def control_cancelled(control: int, selector: selectors.BaseSelector) -> bool:
     raise OSError("unexpected shadow control token")
 
 
+@contextmanager
+def control_selector(
+    control: int, selector: selectors.BaseSelector | None
+) -> Iterator[selectors.BaseSelector]:
+    if selector is not None:
+        yield selector
+    else:
+        with selectors.DefaultSelector() as owned:
+            owned.register(control, selectors.EVENT_READ)
+            yield owned
+
+
 def await_token(
     control: int,
     token: bytes,
     deadline: float,
     cancelled: Cancellation,
     *,
-    clock: Clock = CLOCK,
+    clock: Clock | None = None,
+    selector: selectors.BaseSelector | None = None,
 ) -> str:
-    with selectors.DefaultSelector() as selector:
-        selector.register(control, selectors.EVENT_READ)
+    clock = clock or CLOCK
+    with control_selector(control, selector) as selected:
         while not cancelled.requested:
             remaining = deadline - clock.now()
             if remaining <= 0:
                 return "timed_out"
-            if selector.select(min(POLL_INTERVAL, remaining)):
+            if selected.select(min(POLL_INTERVAL, remaining)):
                 received = os.read(control, 1)
                 if received in (b"", b"C") or cancelled.requested:
                     return "cancelled"
                 if received != token:
                     raise OSError("unexpected shadow admission token")
-                return "cancelled" if control_cancelled(control, selector) else "ready"
+                return "cancelled" if control_cancelled(control, selected) else "ready"
     return "cancelled"
 
 
-def await_start(control: int, deadline: float, cancelled: Cancellation) -> str:
-    return await_token(control, b"S", deadline, cancelled)
+def await_start(
+    control: int,
+    deadline: float,
+    cancelled: Cancellation,
+    *,
+    clock: Clock | None = None,
+) -> str:
+    return await_token(control, b"S", deadline, cancelled, clock=clock)
 
 
 def monitor(
@@ -318,8 +328,9 @@ def monitor(
     deadline: float,
     cancelled: Cancellation,
     *,
-    clock: Clock = CLOCK,
+    clock: Clock | None = None,
 ) -> str:
+    clock = clock or CLOCK
     with selectors.DefaultSelector() as selector:
         selector.register(control, selectors.EVENT_READ)
         selector.register(worker.errors, selectors.EVENT_READ)
@@ -351,27 +362,50 @@ def worker_phase(
     return "timed_out" if clock.now() >= deadline else None
 
 
-def write_frame(descriptor: int, kind: str, event: str, **fields: Any) -> None:
-    payload = memoryview(encode_status(event, fields, kind=kind))
+def write_frame(
+    descriptor: int,
+    kind: str,
+    event: str,
+    *,
+    budget: int = STATUS_LIMIT - LIFECYCLE_LIMIT,
+    **fields: Any,
+) -> int:
+    payload = memoryview(encode_status(event, fields, kind=kind, budget=budget))
+    size = len(payload)
     while payload:
         written = os.write(descriptor, payload)
         if not written:
             raise OSError("guardian channel write made no progress")
         payload = payload[written:]
+    return size
 
 
-def guardian_event(descriptor: int, event: str, **fields: Any) -> None:
+def guardian_event(descriptor: int, event: str, **fields: Any) -> int:
     with suppress(BrokenPipeError):
-        write_frame(descriptor, "shadow_guardian", event, **fields)
+        return write_frame(descriptor, "shadow_guardian", event, **fields)
+    return 0
 
 
-def guardian_error(descriptor: int, error: BaseException) -> None:
-    guardian_event(
+def guardian_error(
+    descriptor: int,
+    error: BaseException,
+    *,
+    budget: int = LAUNCHER_DIAGNOSTICS,
+) -> int:
+    return guardian_event(
         descriptor,
         "error",
         detail=str(error),
         errno=getattr(error, "errno", None),
+        strerror=getattr(error, "strerror", None),
+        filename=str(error.filename)
+        if isinstance(error, OSError) and error.filename is not None
+        else None,
+        filename2=str(error.filename2)
+        if isinstance(error, OSError) and error.filename2 is not None
+        else None,
         notes=list(getattr(error, "__notes__", ())),
+        budget=budget,
     )
 
 
@@ -382,35 +416,79 @@ class FrameStream:
     total: int = 0
     eof: bool = False
     error: OSError | None = None
+    diagnostic_bytes: int = 0
+    lifecycle_bytes: int = 0
+    discarding: bool = False
+    configured: int | None = None
+    pending: list[dict[str, Any]] = field(default_factory=list)
 
     def feed(self, chunk: bytes) -> list[dict[str, Any]]:
         self.total += len(chunk)
         if self.total > STATUS_LIMIT:
             self.error = self.error or OSError(f"{self.kind} channel exceeds limit")
-            return []
-        self.payload += chunk
         frames = []
-        while b"\n" in self.payload:
-            raw, self.payload = self.payload.split(b"\n", 1)
+        parts = chunk.split(b"\n")
+        for index, part in enumerate(parts):
+            ended = index < len(parts) - 1
+            if self.discarding or len(self.payload) + len(part) > STATUS_LIMIT:
+                self.error = self.error or OSError(f"{self.kind} frame exceeds limit")
+                self.payload = b""
+                self.discarding = not ended
+                continue
+            self.payload += part
+            if not ended:
+                continue
+            raw, self.payload = self.payload, b""
             try:
-                value = json.loads(raw)
-                if (
-                    not isinstance(value, dict)
-                    or value.get("kind") != self.kind
-                    or type(value.get("schema_version")) is not int
-                    or value["schema_version"] != PROTOCOL_VERSION
-                ):
-                    raise ValueError("invalid envelope")
-                validate_diagnostic(value)
-                frames.append(value)
-            except (ValueError, OSError) as error:
-                self.error = self.error or OSError(
-                    f"malformed {self.kind} frame: {error}"
+                value = self.parse_frame(raw)
+                if value is not None:
+                    frames.append(value)
+            except (ValueError, OSError, RecursionError) as error:
+                label = (
+                    "shadow supervisor status"
+                    if self.kind == "shadow_supervision"
+                    else f"{self.kind} frame"
                 )
+                self.error = self.error or OSError(f"malformed {label}: {error}")
         return frames
 
+    def parse_frame(self, raw: bytes) -> dict[str, Any] | None:
+        value = json.loads(raw)
+        if (
+            not isinstance(value, dict)
+            or value.get("kind") != self.kind
+            or type(value.get("schema_version")) is not int
+            or value["schema_version"] != PROTOCOL_VERSION
+        ):
+            raise ValueError("invalid envelope")
+        validate_diagnostic(value)
+        if value.get("detail") or value.get("notes"):
+            self.diagnostic_bytes += len(raw) + 1
+            if self.diagnostic_bytes > STATUS_LIMIT - LIFECYCLE_LIMIT:
+                self.error = self.error or OSError(
+                    f"{self.kind} diagnostic budget exceeded"
+                )
+                if value["status"] == "error":
+                    return None
+                value = {
+                    k: v
+                    for k, v in value.items()
+                    if k not in {"detail", "notes", "strerror", "filename", "filename2"}
+                }
+                value["detail"] = "diagnostics omitted after channel budget exhaustion"
+            else:
+                return value
+        self.lifecycle_bytes += len(json.dumps(value).encode()) + 1
+        if self.lifecycle_bytes > LIFECYCLE_LIMIT:
+            raise OSError(f"{self.kind} lifecycle budget exceeded")
+        return value
+
     def read(self, descriptor: int) -> list[dict[str, Any]]:
-        os.set_blocking(descriptor, False)
+        if self.configured is None:
+            os.set_blocking(descriptor, False)
+            self.configured = descriptor
+        elif self.configured != descriptor:
+            raise OSError("frame stream cannot change its owned descriptor")
         frames = []
         while not self.eof:
             try:
@@ -430,6 +508,8 @@ class FrameStream:
 class GuardianEvents:
     stream: FrameStream = field(default_factory=lambda: FrameStream("shadow_guardian"))
     ready: bool = False
+    bootstrap_ready: bool = False
+    startup_clean: bool = False
     returncode: int | None = None
     error: OSError | None = None
 
@@ -443,6 +523,12 @@ class GuardianEvents:
 
     def accept(self, value: dict[str, Any]) -> None:
         match value["status"]:
+            case "bootstrap_ready" if not self.bootstrap_ready and not self.ready:
+                self.bootstrap_ready = True
+            case "startup_stopped" if (
+                not self.ready and value.get("cleanup_complete") is True
+            ):
+                self.startup_clean = True
             case "ready" if not self.ready and self.returncode is None:
                 self.ready = True
             case "launcher_exit" if self.ready and self.returncode is None:
@@ -457,7 +543,18 @@ class GuardianEvents:
                     detail, str
                 ):
                     raise OSError("invalid guardian operational error")
-                error = OSError(code, detail) if code is not None else OSError(detail)
+                if code is not None:
+                    message = value.get("strerror")
+                    if not isinstance(message, str):
+                        message = detail
+                    paths = (value.get("filename"), value.get("filename2"))
+                    if any(
+                        path is not None and not isinstance(path, str) for path in paths
+                    ):
+                        raise OSError("invalid guardian error filename")
+                    error = OSError(code, message, paths[0], None, paths[1])
+                else:
+                    error = OSError(detail)
                 for note in value.get("notes", []):
                     error.add_note(note)
                 if self.error is None:
@@ -491,7 +588,8 @@ class OwnedLauncher:
             self.returncode = os.waitstatus_to_exitcode(status)
             guardian_event(self.event_pipe, "launcher_exit", returncode=self.returncode)
 
-    def wait(self, deadline: float, *, clock: Clock = CLOCK) -> None:
+    def wait(self, deadline: float, *, clock: Clock | None = None) -> None:
+        clock = clock or CLOCK
         while self.pid is not None:
             self.collect()
             if self.pid is None:
@@ -502,11 +600,11 @@ class OwnedLauncher:
                 )
             clock.sleep(POLL_INTERVAL)
 
-    def stop_blocked(self, deadline: float) -> None:
+    def stop_blocked(self, deadline: float, *, clock: Clock | None = None) -> None:
         if self.pid is not None:
             with suppress(ProcessLookupError):
                 os.kill(self.pid, signal.SIGKILL)
-            self.wait(deadline)
+            self.wait(deadline, clock=clock)
 
 
 @dataclass
@@ -517,11 +615,16 @@ class Guardian:
     reserved: bool = False
     admitted: bool = False
     budget: ShutdownBudget | None = None
-    shutdown: GroupShutdown | None = None
     failed: bool = False
+    clock: Clock = field(default_factory=lambda: CLOCK)
+    diagnostic_remaining: int = GUARDIAN_DIAGNOSTICS
+    rescue: GroupShutdown | None = None
+    commands: FrameStream = field(
+        default_factory=lambda: FrameStream("shadow_guardian_control")
+    )
 
     def run(self) -> None:
-        commands = FrameStream("shadow_guardian_control")
+        commands = self.commands
         with selectors.DefaultSelector() as selector:
             selector.register(self.parent, selectors.EVENT_READ)
             while True:
@@ -529,7 +632,9 @@ class Guardian:
                     self.launcher.collect()
                 except (OSError,) as error:  # noqa: B013
                     self.report_failure(error)
-                for value in commands.read(self.parent):
+                values, commands.pending = commands.pending, []
+                values.extend(commands.read(self.parent))
+                for value in values:
                     try:
                         if self.command(value):
                             return
@@ -570,18 +675,54 @@ class Guardian:
 
     def report_failure(self, error: OSError) -> None:
         if not self.failed:
-            guardian_error(self.launcher.event_pipe, error)
+            self.report_diagnostic(error)
             self.failed = True
 
+    def report_diagnostic(self, error: BaseException) -> None:
+        if self.diagnostic_remaining >= 1024:
+            used = guardian_error(
+                self.launcher.event_pipe, error, budget=self.diagnostic_remaining
+            )
+            self.diagnostic_remaining -= used
+
     def fallback(self) -> None:
-        if self.shutdown is None:
-            self.budget = self.budget or ShutdownBudget(CLOCK.now())
-            self.shutdown = GroupShutdown(os.getpid(), self.budget)
+        if self.rescue is None:
+            self.rescue = GroupShutdown(
+                os.getpid(), ShutdownBudget(self.clock.now(), grace=0), self.clock
+            )
         if self.reserved:
-            self.shutdown.run(self.launcher.collect)
-            self.launcher.wait(self.shutdown.budget.deadline)
+            self.rescue.run(self.launcher.collect)
+            self.launcher.wait(self.rescue.budget.deadline, clock=self.clock)
         else:
-            self.launcher.stop_blocked(self.shutdown.budget.deadline)
+            self.launcher.stop_blocked(self.rescue.budget.deadline, clock=self.clock)
+
+
+def authorize_fork(
+    admission: int,
+    events: int,
+    deadline: float,
+    clock: Clock,
+    stream: FrameStream,
+) -> bool:
+    """No child may exist until the supervisor records and sends reserve."""
+    guardian_event(events, "bootstrap_ready")
+    with selectors.DefaultSelector() as selector:
+        selector.register(admission, selectors.EVENT_READ)
+        while clock.now() < deadline:
+            values = stream.read(admission)
+            for index, value in enumerate(values):
+                if value["status"] == "reserve":
+                    stream.pending = values[index + 1 :]
+                    return True
+                if value["status"] == "shutdown":
+                    return False
+                raise OSError("invalid guardian pre-fork control phase")
+            if stream.error is not None:
+                raise stream.error
+            if stream.eof:
+                return False
+            selector.select(min(POLL_INTERVAL, max(0, deadline - clock.now())))
+    return False
 
 
 def launcher_main(
@@ -609,7 +750,14 @@ def launcher_main(
 def bootstrap(
     command: Sequence[str], admission: int, error_pipe: int, deadline: float
 ) -> int:
+    clock = CLOCK
+    commands = FrameStream("shadow_guardian_control")
+    for signum in (signal.SIGINT, signal.SIGTERM):
+        signal.signal(signum, signal.SIG_IGN)
     try:
+        if not authorize_fork(admission, error_pipe, deadline, clock, commands):
+            guardian_event(error_pipe, "startup_stopped", cleanup_complete=True)
+            return 125
         read, write = os.pipe()
         try:
             child = os.fork()
@@ -619,20 +767,28 @@ def bootstrap(
             raise
     except (OSError,) as error:  # noqa: B013
         guardian_error(error_pipe, error)
+        guardian_event(error_pipe, "startup_stopped", cleanup_complete=True)
         return 127
     if child == 0:
         launcher_main(command, read, write, admission, error_pipe, deadline)
         raise AssertionError("forked launcher returned from os._exit")
-    guardian = Guardian(OwnedLauncher(child, error_pipe), admission, write)
+    guardian = Guardian(
+        OwnedLauncher(child, error_pipe),
+        admission,
+        write,
+        clock=clock,
+        commands=commands,
+    )
     try:
         os.close(read)
-        for signum in (signal.SIGINT, signal.SIGTERM):
-            signal.signal(signum, signal.SIG_IGN)
         os.setpgid(0, os.getpgid(os.getppid()))
         guardian.reserved = True
         guardian_event(error_pipe, "ready")
         guardian.run()
         return 0
+    except (OSError,) as error:  # noqa: B013
+        recover_guardian(guardian, error, error_pipe)
+        return 127
     except (BaseException,) as error:  # noqa: B013
         recover_guardian(guardian, error, error_pipe)
         raise
@@ -645,7 +801,7 @@ def bootstrap(
 
 def recover_guardian(guardian: Guardian, error: BaseException, event_pipe: int) -> None:
     with suppress(Exception):
-        guardian_error(event_pipe, error)
+        guardian.report_diagnostic(error)
     try:
         if guardian.reserved:
             # Retain the supervisor's ordinary shutdown authority until EOF.
@@ -653,28 +809,39 @@ def recover_guardian(guardian: Guardian, error: BaseException, event_pipe: int) 
             guardian.run()
         else:
             guardian.fallback()  # Only its still-blocked direct child exists.
+            guardian_event(event_pipe, "startup_stopped", cleanup_complete=True)
     except (Exception,) as secondary:  # noqa: B013
         attach_failure(error, "guardian recovery failed", secondary)
 
 
 def execute_admitted(
-    command: Sequence[str], admission: int, error_pipe: int, deadline: float
+    command: Sequence[str],
+    admission: int,
+    error_pipe: int,
+    deadline: float,
+    *,
+    clock: Clock | None = None,
 ) -> int:
+    clock = clock or CLOCK
     try:
-        for name in ("SIGINT", "SIGTERM", "SIGPIPE", "SIGXFZ", "SIGXFSZ"):
+        for name in ("SIGINT", "SIGTERM"):
             if (signum := getattr(signal, name, None)) is not None:
                 signal.signal(signum, signal.SIG_DFL)
         with selectors.DefaultSelector() as selector:
             selector.register(admission, selectors.EVENT_READ)
             if (
-                not selector.select(max(0, deadline - CLOCK.now()))
+                not selector.select(max(0, deadline - clock.now()))
                 or os.read(admission, 1) != b"G"
             ):
                 return 125
         os.close(admission)
         os.set_inheritable(error_pipe, False)  # noqa: FBT003
+        for name in ("SIGPIPE", "SIGXFZ", "SIGXFSZ"):
+            if (signum := getattr(signal, name, None)) is not None:
+                signal.signal(signum, signal.SIG_DFL)
         os.execvp(command[0], list(command))  # noqa: S606
     except (OSError,) as error:  # noqa: B013
+        signal.signal(signal.SIGPIPE, signal.SIG_IGN)
         guardian_error(error_pipe, error)
         return 127
     return 127
@@ -688,10 +855,13 @@ class Worker:
     cleaned: bool = False
     released: bool = False
     admitted: bool = False
+    fork_authorized: bool = False
+    collected: bool = False
     release_sent: bool = False
     events: GuardianEvents = field(default_factory=GuardianEvents)
     shutdown: GroupShutdown | None = None
     stop_error: Exception | None = None
+    clock: Clock = field(default_factory=lambda: CLOCK)
 
     def command(self, event: str, **fields: Any) -> None:
         write_frame(self.admission, "shadow_guardian_control", event, **fields)
@@ -706,7 +876,19 @@ class Worker:
     def check_error(self) -> None:
         if self.events.error is not None:
             raise self.events.error
-        if not self.release_sent and observe_exit(self.process) is not None:
+        if (
+            not self.release_sent
+            and not self.collected
+            and observe_exit(self.process) is not None
+        ):
+            if not self.fork_authorized:
+                raise OSError(
+                    "guardian failed before fork authorization; native command never started"
+                )
+            if not self.events.ready:
+                raise OSError(
+                    "guardian failed before reserving worker group; blocked launcher cleanup is uncertain"
+                )
             raise OSError(
                 "guardian exited without a valid cleanup release; worker outcome unknown"
             )
@@ -717,21 +899,30 @@ class Worker:
             selector.register(control, selectors.EVENT_READ)
             while True:
                 self.collect()
+                if self.clock.now() >= deadline:
+                    return "timed_out"
                 self.check_error()
-                if self.events.ready:
-                    return "ready"
                 if cancelled.requested or control_cancelled(control, selector):
                     return "cancelled"
-                remaining = deadline - CLOCK.now()
+                if self.events.bootstrap_ready and not self.fork_authorized:
+                    if cancelled.requested:
+                        return "cancelled"
+                    if self.clock.now() >= deadline:
+                        return "timed_out"
+                    self.fork_authorized = True
+                    self.command("reserve")
+                if self.events.ready:
+                    return "ready"
+                remaining = deadline - self.clock.now()
                 if remaining <= 0:
                     return "timed_out"
                 selector.select(min(POLL_INTERVAL, remaining))
 
-    def stop(self) -> int:
+    def stop(self) -> int | None:
         if self.stop_error is not None:
             raise self.stop_error
         if self.cleaned:
-            return self.worker_code()
+            return self.events.returncode
         try:
             return self.stop_owned()
         except (Exception,) as error:  # noqa: B013
@@ -747,21 +938,57 @@ class Worker:
                 attach_failure(error, "guardian collection check failed", secondary)
             raise
 
-    def stop_owned(self) -> int:
+    def stop_owned(self) -> int | None:
+        if not self.fork_authorized or self.events.startup_clean:
+            return self.stop_unstarted()
         if self.shutdown is None:
-            self.shutdown = GroupShutdown(self.process.pid, ShutdownBudget(CLOCK.now()))
+            self.shutdown = GroupShutdown(
+                self.process.pid, ShutdownBudget(self.clock.now()), self.clock
+            )
             try:
                 self.command("shutdown", started=self.shutdown.budget.started)
             except (OSError,) as error:  # noqa: B013
-                self.events.error = self.events.error or error
+                self.collect_for_cleanup()
+                try:
+                    self.check_error()
+                except (OSError,) as owner_error:  # noqa: B013
+                    primary = owner_error
+                else:
+                    primary = OSError(
+                        "guardian control lost; worker cleanup ownership is uncertain"
+                    )
+                attach_failure(primary, "guardian shutdown transport failed", error)
+                self.events.error = primary
         self.await_reservation(self.shutdown.budget.term_until)
+        if self.events.startup_clean:
+            return self.stop_unstarted()
+        if not self.events.ready:
+            if observe_exit(self.process) is not None:
+                self.process.wait(timeout=WAIT_MARGIN)
+                self.collected = True
+            raise OSError(
+                "guardian lost before reservation; cannot certify worker cleanup"
+            )
         self.shutdown.run(self.collect_for_cleanup)
         self.wait_launcher(self.shutdown.budget.deadline)
         self.command("release", group_cleaned=True)
         self.release_sent = True
-        wait_exit(self.process, self.shutdown.budget.deadline)
+        wait_exit(self.process, self.shutdown.budget.deadline, clock=self.clock)
         self.cleaned = True
-        return self.worker_code()
+        if self.admitted:
+            return self.worker_code()
+        return self.events.returncode
+
+    def stop_unstarted(self) -> None:
+        """Fork was never authorized, or the guardian certified no remaining child."""
+        if not self.collected:
+            if observe_exit(self.process) is None:
+                self.process.kill()
+            deadline = self.clock.now() + REAP_TIMEOUT
+            wait_exit(self.process, deadline, clock=self.clock)
+            self.process.wait(timeout=max(0.01, deadline - self.clock.now()))
+            self.collected = True
+        self.cleaned = True
 
     def worker_code(self) -> int:
         if self.events.returncode is None:
@@ -783,7 +1010,7 @@ class Worker:
                 self.collect()
                 if self.events.ready or observe_exit(self.process) is not None:
                     return
-                remaining = deadline - CLOCK.now()
+                remaining = deadline - self.clock.now()
                 if remaining <= 0:
                     return
                 selector.select(min(POLL_INTERVAL, remaining))
@@ -799,7 +1026,7 @@ class Worker:
                     return
                 if observe_exit(self.process) is not None:
                     self.check_error()
-                remaining = deadline - CLOCK.now()
+                remaining = deadline - self.clock.now()
                 if remaining <= 0:
                     raise OSError(
                         "guardian launcher collection exceeded shutdown deadline"
@@ -816,7 +1043,10 @@ class Worker:
         self.check_error()
 
 
-def start_worker(command: Sequence[str], deadline: float) -> Worker:
+def start_worker(
+    command: Sequence[str], deadline: float, *, clock: Clock | None = None
+) -> Worker:
+    clock = clock or CLOCK
     allocated: set[int] = set()
     process = None
     try:
@@ -846,7 +1076,7 @@ def start_worker(command: Sequence[str], deadline: float) -> Worker:
         for descriptor in (admission_read, error_write):
             os.close(descriptor)
             allocated.remove(descriptor)
-        return Worker(process, admission_write, error_read)
+        return Worker(process, admission_write, error_read, clock=clock)
     except (BaseException,) as error:  # noqa: B013
         if process is not None:
             try:
@@ -871,27 +1101,40 @@ def worker_outcome(
     if readiness != "ready":
         return readiness
     send_status(status, "worker_ready", worker_pid=worker.process.pid)
-    admitted = await_token(control, b"A", deadline, cancelled)
-    if admitted != "ready":
-        return admitted
     with selectors.DefaultSelector() as selector:
         selector.register(control, selectors.EVENT_READ)
+        admitted = await_token(
+            control, b"A", deadline, cancelled, clock=worker.clock, selector=selector
+        )
+        if admitted != "ready":
+            return admitted
         if cancelled.requested or control_cancelled(control, selector):
             return "cancelled"
-    if CLOCK.now() >= deadline:
+    if worker.clock.now() >= deadline:
         return "timed_out"
     worker.admit()
-    return monitor(worker, control, deadline, cancelled)
+    return monitor(worker, control, deadline, cancelled, clock=worker.clock)
 
 
 def finish_worker(worker: Worker, control: int, status: int, outcome: str) -> None:
-    code = worker.stop()
-    worker.cleaned = True
-    worker.exec_error()
-    send_status(status, outcome, returncode=code, cleanup_complete=True)
+    notes: list[str] = []
+    try:
+        code = worker.stop()
+        if outcome == "completed":
+            worker.exec_error()
+    except (Exception,) as error:  # noqa: B013
+        if outcome not in {"timed_out", "cancelled"}:
+            raise
+        code = None
+        notes = [f"worker cleanup failed: {text}" for text in exception_notes(error)]
+    send_status(
+        status, outcome, returncode=code, cleanup_complete=worker.cleaned, notes=notes
+    )
     await_release(control)
     worker.released = True
-    worker.process.wait(timeout=REAP_TIMEOUT)
+    if worker.cleaned and not worker.collected:
+        worker.process.wait(timeout=REAP_TIMEOUT)
+        worker.collected = True
 
 
 def failed_worker(
@@ -904,6 +1147,8 @@ def failed_worker(
             cleaned = True
         except (Exception,) as secondary:  # noqa: B013
             attach_failure(error, "worker cleanup failed", secondary)
+        finally:
+            cleaned = worker.cleaned
     send_status(
         status,
         "runtime_failure",
@@ -913,13 +1158,15 @@ def failed_worker(
     )
     if worker is not None:
         await_release(control)
-        if cleaned:
+        if cleaned and not worker.collected:
             worker.process.wait(timeout=REAP_TIMEOUT)
+            worker.collected = True
 
 
 def supervise(
     command: Sequence[str], control: int, status: int, deadline: float
 ) -> int:
+    clock = CLOCK
     cancelled = Cancellation()
     previous = {
         sig: signal.signal(sig, cancelled.handle)
@@ -927,11 +1174,11 @@ def supervise(
     }
     worker = None
     try:
-        readiness = await_start(control, deadline, cancelled)
+        readiness = await_start(control, deadline, cancelled, clock=clock)
         if readiness != "ready":
             send_status(status, readiness, cleanup_complete=True)
             return 0
-        worker = start_worker(command, deadline)
+        worker = start_worker(command, deadline, clock=clock)
         outcome = worker_outcome(worker, control, status, deadline, cancelled)
         finish_worker(worker, control, status, outcome)
         return 0
@@ -1021,17 +1268,31 @@ def attach_stderr(error: BaseException, stderr: str | bytes | None) -> None:
 @dataclass
 class StatusChannel:
     descriptor: int
-    payload: bytes = b""
+    stream: FrameStream = field(
+        default_factory=lambda: FrameStream("shadow_supervision")
+    )
     messages: list[dict[str, Any]] = field(default_factory=list)
     owned_pid: int | None = None
     released: bool = False
     error: Exception | None = None
-    total: int = 0
     control: ControlChannel | None = None
     thread: threading.Thread | None = None
     stderr: str | bytes | None = None
     stopping: threading.Event = field(default_factory=threading.Event)
     lock: threading.RLock = field(default_factory=threading.RLock)
+    clock: Clock = field(default_factory=lambda: CLOCK)
+
+    @property
+    def payload(self) -> bytes:
+        return self.stream.payload
+
+    @payload.setter
+    def payload(self, value: bytes) -> None:
+        self.stream.payload = value
+
+    @property
+    def total(self) -> int:
+        return self.stream.total
 
     def start(self, control: ControlChannel) -> None:
         self.control = control
@@ -1056,7 +1317,9 @@ class StatusChannel:
                 self.error = self.error or error
 
     def drain(self) -> bool:
-        os.set_blocking(self.descriptor, False)
+        if self.stream.configured is None:
+            os.set_blocking(self.descriptor, False)
+            self.stream.configured = self.descriptor
         while not self.stopping.is_set():
             try:
                 chunk = os.read(self.descriptor, STATUS_LIMIT)
@@ -1073,39 +1336,28 @@ class StatusChannel:
             if self.payload and self.error is None:
                 self.error = OSError("incomplete shadow supervisor status")
             return
-        self.total += len(chunk)
-        if self.total > STATUS_LIMIT:
-            self.error = self.error or OSError("shadow supervisor status exceeds limit")
-        if self.total <= STATUS_LIMIT:
+        for value in self.stream.feed(chunk):
             try:
-                self.parse(chunk)
-            except (Exception,) as error:  # noqa: B013
-                self.error = error
-
-    def parse(self, chunk: bytes) -> None:
-        self.payload += chunk
-        while b"\n" in self.payload:
-            raw, self.payload = self.payload.split(b"\n", 1)
-            try:
-                self.parse_message(raw)
+                self.accept_message(value)
             except (OSError,) as error:  # noqa: B013
                 self.error = self.error or error
+        self.error = self.error or self.stream.error
 
     def parse_message(self, raw: bytes) -> None:
-        try:
-            value = json.loads(raw)
-        except (ValueError,) as error:  # noqa: B013
-            raise OSError("malformed shadow supervisor status") from error
-        if (
-            not isinstance(value, dict)
-            or value.get("kind") != "shadow_supervision"
-            or type(value.get("schema_version")) is not int
-            or value["schema_version"] != PROTOCOL_VERSION
-            or len(self.messages) >= 2
-        ):
+        value = self.stream.parse_frame(raw)
+        if value is not None:
+            self.accept_message(value)
+
+    def accept_message(self, value: dict[str, Any]) -> None:
+        if len(self.messages) >= 2:
             raise OSError("invalid shadow supervisor status")
-        self.accept(value)
-        self.messages.append(value)
+        # Keep an authoritative stop outcome even if cleanup requires rescue.
+        if value["status"] in TERMINAL and type(value.get("cleanup_complete")) is bool:
+            self.messages.append(value)
+            self.accept(value)
+        else:
+            self.accept(value)
+            self.messages.append(value)
 
     def accept(self, value: dict[str, Any]) -> None:
         validate_diagnostic(value)
@@ -1158,9 +1410,10 @@ class StatusChannel:
 
 
 def stopped_supervisor(
-    process: subprocess.Popen[str], deadline: float, *, clock: Clock = CLOCK
+    process: subprocess.Popen[str], deadline: float, *, clock: Clock | None = None
 ) -> bool:
     """Only our still-waitable, stopped child can vouch for its unreaped worker."""
+    clock = clock or CLOCK
     if process.returncode is not None or observe_exit(process) is not None:
         return False
     os.kill(process.pid, signal.SIGSTOP)
@@ -1191,8 +1444,9 @@ def resume_supervisor(process: subprocess.Popen[str], channel: StatusChannel) ->
 
 
 def reap_supervisor(
-    process: subprocess.Popen[str], deadline: float, *, clock: Clock = CLOCK
+    process: subprocess.Popen[str], deadline: float, *, clock: Clock | None = None
 ) -> None:
+    clock = clock or CLOCK
     try:
         process.communicate(timeout=max(0, deadline - clock.now()))
     except (Exception,) as error:  # noqa: B013
@@ -1209,12 +1463,13 @@ def reap_supervisor(
 
 
 def emergency_stop(process: subprocess.Popen[str], channel: StatusChannel) -> None:
-    deadline = CLOCK.now() + REAP_TIMEOUT
+    clock = channel.clock
+    deadline = clock.now() + REAP_TIMEOUT
     signal_deadline = deadline - WAIT_MARGIN
     failures: list[Exception] = []
     stopped = False
     try:
-        stopped = stopped_supervisor(process, signal_deadline)
+        stopped = stopped_supervisor(process, signal_deadline, clock=clock)
         with channel.lock:
             worker, released = channel.owned_pid, channel.released
         if not stopped and not released:
@@ -1222,11 +1477,11 @@ def emergency_stop(process: subprocess.Popen[str], channel: StatusChannel) -> No
                 "supervisor exited; cannot certify worker cleanup without live ownership"
             )
         if stopped and worker is not None and not released:
-            if CLOCK.now() >= signal_deadline:
+            if clock.now() >= signal_deadline:
                 raise OSError(
                     "emergency signal budget exhausted; collection reserve retained"
                 )
-            force_group(worker, signal_deadline)
+            force_group(worker, signal_deadline, clock=clock)
     except (Exception,) as error:  # noqa: B013
         failures.append(error)
     finally:
@@ -1236,7 +1491,7 @@ def emergency_stop(process: subprocess.Popen[str], channel: StatusChannel) -> No
             except (Exception,) as error:  # noqa: B013
                 failures.append(error)
         try:
-            reap_supervisor(process, deadline)
+            reap_supervisor(process, deadline, clock=clock)
         except (Exception,) as error:  # noqa: B013
             failures.append(error)
     if failures:
@@ -1310,7 +1565,9 @@ def start_supervisor(
     capture_output: bool,
     control_read: int,
     status_write: int,
+    clock: Clock | None = None,
 ) -> subprocess.Popen[str]:
+    clock = clock or CLOCK
     if not all(hasattr(os, name) for name in ("waitid", "WNOWAIT", "WSTOPPED")):
         raise OSError("shadow supervision requires native waitid/WNOWAIT ownership")
     return subprocess.Popen(  # noqa: S603
@@ -1322,7 +1579,7 @@ def start_supervisor(
             "--status-fd",
             str(status_write),
             "--deadline",
-            repr(CLOCK.now() + timeout),
+            repr(clock.now() + timeout),
             "--",
             *command,
         ],
@@ -1340,8 +1597,9 @@ def communicate_until(
     deadline: float,
     *,
     check_errors: bool = True,
-    clock: Clock = CLOCK,
+    clock: Clock | None = None,
 ) -> tuple[str | None, str | None]:
+    clock = clock or CLOCK
     while True:
         channel.collect(check_errors=check_errors)
         remaining = deadline - clock.now()
@@ -1381,12 +1639,16 @@ def finish_cancellation(
 ) -> None:
     if channel.control is not None:
         channel.control.cancel()
-    communicate_until(
+    stdout, stderr = communicate_until(
         process,
         channel,
-        CLOCK.now() + TERM_GRACE + REAP_TIMEOUT + WAIT_MARGIN,
+        channel.clock.now() + TERM_GRACE + REAP_TIMEOUT + WAIT_MARGIN,
         check_errors=False,
+        clock=channel.clock,
     )
+    if isinstance(primary, subprocess.TimeoutExpired):
+        primary.output = stdout.encode() if isinstance(stdout, str) else stdout
+        primary.stderr = stderr.encode() if isinstance(stderr, str) else stderr
     channel.finish(check_errors=False)
     if not channel.released:
         raise OSError("shadow cleanup lacks a valid terminal acknowledgment")
@@ -1522,6 +1784,7 @@ def close_supervision(
 def run_supervised(
     command: Sequence[str], *, timeout: float, capture_output: bool = False
 ) -> subprocess.CompletedProcess[str]:
+    clock = CLOCK
     descriptors: set[int] = set()
     process = None
     primary = None
@@ -1533,13 +1796,14 @@ def run_supervised(
         status_read, status_write = os.pipe()
         descriptors.update((status_read, status_write))
         control = ControlChannel(control_write)
-        channel = StatusChannel(status_read)
+        channel = StatusChannel(status_read, clock=clock)
         process = start_supervisor(
             command,
             timeout=timeout,
             capture_output=capture_output,
             control_read=control_read,
             status_write=status_write,
+            clock=clock,
         )
         for descriptor in (control_read, status_write):
             os.close(descriptor)
@@ -1550,7 +1814,8 @@ def run_supervised(
             stdout, stderr = communicate_until(
                 process,
                 channel,
-                CLOCK.now() + timeout + TERM_GRACE + REAP_TIMEOUT + WAIT_MARGIN,
+                clock.now() + timeout + TERM_GRACE + REAP_TIMEOUT + WAIT_MARGIN,
+                clock=clock,
             )
             channel.finish()
             return result(
@@ -1562,19 +1827,42 @@ def run_supervised(
                 supervisor_code=process.returncode,
             )
         except (BaseException,) as error:  # noqa: B013
+            selected = selected_stop_error(command, timeout, channel, error)
             if process.returncode is None:
-                cancel_supervisor(process, channel, error)
+                cancel_supervisor(process, channel, selected)
             elif not channel.released:
-                error.add_note(
+                selected.add_note(
                     "supervisor exited; cannot certify worker cleanup without live ownership"
                 )
-            attach_stderr(error, channel.stderr)
+            attach_stderr(selected, channel.stderr)
+            if selected is not error:
+                raise selected from error
             raise
     except (BaseException,) as error:  # noqa: B013
         primary = error
         raise
     finally:
         close_supervision(descriptors, process, channel, control, primary)
+
+
+def selected_stop_error(
+    command: Sequence[str],
+    timeout: float,
+    channel: StatusChannel,
+    error: BaseException,
+) -> BaseException:
+    if isinstance(error, (KeyboardInterrupt, SystemExit, subprocess.TimeoutExpired)):
+        return error
+    with channel.lock:
+        terminal = channel.messages[-1] if channel.messages else {}
+    if terminal.get("status") != "timed_out":
+        return error
+    selected = subprocess.TimeoutExpired(command, timeout, stderr=channel.stderr)
+    attach_failure(selected, "shadow timeout cleanup", error)
+    for note in terminal.get("notes", []):
+        if note not in getattr(error, "__notes__", ()):
+            add_note_once(selected, note)
+    return selected
 
 
 def main() -> int:

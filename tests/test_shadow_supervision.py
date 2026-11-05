@@ -12,7 +12,7 @@ from types import SimpleNamespace
 
 import pytest
 from filelock import FileLock, Timeout
-from shadow_supervision_helpers import raw_owner, statuses
+from shadow_supervision_helpers import raw_owner, statuses, stop_worker
 from test_launchd import SCRIPT, load_script
 from test_shadow_native_guards import window_protocol
 
@@ -269,7 +269,7 @@ def test_supervisor_fault_stops_and_reaps_worker(supervisor, monkeypatch):
         owners.append(process)
         return process
 
-    def broken(*_args):
+    def broken(*_args, **_kwargs):
         raise OSError("injected monitor fault")
 
     monkeypatch.setattr(supervisor.subprocess, "Popen", created)
@@ -332,9 +332,9 @@ def test_permission_probes_retry_but_persistent_denial_fails(
     process = SimpleNamespace(pid=987654, poll=lambda: 0, wait=lambda **_kwargs: 0)
     if persistent:
         with pytest.raises(PermissionError, match="group termination denied"):
-            supervisor.stop_worker(process, clock=timing)
+            stop_worker(supervisor, process, clock=timing)
     else:
-        supervisor.stop_worker(process, clock=timing)
+        stop_worker(supervisor, process, clock=timing)
         assert len(probes) == 2
 
 
@@ -549,7 +549,7 @@ def test_emergency_cleanup_attempts_every_step_and_keeps_first_failure(
         wait=reap_failed,
         kill=lambda: calls.append((987654, signal.SIGKILL)),
     )
-    monkeypatch.setattr(supervisor, "stopped_supervisor", lambda *_: True)
+    monkeypatch.setattr(supervisor, "stopped_supervisor", lambda *_, **__: True)
     monkeypatch.setattr(
         supervisor.os, "kill", lambda pid, sig: calls.append((pid, sig))
     )
@@ -557,7 +557,7 @@ def test_emergency_cleanup_attempts_every_step_and_keeps_first_failure(
     monkeypatch.setattr(
         supervisor,
         "force_group",
-        lambda pid, _deadline: signal_failed(pid, signal.SIGKILL),
+        lambda pid, _deadline, **_: signal_failed(pid, signal.SIGKILL),
     )
     with pytest.raises(PermissionError, match="worker signal denied") as caught:
         supervisor.emergency_stop(process, channel)
@@ -583,7 +583,7 @@ def test_fresh_cancellation_is_not_swallowed_by_cleanup(supervisor, monkeypatch)
         raise cancelled
 
     process = SimpleNamespace(communicate=interrupted)
-    channel = SimpleNamespace(control=None)
+    channel = SimpleNamespace(control=None, clock=supervisor.CLOCK)
     cleaned = []
     monkeypatch.setattr(supervisor, "communicate_until", interrupted)
     monkeypatch.setattr(supervisor, "emergency_stop", lambda *_: cleaned.append(True))
