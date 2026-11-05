@@ -172,7 +172,7 @@ def test_second_cancellation_runs_emergency_before_propagating(supervisor, monke
     primary = KeyboardInterrupt("first")
     calls = []
 
-    def interrupted(*_):
+    def interrupted(*_, **_kwargs):
         raise KeyboardInterrupt("second")
 
     monkeypatch.setattr(supervisor, "communicate_until", interrupted)

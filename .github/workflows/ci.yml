@@ -95,10 +95,17 @@ jobs:
           token: ${{ secrets.CODECOV_TOKEN }}
           verbose: true
 
-  macos-shadow-lifecycle:
-    runs-on: macos-latest
+  shadow-lifecycle:
+    strategy:
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    permissions:
+      contents: read
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
       - uses: astral-sh/setup-uv@d4b2f3b6ecc6e67c4457f6d3e41ec42d3d0fcb86 # v5
         with:
           version: "latest"
@@ -109,7 +116,7 @@ jobs:
       - name: Repeat native shadow ownership and fault tests
         run: |
           for attempt in 1 2 3; do
-            uv run --no-sync pytest tests/test_shadow_supervision.py tests/test_shadow_owned_lifecycle.py tests/test_shadow_native_guards.py tests/test_shadow_output_preparation.py tests/test_shadow_lifecycle.py
+            uv run --no-sync pytest tests/test_shadow_guardian_lifecycle.py tests/test_shadow_supervision.py tests/test_shadow_owned_lifecycle.py tests/test_shadow_native_guards.py tests/test_shadow_output_preparation.py tests/test_shadow_lifecycle.py
           done
 
   windows-import-smoke:

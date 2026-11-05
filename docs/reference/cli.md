@@ -1166,9 +1166,15 @@ including SIGKILL; workers cannot inherit the writer. A separate status channel
 keeps supervision metadata out of worker stdout/stderr. Deadlines remain 30/300
 seconds, followed by two seconds of SIGTERM grace and three seconds to force
 termination/reap, plus one second of wrapper wait margin. Exceptional rescue has
-a separate three-second maximum. Internal protocol 2 admits the bootstrap only
-after worker ownership is acknowledged; `waitid(WNOWAIT)` reserves its PID until
-group cleanup and the terminal release acknowledgment (or wrapper EOF). The status
+a separate three-second maximum. Internal protocol 3 admits the launcher only
+after guardian ownership is acknowledged. The guardian moves outside the worker
+group before readiness, retaining its PID as that group's ID, and reaps the
+launcher before exiting. `waitid(WNOWAIT)` reserves the guardian until group
+cleanup and terminal release acknowledgment (or wrapper EOF). Clean empty groups
+need no two-second wait or force signal; surviving descendants still receive the
+full graceful/forced cleanup. Native exec restores the standard ignored-signal
+defaults. Mode-specific helper descriptors are required arguments; omission is
+an argparse exit-2 error without a traceback. The status
 pipe is continuously drained and capped at 64 KiB, with primary error/path context
 prioritized in explicitly truncated oversized diagnostics. Worker completion wins
 over simultaneous cancellation. Repeated wrapper cancellation is deferred through
@@ -1187,8 +1193,18 @@ diagnostic. Existing untagged successful readiness objects remain accepted.
 Tagged refusals use JSON `detail` once; secondary stderr remains separately
 labelled instead of being appended to the refusal, with supplementary stderr
 capped at 8 KiB and an explicit truncation marker. Multiline primary details are
-filtered as a complete message. Missing, unreadable or syntax-broken supervisor
+filtered as a complete line sequence after newline normalization, never as a
+substring of unrelated stderr. A latched status error does not bypass graceful
+shutdown. Captured stderr and nested cleanup notes are attached once to failures.
+Missing, unreadable or syntax-broken supervisor
 helpers fail shadow preflight while ordinary publication and maintenance continue.
+Status-reader resource exhaustion has the same ordinary-publication fallback;
+partially initialized readers, descriptors and supervisors are cleaned up.
+Required-artifact paths beneath a regular file are named exit-2 input refusals;
+permission and operational I/O errors remain exit 1. Emergency cleanup independently
+attempts resumption after a stop request, including unconfirmed stops and broken
+control writes. A failed reader/sender shutdown preserves its descriptors instead
+of closing them beneath a still-running thread.
 
 Finalization reads capsule state after acquiring the `.sealing` OS-managed lock.
 Before a new seal or fit it acquires the actual records publication guard and

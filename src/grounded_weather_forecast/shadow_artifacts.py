@@ -224,7 +224,7 @@ def required_artifact(
             path = path.resolve(strict=True)
         regular(path)
         return path.read_bytes() if snapshot is None else snapshot
-    except (FileNotFoundError,) as error:  # noqa: B013 -- required supplied evidence
+    except (FileNotFoundError, NotADirectoryError) as error:
         raise EvidenceError(f"{path}: missing required enrollment artifact") from error
     except (OSError,) as error:  # noqa: B013 -- preserve operational permission failures
         if error.errno == errno.ELOOP:
