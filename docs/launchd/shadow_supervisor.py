@@ -303,13 +303,22 @@ def await_token(
             if remaining <= 0:
                 return "timed_out"
             if selected.select(min(POLL_INTERVAL, remaining)):
-                received = os.read(control, 1)
-                if received in (b"", b"C") or cancelled.requested:
-                    return "cancelled"
-                if received != token:
-                    raise OSError("unexpected shadow admission token")
-                return "cancelled" if control_cancelled(control, selected) else "ready"
+                return receive_token(control, token, cancelled, selected)
     return "cancelled"
+
+
+def receive_token(
+    control: int,
+    token: bytes,
+    cancelled: Cancellation,
+    selector: selectors.BaseSelector,
+) -> str:
+    received = os.read(control, 1)
+    if received in (b"", b"C") or cancelled.requested:
+        return "cancelled"
+    if received != token:
+        raise OSError("unexpected shadow admission token")
+    return "cancelled" if control_cancelled(control, selector) else "ready"
 
 
 def await_start(
@@ -430,27 +439,30 @@ class FrameStream:
         parts = chunk.split(b"\n")
         for index, part in enumerate(parts):
             ended = index < len(parts) - 1
-            if self.discarding or len(self.payload) + len(part) > STATUS_LIMIT:
-                self.error = self.error or OSError(f"{self.kind} frame exceeds limit")
-                self.payload = b""
-                self.discarding = not ended
-                continue
-            self.payload += part
-            if not ended:
-                continue
-            raw, self.payload = self.payload, b""
-            try:
-                value = self.parse_frame(raw)
-                if value is not None:
-                    frames.append(value)
-            except (ValueError, OSError, RecursionError) as error:
-                label = (
-                    "shadow supervisor status"
-                    if self.kind == "shadow_supervision"
-                    else f"{self.kind} frame"
-                )
-                self.error = self.error or OSError(f"malformed {label}: {error}")
+            if (value := self.feed_piece(part, ended=ended)) is not None:
+                frames.append(value)
         return frames
+
+    def feed_piece(self, part: bytes, *, ended: bool) -> dict[str, Any] | None:
+        if self.discarding or len(self.payload) + len(part) > STATUS_LIMIT:
+            self.error = self.error or OSError(f"{self.kind} frame exceeds limit")
+            self.payload = b""
+            self.discarding = not ended
+            return None
+        self.payload += part
+        if not ended:
+            return None
+        raw, self.payload = self.payload, b""
+        try:
+            return self.parse_frame(raw)
+        except (ValueError, OSError, RecursionError) as error:
+            label = (
+                "shadow supervisor status"
+                if self.kind == "shadow_supervision"
+                else f"{self.kind} frame"
+            )
+            self.error = self.error or OSError(f"malformed {label}: {error}")
+        return None
 
     def parse_frame(self, raw: bytes) -> dict[str, Any] | None:
         value = json.loads(raw)
@@ -538,31 +550,32 @@ class GuardianEvents:
                     )
                 self.returncode = value["returncode"]
             case "error":
-                code, detail = value.get("errno"), value.get("detail")
-                if (code is not None and type(code) is not int) or not isinstance(
-                    detail, str
-                ):
-                    raise OSError("invalid guardian operational error")
-                if code is not None:
-                    message = value.get("strerror")
-                    if not isinstance(message, str):
-                        message = detail
-                    paths = (value.get("filename"), value.get("filename2"))
-                    if any(
-                        path is not None and not isinstance(path, str) for path in paths
-                    ):
-                        raise OSError("invalid guardian error filename")
-                    error = OSError(code, message, paths[0], None, paths[1])
-                else:
-                    error = OSError(detail)
-                for note in value.get("notes", []):
-                    error.add_note(note)
+                error = guardian_operational_error(value)
                 if self.error is None:
                     self.error = error
                 else:
                     attach_failure(self.error, "guardian failure", error)
             case _:
                 raise OSError("invalid guardian lifecycle phase")
+
+
+def guardian_operational_error(value: dict[str, Any]) -> OSError:
+    code, detail = value.get("errno"), value.get("detail")
+    if (code is not None and type(code) is not int) or not isinstance(detail, str):
+        raise OSError("invalid guardian operational error")
+    if code is None:
+        error = OSError(detail)
+    else:
+        message = value.get("strerror")
+        if not isinstance(message, str):
+            message = detail
+        paths = (value.get("filename"), value.get("filename2"))
+        if any(path is not None and not isinstance(path, str) for path in paths):
+            raise OSError("invalid guardian error filename")
+        error = OSError(code, message, paths[0], None, paths[1])
+    for note in value.get("notes", []):
+        error.add_note(note)
+    return error
 
 
 @dataclass
@@ -634,15 +647,15 @@ class Guardian:
                     self.report_failure(error)
                 values, commands.pending = commands.pending, []
                 values.extend(commands.read(self.parent))
+                if commands.error is not None:
+                    self.report_failure(commands.error)
+                    commands.error = None
                 for value in values:
                     try:
                         if self.command(value):
                             return
                     except (OSError,) as error:  # noqa: B013
                         self.report_failure(error)
-                if commands.error is not None:
-                    self.report_failure(commands.error)
-                    commands.error = None
                 if commands.eof:
                     self.fallback()
                     return
@@ -710,6 +723,8 @@ def authorize_fork(
         selector.register(admission, selectors.EVENT_READ)
         while clock.now() < deadline:
             values = stream.read(admission)
+            if stream.error is not None:
+                raise stream.error
             for index, value in enumerate(values):
                 if value["status"] == "reserve":
                     stream.pending = values[index + 1 :]
@@ -717,8 +732,6 @@ def authorize_fork(
                 if value["status"] == "shutdown":
                     return False
                 raise OSError("invalid guardian pre-fork control phase")
-            if stream.error is not None:
-                raise stream.error
             if stream.eof:
                 return False
             selector.select(min(POLL_INTERVAL, max(0, deadline - clock.now())))
@@ -898,25 +911,41 @@ class Worker:
             selector.register(self.errors, selectors.EVENT_READ)
             selector.register(control, selectors.EVENT_READ)
             while True:
-                self.collect()
-                if self.clock.now() >= deadline:
-                    return "timed_out"
-                self.check_error()
-                if cancelled.requested or control_cancelled(control, selector):
-                    return "cancelled"
-                if self.events.bootstrap_ready and not self.fork_authorized:
-                    if cancelled.requested:
-                        return "cancelled"
-                    if self.clock.now() >= deadline:
-                        return "timed_out"
-                    self.fork_authorized = True
-                    self.command("reserve")
-                if self.events.ready:
-                    return "ready"
-                remaining = deadline - self.clock.now()
-                if remaining <= 0:
-                    return "timed_out"
-                selector.select(min(POLL_INTERVAL, remaining))
+                if (
+                    phase := self.readiness_step(control, deadline, cancelled, selector)
+                ) is not None:
+                    return phase
+                selector.select(min(POLL_INTERVAL, max(0, deadline - self.clock.now())))
+
+    def readiness_step(
+        self,
+        control: int,
+        deadline: float,
+        cancelled: Cancellation,
+        selector: selectors.BaseSelector,
+    ) -> str | None:
+        self.collect()
+        if self.clock.now() >= deadline:
+            return "timed_out"
+        self.check_error()
+        if cancelled.requested or control_cancelled(control, selector):
+            return "cancelled"
+        if (
+            self.events.bootstrap_ready
+            and not self.fork_authorized
+            and (phase := self.reserve_current(deadline, cancelled)) is not None
+        ):
+            return phase
+        return "ready" if self.events.ready else None
+
+    def reserve_current(self, deadline: float, cancelled: Cancellation) -> str | None:
+        if cancelled.requested:
+            return "cancelled"
+        if self.clock.now() >= deadline:
+            return "timed_out"
+        self.fork_authorized = True
+        self.command("reserve")
+        return None
 
     def stop(self) -> int | None:
         if self.stop_error is not None:
@@ -1835,7 +1864,10 @@ def run_supervised(
                     "supervisor exited; cannot certify worker cleanup without live ownership"
                 )
             attach_stderr(selected, channel.stderr)
-            if selected is not error:
+            if (
+                isinstance(selected, subprocess.TimeoutExpired)
+                and selected is not error
+            ):
                 raise selected from error
             raise
     except (BaseException,) as error:  # noqa: B013

@@ -39,7 +39,8 @@ def test_bootstrap_waits_for_fork_authorization(supervisor, tmp_path, monkeypatc
             lambda *_: pytest.fail("no worker group was authorized"),
         )
         assert worker.stop() is None
-        assert worker.cleaned and worker.collected
+        assert worker.cleaned
+        assert worker.collected
         with pytest.raises(ChildProcessError):
             os.waitpid(worker.process.pid, os.WNOHANG)
     finally:
@@ -69,7 +70,8 @@ def test_dead_unstarted_helper_is_collected_without_group_cleanup(
             lambda *_: pytest.fail("zombie-only group cleanup"),
         )
         assert worker.stop() is None
-        assert worker.cleaned and worker.collected
+        assert worker.cleaned
+        assert worker.collected
         with pytest.raises(ChildProcessError):
             os.waitpid(process.pid, os.WNOHANG)
     finally:
@@ -215,7 +217,8 @@ def test_expired_normal_budget_has_bounded_force_rescue(supervisor, monkeypatch)
     monkeypatch.setattr(supervisor, "signal_group", denied)
     with pytest.raises(PermissionError, match="fallback kernel denial"):
         guardian.fallback()
-    assert signals and set(signals) == {signal.SIGKILL}
+    assert signals
+    assert set(signals) == {signal.SIGKILL}
     assert 22 <= elapsed[0] < 22.1
     assert guardian.rescue.budget.deadline == 23
     first = guardian.rescue
@@ -258,6 +261,22 @@ def test_authorization_keeps_coalesced_shutdown_frame(supervisor):
         )
         assert [value["status"] for value in stream.pending] == ["shutdown"]
         assert stream.pending[0]["started"] == 123
+    finally:
+        for fd in (read, write, events_read, events_write):
+            os.close(fd)
+
+
+def test_malformed_frame_cannot_authorize_fork(supervisor):
+    read, write = os.pipe()
+    events_read, events_write = os.pipe()
+    stream = supervisor.FrameStream("shadow_guardian_control")
+    try:
+        os.write(write, b"malformed\n")
+        supervisor.write_frame(write, stream.kind, "reserve")
+        with pytest.raises(OSError, match="malformed shadow_guardian_control frame"):
+            supervisor.authorize_fork(
+                read, events_write, time.monotonic() + 3, supervisor.CLOCK, stream
+            )
     finally:
         for fd in (read, write, events_read, events_write):
             os.close(fd)
