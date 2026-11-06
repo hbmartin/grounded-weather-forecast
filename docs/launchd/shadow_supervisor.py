@@ -1306,6 +1306,7 @@ class StatusChannel:
     error: Exception | None = None
     control: ControlChannel | None = None
     thread: threading.Thread | None = None
+    stdout: str | bytes | None = None
     stderr: str | bytes | None = None
     stopping: threading.Event = field(default_factory=threading.Event)
     lock: threading.RLock = field(default_factory=threading.RLock)
@@ -1474,10 +1475,10 @@ def resume_supervisor(process: subprocess.Popen[str], channel: StatusChannel) ->
 
 def reap_supervisor(
     process: subprocess.Popen[str], deadline: float, *, clock: Clock | None = None
-) -> None:
+) -> tuple[str | None, str | None]:
     clock = clock or CLOCK
     try:
-        process.communicate(timeout=max(0, deadline - clock.now()))
+        return process.communicate(timeout=max(0, deadline - clock.now()))
     except (Exception,) as error:  # noqa: B013
         # Popen.kill safely handles a direct child that exited during communicate.
         try:
@@ -1489,6 +1490,18 @@ def reap_supervisor(
         except (Exception,) as secondary:  # noqa: B013
             attach_failure(error, "supervisor left unreaped", secondary)
         raise
+
+
+def collect_supervisor(
+    process: subprocess.Popen[str], channel: StatusChannel, deadline: float
+) -> None:
+    try:
+        captured = reap_supervisor(process, deadline, clock=channel.clock)
+    except (subprocess.TimeoutExpired,) as error:  # noqa: B013
+        retain_output(channel, error.output, error.stderr)
+        raise
+    if captured is not None:
+        retain_output(channel, *captured)
 
 
 def emergency_stop(process: subprocess.Popen[str], channel: StatusChannel) -> None:
@@ -1520,7 +1533,7 @@ def emergency_stop(process: subprocess.Popen[str], channel: StatusChannel) -> No
             except (Exception,) as error:  # noqa: B013
                 failures.append(error)
         try:
-            reap_supervisor(process, deadline, clock=clock)
+            collect_supervisor(process, channel, deadline)
         except (Exception,) as error:  # noqa: B013
             failures.append(error)
     if failures:
@@ -1636,10 +1649,36 @@ def communicate_until(
             raise OSError("shadow supervisor did not finish within shutdown allowance")
         try:
             stdout, stderr = process.communicate(timeout=min(POLL_INTERVAL, remaining))
-            channel.stderr = stderr
+            retain_output(channel, stdout, stderr)
             return stdout, stderr
         except (subprocess.TimeoutExpired,) as error:  # noqa: B013
-            channel.stderr = error.stderr
+            retain_output(channel, error.output, error.stderr)
+
+
+def retain_output(
+    channel: StatusChannel, stdout: str | bytes | None, stderr: str | bytes | None
+) -> None:
+    """Retain the latest cumulative snapshot without decoding it during polling."""
+    if stdout is not None:
+        channel.stdout = stdout
+    if stderr is not None:
+        channel.stderr = stderr
+
+
+def attach_timeout_output(error: BaseException, channel: StatusChannel) -> None:
+    if isinstance(error, subprocess.TimeoutExpired):
+        if channel.stdout is not None:
+            error.output = (
+                channel.stdout.encode()
+                if isinstance(channel.stdout, str)
+                else channel.stdout
+            )
+        if channel.stderr is not None:
+            error.stderr = (
+                channel.stderr.encode()
+                if isinstance(channel.stderr, str)
+                else channel.stderr
+            )
 
 
 def decoded_output(output: str | bytes | None) -> str | None:
@@ -1668,16 +1707,14 @@ def finish_cancellation(
 ) -> None:
     if channel.control is not None:
         channel.control.cancel()
-    stdout, stderr = communicate_until(
+    communicate_until(
         process,
         channel,
         channel.clock.now() + TERM_GRACE + REAP_TIMEOUT + WAIT_MARGIN,
         check_errors=False,
         clock=channel.clock,
     )
-    if isinstance(primary, subprocess.TimeoutExpired):
-        primary.output = stdout.encode() if isinstance(stdout, str) else stdout
-        primary.stderr = stderr.encode() if isinstance(stderr, str) else stderr
+    attach_timeout_output(primary, channel)
     channel.finish(check_errors=False)
     if not channel.released:
         raise OSError("shadow cleanup lacks a valid terminal acknowledgment")
@@ -1728,6 +1765,7 @@ def cancel_supervisor(
         finally:
             if not completed:
                 rescue_cancellation(process, channel, primary)
+            attach_timeout_output(primary, channel)
     propagate_cancellation(primary, pending)
 
 
@@ -1864,6 +1902,7 @@ def run_supervised(
                     "supervisor exited; cannot certify worker cleanup without live ownership"
                 )
             attach_stderr(selected, channel.stderr)
+            attach_timeout_output(selected, channel)
             if (
                 isinstance(selected, subprocess.TimeoutExpired)
                 and selected is not error
@@ -1890,6 +1929,7 @@ def selected_stop_error(
     if terminal.get("status") != "timed_out":
         return error
     selected = subprocess.TimeoutExpired(command, timeout, stderr=channel.stderr)
+    attach_timeout_output(selected, channel)
     attach_failure(selected, "shadow timeout cleanup", error)
     for note in terminal.get("notes", []):
         if note not in getattr(error, "__notes__", ()):

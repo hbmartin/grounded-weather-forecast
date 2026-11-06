@@ -304,6 +304,8 @@ def test_partial_output_is_not_decoded_on_each_poll(supervisor, monkeypatch):
 
     def communicate(**_kwargs):
         calls.append(True)
+        if len(calls) > 1:
+            assert channel.stdout is payload
         if len(calls) < 4:
             raise subprocess.TimeoutExpired([], 0.05, output=payload, stderr=payload)
         return payload.decode(), payload.decode()
@@ -321,7 +323,7 @@ def test_partial_output_is_not_decoded_on_each_poll(supervisor, monkeypatch):
     assert result == (payload.decode(), payload.decode())
     assert len(calls) == 4
     assert decodes == []
-    assert not hasattr(channel, "stdout")
+    assert channel.stdout is result[0]
 
 
 def test_readiness_reuses_one_selector(supervisor, monkeypatch):

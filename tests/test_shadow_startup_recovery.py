@@ -438,3 +438,31 @@ os._exit(m.execute_admitted(['/definitely-missing-shadow-executable'],r,ew,time.
     )
     assert result.returncode == 127
     assert result.stderr == b""
+
+
+def test_timeout_preserves_output_through_emergency_collection(supervisor, monkeypatch):
+    release = supervisor.StatusChannel.release_identity
+
+    def incomplete(channel, value):
+        if value["status"] == "timed_out":
+            value["cleanup_complete"] = False
+        release(channel, value)
+
+    def failed_communication(*_):
+        raise OSError("injected cleanup communication failure")
+
+    monkeypatch.setattr(supervisor.StatusChannel, "release_identity", incomplete)
+    monkeypatch.setattr(supervisor, "finish_cancellation", failed_communication)
+    command = [
+        sys.executable,
+        "-c",
+        "import sys,time; print('timeout stdout',flush=True); print('timeout stderr',file=sys.stderr,flush=True); time.sleep(30)",
+    ]
+    with pytest.raises(subprocess.TimeoutExpired) as caught:
+        supervisor.run_supervised(command, timeout=2, capture_output=True)
+    assert caught.value.output == b"timeout stdout\n"
+    assert caught.value.stderr == b"timeout stderr\n"
+    assert any(
+        "injected cleanup communication failure" in note
+        for note in caught.value.__notes__
+    )
