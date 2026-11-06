@@ -217,6 +217,8 @@ def test_startup_errno_reaches_supervisor_before_ready(supervisor, monkeypatch):
 
     try:
         monkeypatch.setattr(supervisor.os, "pipe", exhausted)
+        monkeypatch.setattr(supervisor, "authorize_fork", lambda *_, **__: True)
+        monkeypatch.setattr(supervisor.signal, "signal", lambda *_: None)
         assert supervisor.bootstrap(["unused"], -1, write, 100) == 127
         events = supervisor.GuardianEvents()
         events.collect(read)
@@ -302,6 +304,8 @@ def test_partial_output_is_not_decoded_on_each_poll(supervisor, monkeypatch):
 
     def communicate(**_kwargs):
         calls.append(True)
+        if len(calls) > 1:
+            assert channel.stdout is payload
         if len(calls) < 4:
             raise subprocess.TimeoutExpired([], 0.05, output=payload, stderr=payload)
         return payload.decode(), payload.decode()
@@ -319,7 +323,7 @@ def test_partial_output_is_not_decoded_on_each_poll(supervisor, monkeypatch):
     assert result == (payload.decode(), payload.decode())
     assert len(calls) == 4
     assert decodes == []
-    assert not hasattr(channel, "stdout")
+    assert channel.stdout is result[0]
 
 
 def test_readiness_reuses_one_selector(supervisor, monkeypatch):
@@ -395,23 +399,35 @@ def test_shutdown_announcement_does_not_invoke_guardian_fallback(
         os.close(write)
 
 
-def test_guardian_fallback_cannot_renew_announced_budget(supervisor, monkeypatch):
+def test_guardian_fallback_uses_one_separate_force_budget(supervisor, monkeypatch):
     launcher = supervisor.OwnedLauncher(123456, -1)
     launcher.pid, launcher.returncode = None, 0
+    elapsed, signals, live = [10.0], [], [True]
+    clock = supervisor.Clock(
+        lambda: elapsed[0], lambda delay: elapsed.__setitem__(0, elapsed[0] + delay)
+    )
     budget = supervisor.ShutdownBudget(0)
-    clock = supervisor.Clock(lambda: 10, lambda _: pytest.fail("expired budget slept"))
-    shutdown = supervisor.GroupShutdown(123456, budget, clock)
     guardian = supervisor.Guardian(
-        launcher, -1, -1, reserved=True, budget=budget, shutdown=shutdown
+        launcher, -1, -1, reserved=True, budget=budget, clock=clock
     )
-    monkeypatch.setattr(supervisor, "group_exists", lambda _: True)
-    monkeypatch.setattr(
-        supervisor, "signal_group", lambda *_: pytest.fail("expired budget signalled")
-    )
-    with pytest.raises(OSError, match="collection reserve"):
-        guardian.fallback()
+    monkeypatch.setattr(supervisor, "group_exists", lambda _: live[0])
+
+    def killed(_pid, signum):
+        signals.append(signum)
+        live[0] = False
+
+    monkeypatch.setattr(supervisor, "signal_group", killed)
+    guardian.fallback()
+    rescue = guardian.rescue
+    assert signals == [signal.SIGKILL]
+    assert rescue.budget.started == 10
+    assert rescue.budget.deadline == 13
+    assert rescue.complete
+    elapsed[0] += 20
+    guardian.fallback()
+    assert guardian.rescue is rescue
     assert guardian.budget is budget
-    assert guardian.shutdown is shutdown
+    assert signals == [signal.SIGKILL]
 
 
 def test_emergency_denial_reserves_time_for_resume_and_reap(supervisor, monkeypatch):
@@ -425,12 +441,13 @@ def test_emergency_denial_reserves_time_for_resume_and_reap(supervisor, monkeypa
         raise PermissionError("rescue signal denied")
 
     monkeypatch.setattr(supervisor, "CLOCK", clock)
-    monkeypatch.setattr(supervisor, "stopped_supervisor", lambda *_: True)
+    monkeypatch.setattr(supervisor, "stopped_supervisor", lambda *_, **__: True)
     monkeypatch.setattr(supervisor, "signal_group", denied)
+    monkeypatch.setattr(supervisor, "group_exists", lambda _: True)
     monkeypatch.setattr(
         supervisor,
         "force_group",
-        lambda pid, deadline: original(pid, deadline, clock=clock),
+        lambda pid, deadline, **_: original(pid, deadline, clock=clock),
     )
     monkeypatch.setattr(
         supervisor, "resume_supervisor", lambda *_: calls.append("resumed")
@@ -438,7 +455,7 @@ def test_emergency_denial_reserves_time_for_resume_and_reap(supervisor, monkeypa
     monkeypatch.setattr(
         supervisor,
         "reap_supervisor",
-        lambda _process, deadline: calls.append(deadline - elapsed[0]),
+        lambda _process, deadline, **_: calls.append(deadline - elapsed[0]),
     )
     process = SimpleNamespace(returncode=None)
     channel = supervisor.StatusChannel(-1, owned_pid=123456)
@@ -478,6 +495,7 @@ def test_secondary_ownership_probe_cannot_replace_stop_failure(supervisor, monke
 def test_event_read_failure_still_delivers_graceful_signal(supervisor, monkeypatch):
     worker = supervisor.Worker(SimpleNamespace(pid=123456), -1, -1)
     worker.events.ready, worker.events.returncode = True, 0
+    worker.fork_authorized = True
     failure, calls = OSError("guardian event read failed"), []
     probes = iter([True, False])
 
@@ -490,7 +508,7 @@ def test_event_read_failure_still_delivers_graceful_signal(supervisor, monkeypat
     monkeypatch.setattr(
         supervisor, "signal_group", lambda pid, sig: calls.append((pid, sig))
     )
-    monkeypatch.setattr(supervisor, "wait_exit", lambda *_: 0)
+    monkeypatch.setattr(supervisor, "wait_exit", lambda *_, **__: 0)
     assert worker.stop() == 0
     assert calls == [(123456, signal.SIGTERM)]
     assert worker.cleaned

@@ -5,6 +5,14 @@ import subprocess
 from contextlib import contextmanager
 
 
+def stop_worker(supervisor, process, *, clock=None, started=None):
+    """Exercise the shared shutdown policy with a still-owned synthetic group."""
+    clock = clock or supervisor.CLOCK
+    budget = supervisor.ShutdownBudget(clock.now() if started is None else started)
+    supervisor.GroupShutdown(process.pid, budget, clock).run(lambda: None)
+    return supervisor.wait_exit(process, budget.deadline, clock=clock)
+
+
 @contextmanager
 def raw_owner(supervisor, command, *, timeout=3):
     control_read, control_write = os.pipe()

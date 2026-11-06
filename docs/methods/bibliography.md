@@ -183,14 +183,18 @@ operational ownership mechanisms, not statistical methods.
 The [Python `waitid` and `WNOWAIT` contracts](https://docs.python.org/3.13/library/os.html#os.waitid)
 support retaining child identity until acknowledged cleanup; the
 [standard-library threading primitives](https://docs.python.org/3.13/library/threading.html)
-support independently draining supervision status. Internal protocol 4 uses a
+support independently draining supervision status. Internal protocol 5 uses a
 guardian outside its reserved worker group, a blocked launcher, and explicit
-admission/release acknowledgments. The [POSIX process-group operations](https://docs.python.org/3.13/library/os.html#os.setpgid)
+pre-fork authorization and admission/release acknowledgments. Bounded shared
+framing and per-producer diagnostic quotas preserve lifecycle events. Structured
+OS error fields reconstruct errno/path once, and closed-reader exec diagnostics
+retain the native launcher `_exit` boundary. The [POSIX process-group operations](https://docs.python.org/3.13/library/os.html#os.setpgid)
 and [`Popen` signal restoration](https://docs.python.org/3.13/library/subprocess.html#subprocess.Popen)
 map to `bootstrap`, `Guardian`, `OwnedLauncher`, `GroupShutdown`, and
 `execute_admitted` in the same supervisor helper. Normal shutdown belongs to the
-supervisor; guardian fallback requires liveness EOF and reuses any announced
-budget. The guardian reports and reaps the launcher before cleanup release, so its
+supervisor; guardian fallback requires liveness EOF and has one independent
+three-second force-only rescue budget, with the final second reserved for reaping.
+The rescue never renews normal TERM grace or its own deadline. The guardian reports and reaps the launcher before cleanup release, so its
 own retained identity cannot make an empty worker group appear alive. Incremental
 frames, selector reuse and deferred output decoding are operational mechanisms.
 These references

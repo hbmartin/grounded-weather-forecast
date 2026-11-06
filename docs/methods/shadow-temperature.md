@@ -104,16 +104,23 @@ outside it returns `outside_window` without those checks. The wrapper allows 30 
 and 300 seconds for finalization; capability/preflight failures preserve ordinary
 publication and report shadow failure. There is no persistent validation cache.
 The installed standard-library supervisor monitors a wrapper-only pipe and owns
-the POSIX worker group. Internal protocol **4** acknowledges guardian ownership
-before admitting the command. The guardian forks a blocked launcher into its
+the POSIX worker group. Internal protocol **5** acknowledges guardian ownership
+before admitting the command. A `bootstrap_ready`/`reserve` handshake proves
+whether fork was authorized before any launcher can exist. Unstarted helper exits
+are collected without zombie-group cleanup; a pre-admission timeout remains a
+timeout without requiring a native return code. The guardian forks a blocked launcher into its
 original group, then moves into the supervisor group before reporting readiness.
 Its PID reserves the worker group ID from outside that group; it reaps the launcher
 and reports the native return code independently, remaining alive until cleanup
 release. The supervisor alone selects normal outcomes and signals the group.
 The guardian ignores INT/TERM and falls back to shared shutdown policy only on
-supervisor-liveness EOF. A previously announced budget is never restarted.
+supervisor-liveness EOF. Normal shutdown never restarts its budget. On owner loss,
+the guardian gets one separate three-second force-only rescue, including when
+the announced normal budget has expired; its final second is reserved for reaping.
 Structured ready/exit/error frames replace the mixed readiness byte and JSON;
-missing launcher evidence and startup errno details remain operational failures.
+missing launcher evidence after admission and startup errno details remain operational failures.
+Cleanup certification is independent of outcome availability and requires confirmed
+group disappearance, not merely successful SIGKILL delivery.
 The forked launcher always ends through its own `_exit` boundary, and reaping
 clears its identity before fallible reporting. `waitid(WNOWAIT)` retains the guardian identity until cleanup and
 the terminal acknowledgment (or wrapper EOF). Clean completion therefore adds no
@@ -122,6 +129,11 @@ descendants retain the full bounded TERM/KILL cleanup. The final native exec
 restores Python-ignored SIGPIPE/SIGXFZ/SIGXFSZ defaults, matching `Popen`.
 The wrapper continuously drains the separate status pipe, bounded to **64 KiB**;
 oversized diagnostics retain error/path context with explicit truncation markers.
+The 64 KiB channel budget reserves 8 KiB for lifecycle events. Shared guardian
+writers have 48 KiB of guardian diagnostics and 8 KiB of launcher diagnostics;
+overflow is an operational protocol failure but cannot discard retained exit evidence.
+Framing and partial writes are shared; channel phase policies remain separate.
+One injected clock follows each lifecycle and descriptors become nonblocking once.
 An observed launcher exit takes precedence over simultaneous cancellation. A
 selected cancellation/timeout remains latched through subsequent cleanup exits,
 including exit zero; guardian exit alone never proves worker completion. Repeated

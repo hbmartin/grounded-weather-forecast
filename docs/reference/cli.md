@@ -1168,22 +1168,37 @@ seconds, followed by two seconds of SIGTERM grace and three seconds to force
 termination/reap, plus one second of wrapper wait margin. Exceptional rescue has
 a separate three-second maximum. The final second of forced cleanup and rescue
 is reserved for collection/resumption rather than permission-error retries;
-failed shutdown does not restart either budget. Internal protocol 4 admits the launcher only
-after guardian ownership is acknowledged. The guardian moves outside the worker
+failed shutdown does not restart either budget. Guardian liveness EOF starts one
+separate three-second force-only rescue even if normal cleanup has expired, with
+the final second reserved for collection. Internal protocol 5 admits the launcher only
+after guardian ownership is acknowledged. Before forking, the guardian reports
+`bootstrap_ready` and waits for `reserve`; cancellation and deadlines are checked
+before both fork authorization and command admission. A helper that never received
+fork authorization is safely collected without worker-group cleanup. Timeout before
+admission remains `TimeoutExpired`; unavailable native exit evidence does not
+replace it. Unknown ownership after authorization is reported explicitly.
+The guardian moves outside the worker
 group before readiness, retaining its PID as that group's ID, and reaps the
 launcher and reports its actual exit separately from its own process exit.
 It ignores INT/TERM, retains ownership after reporting the launcher, and initiates
 fallback group cleanup only on supervisor-liveness EOF. The supervisor alone owns
 normal deadlines, signals and outcome selection. Structured guardian readiness,
 exit and errno events share one incremental parser; missing exit evidence is an
-operational failure. `waitid(WNOWAIT)` reserves the guardian until group
+operational failure after admission. Cleanup flags reflect the state after every
+stop attempt; group disappearance must be confirmed after SIGKILL.
+`waitid(WNOWAIT)` reserves the guardian until group
 cleanup and terminal release acknowledgment (or wrapper EOF). Clean empty groups
 need no two-second wait or force signal; surviving descendants still receive the
 full graceful/forced cleanup. Native exec restores the standard ignored-signal
 defaults. Mode-specific helper descriptors are required arguments; omission is
 an argparse exit-2 error without a traceback. The status
 pipe is continuously drained and capped at 64 KiB, with primary error/path context
-prioritized in explicitly truncated oversized diagnostics. An observed launcher
+prioritized in explicitly truncated oversized diagnostics. Reserve 8 KiB of each
+channel for lifecycle events; guardian and launcher diagnostic quotas are 48 KiB
+and 8 KiB respectively. Diagnostic overflow cannot discard an exit event.
+Expected bootstrap/exec OS failures use structured errno/path diagnostics once.
+Exec-error reporting tolerates a closed reader without dying from SIGPIPE;
+unexpected programming errors retain traceback evidence. An observed launcher
 exit wins over simultaneous cancellation; once cancellation or timeout is selected,
 a subsequent cleanup exit (including zero) cannot override it. Repeated wrapper cancellation is deferred through
 bounded cleanup; the CLI ignores subsequent SIGTERM while unwinding evidence

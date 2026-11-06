@@ -151,7 +151,7 @@ def test_observe_exit_keeps_direct_child_waitable(supervisor):
 def test_no_historical_worker_signal_after_release(supervisor, monkeypatch):
     channel = supervisor.StatusChannel(-1, owned_pid=123456, released=True)
     process = SimpleNamespace(returncode=0, communicate=lambda **_: ("", ""))
-    monkeypatch.setattr(supervisor, "stopped_supervisor", lambda *_: False)
+    monkeypatch.setattr(supervisor, "stopped_supervisor", lambda *_, **__: False)
     monkeypatch.setattr(
         supervisor, "signal_group", lambda *_: pytest.fail("signaled historical group")
     )
@@ -163,7 +163,7 @@ def test_unknown_dead_supervisor_reports_uncertainty_without_signaling(
 ):
     channel = supervisor.StatusChannel(-1, owned_pid=123456)
     process = SimpleNamespace(returncode=1, communicate=lambda **_: ("", ""))
-    monkeypatch.setattr(supervisor, "stopped_supervisor", lambda *_: False)
+    monkeypatch.setattr(supervisor, "stopped_supervisor", lambda *_, **__: False)
     monkeypatch.setattr(
         supervisor, "signal_group", lambda *_: pytest.fail("signaled uncertain group")
     )
@@ -185,7 +185,7 @@ def test_second_cancellation_runs_emergency_before_propagating(supervisor, monke
         supervisor, "emergency_stop", lambda *_: calls.append("cleaned")
     )
     process = SimpleNamespace()
-    channel = SimpleNamespace(control=None)
+    channel = SimpleNamespace(control=None, clock=supervisor.CLOCK)
     with pytest.raises(KeyboardInterrupt, match="second") as caught:
         supervisor.cancel_supervisor(process, channel, primary)
     assert calls == ["cleaned"]
@@ -236,7 +236,7 @@ def test_error_protocol_does_not_claim_process_cleanup_failed(supervisor, monkey
         process = SimpleNamespace(
             pid=987654, returncode=None, communicate=lambda **_: ("", "")
         )
-        monkeypatch.setattr(supervisor, "stopped_supervisor", lambda *_: True)
+        monkeypatch.setattr(supervisor, "stopped_supervisor", lambda *_, **__: True)
         monkeypatch.setattr(supervisor, "signal_group", lambda *_: None)
         monkeypatch.setattr(supervisor.os, "kill", lambda *_: None)
         supervisor.emergency_stop(process, channel)

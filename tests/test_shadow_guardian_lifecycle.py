@@ -10,11 +10,10 @@ import sys
 import threading
 import time
 from datetime import UTC, datetime, timedelta
-from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
-from shadow_supervision_helpers import raw_owner, statuses
+from shadow_supervision_helpers import raw_owner, statuses, stop_worker
 from test_launchd import SCRIPT, load_script
 from test_shadow_supervision import supervisor as supervisor
 from test_shadow_supervision import unlocked, wait_for
@@ -58,7 +57,7 @@ def test_empty_group_cleanup_never_sends_a_signal(supervisor, monkeypatch):
     monkeypatch.setattr(supervisor, "observe_exit", lambda _process: 0)
     monkeypatch.setattr(supervisor, "signal_group", lambda *_: calls.append(True))
     clock = supervisor.Clock(lambda: 0, lambda _: pytest.fail("unnecessary grace"))
-    assert supervisor.stop_worker(SimpleNamespace(pid=123456), clock=clock) == 0
+    assert stop_worker(supervisor, SimpleNamespace(pid=123456), clock=clock) == 0
     assert calls == []
 
 
@@ -72,8 +71,8 @@ def test_cancel_after_spawn_before_guardian_ready_never_admits(
     original = supervisor.start_worker
     marker = tmp_path / "never-executed"
 
-    def cancel_after_spawn(*args):
-        worker = original(*args)
+    def cancel_after_spawn(*args, **kwargs):
+        worker = original(*args, **kwargs)
         control.cancel()
         return worker
 
@@ -248,7 +247,7 @@ def test_unconfirmed_stop_still_resumes_and_reaps(supervisor, tmp_path, monkeypa
         control.send(b"S")
         wait_for(marker.exists)
 
-        def unconfirmed(owned, _deadline):
+        def unconfirmed(owned, _deadline, **_kwargs):
             os.kill(owned.pid, signal.SIGSTOP)
             raise OSError("could not verify stopped shadow supervisor")
 
@@ -376,6 +375,7 @@ def test_force_denial_remains_failure_with_injected_clock(supervisor, monkeypatc
         elapsed[0] += seconds
 
     monkeypatch.setattr(supervisor, "signal_group", denied)
+    monkeypatch.setattr(supervisor, "group_exists", lambda _: True)
     clock = supervisor.Clock(lambda: elapsed[0], sleep)
     with pytest.raises(PermissionError, match="group termination denied"):
         supervisor.force_group(123456, 0.1, clock=clock)
